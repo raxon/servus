@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { request } from 'node:http';
-import type { Action, ActionDetail, Project, Service, SessionResponse } from '../src/shared/types.js';
+import type { Action, ActionDetail, Project, Service, SessionResponse } from '../apps/panel/src/shared/types.js';
 
 const base = process.env.PANEL_URL || 'http://localhost:4180';
 const dataDir = resolve(process.env.PANEL_DATA_DIR || '.data');

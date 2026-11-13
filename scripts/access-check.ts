@@ -1,8 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { Store } from '../src/server/store.js';
-import { hashPassword } from '../src/server/auth.js';
+import { Store } from '../apps/panel/src/server/store.js';
+import { hashPassword } from '../apps/panel/src/server/auth.js';
 import { assert, dataRoot, PanelApi, projectRoot, Report, runId } from './parity-lib.js';
 
 const identity = JSON.parse(readFileSync(resolve(dataRoot, `${runId}-panel-identity.json`), 'utf8'));

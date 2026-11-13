@@ -5,7 +5,7 @@ import { runtimeStatus } from '../agent/client.js';
 const dataDir = resolve(process.env.PANEL_DATA_DIR ?? '.data');
 const app = await createApp({
   dataDir,
-  webDir: resolve(process.env.PANEL_WEB_DIR || 'dist/web'),
+  webDir: resolve(process.env.PANEL_WEB_DIR || resolve(import.meta.dirname, '../../dist/web')),
   runtimeStatus,
   logger: true,
   allowedOrigins: process.env.PANEL_ALLOWED_ORIGINS?.split(',').map(value=>value.trim()).filter(Boolean),

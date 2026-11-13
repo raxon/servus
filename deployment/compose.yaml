@@ -1,0 +1,53 @@
+name: servus
+x-runtime: &runtime
+  image: ${SERVUS_IMAGE:?Run scripts/install.sh to prepare the image}
+  environment: &runtime-env
+    PANEL_DATA_DIR: ${SERVUS_DATA_DIR:-/var/lib/servus}
+    PANEL_INGRESS_PORT: ${SERVUS_INGRESS_PORT:-80}
+  volumes:
+    - ${SERVUS_DATA_DIR:-/var/lib/servus}:${SERVUS_DATA_DIR:-/var/lib/servus}
+  restart: unless-stopped
+  init: true
+services:
+  api:
+    <<: *runtime
+    command: [node, dist/server/index.js]
+    environment:
+      <<: *runtime-env
+      PANEL_HOST: 0.0.0.0
+      PANEL_PORT: 4180
+      PANEL_ALLOWED_ORIGINS: ${SERVUS_ALLOWED_ORIGINS:?Missing allowed origins}
+      PANEL_SECURE_COOKIES: ${SERVUS_SECURE_COOKIES:-false}
+    ports:
+      - ${SERVUS_BIND_ADDRESS:-0.0.0.0}:${SERVUS_PORT:-4180}:4180
+    depends_on:
+      agent:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:4180/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 12
+  worker:
+    <<: *runtime
+    command: [node, dist/worker/index.js]
+    depends_on:
+      agent:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+  agent:
+    <<: *runtime
+    command: [node, dist/agent/index.js]
+    group_add:
+      - ${SERVUS_DOCKER_GID:?Missing Docker socket group}
+    volumes:
+      - ${SERVUS_DATA_DIR:-/var/lib/servus}:${SERVUS_DATA_DIR:-/var/lib/servus}
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: [CMD, node, --input-type=module, -e, "import {runtimeStatus} from './dist/agent/client.js'; runtimeStatus().then(s=>process.exit(s.online?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 10s
+      start_period: 10s
+      retries: 24

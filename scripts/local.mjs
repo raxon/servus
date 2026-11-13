@@ -3,7 +3,8 @@ import { resolve } from 'node:path';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 
 if (Number(process.versions.node.split('.')[0]) < 24) throw new Error('Use Node.js 24 or later. Run nvm use first.');
-const dataDir = resolve(process.env.PANEL_DATA_DIR || '.data');
+const root = resolve(import.meta.dirname, '..');
+const dataDir = resolve(process.env.PANEL_DATA_DIR || resolve(root, '.data'));
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 let dockerSocket = process.env.PANEL_DOCKER_SOCKET;
 if (!dockerSocket) {
@@ -17,7 +18,7 @@ if (!dockerConfig && existsSync('/opt/homebrew/lib/docker/cli-plugins/docker-bui
   mkdirSync(dockerConfig, { recursive: true, mode: 0o700 });
   writeFileSync(resolve(dockerConfig, 'config.json'), JSON.stringify({ cliPluginsExtraDirs: ['/opt/homebrew/lib/docker/cli-plugins'] }), { mode: 0o600 });
 }
-const env = { ...process.env, ...(dockerConfig ? { DOCKER_CONFIG: dockerConfig } : {}), PANEL_DATA_DIR: dataDir, PANEL_DOCKER_SOCKET: dockerSocket };
+const env = { ...process.env, ...(dockerConfig ? { DOCKER_CONFIG: dockerConfig } : {}), PANEL_DATA_DIR: dataDir, PANEL_DOCKER_SOCKET: dockerSocket, PANEL_WEB_DIR: resolve(root, 'apps/panel/dist/web') };
 const children = [];
 const restarts = new Map();
 const timers = new Set();
@@ -33,7 +34,7 @@ function stop() {
   setTimeout(() => { for (const child of children) child.kill('SIGKILL'); }, 5000).unref();
 }
 function launch(component) {
-  const child = spawn(process.execPath, [`dist/${component}/index.js`], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [resolve(root, `apps/panel/dist/${component}/index.js`)], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] });
   child.component = component;
   children.push(child);
   child.stdout.on('data', chunk => process.stdout.write(`[${component}] ${chunk}`));

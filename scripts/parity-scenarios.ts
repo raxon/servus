@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import type { ServiceInput, ServicePatch } from '../src/shared/types.js';
+import type { ServiceInput, ServicePatch } from '../apps/panel/src/shared/types.js';
 import { assert, containerId, dataRoot, docker, eventually, healthy, PanelApi, ReferenceApi, Report, route, runId } from './parity-lib.js';
 
 export interface Target {

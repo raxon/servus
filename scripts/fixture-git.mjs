@@ -13,12 +13,12 @@ if (!existsSync(bare)) {
   mkdirSync(work, { recursive: true });
   git(['init', '-b', 'v1']);
   git(['config', 'user.name', 'Panel Fixture']); git(['config', 'user.email', 'fixture@localhost.test']);
-  for (const file of ['Dockerfile', 'server.mjs', 'package.json', 'package-lock.json']) copyFileSync(join(root, 'tests/fixtures/control', file), join(work, file));
+  for (const file of ['Dockerfile', 'server.mjs', 'package.json', 'package-lock.json']) copyFileSync(join(root, 'apps/panel/tests/fixtures/control', file), join(work, file));
   git(['add', '.']); git(['commit', '-m', 'Add deterministic application fixture']);
   git(['switch', '-c', 'v2']);
   writeFileSync(join(work, 'Dockerfile'), readFileSync(join(work, 'Dockerfile'), 'utf8').replace('FIXTURE_VERSION=v1', 'FIXTURE_VERSION=v2'));
   git(['add', '.']); git(['commit', '-m', 'Set application version v2']);
-  git(['switch', '-c', 'broken']); copyFileSync(join(root, 'tests/fixtures/control/Dockerfile.broken'), join(work, 'Dockerfile'));
+  git(['switch', '-c', 'broken']); copyFileSync(join(root, 'apps/panel/tests/fixtures/control/Dockerfile.broken'), join(work, 'Dockerfile'));
   git(['add', '.']); git(['commit', '-m', 'Add intentionally failing build']);
   git(['switch', 'v1']); git(['switch', '-c', 'unhealthy']);
   writeFileSync(join(work, 'Dockerfile'), readFileSync(join(work, 'Dockerfile'), 'utf8').replace('PORT=8080', 'PORT=8080 FAIL_HEALTH=1'));
@@ -29,7 +29,7 @@ if (!existsSync(bare)) {
 const commits = Object.fromEntries(['v1', 'v2', 'broken', 'unhealthy'].map(branch => [branch, git(['rev-parse', branch], bare)]));
 if (!git(['branch', '--list', 'slow'], bare).trim()) {
   git(['switch', 'v2']); git(['switch', '-c', 'slow']);
-  copyFileSync(join(root, 'tests/fixtures/control/server.mjs'), join(work, 'server.mjs'));
+  copyFileSync(join(root, 'apps/panel/tests/fixtures/control/server.mjs'), join(work, 'server.mjs'));
   writeFileSync(join(work, 'Dockerfile'), readFileSync(join(work, 'Dockerfile'), 'utf8').replace('--start-period=5s', '--start-period=30s'));
   git(['add', '.']); git(['commit', '-m', 'Add controlled readiness delay']);
   git(['push', bare, 'slow']); git(['update-server-info'], bare);

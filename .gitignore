@@ -11,3 +11,6 @@ test-results/
 *.sqlite*
 *.sock
 .DS_Store
+.turbo/
+.wrangler/
+apps/website/public/install.sh

@@ -1,10 +1,79 @@
 # Servus
 
-Brand domain: `servus.run`. The local instance runs at <http://localhost:4180>.
+Brand domain: `servus.run`. The local panel runs at <http://localhost:4180>, and the website development server runs at <http://localhost:4182>.
 
 Deploy applications and private databases on a Docker server you control. Servus stores project settings and deployment actions in SQLite, while its worker sends recorded operations to a separate local agent that builds Dockerfiles and manages Docker Swarm workloads.
 
 This repository contains an expanded local pilot with an independently written API, worker, agent and browser interface. Full EasyPanel compatibility remains unfinished. Fonts and browser assets are bundled locally.
+
+## Monorepo
+
+The repository uses npm workspaces and Turborepo. Run commands from the repository root with Node.js 24 and the npm version pinned in `package.json`.
+
+```text
+apps/panel/       API, worker, Docker agent and React management interface
+apps/website/     React website and Cloudflare static asset configuration
+scripts/          Local supervisor, installer and integration tools
+deployment/       Linux installation package
+tests/install/    Host-safe installer tests
+spec/parity/      Comparison scenarios
+```
+
+Each app builds into its own `dist` directory. The root `.data` directory keeps local projects, authentication state and secrets in place. Source paths changed during the workspace migration, but the existing local state directory is retained.
+
+See [AGENTS.md](AGENTS.md) for contribution instructions and [the architecture notes](docs/architecture.md) for process boundaries.
+
+## VPS installation
+
+The installer supports Ubuntu 22.04, 24.04 and 26.04, plus Debian 12 and 13 on amd64 or arm64. It prepares Docker when needed, builds Servus from source and starts the installation Compose package. You do not need Node.js on the VPS. Installation state lives under `/var/lib/servus`, and host configuration lives under `/etc/servus`.
+
+After the website and matching repository revision are published, the public command will be:
+
+```sh
+curl -fsSL https://servus.run/install.sh | sudo bash
+```
+
+Publication is required. Preparing this repository does not establish that `servus.run/install.sh` already serves the new installer. Inspect the script locally, then preview the installation on a supported Linux host:
+
+```sh
+bash scripts/install.sh --help
+bash scripts/install.sh --dry-run --source "$(pwd)"
+```
+
+On the target Linux host, install from a local checkout with:
+
+```sh
+sudo bash scripts/install.sh --source "$(pwd)"
+```
+
+The installer exposes management HTTP on port 4180 and application HTTP ingress on port 80 by default. Read [the installation guide](deployment/README.md) for host settings, port options and bootstrap access. Use a tested immutable source revision for a release. Each installed panel needs its own address and management TLS configuration.
+
+## Website
+
+In one terminal, start the local panel with `npm run local`. In another, run:
+
+```sh
+npm run dev
+```
+
+This starts the panel frontend on <http://localhost:4181> and the React website on <http://localhost:4182>. Use `npm run dev:website` to work on the website alone. Its basic assets and fonts are local.
+
+The website's `public/install.sh` is generated from `scripts/install.sh` before development and builds. Edit the canonical script, then run its tests. Do not maintain a second installer copy by hand.
+
+Cloudflare configuration is in `apps/website/wrangler.jsonc`. Package it without publication using:
+
+```sh
+npm run check:cloudflare
+```
+
+Publishing requires an authenticated Cloudflare account with access to the `servus.run` zone. After deployment has been authorized, log in locally and publish:
+
+```sh
+npx wrangler login
+npm run deploy:website
+```
+
+The website deployment is independent of the VPS panel. A successful local build or dry run does not confirm public DNS, HTTPS or installer availability.
 
 ## Supported operations
 
@@ -24,7 +93,7 @@ Automatic application HTTPS, private Git credentials, Compose application import
 
 ## Requirements
 
-Use Node.js 24 or later, npm and a Linux Docker Engine available to the agent with Swarm manager privileges. The macOS workflow also requires Docker CLI, its Buildx plugin and Colima. Servus listens on port 4180 and application HTTP ingress on port 18080.
+Use Node.js 24, the npm version declared in the root `packageManager` field and a Linux Docker Engine available to the agent with Swarm manager privileges. The macOS workflow also requires Docker CLI, its Buildx plugin and Colima. Servus listens on port 4180 and application HTTP ingress on port 18080.
 
 Choose a dedicated test daemon. The agent can initialize Swarm and create ingress services, so this pilot assumes trusted operators with Docker administration rights.
 
@@ -107,7 +176,7 @@ All endpoints use `/api/v1`. Authentication uses a session cookie. Read the `csr
 | `POST /services/:id/connection/reveal`                     | Explicit authorized password reveal                              |
 | `POST /services/:id/console-ticket`                        | `{containerId,shell:"/bin/sh"}` returns a single-use ticket      |
 
-Configuration updates require `expectedRevision`. A stale revision returns HTTP 409. Arrays supplied in a patch replace the corresponding desired collection. The typed request shapes are defined in `src/shared/types.ts`, and validation rules in `src/server/configuration.ts`.
+Configuration updates require `expectedRevision`. A stale revision returns HTTP 409. Arrays supplied in a patch replace the corresponding desired collection. The typed request shapes are defined in `apps/panel/src/shared/types.ts`, and validation rules in `apps/panel/src/server/configuration.ts`.
 
 The console connects to `/api/v1/services/:id/console?ticket=...` by WebSocket. Input packets use `{type:"input",data}`, resize packets use `{type:"resize",cols,rows}`, and output is raw terminal data. Reloading or leaving the console closes its connection. Errors use `{error:{code,message}}`.
 
@@ -124,7 +193,7 @@ docker compose up -d
 docker compose exec api cat /var/lib/panel/bootstrap-token
 ```
 
-The `panel-data` volume stores SQLite, agent state and secret material. Keep live SQLite files on local storage. The installer binds the management interface to localhost. Configure management HTTPS and secure cookies before exposing it on a public server, and decide separately whether application ingress should be reachable remotely.
+The `panel-data` volume stores SQLite, agent state and secret material. Keep live SQLite files on local storage. This root Compose package binds the management interface to localhost. The VPS installer has separate port and host settings described in its installation guide. Configure management HTTPS and secure cookies before exposing the panel publicly, and decide separately whether application ingress should be reachable remotely.
 
 The recorded package verification covers a Linux ARM64 image with Node.js 24 and Docker 29. It includes a real deployment, Git clone and BuildKit build inside the Linux package. Other architectures need their own verification.
 
@@ -162,7 +231,7 @@ npm run report:parity
 
 Storage checks create disposable bind services after the reboot and verify persistence through API service restart, read-only behavior, symlink escape rejection and two real replicas. This does not claim that those bind fixtures existed during the VM reboot. The report writes `artifacts/parity/<run-id>/index.html` and `summary.json`, preserving recorded reference failures and marking missing required evidence as pending. A unit test count alone does not establish parity or certify the complete product.
 
-For separate development processes, run `npm run dev`, `npm run agent`, `npm run worker` and optionally `npm run dev:web`, using the same `PANEL_DATA_DIR`. Set `PANEL_DOCKER_SOCKET` for the agent. Vite proxies API and WebSocket requests to port 4180. Environment files are not loaded automatically.
+For separate panel processes, run `npm run dev:api`, `npm run agent` and `npm run worker`, using the same `PANEL_DATA_DIR`. Start the frontend with `npm run dev:panel`. Set `PANEL_DOCKER_SOCKET` for the agent. The panel Vite server proxies API and WebSocket requests to port 4180. Environment files are not loaded automatically.
 
 The API commits configuration and jobs together. The worker owns orchestration leases, and the agent journals operation IDs before talking to Docker. Recovery inspects or resumes the same operation after an interruption. Browser builds retain earlier hashed assets so an already open tab can still load its console module.
 
