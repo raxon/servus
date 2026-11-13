@@ -1,0 +1,25 @@
+FROM docker:29-cli AS docker-cli
+
+FROM node:24-bookworm-slim AS build
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY tsconfig.server.json tsconfig.web.json vite.config.ts index.html ./
+COPY src ./src
+COPY public ./public
+RUN npm run build && npm prune --omit=dev --no-audit --no-fund
+
+FROM node:24-bookworm-slim
+WORKDIR /app
+ENV NODE_ENV=production PANEL_DATA_DIR=/var/lib/panel PANEL_HOST=0.0.0.0 PANEL_PORT=4180
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json ./
+RUN mkdir -p /var/lib/panel && chown -R node:node /var/lib/panel
+USER node
+EXPOSE 4180
+CMD ["node", "dist/server/index.js"]

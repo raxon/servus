@@ -1,0 +1,20 @@
+import { existsSync, unlinkSync, chmodSync } from 'node:fs';
+import { createAgent } from './app.js';
+import { agentConfig } from './config.js';
+
+const config = agentConfig();
+if (existsSync(config.socketPath)) {
+  const { connect } = await import('node:net');
+  const live = await new Promise<boolean>(resolve => {
+    const connection = connect(config.socketPath);
+    connection.on('connect', () => { connection.destroy(); resolve(true); });
+    connection.on('error', () => resolve(false));
+  });
+  if (live) throw new Error('A local agent is already listening.');
+  unlinkSync(config.socketPath);
+}
+const app = await createAgent(config);
+await app.listen({ path: config.socketPath });
+chmodSync(config.socketPath, 0o600);
+console.log(`Local agent listening on ${config.socketPath}`);
+for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, async () => { await app.close(); process.exit(0); });

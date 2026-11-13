@@ -1,0 +1,42 @@
+name: panel
+services:
+  api:
+    image: panel:local
+    build: .
+    ports:
+      - "127.0.0.1:4180:4180"
+    environment:
+      PANEL_DATA_DIR: /var/lib/panel
+      PANEL_HOST: 0.0.0.0
+      PANEL_ALLOWED_ORIGINS: http://localhost:4180,http://127.0.0.1:4180
+      PANEL_INGRESS_PORT: 18080
+    volumes:
+      - panel-data:/var/lib/panel
+    depends_on:
+      - agent
+    restart: unless-stopped
+  worker:
+    image: panel:local
+    command: ["node", "dist/worker/index.js"]
+    environment:
+      PANEL_DATA_DIR: /var/lib/panel
+      PANEL_INGRESS_PORT: 18080
+    volumes:
+      - panel-data:/var/lib/panel
+    depends_on:
+      - agent
+    restart: unless-stopped
+  agent:
+    image: panel:local
+    command: ["node", "dist/agent/index.js"]
+    group_add:
+      - "${DOCKER_GID:-999}"
+    environment:
+      PANEL_DATA_DIR: /var/lib/panel
+      PANEL_INGRESS_PORT: 18080
+    volumes:
+      - panel-data:/var/lib/panel
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+volumes:
+  panel-data:
