@@ -4995,3 +4995,27 @@ select:disabled {
     padding: 21px 22px;
   }
 }
+
+.central-sign-in {
+  border-top: 1px solid #e2e7dd;
+  margin-top: 22px;
+  padding-top: 20px;
+}
+.central-settings {
+  margin-top: 19px;
+  max-width: 720px;
+}
+.central-settings p {
+  color: #687667;
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 0 0 16px;
+}
+.central-settings form { margin-top: 18px; }
+.central-result, .central-disconnect {
+  border-top: 1px solid #e2e7dd;
+  margin-top: 20px;
+  padding-top: 20px;
+}
+.central-result .button { margin: 0 8px 8px 0; }
+.central-result input { overflow-wrap: anywhere; }

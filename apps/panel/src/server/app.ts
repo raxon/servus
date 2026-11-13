@@ -13,6 +13,7 @@ import { Store } from './store.js';
 import { nameSchema, normalizeServiceInput, parseServicePatch } from './configuration.js';
 import { agentRequest as defaultAgentRequest, AgentRequestError } from '../agent/client.js';
 import { registerConsole } from './console.js';
+import { registerCentralAuth } from './central-auth.js';
 
 const prefix = '/api/v1';
 const cookieName = 'panel_session';
@@ -68,9 +69,9 @@ export async function createApp(options: AppOptions) {
       throw new AppError('FORBIDDEN','Only instance administrators can configure host bind mounts',403);
     }
   }
-  function setSession(reply: FastifyReply, user: User) {
-    const created = store.createSession(user.id);
-    reply.setCookie(cookieName,created.token,{path:'/',httpOnly:true,sameSite:'strict',secure:options.secureCookies ?? false,maxAge:30*86_400});
+  function setSession(reply: FastifyReply, user: User, central = false) {
+    const created = store.createSession(user.id,central);
+    reply.setCookie(cookieName,created.token,{path:'/',httpOnly:true,sameSite:'strict',secure:central || (options.secureCookies ?? false),maxAge:central ? 900 : 30*86_400});
     return {user,csrfToken:created.csrfToken};
   }
 
@@ -90,6 +91,34 @@ export async function createApp(options: AppOptions) {
   });
   app.get(`${prefix}/auth/session`, async req => session(req));
   app.post(`${prefix}/auth/logout`, async (req,reply) => { session(req,true);store.deleteSession(req.cookies[cookieName]!);reply.clearCookie(cookieName,{path:'/'});return {success:true}; });
+  registerCentralAuth(app,{store,allowedOrigins,secureCookies:options.secureCookies??false,session,setSession});
+
+  function administrator(req:FastifyRequest,mutation=false) {
+    const auth=session(req,mutation);
+    if(auth.user.role!=='admin')throw new AppError('FORBIDDEN','Administrator access required',403);
+    return auth.user;
+  }
+  app.get(`${prefix}/users`,async req=>{
+    administrator(req);
+    return {users:store.db.prepare('SELECT id,email,role,created_at AS createdAt FROM users ORDER BY email').all()};
+  });
+  app.get<{Params:{id:string}}>(`${prefix}/projects/:id/members`,async req=>{
+    administrator(req);
+    if(!store.getProject(req.params.id))throw new AppError('NOT_FOUND','Project not found',404);
+    return {members:store.db.prepare('SELECT m.user_id AS userId,u.email,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.project_id=? ORDER BY u.email').all(req.params.id)};
+  });
+  app.put<{Params:{id:string;userId:string}}>(`${prefix}/projects/:id/members/:userId`,async req=>{
+    const actor=administrator(req,true),{role}=z.object({role:z.enum(['editor','viewer'])}).strict().parse(req.body);
+    if(!store.getProject(req.params.id)||!store.db.prepare('SELECT 1 FROM users WHERE id=?').get(req.params.userId))throw new AppError('NOT_FOUND','Project or user not found',404);
+    store.db.transaction(()=>{store.addMember(req.params.id,req.params.userId,role);store.recordAudit(actor.id,'project.member.set',`${req.params.id}:${req.params.userId}`);})();
+    return {success:true};
+  });
+  app.delete<{Params:{id:string;userId:string}}>(`${prefix}/projects/:id/members/:userId`,async req=>{
+    const actor=administrator(req,true);
+    if(!store.getProject(req.params.id)||!store.db.prepare('SELECT 1 FROM users WHERE id=?').get(req.params.userId))throw new AppError('NOT_FOUND','Project or user not found',404);
+    store.db.transaction(()=>{store.db.prepare('DELETE FROM memberships WHERE project_id=? AND user_id=?').run(req.params.id,req.params.userId);store.recordAudit(actor.id,'project.member.remove',`${req.params.id}:${req.params.userId}`);})();
+    return {success:true};
+  });
 
   app.get(`${prefix}/projects`, async req => store.listProjects(session(req).user));
   app.post(`${prefix}/projects`, async (req,reply) => {

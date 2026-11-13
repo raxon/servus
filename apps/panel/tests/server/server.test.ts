@@ -137,7 +137,7 @@ describe('durable job ownership',()=>{
     for(const worker of workers)worker.child.stdin.end('go');
     const results=await Promise.all(workers.map(worker=>worker.result));
     expect(results).toEqual(results.map(()=>({code:0,stderr:''})));
-    const store=new Store(dir);expect(store.db.pragma('user_version',{simple:true})).toBe(2);store.close();
+    const store=new Store(dir);expect(store.db.pragma('user_version',{simple:true})).toBe(3);store.close();
     expect(readFileSync(join(dir,'bootstrap-token'),'utf8')).toHaveLength(64);
   });
   it('reclaims expired jobs, preserves snapshots and fences stale worker completion',async()=>{

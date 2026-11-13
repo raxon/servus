@@ -66,6 +66,8 @@ import type {
 } from "../shared/types.js";
 import { api, errorMessage, RequestError, setCsrfToken } from "./api.js";
 import { CreateService } from "./ServiceCreate.js";
+import { CentralAccessSettings, CentralSignIn } from "./CentralAccess.js";
+import { ProjectAccess } from "./ProjectAccess.js";
 import {
   DatabaseConnection,
   DestroyService,
@@ -326,8 +328,9 @@ function AuthForm({ setup }: { setup: boolean }) {
           </button>
           <div className="auth-note">
             <ShieldCheck size={15} />
-            <span>Credentials stay on your own installation.</span>
+            <span>Your local account password stays on this installation.</span>
           </div>
+          {!setup ? <CentralSignIn /> : null}
         </form>
         <div className="auth-footer">
           Servus <span>/</span> servus.run
@@ -1773,6 +1776,8 @@ function SettingsPage() {
           </div>
         </section>
       </div>
+      {user.role === "admin" ? <CentralAccessSettings /> : null}
+      {user.role === "admin" ? <ProjectAccess /> : null}
     </>
   );
 }

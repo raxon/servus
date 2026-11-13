@@ -44,7 +44,7 @@ export class Store {
     retryStartupLock(()=>this.db.pragma('journal_mode = WAL'));
     this.db.pragma('foreign_keys = ON');
     const version = this.db.pragma('user_version', { simple: true }) as number;
-    if (version > 2) throw new Error('This database requires a newer panel release');
+    if (version > 3) throw new Error('This database requires a newer panel release');
     if (version === 0) this.db.transaction(() => {
       const currentVersion = this.db.pragma('user_version', { simple: true }) as number;
       if(currentVersion>=1)return;
@@ -81,6 +81,22 @@ export class Store {
         PRAGMA user_version = 2;
       `);
     }).immediate();
+    this.db.transaction(()=>{
+      if(Number(this.db.pragma('user_version',{simple:true}))>=3)return;
+      this.db.exec(`
+        CREATE TABLE local_credentials (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, password_hash TEXT NOT NULL);
+        INSERT INTO local_credentials SELECT id,password_hash FROM users;
+        UPDATE users SET password_hash='external-credentials';
+        CREATE TABLE external_identities (issuer TEXT NOT NULL, subject TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, PRIMARY KEY(issuer,subject));
+        CREATE TABLE central_sessions (token_hash TEXT PRIMARY KEY REFERENCES sessions(token_hash) ON DELETE CASCADE);
+        CREATE TABLE central_config (id INTEGER PRIMARY KEY CHECK(id=1), issuer TEXT NOT NULL, client_id TEXT NOT NULL, client_secret TEXT NOT NULL, callback_url TEXT NOT NULL, revoke_token TEXT NOT NULL);
+        CREATE TABLE central_pending_revocations (client_id TEXT PRIMARY KEY, service_origin TEXT NOT NULL, revoke_token TEXT NOT NULL);
+        CREATE TABLE central_pairings (id TEXT PRIMARY KEY, service_url TEXT NOT NULL, callback_url TEXT NOT NULL, secret TEXT NOT NULL, actor_id TEXT NOT NULL REFERENCES users(id), expires_at TEXT NOT NULL, redeemed_credentials TEXT);
+        CREATE TABLE central_invitations (token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, actor_id TEXT NOT NULL REFERENCES users(id), expires_at TEXT NOT NULL, used_at TEXT);
+        CREATE TABLE central_transactions (state_hash TEXT PRIMARY KEY, cookie_hash TEXT NOT NULL, verifier TEXT NOT NULL, nonce TEXT NOT NULL, invitation_hash TEXT, expires_at TEXT NOT NULL);
+        PRAGMA user_version = 3;
+      `);
+    }).immediate();
     this.orm = drizzle(this.db, { schema });
     this.vault = new SecretVault(dataDir);
     if (!this.isSetup() && !existsSync(this.bootstrapPath)) {
@@ -92,7 +108,8 @@ export class Store {
   isSetup() { return (this.db.prepare('SELECT count(*) AS count FROM users WHERE role = ?').get('admin') as { count: number }).count > 0; }
   createUser(email: string, passwordHash: string, role: User['role'] = 'member'): User {
     const user = { id: randomUUID(), email: email.toLowerCase(), role, createdAt: now() };
-    this.db.prepare('INSERT INTO users VALUES (?,?,?,?,?)').run(user.id, user.email, passwordHash, role, user.createdAt);
+    this.db.prepare('INSERT INTO users VALUES (?,?,?,?,?)').run(user.id, user.email, 'external-credentials', role, user.createdAt);
+    this.db.prepare('INSERT INTO local_credentials VALUES (?,?)').run(user.id,passwordHash);
     return user;
   }
   setup(token: string, email: string, passwordHash: string): User {
@@ -105,11 +122,15 @@ export class Store {
   }
   removeBootstrapToken() { if (existsSync(this.bootstrapPath)) unlinkSync(this.bootstrapPath); }
   findUser(email: string) {
-    return this.db.prepare('SELECT id,email,role,created_at AS createdAt,password_hash AS passwordHash FROM users WHERE email = ?').get(email.toLowerCase()) as (User & { passwordHash: string }) | undefined;
+    return this.db.prepare('SELECT u.id,u.email,u.role,u.created_at AS createdAt,c.password_hash AS passwordHash FROM users u JOIN local_credentials c ON c.user_id=u.id WHERE u.email = ?').get(email.toLowerCase()) as (User & { passwordHash: string }) | undefined;
   }
-  createSession(userId: string) {
+  createSession(userId: string, central = false) {
     const token = randomBytes(32).toString('hex'), csrfToken = randomBytes(32).toString('hex');
-    this.db.prepare('INSERT INTO sessions VALUES (?,?,?,?,?)').run(hashToken(token), userId, csrfToken, new Date(Date.now() + 86_400_000).toISOString(), new Date(Date.now() + 30 * 86_400_000).toISOString());
+    const absolute = new Date(Date.now() + (central ? 900_000 : 30 * 86_400_000)).toISOString();
+    this.db.transaction(()=>{
+      this.db.prepare('INSERT INTO sessions VALUES (?,?,?,?,?)').run(hashToken(token), userId, csrfToken, central ? absolute : new Date(Date.now() + 86_400_000).toISOString(), absolute);
+      if(central)this.db.prepare('INSERT INTO central_sessions VALUES (?)').run(hashToken(token));
+    })();
     return { token, csrfToken };
   }
   getSession(token: string) {
