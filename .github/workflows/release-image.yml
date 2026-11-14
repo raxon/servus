@@ -48,6 +48,7 @@ jobs:
           npm test
           npm run build
       - name: Build image from the checked-out commit
+        id: build
         env:
           IMAGE: ${{ steps.release.outputs.image }}
           VERSION: ${{ steps.release.outputs.tag }}
@@ -62,13 +63,26 @@ jobs:
             --label "org.opencontainers.image.revision=$COMMIT" \
             --label "org.opencontainers.image.version=$VERSION" \
             --tag "$IMAGE:$VERSION" .
+          image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE:$VERSION")
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'Invalid built image ID.' >&2; exit 1; }
+          printf 'image_id=%s\n' "$image_id" >> "$GITHUB_OUTPUT"
       - name: Test the built image on amd64
         env:
-          IMAGE: ${{ steps.release.outputs.image }}
-          VERSION: ${{ steps.release.outputs.tag }}
+          IMAGE_ID: ${{ steps.build.outputs.image_id }}
           EXPECTED_REVISION: ${{ steps.release.outputs.commit }}
           EXPECTED_VERSION: ${{ steps.release.outputs.tag }}
-        run: bash scripts/verify-image.sh "$IMAGE:$VERSION"
+        run: bash scripts/verify-image.sh "$IMAGE_ID"
+      - name: Test supervisor entrypoints in the built image
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          docker run --rm --pull=never --network none --read-only --user root \
+            --tmpfs /srv:rw,nosuid,nodev,size=128m \
+            --tmpfs /tmp:rw,nosuid,nodev,size=32m \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/tests/integration/supervisor-entrypoint.mjs,target=/fixture.mjs,readonly" \
+            --env SERVUS_SUPERVISOR_INTEGRATION_FIXTURE=1 \
+            --entrypoint node "$IMAGE_ID" /fixture.mjs
       - name: Authenticate to GHCR
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -79,8 +93,10 @@ jobs:
         env:
           IMAGE: ${{ steps.release.outputs.image }}
           VERSION: ${{ steps.release.outputs.tag }}
+          IMAGE_ID: ${{ steps.build.outputs.image_id }}
         run: |
           set -euo pipefail
+          [[ $(docker image inspect --format '{{.Id}}' "$IMAGE:$VERSION") == "$IMAGE_ID" ]] || { echo 'Image tag no longer references the tested image.' >&2; exit 1; }
           docker push "$IMAGE:$VERSION" | tee "$RUNNER_TEMP/servus-image-push.log"
           digest=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$RUNNER_TEMP/servus-image-push.log" | tail -n 1)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'Registry did not return an image digest.' >&2; exit 1; }
