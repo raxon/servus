@@ -1,4 +1,5 @@
 import importlib.util
+import fcntl
 import json
 import hashlib
 from types import SimpleNamespace
@@ -27,6 +28,45 @@ class HostProvisioningTest(unittest.TestCase):
     def tearDown(self): self.temp.cleanup()
 
     def prepare(self): module.prepare(str(self.config),str(self.state))
+
+    def runtime_fixture(self):
+        install=self.root/'install';install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
+        return install
+
+    def test_runtime_preparation_is_idempotent_and_preserves_credentials(self):
+        install=self.runtime_fixture()
+        def run(): module.prepare_runtime(str(self.config),str(install),supervisor)
+        run()
+        tokens=supervisor.ComponentEndpoint().read_component_tokens(str(self.config/'supervisor-secrets'),1000)
+        gate=self.config/'lifecycle'; lock=(gate/'lock').stat().st_ino
+        control=(self.config/'supervisor-control').stat()
+        self.assertEqual((control.st_uid,control.st_gid,stat.S_IMODE(control.st_mode)),(0,1000,0o750))
+        run()
+        self.assertEqual(tokens,supervisor.ComponentEndpoint().read_component_tokens(str(self.config/'supervisor-secrets'),1000))
+        self.assertEqual(lock,(gate/'lock').stat().st_ino)
+
+    def test_runtime_refuses_existing_installation_and_partial_state(self):
+        install=self.runtime_fixture(); env=self.config/'servus.env';env.write_text('existing\n');env.chmod(0o600)
+        with self.assertRaises(module.ProvisionError): module.prepare_runtime(str(install),str(install),supervisor)
+        with self.assertRaises(module.ProvisionError): module.prepare_runtime(str(self.config),str(install),supervisor)
+        self.assertEqual(env.read_text(),'existing\n');self.assertFalse((self.config/'lifecycle').exists())
+        env.unlink();(self.config/'lifecycle').mkdir(mode=0o755)
+        with self.assertRaises(module.ProvisionError): module.prepare_runtime(str(self.config),str(install),supervisor)
+        self.assertTrue((self.config/'lifecycle').is_dir())
+
+    def test_runtime_rejects_changed_state_credentials_and_install_lock(self):
+        install=self.runtime_fixture()
+        def run(): module.prepare_runtime(str(self.config),str(install),supervisor)
+        fd=os.open(install/'install.lock',os.O_RDONLY)
+        try:
+            fcntl.flock(fd,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError): run()
+        finally: os.close(fd)
+        run();state=self.config/'lifecycle/state';state.write_text('maintenance\n');state.chmod(0o644)
+        with self.assertRaises(module.ProvisionError): run()
+        state.write_text('servus-lifecycle-v1 normal\n');state.chmod(0o644)
+        credential=self.config/'supervisor-secrets/api';credential.chmod(0o666)
+        with self.assertRaises(supervisor.SupervisorError): run()
 
     def test_creates_private_configuration_and_is_idempotent(self):
         self.prepare()

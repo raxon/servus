@@ -5,6 +5,7 @@ Existing files and directories are verified, never silently replaced. Service
 installation, policy activation, and live panel changes are separate steps.
 """
 import argparse
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -110,6 +111,99 @@ def prepare(config_dir, state_dir):
         os.close(config)
 
 
+def prepare_runtime(config_dir, install_dir, supervisor):
+    """Create the first lifecycle gate and component credentials under the install lock."""
+    if os.geteuid() != 0: raise ProvisionError('Root is required')
+    if (not all(isinstance(path, str) and path.startswith('/') and path != '/' and os.path.normpath(path) == path
+                for path in (config_dir, install_dir)) or config_dir == install_dir or
+        config_dir.startswith(install_dir + '/') or install_dir.startswith(config_dir + '/')):
+        raise ProvisionError('Runtime paths overlap or are invalid')
+    config = directory(config_dir, 0o700); install = lock = None
+    names = ('lifecycle', 'supervisor-secrets', 'supervisor-control', '.supervisor-enabled-v1')
+    def exists(parent, name):
+        try: os.stat(name, dir_fd=parent, follow_symlinks=False); return True
+        except FileNotFoundError: return False
+    def create_file(parent, name, value, mode, gid):
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+        try:
+            os.fchown(fd, 0, gid); os.fchmod(fd, mode)
+            with os.fdopen(fd, 'wb', closefd=False) as stream:
+                stream.write(value); stream.flush(); os.fsync(fd)
+        finally: os.close(fd)
+    try:
+        install = directory(install_dir, 0o700)
+        lock = supervisor._open_root_file(install, 'install.lock', 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        present = [exists(config, name) for name in names]
+        marker = exists(install, '.lifecycle-enabled-v1')
+        if any(present) or marker:
+            if not all(present) or not marker: raise ProvisionError('Incomplete runtime preparation requires recovery')
+        else:
+            if exists(config, 'servus.env'):
+                raise ProvisionError('Existing installations require a verified migration')
+            os.mkdir('lifecycle', 0o755, dir_fd=config)
+            gate = os.open('lifecycle', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=config)
+            try:
+                os.fchmod(gate, 0o755)
+                create_file(gate, 'lock', b'', 0o644, 0)
+                create_file(gate, 'state', b'servus-lifecycle-v1 normal\n', 0o644, 0)
+                os.fsync(gate)
+            finally: os.close(gate)
+            os.mkdir('supervisor-secrets', 0o700, dir_fd=config)
+            secret_dir = os.open('supervisor-secrets', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=config)
+            try:
+                os.fchmod(secret_dir, 0o700)
+                tokens = set()
+                for role in supervisor.ROLES:
+                    token = secrets.token_hex(32)
+                    if token in tokens: raise ProvisionError('Duplicate component credential')
+                    tokens.add(token)
+                    create_file(secret_dir, role, (token + '\n').encode('ascii'), 0o640, 1000)
+                os.fsync(secret_dir)
+            finally: os.close(secret_dir)
+            os.mkdir('supervisor-control', 0o750, dir_fd=config)
+            control = os.open('supervisor-control', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=config)
+            try: os.fchown(control, 0, 1000); os.fchmod(control, 0o750); os.fsync(control)
+            finally: os.close(control)
+            os.fsync(config)
+            create_file(install, '.lifecycle-enabled-v1', b'servus-lifecycle-v1\n', 0o600, 0)
+            os.fsync(install)
+            create_file(config, '.supervisor-enabled-v1', b'servus-supervisor-v1\n', 0o600, 0)
+            os.fsync(config)
+        for parent, name, content in ((install, '.lifecycle-enabled-v1', b'servus-lifecycle-v1\n'),
+                                      (config, '.supervisor-enabled-v1', b'servus-supervisor-v1\n')):
+            fd = supervisor._open_root_file(parent, name, 0o600)
+            try:
+                if os.read(fd, len(content) + 1) != content: raise ProvisionError('Invalid runtime marker')
+            finally: os.close(fd)
+        control = os.open('supervisor-control', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=config)
+        try:
+            info = os.fstat(control)
+            if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 1000, 0o750):
+                raise ProvisionError('Unsafe supervisor control directory')
+        finally: os.close(control)
+        supervisor.ComponentEndpoint().read_component_tokens(config_dir + '/supervisor-secrets', 1000)
+        gate = supervisor._trusted_directory(config_dir + '/lifecycle', 0o755)
+        try:
+            gate_lock = supervisor._open_root_file(gate, 'lock', 0o644)
+            try:
+                fcntl.flock(gate_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                named = os.stat('lock', dir_fd=gate, follow_symlinks=False); opened = os.fstat(gate_lock)
+                if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise ProvisionError('Lifecycle lock changed')
+                state = supervisor._open_root_file(gate, 'state', 0o644)
+                try:
+                    if os.read(state, 64) != b'servus-lifecycle-v1 normal\n':
+                        raise ProvisionError('Lifecycle gate is not in normal state')
+                finally: os.close(state)
+            finally: os.close(gate_lock)
+        finally: os.close(gate)
+    finally:
+        if lock is not None: os.close(lock)
+        if install is not None: os.close(install)
+        os.close(config)
+
+
 
 def trusted_ingress(docker_config, runtime):
     raw = runtime._docker(docker_config, 'ps', '--no-trunc', '--filter', 'label=com.docker.swarm.service.name=panel-ingress', '--format', '{{.ID}}', limit=8192)
@@ -201,11 +295,16 @@ def main():
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
         print('Host preparation requires isolated Linux root.', file=sys.stderr); return 1
     parser = argparse.ArgumentParser()
-    parser.add_argument('--finalize', action='store_true')
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument('--finalize', action='store_true')
+    actions.add_argument('--runtime', action='store_true')
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        if args.finalize:
+        if args.runtime:
+            supervisor, _, _, _ = trusted_modules()
+            prepare_runtime('/etc/servus', '/opt/servus', supervisor)
+        elif args.finalize:
             supervisor, daemon, backup, runtime = trusted_modules()
             finalize('/etc/servus', '/var/lib/servus-updater', '/opt/servus', '/usr/bin/node', supervisor, daemon, backup, runtime)
         else:

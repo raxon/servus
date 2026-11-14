@@ -43,7 +43,7 @@ git archive HEAD | tar -xf - -C "$temp_dir/head"
 release_mode=head
 if [ "${SERVUS_TEST_WORKTREE:-0}" = 1 ]; then
   release_mode=worktree
-  for component in extract-install.py prepare-verified.py; do
+  for component in extract-install.py prepare-verified.py provision-host.py; do
     cp "apps/updater/$component" "$temp_dir/head/apps/updater/$component"
   done
 fi
@@ -99,3 +99,14 @@ for unit in servus-updater-socket.service servus-updater-bootstrap.service; do
 done
 guest sudo tee /run/servus-release-fixture/bootstrap-unit.py < tests/release-preparation-e2e/bootstrap-unit.py > /dev/null
 guest sudo /usr/bin/python3 -I /run/servus-release-fixture/bootstrap-unit.py
+# Provision only in the disposable VM after the updater fixture has stopped.
+for component in supervisor.py supervisor-daemon.py backup.py runtime-policy.py; do
+  guest sudo tee "/usr/local/libexec/servus/$component" < "$temp_dir/head/apps/updater/$component" > /dev/null
+  guest sudo chmod 644 "/usr/local/libexec/servus/$component"
+done
+guest sudo chmod 700 /opt/servus
+guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/provision-host.py --runtime
+guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/provision-host.py --runtime
+guest sudo test -f /etc/servus/.supervisor-enabled-v1
+guest sudo test -f /opt/servus/.lifecycle-enabled-v1
+printf 'PASS first runtime provisioning and safe rerun on Linux\n'
