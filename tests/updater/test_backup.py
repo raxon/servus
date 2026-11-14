@@ -316,6 +316,36 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
             self.assertEqual(self.panel.execute('PRAGMA user_version').fetchone(),(4,))
             self.assertEqual((pathlib.Path(destination)/'panel.sqlite').stat().st_uid,1000)
 
+    def test_legacy_capture_records_and_verifies_real_snapshot(self):
+        def load(name,filename):
+            spec=importlib.util.spec_from_file_location(name,ROOT/'apps/updater'/filename)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+        supervisor=load('legacy_capture_supervisor','supervisor.py')
+        coordinator=load('legacy_capture_coordinator','update-coordinator.py')
+        legacy=load('legacy_capture','legacy-stop.py')
+        updater=load('legacy_capture_updater','servus-updater.py')
+        with tempfile.TemporaryDirectory(dir='/root') as protected:
+            root=pathlib.Path(protected);install=root/'install';install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
+            state=root/'state';state.mkdir(mode=0o700);snapshot=root/'snapshot';snapshot.mkdir(mode=0o700)
+            journal=updater.Journal(state);attempt='12345678-1234-4123-8123-123456789abd';prep='12345678-1234-4123-8123-123456789abe'
+            image='sha256:'+'a'*64;config='sha256:'+'b'*64;nonce='c'*64;binding=(prep,attempt,nonce,image,config)
+            approved=SimpleNamespace(install_dir=str(install),data_dir=str(root/'target'))
+            adoption=SimpleNamespace(_binding=lambda *_:('/policy','/accepted',approved,binding))
+            old={role:letter*64 for role,letter in zip(('api','worker','agent'),'def')}
+            source=os.stat(self.src)
+            journal.db.execute('CREATE TABLE legacy_stop_operations(operation_id TEXT PRIMARY KEY,preparation_id TEXT,attempt_id TEXT,nonce TEXT,root_digest TEXT,config_digest TEXT,policy_path TEXT,accepted_env TEXT,active_env TEXT,source TEXT,source_dev INTEGER,source_ino INTEGER,old_image TEXT,old_image_id TEXT,old_ids TEXT,state TEXT)')
+            journal.db.execute('INSERT INTO legacy_stop_operations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(UUID,*binding,'/policy','/accepted','/active',str(self.src),source.st_dev,source.st_ino,'old','old',json.dumps(old),'stopped'))
+            quiet=SimpleNamespace(ensure_host_namespaces=lambda:None,ensure_restart_fenced=lambda *_:None,ensure_no_other_data_mounts=lambda *_,**__:None,
+                                  ensure_no_mount_aliases=lambda *_:None,ensure_no_open_data=lambda *_:None,ensure_no_uid_writers=lambda *_:None)
+            lock=os.open(install/'install.lock',os.O_RDONLY);fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            try:
+                with mock.patch.object(supervisor,'_verify_data_directory'):
+                    digest=legacy.capture(journal,UUID,'/active',str(snapshot),self.node_fd,supervisor,object(),adoption,quiet,object(),backup,coordinator,install_lock=lock)
+                self.assertEqual(journal.db.execute('SELECT path,digest,state FROM legacy_snapshots').fetchone(),(str(snapshot),digest,'verified'))
+                self.assertEqual('sha256:'+hashlib.sha256((snapshot/'manifest.json').read_bytes()).hexdigest(),digest)
+                coordinator.verify_snapshot(str(snapshot),digest,backup,self.node_fd,supervisor)
+            finally:os.close(lock);journal.close()
+
     def test_wrong_key_or_corrupted_ciphertext_is_rejected(self):
         (self.src/'secret-key').write_text('43'*32); self.fix_permissions()
         with self.assertRaisesRegex(backup.CaptureError,'Encryption verification failed'): self.capture()

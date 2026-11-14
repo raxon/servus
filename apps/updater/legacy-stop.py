@@ -4,6 +4,7 @@
 This module neither creates a snapshot nor permits starting a new generation.
 The coordinator must protect the original data and implement explicit recovery.
 """
+import hashlib
 import json
 import os
 import re
@@ -108,3 +109,93 @@ def stop(journal,operation,active_env,source,old_image,old_image_id,old_ids,supe
             raise
         return identity
     finally:os.close(source_fd)
+
+
+def capture(journal,operation,active_env,destination,node_fd,supervisor,daemon,adoption,quiescence,docker,backup,coordinator,
+            *,install_lock,trusted_ingress=None):
+    """Capture a stopped installation under the same installation lock.
+
+    The caller must maintain the independent startup and writer fence throughout
+    capture and restore. A recorded snapshot does not authorize a start.
+    """
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or not supervisor._uuid4(operation):
+        raise LegacyStopError('Isolated Linux root is required')
+    policy_path,accepted,approved,binding=adoption._binding(journal,operation,active_env,supervisor,daemon)
+    directory=supervisor._trusted_directory(approved.install_dir,0o700)
+    try:
+        expected=supervisor._open_root_file(directory,'install.lock',0o600)
+        try:
+            held,named=os.fstat(install_lock),os.fstat(expected)
+            if (held.st_dev,held.st_ino)!=(named.st_dev,named.st_ino):raise LegacyStopError('Installation lock does not match')
+            supervisor._assert_exclusive_flock(install_lock)
+        finally:os.close(expected)
+    finally:os.close(directory)
+    row=journal.db.execute('SELECT preparation_id,attempt_id,nonce,root_digest,config_digest,policy_path,accepted_env,active_env,source,source_dev,source_ino,old_image,old_image_id,old_ids,state FROM legacy_stop_operations WHERE operation_id=?',(operation,)).fetchone()
+    if not row or row[:8]!=(*binding,policy_path,accepted,active_env) or row[-1]!='stopped':raise LegacyStopError('Stopped installation does not match')
+    source,dev,ino=row[8:11]
+    try:old_ids=json.loads(row[13],object_pairs_hook=coordinator._pairs)
+    except (ValueError,TypeError,UnicodeError) as error:raise LegacyStopError('Legacy container identity is invalid') from error
+    if (not isinstance(old_ids,dict) or set(old_ids)!={'api','worker','agent'} or
+        any(not isinstance(value,str) or not re.fullmatch(r'[a-f0-9]{64}',value) for value in old_ids.values()) or len(set(old_ids.values()))!=3 or
+        not isinstance(destination,str) or not destination.startswith('/') or os.path.normpath(destination)!=destination or destination=='/' or
+        destination==source or destination.startswith(source+'/') or source.startswith(destination+'/') or
+        destination==approved.data_dir or destination.startswith(approved.data_dir+'/') or approved.data_dir.startswith(destination+'/')):
+        raise LegacyStopError('Snapshot identity or destination is invalid')
+    supervisor._verify_data_directory(source)
+    source_fd=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    destination_fd=None
+    try:
+        destination_fd=supervisor._trusted_directory(destination,0o700)
+        if os.fstat(destination_fd).st_gid!=0 or os.listdir(destination_fd):raise LegacyStopError('Snapshot destination is not empty and protected')
+        def check():
+            supervisor._assert_exclusive_flock(install_lock)
+            current=os.fstat(source_fd);named=os.stat(source,follow_symlinks=False)
+            if ((current.st_dev,current.st_ino)!=(dev,ino) or (named.st_dev,named.st_ino)!=(dev,ino) or
+                (current.st_uid,current.st_gid,stat.S_IMODE(current.st_mode))!=(1000,1000,0o700)):
+                raise LegacyStopError('Legacy data directory changed')
+            if adoption._binding(journal,operation,active_env,supervisor,daemon)!=(policy_path,accepted,approved,binding):raise LegacyStopError('Approved release changed')
+            current_row=journal.db.execute('SELECT preparation_id,attempt_id,nonce,root_digest,config_digest,policy_path,accepted_env,active_env,source,source_dev,source_ino,old_image,old_image_id,old_ids,state FROM legacy_stop_operations WHERE operation_id=?',(operation,)).fetchone()
+            if current_row!=row:raise LegacyStopError('Legacy stop state changed')
+            quiescence.ensure_host_namespaces()
+            quiescence.ensure_restart_fenced(docker,set(old_ids.values()))
+            quiescence.ensure_no_other_data_mounts(docker,set(old_ids.values()),source,trusted_ingress=trusted_ingress)
+            quiescence.ensure_no_mount_aliases(docker,source)
+            quiescence.ensure_no_open_data(source)
+            quiescence.ensure_no_uid_writers(1000)
+        check()
+        db=journal.db;db.execute('BEGIN IMMEDIATE')
+        try:
+            check()
+            db.execute("CREATE TABLE IF NOT EXISTS legacy_snapshots(operation_id TEXT PRIMARY KEY, path TEXT NOT NULL, digest TEXT, state TEXT NOT NULL CHECK(state IN ('capturing','verified','recovery_required'))) ")
+            if db.execute('SELECT 1 FROM legacy_snapshots LIMIT 1').fetchone():raise LegacyStopError('Existing snapshot requires recovery')
+            db.execute("INSERT INTO legacy_snapshots VALUES(?,?,NULL,'capturing')",(operation,destination))
+            db.execute('COMMIT')
+        except BaseException:
+            if db.in_transaction:db.execute('ROLLBACK')
+            raise
+        try:
+            check()
+            backup._capture_quiescent(source_fd,destination_fd,node_fd,source_uid=1000,reader_gid=65534)
+            check()
+            manifest,_=backup._file(destination_fd,'manifest.json',0,os.fstat(destination_fd).st_dev)
+            try:digest='sha256:'+hashlib.sha256(backup._read(manifest)).hexdigest()
+            finally:os.close(manifest)
+            coordinator.verify_snapshot(destination,digest,backup,node_fd,supervisor)
+            check()
+            if db.execute("UPDATE legacy_snapshots SET digest=?,state='verified' WHERE operation_id=? AND path=? AND state='capturing' AND digest IS NULL",(digest,operation,destination)).rowcount!=1:
+                raise LegacyStopError('Snapshot state changed')
+            return digest
+        except BaseException:
+            try:
+                db.execute('BEGIN IMMEDIATE')
+                db.execute("UPDATE legacy_snapshots SET state='recovery_required' WHERE operation_id=? AND state='capturing'",(operation,))
+                db.execute("UPDATE legacy_stop_operations SET state='recovery_required' WHERE operation_id=? AND state='stopped'",(operation,))
+                db.execute('COMMIT')
+            except BaseException:
+                if db.in_transaction:
+                    try:db.execute('ROLLBACK')
+                    except BaseException:pass
+            raise
+    finally:
+        if destination_fd is not None:os.close(destination_fd)
+        os.close(source_fd)

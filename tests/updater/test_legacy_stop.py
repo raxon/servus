@@ -88,5 +88,15 @@ class LegacyStopTest(unittest.TestCase):
         self.quiet.ensure_no_uid_writers.side_effect=RuntimeError('writer')
         with self.assertRaises(RuntimeError):self.stop()
         self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_stop_operations').fetchone(),('recovery_required',))
+    def test_failed_capture_requires_recovery_and_rejects_retry(self):
+        self.stop();destination=self.root/'snapshot';destination.mkdir(mode=0o700)
+        capture=SimpleNamespace(_capture_quiescent=mock.Mock(side_effect=RuntimeError('capture failed')))
+        coordinator=SimpleNamespace(_pairs=dict)
+        def run():
+            return legacy.capture(self.journal,self.operation,'/active',str(destination),-1,supervisor,object(),self.adoption,self.quiet,self.docker,capture,coordinator,install_lock=self.lock)
+        with self.assertRaisesRegex(RuntimeError,'capture failed'):run()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_snapshots').fetchone(),('recovery_required',))
+        self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_stop_operations').fetchone(),('recovery_required',))
+        with self.assertRaises(legacy.LegacyStopError):run()
 
 if __name__=='__main__':unittest.main()
