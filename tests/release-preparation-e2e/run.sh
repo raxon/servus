@@ -67,6 +67,12 @@ colima start "$profile" --activate=false --ssh-config=false --cpus 2 --memory 3 
 guest() { colima -p "$profile" ssh -- "$@"; }
 guest sh -c 'test "$(uname -m)" = aarch64 && test ! -e /usr/bin/gh && test ! -e /usr/local/libexec/servus && test ! -e /opt/servus && test ! -e /run/servus-updater'
 guest sudo install -d -m 755 /usr/local/libexec/servus
+guest sudo install -d -m 700 /etc/servus
+guest sudo tee /usr/local/libexec/servus/provision-host.py < "$temp_dir/head/apps/updater/provision-host.py" > /dev/null
+guest sudo chmod 644 /usr/local/libexec/servus/provision-host.py
+guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/provision-host.py
+guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/provision-host.py
+guest sudo test -f /etc/servus/updater.env
 guest sudo install -d -m 700 /run/servus-release-fixture
 guest sudo tee /usr/bin/gh < "$temp_dir/gh_2.104.0_linux_arm64/bin/gh" > /dev/null
 guest sudo chmod 755 /usr/bin/gh
@@ -85,3 +91,11 @@ install_modules head
 guest sudo tee /usr/local/libexec/servus/bootstrap-release.py < "$temp_dir/head/apps/updater/bootstrap-release.py" > /dev/null
 guest sudo chmod 644 /usr/local/libexec/servus/bootstrap-release.py
 guest sudo /usr/bin/python3 -I -B /run/servus-release-fixture/flow.py "$release_mode"
+guest sudo tee /usr/local/libexec/servus/provision-socket.py < "$temp_dir/head/apps/updater/provision-socket.py" > /dev/null
+guest sudo chmod 644 /usr/local/libexec/servus/provision-socket.py
+for unit in servus-updater-socket.service servus-updater-bootstrap.service; do
+  guest sudo tee "/etc/systemd/system/$unit" < "$temp_dir/head/deployment/systemd/$unit" > /dev/null
+  guest sudo chmod 644 "/etc/systemd/system/$unit"
+done
+guest sudo tee /run/servus-release-fixture/bootstrap-unit.py < tests/release-preparation-e2e/bootstrap-unit.py > /dev/null
+guest sudo /usr/bin/python3 -I /run/servus-release-fixture/bootstrap-unit.py
