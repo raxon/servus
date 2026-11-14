@@ -130,7 +130,7 @@ jobs:
           cp apps/panel/package.json "$scratch/apps/panel/"
           cp apps/website/package.json "$scratch/apps/website/"
           cp -R apps/panel/dist "$scratch/panel-dist"
-          cp apps/updater/adoption-proof.py apps/updater/backup.py apps/updater/legacy-stop.py apps/updater/supervisor.py apps/updater/supervisor-daemon.py apps/updater/runtime-policy.py apps/updater/update-coordinator.py apps/updater/restore-snapshot.py apps/updater/quiescence.py apps/updater/servus-updater.py "$scratch/apps/updater/"
+          cp apps/updater/adoption-proof.py apps/updater/backup.py apps/updater/legacy-stop.py apps/updater/legacy-recovery.py apps/updater/legacy-transition.py apps/updater/migration-fence.py apps/updater/initial-generation.py apps/updater/supervisor.py apps/updater/supervisor-daemon.py apps/updater/runtime-policy.py apps/updater/update-coordinator.py apps/updater/restore-snapshot.py apps/updater/quiescence.py apps/updater/servus-updater.py "$scratch/apps/updater/"
           cp tests/updater/test_backup.py tests/updater/test_update_coordinator.py tests/updater/test_updater.py tests/updater/test_runtime_policy.py tests/updater/test_supervisor.py "$scratch/tests/updater/"
           docker build --file tests/backup-ci/Dockerfile --tag "$image" "$scratch"
           docker run --rm --user 0:0 --network none --read-only --cgroupns=host --memory 1200m --pids-limit 256 \

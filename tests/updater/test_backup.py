@@ -11,6 +11,7 @@ import select
 import signal
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import time
@@ -354,6 +355,89 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
                 self.assertEqual((os.stat(self.src).st_uid,os.stat(self.src).st_gid),(0,0))
                 self.assertEqual(restore.verify_staged(str(snapshot),digest,str(parent),UUID,backup,self.node_fd,supervisor,coordinator),
                                  (os.stat(approved.data_dir).st_dev,os.stat(approved.data_dir).st_ino))
+            finally:os.close(lock);journal.close()
+
+    def test_legacy_transition_with_real_snapshot_and_simulated_docker(self):
+        def load(name,filename):
+            spec=importlib.util.spec_from_file_location(name,ROOT/'apps/updater'/filename)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+        supervisor=load('transition_real_supervisor','supervisor.py');runtime=load('transition_real_policy','runtime-policy.py')
+        coordinator=load('transition_real_coordinator','update-coordinator.py');restore=load('transition_real_restore','restore-snapshot.py')
+        adoption=load('transition_real_adoption','adoption-proof.py');updater=load('transition_real_updater','servus-updater.py')
+        legacy=load('transition_real_legacy','legacy-stop.py');recovery=load('transition_real_recovery','legacy-recovery.py')
+        initial=load('transition_real_initial','initial-generation.py');fence_module=load('transition_real_fence','migration-fence.py')
+        transition=load('transition_real_coordinator_entry','legacy-transition.py');quiescence=load('transition_real_quiet','quiescence.py')
+        with tempfile.TemporaryDirectory(dir='/root') as protected:
+            root=pathlib.Path(protected);install=root/'install';install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
+            state=root/'state';state.mkdir(mode=0o700);docker_config=state/'docker';docker_config.mkdir(mode=0o700)
+            snapshot=root/'snapshot';snapshot.mkdir(mode=0o700);recover=root/'recovery';recover.mkdir(mode=0o700)
+            parent=root/'restores';parent.mkdir(mode=0o711);gate=root/'gate';gate.mkdir(mode=0o755)
+            (gate/'state').write_bytes(b'servus-lifecycle-v1 normal\n');(gate/'state').chmod(0o644)
+            stage=state/('servus-install-'+'a'*32);stage.mkdir(mode=0o700);(stage/'deployment').mkdir(mode=0o755)
+            compose=stage/'deployment'/'compose-supervised.yaml';compose.write_bytes(b'fixture');compose.chmod(0o644)
+            manifest=stage/'manifest.json';manifest.write_bytes(b'fixture');manifest.chmod(0o644)
+            old_image='ghcr.io/raxon/servus@sha256:'+'e'*64;old_image_id='sha256:'+'e'*64
+            old_env=root/'old.env';old_env.write_text('SERVUS_IMAGE='+old_image+'\nSERVUS_DATA_DIR='+str(self.src)+'\n');old_env.chmod(0o600)
+            old_compose=root/'old-compose.yaml';old_compose.write_text('fixture\n');old_compose.chmod(0o644)
+            journal=updater.Journal(state);attempt='12345678-1234-4123-8123-123456789abd';prep='12345678-1234-4123-8123-123456789abe'
+            image='sha256:'+'a'*64;config='sha256:'+'b'*64;nonce='c'*64
+            journal.db.execute('CREATE TABLE policy_approvals(operation_id TEXT,attempt_id TEXT,attempt_nonce TEXT,preparation_id TEXT,root_digest TEXT,image_config_digest TEXT,policy_path TEXT,accepted_env_path TEXT,source_env_path TEXT,state TEXT)')
+            journal.db.execute('INSERT INTO operations(id,commit_sha,digest,tag,status,attempt_id,attempt_nonce,config_digest) VALUES(?,?,?,?,?,?,?,?)',(UUID,'d'*40,image,'v1.0.0','verified',attempt,nonce,config))
+            journal.db.execute('INSERT INTO preparations VALUES(?,?,?,?,?,?)',(UUID,attempt,nonce,prep,'prepared',str(stage)))
+            journal.db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?,?,?,?,?,?,?)',(UUID,attempt,nonce,prep,image,config,'/policy','/accepted','/active','active'))
+            approved=SimpleNamespace(install_dir=str(install),data_dir=str(parent/('restore-'+UUID)),gate_dir=str(gate),
+                                     control_dir='/control',updater_dir='/updater',image_reference='ghcr.io/raxon/servus@'+image)
+            daemon=SimpleNamespace(resolve_active_policy=lambda *_:('/policy','/accepted',approved))
+            old_ids={role:letter*64 for role,letter in zip(('api','worker','agent'),'abc')};items={};services={}
+            for role,cid in old_ids.items():
+                command=['node','dist/'+('server' if role=='api' else role)+'/index.js']
+                mounts=[{'Type':'bind','Source':str(self.src),'Destination':str(self.src),'RW':True}]
+                volumes=[{'type':'bind','source':str(self.src),'target':str(self.src)}]
+                if role=='agent':
+                    mounts.append({'Type':'bind','Source':'/var/run/docker.sock','Destination':'/var/run/docker.sock','RW':True})
+                    volumes.append({'type':'bind','source':'/var/run/docker.sock','target':'/var/run/docker.sock'})
+                items[cid]={'Id':cid,'Image':old_image_id,'Config':{'Image':old_image,'User':'node','Cmd':command,'Env':['PANEL_DATA_DIR='+str(self.src)],
+                            'Labels':{'com.docker.compose.project':'servus','com.docker.compose.service':role}},
+                            'State':{'Running':True,'Paused':False,'Restarting':False,'ExitCode':0},
+                            'HostConfig':{'Privileged':False,'PidMode':'','AutoRemove':False,'RestartPolicy':{'Name':'unless-stopped'}},'Mounts':mounts}
+                services[role]={'image':old_image,'command':command,'volumes':volumes,'environment':{'PANEL_DATA_DIR':str(self.src)}}
+            def call(*args,**kwargs):
+                if args[0]=='ps':return ('\n'.join(items)+('\n' if items else '')).encode()
+                if args[0]=='compose':return json.dumps({'services':services}).encode()
+                if args[0]=='update':items[args[-1]]['HostConfig']['RestartPolicy']['Name']='no'
+                if args[0]=='stop':items[args[-1]]['State']['Running']=False
+                if args[0]=='rm':del items[args[-1]]
+                return b''
+            docker=SimpleNamespace(call=call,inspect=lambda *ids:[items[cid] for cid in ids])
+            quiet=SimpleNamespace(ensure_host_namespaces=lambda:None,ensure_restart_fenced=quiescence.ensure_restart_fenced,
+                  ensure_no_other_data_mounts=quiescence.ensure_no_other_data_mounts,ensure_no_mount_aliases=lambda *_:None,
+                  ensure_no_open_data=lambda *_:None,ensure_no_uid_writers=lambda *_:None)
+            fence=fence_module.MigrationFence(journal,UUID,'/active',str(self.src),old_ids,supervisor,daemon,adoption,quiet,docker)
+            extractor=SimpleNamespace(MANIFEST_LIMIT=4096,MAX_FILE=4096,_manifest_files=lambda _:{'deployment/compose-supervised.yaml':(0o644,7,hashlib.sha256(b'fixture').hexdigest())})
+            new_ids={role:{'id':letter*64} for role,letter in zip(('api','worker','agent'),'456')}
+            lock=os.open(install/'install.lock',os.O_RDONLY);fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            try:
+                trusted_directory=supervisor._trusted_directory
+                def fixture_directory(path,mode=None):
+                    if path==str(self.src):
+                        fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                        info=os.fstat(fd)
+                        if (info.st_uid,stat.S_IMODE(info.st_mode))!=(0,mode):os.close(fd);raise ValueError('Unprotected fixture')
+                        return fd
+                    return trusted_directory(path,mode)
+                with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace),mock.patch.object(supervisor,'_verify_data_directory'),\
+                     mock.patch.object(supervisor,'_trusted_directory',side_effect=fixture_directory),\
+                     mock.patch.object(supervisor,'inspect_servus',return_value=new_ids),mock.patch.object(supervisor,'_docker',return_value=b''),\
+                     mock.patch.object(runtime,'_docker',return_value=b''):
+                    result=transition.transition(journal,UUID,'/active',str(self.src),old_image,old_image_id,old_ids,str(old_env),str(old_compose),
+                        str(recover),str(snapshot),str(parent),self.node_fd,str(docker_config),supervisor,daemon,adoption,runtime,quiet,docker,
+                        backup,coordinator,restore,recovery,legacy,initial,extractor,fence,install_lock=lock,check=lambda *_:None,updater_check=lambda *_:None)
+                self.assertEqual(result,new_ids);self.assertFalse(items)
+                self.assertEqual(journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('started',))
+                self.assertEqual(journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('consumed',))
+                self.assertEqual((os.stat(self.src).st_uid,os.stat(self.src).st_gid),(0,0))
+                script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.vault.get(process.argv[2])!=='synthetic-secret'||!s.db.prepare('SELECT 1 FROM users WHERE id=?').get(process.argv[3])||s.db.prepare('SELECT description FROM projects WHERE id=?').get(process.argv[4])?.description!=='committed-wal')process.exit(2);s.close()"
+                subprocess.run([NODE,'--input-type=module','-e',script,approved.data_dir,self.ref,self.actor,UUID],check=True,timeout=20)
             finally:os.close(lock);journal.close()
 
     def test_wrong_key_or_corrupted_ciphertext_is_rejected(self):

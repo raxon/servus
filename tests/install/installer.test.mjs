@@ -448,3 +448,4 @@ test('unfinished legacy migration blocks installation, including a dangling syml
     fails(result,/legacy migration requires recovery/);
     assert.equal(existsSync(join(f.env.SERVUS_DATA_DIR,'dependencies')),false);
   }
+});
