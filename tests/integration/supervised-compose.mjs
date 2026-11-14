@@ -19,7 +19,13 @@ try {
   const raw=execFileSync('docker',['compose','--env-file',envFile,'-f',join(root,'deployment/compose-supervised.yaml'),'-p','servus','config','--format','json'], {encoding:'utf8',env:dockerEnv});
   const document=JSON.parse(raw);
   const validate = (value, output) => spawnSync('python3',['-I',join(root,'apps/updater/validate-compose.py'),gate,image,data,envFile,imageEnv,control,secrets,output],{input:JSON.stringify(value),encoding:'utf8'});
-  const result=validate(document,canonical);assert.equal(result.status,0,result.stderr);
+  const result=validate(document,canonical);
+  if (result.status !== 0) {
+    const trace = `import runpy,sys\np=sys.argv[1];sys.argv=sys.argv[1:]\ndef observe(frame,event,arg):\n if event=='exception' and frame.f_code.co_filename==p and arg[0] is ValueError: print('validator rejected line',frame.f_lineno,file=sys.stderr)\n return observe\nsys.settrace(observe);runpy.run_path(p,run_name='__main__')`;
+    const detail=spawnSync('python3',['-I','-c',trace,join(root,'apps/updater/validate-compose.py'),gate,image,data,envFile,imageEnv,control,secrets,join(dir,'diagnostic.json')],{input:JSON.stringify(document),encoding:'utf8'});
+    console.error(execFileSync('docker',['compose','version'],{encoding:'utf8',env:dockerEnv}).trim(),detail.stderr,JSON.stringify(document));
+  }
+  assert.equal(result.status,0,result.stderr);
   const checked=JSON.parse(readFileSync(canonical,'utf8'));
   for (const role of ['api','worker','agent']) {
     const mounts=checked.services[role].volumes.filter(item=>item.target==='/run/servus-updater');
