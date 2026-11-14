@@ -855,7 +855,7 @@ class DrainLease:
 
     def record(self, state):
         transitions = {'stopped_unverified': 'snapshotting', 'snapshotting': 'snapshot_verified',
-                       'snapshot_verified': 'switching'}
+                       'snapshot_verified': 'switching', 'switching': 'starting'}
         if self._settled or transitions.get(self._state) != state:
             raise SupervisorError('Invalid maintenance transition')
         self.assert_locked(self._operation_id, self._state)
@@ -867,4 +867,11 @@ class DrainLease:
         if self._settled:
             raise SupervisorError('Maintenance window is already settled')
         self.assert_locked(self._operation_id, self._state)
+        self._settled = True
+
+    def release_for_start(self):
+        """Open the gate only after a durable starting marker has been recorded."""
+        self.assert_locked(self._operation_id, 'starting')
+        _atomic_file(self._owner.gate, 'state', b'servus-lifecycle-v1 normal\n', 0o644)
+        fcntl.flock(self._owner.gate_lock, fcntl.LOCK_UN)
         self._settled = True

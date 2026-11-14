@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 
 
 class UpdateError(Exception):
@@ -327,3 +328,95 @@ def create_generation(journal, operation_id, lease, daemon_ownership, approval_j
         if deployment_fd is not None:
             os.close(deployment_fd)
         os.close(stage_fd)
+
+
+def start_generation(journal, operation_id, lease, daemon_ownership, approval_journal,
+                     active_env, candidates, supervisor, daemon, backup_module, node_fd, *, timeout=120):
+    """Start only the inspected candidate containers and leave finalization pending.
+
+    Once the gate opens, the new version can write data. An uncertain or failed
+    start requires recovery; this operation never automatically rolls back.
+    """
+    if (not isinstance(lease, supervisor.DrainLease) or not supervisor._uuid4(operation_id) or
+        type(timeout) is not int or not 1 <= timeout <= 180 or not isinstance(candidates, dict) or
+        set(candidates) != set(supervisor.ROLES) or
+        any(not isinstance(item, dict) or set(item) != {'id'} or not isinstance(item['id'], str) or
+            not re.fullmatch(r'[a-f0-9]{64}', item['id']) for item in candidates.values()) or
+        len({item['id'] for item in candidates.values()}) != len(supervisor.ROLES)):
+        raise UpdateError('Invalid candidate generation')
+    lease.assert_locked(operation_id, 'switching')
+    control_dir = os.readlink('/proc/self/fd/' + str(daemon_ownership.directory))
+    daemon_ownership.assert_held(control_dir)
+    database = journal.db.execute('PRAGMA database_list').fetchone()
+    if not database or os.path.realpath(database[2]) != os.path.realpath(approval_journal):
+        raise UpdateError('Approval journal does not match update journal')
+    policy_path, accepted_env, policy = daemon.resolve_active_policy(approval_journal, active_env)
+    if not isinstance(policy, supervisor.RuntimePolicy) or policy.control_dir != control_dir:
+        raise UpdateError('Active policy identity changed')
+    row = journal.db.execute("SELECT t.backup_path,t.backup_manifest_digest,t.root_digest "
+        "FROM update_transactions t JOIN operations o ON o.id=t.operation_id "
+        "JOIN preparations p ON p.operation_id=t.operation_id JOIN policy_approvals a ON a.operation_id=t.operation_id "
+        "WHERE t.operation_id=? AND t.phase='switching' AND o.status='verified' AND p.status='prepared' "
+        "AND a.state='active' AND a.policy_path=? AND a.accepted_env_path=? AND a.source_env_path=? "
+        "AND t.preparation_id=p.preparation_id AND t.attempt_id=p.attempt_id AND t.attempt_nonce=p.attempt_nonce "
+        "AND t.attempt_id=o.attempt_id AND t.attempt_nonce=o.attempt_nonce AND t.root_digest=o.digest "
+        "AND a.attempt_id=t.attempt_id AND a.attempt_nonce=t.attempt_nonce AND a.preparation_id=t.preparation_id "
+        "AND a.root_digest=t.root_digest AND a.image_config_digest=o.config_digest",
+        (operation_id, policy_path, accepted_env, active_env)).fetchone()
+    if not row or policy.image_reference != 'ghcr.io/raxon/servus@' + row[2]:
+        raise UpdateError('Candidate generation is not approved')
+    verify_snapshot(row[0], row[1], backup_module, node_fd, supervisor)
+    if supervisor.inspect_servus(policy, created=True) != candidates:
+        raise UpdateError('Candidate container identity changed')
+    lease.assert_locked(operation_id, 'switching')
+    daemon_ownership.assert_held(control_dir)
+    result = journal.db.execute("UPDATE update_transactions SET phase='starting' WHERE operation_id=? AND phase='switching' AND backup_path=? AND backup_manifest_digest=? AND root_digest=?",
+                                (operation_id, row[0], row[1], row[2]))
+    if result.rowcount != 1:
+        raise UpdateError('Update transaction changed')
+    try:
+        lease.record('starting')
+        lease.release_for_start()
+        deadline = time.monotonic() + timeout
+        for role in ('agent', 'api', 'worker'):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UpdateError('Candidate startup timed out')
+            supervisor._docker('start', candidates[role]['id'], timeout=min(remaining, 30))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UpdateError('Candidate health check timed out')
+            ids = [candidates[role]['id'] for role in supervisor.ROLES]
+            records = json.loads(supervisor._docker('inspect', *ids, timeout=min(remaining, 15)), object_pairs_hook=_pairs)
+            if not isinstance(records, list) or len(records) != len(ids):
+                raise UpdateError('Started container inventory is unavailable')
+            by_id = {item.get('Id'): item for item in records if isinstance(item, dict)}
+            if set(by_id) != set(ids):
+                raise UpdateError('Started container identity changed')
+            ready = True
+            for role in supervisor.ROLES:
+                item = by_id[candidates[role]['id']]; state = item.get('State')
+                if not isinstance(state, dict) or state.get('Running') is not True or item.get('Image') != policy.image_id:
+                    raise UpdateError('A candidate container failed to start')
+                if policy.healthchecks[role] is not None:
+                    health = state.get('Health')
+                    if not isinstance(health, dict) or health.get('Status') not in ('starting', 'healthy'):
+                        raise UpdateError('A candidate container is unhealthy')
+                    if health['Status'] != 'healthy':
+                        ready = False
+            if ready:
+                break
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+        running = supervisor.inspect_servus(policy)
+        if time.monotonic() >= deadline:
+            raise UpdateError('Candidate startup timed out')
+        if any(running.get(role, {}).get('id') != candidates[role]['id'] for role in supervisor.ROLES):
+            raise UpdateError('Started container identity changed')
+        daemon_ownership.assert_held(control_dir)
+        if daemon.resolve_active_policy(approval_journal, active_env) != (policy_path, accepted_env, policy):
+            raise UpdateError('Active policy changed during startup')
+        return running
+    except BaseException:
+        journal.db.execute("UPDATE update_transactions SET phase='recovery_required' WHERE operation_id=? AND phase='starting'", (operation_id,))
+        raise

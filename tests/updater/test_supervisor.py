@@ -254,6 +254,26 @@ class SupervisorTest(unittest.TestCase):
                     lease.assert_snapshot_verified(operation)
         self.assertEqual(json.loads((self.journal / 'maintenance.json').read_bytes())['state'], 'recovery_required')
 
+    def test_start_gate_requires_durable_starting_transition(self):
+        operation = str(uuid.uuid4())
+        requests = {role: str(uuid.uuid4()) for role in supervisor.ROLES}
+        (self.gate / 'state').write_bytes(b'servus-lifecycle-v1 maintenance\n')
+        with supervisor.MaintenanceSupervisor(self.install, self.gate, self.journal) as owner:
+            fcntl.flock(owner.gate_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lease = supervisor.DrainLease(owner, operation, requests, 5000)
+            with self.assertRaises(supervisor.SupervisorError): lease.release_for_start()
+            for state in ('snapshotting', 'snapshot_verified', 'switching', 'starting'):
+                lease.record(state)
+            self.assertEqual(json.loads((self.journal / 'maintenance.json').read_bytes())['state'], 'starting')
+            lease.release_for_start()
+            self.assertEqual((self.gate / 'state').read_bytes(), b'servus-lifecycle-v1 normal\n')
+            fd = os.open(self.gate / 'lock', os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            with self.assertRaises(supervisor.SupervisorError): lease.release_for_start()
+
     def test_host_socket_and_credentials_are_root_owned_and_never_adopt_existing_socket(self):
         directory = self.root / 'control'
         directory.mkdir(mode=0o750); os.chown(directory, 0, 1000)

@@ -57,6 +57,8 @@ class CreateGenerationTest(unittest.TestCase):
         self.journal.db.execute('INSERT INTO policy_approvals VALUES (?,?,?,?,?,?,?,?,?,?)', (self.op, attempt, nonce, prep, self.digest, self.digest, self.policy_path, self.accepted, self.env, 'active'))
         self.policy = mock.create_autospec(supervisor.RuntimePolicy, instance=True)
         self.policy.control_dir = str(self.control); self.policy.image_reference = 'ghcr.io/raxon/servus@' + self.digest
+        self.policy.image_id = 'sha256:' + 'f' * 64
+        self.policy.healthchecks = {role: None for role in supervisor.ROLES}
         self.daemon = SimpleNamespace(resolve_active_policy=mock.Mock(return_value=(self.policy_path, self.accepted, self.policy)))
         self.control_fd = os.open(self.control, os.O_RDONLY | os.O_DIRECTORY)
         self.ownership = SimpleNamespace(directory=self.control_fd, assert_held=mock.Mock())
@@ -120,6 +122,44 @@ class CreateGenerationTest(unittest.TestCase):
              mock.patch.object(supervisor, 'inspect_servus', side_effect=supervisor.SupervisorError('drift')):
             with self.assertRaises(supervisor.SupervisorError): self.execute()
         record.assert_called_once_with('switching')
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('recovery_required',))
+
+    def start(self):
+        return coordinator.start_generation(self.journal, self.op, self.lease, self.ownership,
+            str(self.state / 'journal.sqlite'), self.env, self.ids, supervisor, self.daemon, backup, -1, timeout=2)
+
+    def test_starts_only_inspected_candidates_and_leaves_completion_pending(self):
+        self.journal.db.execute("UPDATE update_transactions SET phase='switching'")
+        records = [{'Id': item['id'], 'Image': self.policy.image_id, 'State': {'Running': True}} for item in self.ids.values()]
+        running = {role: {'id': item['id'], 'pid': 123, 'cgroup': '/docker/' + item['id']} for role, item in self.ids.items()}
+        with mock.patch.object(self.lease, 'assert_locked'), mock.patch.object(self.lease, 'record') as record, \
+             mock.patch.object(self.lease, 'release_for_start') as release, mock.patch.object(coordinator, 'verify_snapshot'), \
+             mock.patch.object(supervisor, 'inspect_servus', side_effect=[self.ids, running]), \
+             mock.patch.object(supervisor, '_docker', side_effect=[b'', b'', b'', json.dumps(records).encode()]) as docker:
+            self.assertEqual(self.start(), running)
+        record.assert_called_once_with('starting'); release.assert_called_once()
+        self.assertEqual([call.args[:2] for call in docker.call_args_list[:3]],
+                         [('start', self.ids[role]['id']) for role in ('agent', 'api', 'worker')])
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('starting',))
+
+    def test_identity_drift_never_opens_gate(self):
+        self.journal.db.execute("UPDATE update_transactions SET phase='switching'")
+        with mock.patch.object(self.lease, 'assert_locked'), mock.patch.object(self.lease, 'release_for_start') as release, \
+             mock.patch.object(coordinator, 'verify_snapshot'), mock.patch.object(supervisor, 'inspect_servus', return_value={}):
+            with self.assertRaisesRegex(coordinator.UpdateError, 'identity changed'): self.start()
+        release.assert_not_called()
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('switching',))
+
+    def test_uncertain_start_requires_recovery_and_does_not_roll_back(self):
+        self.journal.db.execute("UPDATE update_transactions SET phase='switching'")
+        with mock.patch.object(self.lease, 'assert_locked'), mock.patch.object(self.lease, 'record'), \
+             mock.patch.object(self.lease, 'release_for_start') as release, mock.patch.object(coordinator, 'verify_snapshot'), \
+             mock.patch.object(supervisor, 'inspect_servus', return_value=self.ids), \
+             mock.patch.object(supervisor, '_docker', side_effect=TimeoutError('fixture timeout')) as docker:
+            with self.assertRaises(TimeoutError): self.start()
+        release.assert_called_once(); self.assertEqual(docker.call_args.args, ('start', self.ids['agent']['id']))
+        self.assertGreater(docker.call_args.kwargs['timeout'], 0)
+        self.assertLessEqual(docker.call_args.kwargs['timeout'], 2)
         self.assertEqual(self.journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('recovery_required',))
 
 
