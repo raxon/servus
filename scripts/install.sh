@@ -199,7 +199,7 @@ PYADMIN
 install_dependencies() {
   command -v apt-get >/dev/null || fail 'apt-get is required.'
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl python3 iproute2 util-linux
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl python3 nodejs iproute2 util-linux
   if ! command -v docker >/dev/null; then
     install -d -m 0755 /etc/apt/keyrings
     curl --proto '=https' --tlsv1.2 -fsSL "https://download.docker.com/linux/$os_id/gpg" -o /etc/apt/keyrings/docker.asc
@@ -339,6 +339,7 @@ main() {
   flock -n 9 || fail 'Another Servus installation is running.'
   [[ ! -e $install_dir/.initial-handoff-v1 && ! -L $install_dir/.initial-handoff-v1 ]] || fail 'An interrupted initial handoff requires recovery before installation.'
   [[ ! -e $install_dir/.bootstrap-verification-v1 && ! -L $install_dir/.bootstrap-verification-v1 ]] || fail 'An interrupted bootstrap verification requires recovery before installation.'
+  [[ ! -e $install_dir/.lifecycle-enabled-v1 && ! -L $install_dir/.lifecycle-enabled-v1 ]] || fail 'A supervised installation must be managed through the panel updater.'
   [[ ! -e $config_dir/servus-origin-migration.pending && ! -L $config_dir/servus-origin-migration.pending ]] || fail 'An unfinished origin migration requires recovery before installation.'
   [[ ! -L $config_dir/servus.env ]] || fail 'Configuration must not be a symlink.'
   if [[ $bind_address == 0.0.0.0 && ! -f $config_dir/servus.env ]]; then
@@ -419,6 +420,12 @@ main() {
   [[ -f $staging/source/apps/panel/package.json && -f $staging/source/deployment/compose.yaml && -f $staging/source/Dockerfile ]] || fail 'Downloaded revision has no Servus monorepo installer. Publish a compatible revision, then retry.'
   mv "$staging/source" "$install_dir/releases/$release"
   local source=$install_dir/releases/$release
+  if [[ -z $source_dir && -z $image_ref && $ref_explicit == 0 && $ref == main ]]; then
+    [[ -f $source/scripts/signed-bootstrap.sh && ! -L $source/scripts/signed-bootstrap.sh ]] || fail 'The source does not contain the signed installer.'
+    source "$source/scripts/signed-bootstrap.sh"
+    bootstrap_signed_install "$source" "$staging"
+    return
+  fi
   if [[ -n $image_ref ]]; then
     image=$image_ref
   else
