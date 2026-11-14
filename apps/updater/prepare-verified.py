@@ -33,6 +33,19 @@ def prepare_verified(journal, operation_id, staging_parent, extractor, *, resolv
     except (OSError, extractor.ExtractionError) as error:
         raise PreparationError('A private staging directory is required') from error
     operation = journal.claim_preparation(operation_id)
+    return prepare_claimed(journal, operation, staging_parent, extractor, resolve_child=resolve_child)
+
+
+def prepare_claimed(journal, operation, staging_parent, extractor, *, resolve_child=None, defer_commit=False):
+    """Execute a durable claim established by the trusted host coordinator."""
+    if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
+        raise PreparationError('An isolated Linux root coordinator is required')
+    journal.assert_preparation(operation)
+    try:
+        directory = extractor._trusted_parent(staging_parent)
+        os.close(directory)
+    except (OSError, extractor.ExtractionError) as error:
+        raise PreparationError('A private staging directory is required') from error
     try:
         root_digest, config_digest = operation['digest'], operation['configDigest']
         if (not isinstance(root_digest, str) or not DIGEST.fullmatch(root_digest) or
@@ -68,7 +81,10 @@ def prepare_verified(journal, operation_id, staging_parent, extractor, *, resolv
         probe_name = journal.record_extraction_probe(operation, 'prepare')
         stage = extractor.extract(image_id, staging_parent, verified_platform_ids=tuple(sorted(verified_ids - {image_id})), probe_name=probe_name)
         journal.complete_extraction_probe(operation, probe_name)
-        journal.finish_preparation(operation, stage)
+        if defer_commit:
+            journal.stage_preparation(operation, stage)
+        else:
+            journal.finish_preparation(operation, stage)
         return stage
     except BaseException:
         # This also covers uncertain cleanup, timeouts and a lost journal race.

@@ -24,6 +24,7 @@ import time
 
 MAX_REQUEST = 4096
 EXECUTOR = pathlib.Path('/usr/local/libexec/servus/verification-executor.py')
+PREPARATION_FENCE = pathlib.Path('/usr/local/libexec/servus/preparation-fence.py')
 FENCE_MODULE = pathlib.Path('/usr/local/libexec/servus/verification-fence.py')
 FENCE_ROOT = pathlib.Path('/run/servus-updater/fences')
 NSS_CONFIG = pathlib.Path('/etc/nsswitch.conf')
@@ -176,8 +177,50 @@ class Journal:
         if staging_path is not None and (not isinstance(staging_path, str) or not staging_path.startswith('/') or os.path.normpath(staging_path) != staging_path or not re.fullmatch(r'servus-install-[a-f0-9]{32}', os.path.basename(staging_path))):
             raise ValueError('Invalid installation staging path')
         status = 'prepared' if staging_path is not None else 'recovery_required'
-        cursor = self.db.execute("UPDATE preparations SET status=?,staging_path=? WHERE operation_id=? AND status='preparing' AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND EXISTS (SELECT 1 FROM operations WHERE id=? AND status='verified' AND attempt_id=? AND attempt_nonce=? AND config_digest=?) AND (? != 'prepared' OR (NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM extraction_probes WHERE operation_id=? AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND purpose='prepare' AND status='removed')))", (status, staging_path, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['configDigest'], status, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId']))
+        cursor = self.db.execute("UPDATE preparations SET status=?,staging_path=CASE WHEN ?='prepared' THEN ? ELSE staging_path END WHERE operation_id=? AND status='preparing' AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND EXISTS (SELECT 1 FROM operations WHERE id=? AND status='verified' AND attempt_id=? AND attempt_nonce=? AND config_digest=?) AND (? != 'prepared' OR (NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM extraction_probes WHERE operation_id=? AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND purpose='prepare' AND status='removed')))", (status, status, staging_path, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['configDigest'], status, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId']))
         if cursor.rowcount != 1: raise RuntimeError('Unexpected preparation state')
+
+    def preparing(self, operation_id=None, preparation_id=None):
+        """Return a pending claim only while its verified attempt still matches."""
+        if operation_id is not None and not valid_uuid(operation_id):
+            raise ValueError('Invalid operation identity')
+        if preparation_id is not None and not valid_uuid(preparation_id):
+            raise ValueError('Invalid preparation identity')
+        query = ("SELECT o.id,o.commit_sha,o.digest,o.tag,o.attempt_id,o.attempt_nonce,o.config_digest,p.preparation_id "
+                 "FROM preparations p JOIN operations o ON o.id=p.operation_id "
+                 "WHERE p.status='preparing' AND o.status='verified' AND p.attempt_id=o.attempt_id "
+                 "AND p.attempt_nonce=o.attempt_nonce AND o.config_digest IS NOT NULL")
+        params = []
+        if operation_id is not None:
+            query += ' AND o.id=?'; params.append(operation_id)
+        if preparation_id is not None:
+            query += ' AND p.preparation_id=?'; params.append(preparation_id)
+        rows = self.db.execute(query, params).fetchall()
+        if len(rows) > 1: raise RuntimeError('Multiple preparation claims')
+        if not rows: return None
+        return dict(zip(('operationId','commit','digest','tag','attemptId','attemptNonce','configDigest','preparationId'), rows[0]))
+
+    def assert_preparation(self, operation):
+        if not isinstance(operation, dict): raise RuntimeError('Unexpected preparation state')
+        actual = self.preparing(operation.get('operationId'), operation.get('preparationId'))
+        if actual is None or actual != operation: raise RuntimeError('Unexpected preparation state')
+
+    def stage_preparation(self, operation, staging_path):
+        if (not isinstance(staging_path, str) or not staging_path.startswith('/') or
+            os.path.normpath(staging_path) != staging_path or
+            not re.fullmatch(r'servus-install-[a-f0-9]{32}', os.path.basename(staging_path))):
+            raise ValueError('Invalid installation staging path')
+        cursor = self.db.execute("UPDATE preparations SET staging_path=? WHERE operation_id=? AND status='preparing' AND staging_path IS NULL AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND EXISTS (SELECT 1 FROM operations WHERE id=? AND status='verified' AND attempt_id=? AND attempt_nonce=? AND config_digest=?) AND NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM extraction_probes WHERE operation_id=? AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND purpose='prepare' AND status='removed')", (staging_path, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['configDigest'], operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId']))
+        if cursor.rowcount != 1: raise RuntimeError('Unexpected preparation state')
+
+    def staged_preparation(self, operation):
+        self.assert_preparation(operation)
+        row = self.db.execute("SELECT staging_path FROM preparations WHERE operation_id=? AND preparation_id=? AND status='preparing'", (operation['operationId'], operation['preparationId'])).fetchone()
+        return row[0] if row else None
+
+    def preparation_status(self, operation_id):
+        row = self.db.execute('SELECT preparation_id,status FROM preparations WHERE operation_id=?', (operation_id,)).fetchone()
+        return {'operationId': operation_id, 'preparationId': row[0], 'status': row[1]} if row else None
 
     def record_extraction_probe(self, operation, purpose):
         if purpose not in ('prepare', 'policy'):
@@ -722,6 +765,91 @@ class VerificationWorker:
             # Leave verifying durable; recovery will not infer a result.
 
 
+class PreparationWorker:
+    """Run a durably claimed preparation in its own systemd cgroup."""
+    def __init__(self, journal, state, launcher=None, stopper=None):
+        self.journal, self.state = journal, state
+        self.launcher = launcher or self.start_executor
+        self.stopper = stopper or (self.stop_executor if launcher is None else lambda _: None)
+        self.process = self.operation = self.started = None
+
+    def start_executor(self, operation):
+        assert_host_systemd()
+        trusted_root_file(PREPARATION_FENCE)
+        trusted_root_file(EXECUTOR)
+        spec = importlib.util.spec_from_file_location('servus_preparation_fence', PREPARATION_FENCE)
+        if not spec or not spec.loader: raise RuntimeError('Preparation fence is unavailable')
+        fence = importlib.util.module_from_spec(spec); spec.loader.exec_module(fence)
+        executor_spec = importlib.util.spec_from_file_location('servus_preparation_environment', EXECUTOR)
+        if not executor_spec or not executor_spec.loader: raise RuntimeError('Preparation environment check is unavailable')
+        executor = importlib.util.module_from_spec(executor_spec); executor_spec.loader.exec_module(executor)
+        if not executor.trusted_path(fence.PYTHON, executable=True, final_symlink=True) or not executor.trusted_path(fence.SYSTEMD_RUN, executable=True, final_symlink=True):
+            raise RuntimeError('Preparation executables are not trusted')
+        try:
+            executor.check_manager_environment()
+        except executor.ExecutorError as error:
+            raise RuntimeError('Preparation environment is not trusted') from error
+        trusted_directory(self.state / 'staging', 0o700)
+        return subprocess.Popen(fence.command(self.state, operation['operationId'], operation['preparationId']),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                cwd='/', env=CLEAN_ENV, close_fds=True, start_new_session=True)
+
+    def stop_executor(self, operation):
+        """Request cgroup stop; this does not reconcile daemon-side work."""
+        assert_host_systemd()
+        trusted_root_file(PREPARATION_FENCE)
+        spec = importlib.util.spec_from_file_location('servus_preparation_fence_stop', PREPARATION_FENCE)
+        if not spec or not spec.loader: raise RuntimeError('Preparation fence is unavailable')
+        fence = importlib.util.module_from_spec(spec); spec.loader.exec_module(fence)
+        trusted_root_file(pathlib.Path('/usr/bin/systemctl'))
+        subprocess.run(['/usr/bin/systemctl', 'stop', fence.unit_name(operation['preparationId'])],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       cwd='/', env=CLEAN_ENV, timeout=10, check=False)
+
+    def fail(self):
+        operation = self.operation
+        if operation and self.journal.preparing(operation['operationId'], operation['preparationId']) == operation:
+            self.journal.finish_preparation(operation)
+        if operation:
+            try: self.stopper(operation)
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired): pass
+        if self.process and self.process.poll() is None:
+            self.process.kill()
+            try: self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired: pass
+        self.process = self.operation = self.started = None
+
+    def tick(self):
+        if self.process is None:
+            operation = self.journal.preparing()
+            if operation is None: return
+            self.operation = operation
+            try:
+                self.process = self.launcher(operation)
+                self.started = time.monotonic()
+            except (OSError, RuntimeError, ValueError):
+                self.fail()
+            return
+        result = self.process.poll()
+        if result is None and time.monotonic() - self.started < 1010: return
+        operation = self.operation
+        # No failed or interrupted Docker request is considered reconciled.
+        if result != 0:
+            self.fail()
+            return
+        try:
+            stage = self.journal.staged_preparation(operation)
+            if not stage: raise RuntimeError('Preparation did not produce a stage')
+            self.journal.finish_preparation(operation, stage)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            self.fail()
+            return
+        self.process = self.operation = self.started = None
+
+    def close(self):
+        if self.operation is not None: self.fail()
+
+
 def process(journal, request):
     if not isinstance(request, dict) or request.get('version') != 1 or type(request.get('version')) is not int:
         raise ProtocolError('invalid_request')
@@ -739,6 +867,14 @@ def process(journal, request):
         if not valid_uuid(request['operationId']):
             raise ProtocolError('invalid_request')
         return journal.status(request['operationId'])
+    if action == 'prepare' and set(request) == {'version', 'action', 'operationId'}:
+        operation_id = request['operationId']
+        if not valid_uuid(operation_id): raise ProtocolError('invalid_request')
+        status = journal.preparation_status(operation_id)
+        if status is None:
+            journal.claim_preparation(operation_id)
+            status = journal.preparation_status(operation_id)
+        return status
     raise ProtocolError('invalid_request')
 
 
@@ -787,6 +923,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None):
                 try: revoke_fence(pending)
                 except (OSError, RuntimeError): pass
         worker = VerificationWorker(journal, launcher, (lambda _: None) if launcher else None, (lambda _: None) if launcher else None)
+        preparation_worker = PreparationWorker(journal, state)
         socket_path = directory / 'updater.sock'
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         bound_inode = None
@@ -825,6 +962,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None):
             signal.signal(signal.SIGINT, stop)
             while not stopping:
                 worker.tick()
+                preparation_worker.tick()
                 try:
                     client, _ = server.accept()
                 except TimeoutError:
@@ -847,6 +985,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None):
                         pass
         finally:
             worker.close()
+            preparation_worker.close()
             server.close()
             try:
                 info = socket_path.lstat()
