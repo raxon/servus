@@ -128,6 +128,29 @@ export class Store {
   findUser(email: string) {
     return this.db.prepare('SELECT u.id,u.email,u.role,u.created_at AS createdAt,c.password_hash AS passwordHash FROM users u JOIN local_credentials c ON c.user_id=u.id WHERE u.email = ?').get(email.toLowerCase()) as (User & { passwordHash: string }) | undefined;
   }
+  localCredentialForSession(userId: string, token: string) {
+    return this.db.prepare(`SELECT c.password_hash AS passwordHash FROM local_credentials c
+      JOIN sessions s ON s.user_id=c.user_id LEFT JOIN central_sessions cs ON cs.token_hash=s.token_hash
+      WHERE c.user_id=? AND s.token_hash=? AND cs.token_hash IS NULL AND s.expires_at>? AND s.absolute_expires_at>?`)
+      .get(userId,hashToken(token),now(),now()) as {passwordHash:string} | undefined;
+  }
+  createLocalSession(userId:string, expectedHash:string) {
+    return this.db.transaction(()=>{
+      const credential=this.db.prepare('SELECT 1 FROM local_credentials WHERE user_id=? AND password_hash=?').get(userId,expectedHash);
+      return credential ? this.createSession(userId) : null;
+    }).immediate();
+  }
+  changeLocalPassword(userId:string, token:string, expectedHash:string, replacementHash:string) {
+    return this.db.transaction(()=>{
+      const credential=this.localCredentialForSession(userId,token);
+      if(!credential || credential.passwordHash!==expectedHash)return false;
+      const changed=this.db.prepare('UPDATE local_credentials SET password_hash=? WHERE user_id=? AND password_hash=?').run(replacementHash,userId,expectedHash);
+      if(changed.changes!==1)return false;
+      this.db.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash<>?').run(userId,hashToken(token));
+      this.recordAudit(userId,'account.password.changed',userId);
+      return true;
+    }).immediate();
+  }
   createSession(userId: string, central = false) {
     const token = randomBytes(32).toString('hex'), csrfToken = randomBytes(32).toString('hex');
     const absolute = new Date(Date.now() + (central ? 900_000 : 30 * 86_400_000)).toISOString();

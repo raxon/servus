@@ -67,6 +67,7 @@ import type {
 import { api, errorMessage, RequestError, setCsrfToken } from "./api.js";
 import { CreateService } from "./ServiceCreate.js";
 import { AccountLinkSettings, CentralAccessSettings, CentralSignIn } from "./CentralAccess.js";
+import { LocalPasswordSettings } from "./LocalPassword.js";
 import { ProjectAccess } from "./ProjectAccess.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
@@ -80,12 +81,14 @@ import {
 import type { ServiceTab } from "./ServiceFeatures.js";
 import "./styles.css";
 
-const queryClient = new QueryClient({
+const createQueryClient = () => new QueryClient({
   defaultOptions: {
     queries: { retry: 1, staleTime: 2_000, refetchOnWindowFocus: true },
   },
 });
+const queryClient = createQueryClient();
 const AuthContext = createContext<SessionResponse | null>(null);
+const SessionClientContext = createContext<QueryClient | null>(null);
 const useAuth = () => useContext(AuthContext)!;
 const pendingAction = (action: Action) =>
   action.status === "queued" || action.status === "running";
@@ -151,15 +154,21 @@ function Badge({ status }: { status: string }) {
 }
 
 function AuthGate() {
+  const sessionClient = useQueryClient();
   const session = useQuery({
     queryKey: ["session"],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       try {
-        const data = await api<SessionResponse>("/auth/session");
+        const data = await api<SessionResponse>("/auth/session", { signal });
+        signal.throwIfAborted();
         setCsrfToken(data.csrfToken);
         return data;
       } catch (error) {
-        if (error instanceof RequestError && error.status === 401) return null;
+        if (error instanceof RequestError && error.status === 401) {
+          signal.throwIfAborted();
+          setCsrfToken("");
+          return null;
+        }
         throw error;
       }
     },
@@ -194,11 +203,16 @@ function AuthGate() {
       </div>
     );
   if (!session.data) return <AuthForm setup={setup.data?.required ?? false} />;
-  return (
-    <AuthContext.Provider value={session.data}>
-      <RouterProvider router={router} />
+  return <AuthenticatedApp key={session.data.csrfToken} auth={session.data} sessionClient={sessionClient} />;
+}
+
+function AuthenticatedApp({ auth, sessionClient }: { auth: SessionResponse; sessionClient: QueryClient }) {
+  const [client] = useState(createQueryClient);
+  return <SessionClientContext.Provider value={sessionClient}>
+    <AuthContext.Provider value={auth}>
+      <QueryClientProvider client={client}><RouterProvider router={router} /></QueryClientProvider>
     </AuthContext.Provider>
-  );
+  </SessionClientContext.Provider>;
 }
 
 function AuthForm({ setup }: { setup: boolean }) {
@@ -211,7 +225,8 @@ function AuthForm({ setup }: { setup: boolean }) {
         method: "POST",
         body: { email, password },
       }),
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
+      await client.cancelQueries({ queryKey: ["session"], exact: true });
       setCsrfToken(data.csrfToken);
       client.setQueryData(["session"], data);
     },
@@ -286,15 +301,17 @@ function useActions(projectId?: string) {
 function Shell() {
   const { user } = useAuth();
   const client = useQueryClient();
+  const sessionClient = useContext(SessionClientContext)!;
   const path = useRouterState({ select: (state) => state.location.pathname });
   const projects = useProjects();
   const runtime = useRuntime();
   const logout = useMutation({
     mutationFn: () => api("/auth/logout", { method: "POST", body: {} }),
-    onSuccess: () => {
+    onSuccess: async () => {
+      await sessionClient.cancelQueries({ queryKey: ["session"], exact: true });
       setCsrfToken("");
       client.clear();
-      client.setQueryData(["session"], null);
+      sessionClient.setQueryData(["session"], null);
     },
   });
   const locationName = path.startsWith("/services/")
@@ -1684,6 +1701,7 @@ function SettingsPage() {
           </div>
         </section>
       </div>
+      <LocalPasswordSettings />
       {user.role === "admin" ? <CentralAccessSettings /> : null}
       <AccountLinkSettings />
       {user.role === "admin" ? <ProjectAccess /> : null}

@@ -113,8 +113,9 @@ export async function createApp(options: AppOptions) {
       throw new AppError('FORBIDDEN','Only instance administrators can configure host bind mounts',403);
     }
   }
-  function setSession(reply: FastifyReply, user: User, central = false) {
-    const created = store.createSession(user.id,central);
+  function setSession(reply: FastifyReply, user: User, central = false, expectedHash?: string) {
+    const created = expectedHash === undefined ? store.createSession(user.id,central) : store.createLocalSession(user.id,expectedHash);
+    if(!created)throw new AppError('INVALID_CREDENTIALS','Email or password is incorrect',401);
     reply.setCookie(cookieName,created.token,{path:'/',httpOnly:true,sameSite:'strict',secure:central || (options.secureCookies ?? false),maxAge:central ? 900 : 30*86_400});
     return {user,csrfToken:created.csrfToken};
   }
@@ -131,10 +132,25 @@ export async function createApp(options: AppOptions) {
   app.post(`${prefix}/auth/login`, {config:{rateLimit:{max:10,timeWindow:'1 minute'}}}, async (req,reply) => {
     const input = credentials.parse(req.body), user = store.findUser(input.email);
     if (!user || !await verifyPassword(input.password,user.passwordHash)) throw new AppError('INVALID_CREDENTIALS','Email or password is incorrect',401);
-    return setSession(reply,{id:user.id,email:user.email,role:user.role,createdAt:user.createdAt});
+    return setSession(reply,{id:user.id,email:user.email,role:user.role,createdAt:user.createdAt},false,user.passwordHash);
   });
   app.get(`${prefix}/auth/session`, async req => session(req));
   app.post(`${prefix}/auth/logout`, async (req,reply) => { session(req,true);store.deleteSession(req.cookies[cookieName]!);reply.clearCookie(cookieName,{path:'/'});return {success:true}; });
+  app.get(`${prefix}/auth/password`,async req=>{
+    const {user}=session(req);
+    return {available:Boolean(store.localCredentialForSession(user.id,req.cookies[cookieName]!))};
+  });
+  app.post(`${prefix}/auth/password`,{config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async req=>{
+    const {user}=session(req,true);
+    const input=z.object({currentPassword:z.string().min(1).max(128),newPassword:z.string().min(8).max(128)}).strict().parse(req.body);
+    const token=req.cookies[cookieName]!;
+    const credential=store.localCredentialForSession(user.id,token);
+    if(!credential)throw new AppError('LOCAL_PASSWORD_UNAVAILABLE','Sign in with a local account to change its password',403);
+    if(!await verifyPassword(input.currentPassword,credential.passwordHash))throw new AppError('INVALID_PASSWORD','Current password is incorrect',401);
+    const replacement=await hashPassword(input.newPassword);
+    if(!store.changeLocalPassword(user.id,token,credential.passwordHash,replacement))throw new AppError('PASSWORD_CHANGE_CONFLICT','Your session or password changed. Sign in and try again',409);
+    return {success:true};
+  });
   registerCentralAuth(app,{store,allowedOrigins,secureCookies:options.secureCookies??false,session,setSession});
 
   function administrator(req:FastifyRequest,mutation=false) {

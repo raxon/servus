@@ -1,4 +1,5 @@
 let csrfToken = "";
+let sessionEpoch = 0;
 
 export class RequestError extends Error {
   constructor(
@@ -12,14 +13,16 @@ export class RequestError extends Error {
 }
 
 export function setCsrfToken(value: string) {
+  if (value !== csrfToken) sessionEpoch += 1;
   csrfToken = value;
 }
 
 export async function api<T>(
   path: string,
-  options: { method?: string; body?: unknown; idempotent?: boolean } = {},
+  options: { method?: string; body?: unknown; idempotent?: boolean; signal?: AbortSignal } = {},
 ): Promise<T> {
   const method = options.method ?? "GET";
+  const requestEpoch = sessionEpoch;
   const headers: Record<string, string> = { Accept: "application/json" };
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET" && csrfToken) headers["X-CSRF-Token"] = csrfToken;
@@ -28,11 +31,16 @@ export async function api<T>(
     method,
     headers,
     credentials: "same-origin",
+    signal: options.signal,
     ...(options.body !== undefined
       ? { body: JSON.stringify(options.body) }
       : {}),
   });
   const content = await response.text();
+  options.signal?.throwIfAborted();
+  if (requestEpoch !== sessionEpoch) {
+    throw new RequestError(0, "SESSION_CHANGED", "Your session changed. Please try again.");
+  }
   let data: unknown;
   try {
     data = content ? JSON.parse(content) : undefined;

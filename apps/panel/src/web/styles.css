@@ -4967,6 +4967,7 @@ select:disabled {
   margin: 0 0 16px;
 }
 .central-settings form { margin-top: 18px; }
+.local-password-form { max-width: 420px; }
 .central-result, .central-disconnect {
   border-top: 1px solid #e2e7dd;
   margin-top: 20px;

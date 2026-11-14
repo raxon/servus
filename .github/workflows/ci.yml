@@ -96,6 +96,10 @@ jobs:
           done
       - name: Build workspace
         run: npm run build
+      - name: Test session isolation in Chromium
+        run: |
+          npx playwright install --with-deps chromium
+          node tests/integration/session-races.mjs
       - name: Test control-plane capture and restore
         run: |
           set -euo pipefail
