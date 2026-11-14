@@ -89,6 +89,59 @@ class CgroupHeadroomTest(unittest.TestCase):
             with self.assertRaisesRegex(backup.CaptureError,'Cannot verify complete cgroup ancestry'): backup._memory_headroom(1)
             headroom.assert_not_called()
 
+class OperationHistoryTest(unittest.TestCase):
+    def setUp(self):
+        self.panel = sqlite3.connect(':memory:')
+        self.agent = sqlite3.connect(':memory:')
+        self.panel.executescript("""
+            CREATE TABLE actions(id TEXT PRIMARY KEY,service_id TEXT,type TEXT,status TEXT,phase TEXT,created_at TEXT,finished_at TEXT);
+            CREATE TABLE jobs(action_id TEXT UNIQUE,service_id TEXT,status TEXT,lease_until TEXT);
+        """)
+        self.agent.execute('CREATE TABLE operations(id TEXT PRIMARY KEY,service_id TEXT,state TEXT,response TEXT)')
+        self.panel.execute("INSERT INTO actions VALUES('old','service','deploy','failed','failed','2026-01-01T00:00:00.000Z','2026-01-01T00:01:00.000Z')")
+        self.panel.execute("INSERT INTO jobs VALUES('old','service','failed',NULL)")
+        self.agent.execute("INSERT INTO operations VALUES('old','service','failed','{}')")
+        self.panel.execute("INSERT INTO actions VALUES('new','service','deploy','succeeded','complete','2026-01-01T00:02:00.000Z','2026-01-01T00:03:00.000Z')")
+        self.panel.execute("INSERT INTO jobs VALUES('new','service','succeeded',NULL)")
+        self.agent.execute("INSERT INTO operations VALUES('new','service','succeeded',?)", (json.dumps({'state':'running'}),))
+
+    def tearDown(self):
+        self.panel.close(); self.agent.close()
+
+    def test_later_successful_deployment_preserves_failed_history(self):
+        backup._validate_operation_history(self.panel, self.agent)
+        self.assertEqual(self.panel.execute("SELECT status FROM actions WHERE id='old'").fetchone(), ('failed',))
+        self.assertEqual(self.agent.execute("SELECT state FROM operations WHERE id='old'").fetchone(), ('failed',))
+
+    def test_failed_history_requires_correlated_later_success(self):
+        cases = [
+            (self.panel, "UPDATE actions SET created_at='2026-01-01T00:00:30.000Z' WHERE id='new'"),
+            (self.panel, "UPDATE actions SET type='restart' WHERE id='new'"),
+            (self.panel, "UPDATE jobs SET service_id='other' WHERE action_id='new'"),
+            (self.panel, "UPDATE jobs SET lease_until='held' WHERE action_id='old'"),
+            (self.panel, "DELETE FROM jobs WHERE action_id='old'"),
+            (self.agent, "UPDATE operations SET service_id='other' WHERE id='new'"),
+            (self.agent, "UPDATE operations SET state='failed' WHERE id='new'"),
+            (self.agent, "UPDATE operations SET response='{}' WHERE id='new'"),
+            (self.agent, "UPDATE operations SET response='invalid' WHERE id='new'"),
+            (self.agent, "DELETE FROM operations WHERE id='old'"),
+        ]
+        for db, statement in cases:
+            with self.subTest(statement=statement):
+                db.execute('SAVEPOINT mutation')
+                db.execute(statement)
+                with self.assertRaises(backup.CaptureError): backup._validate_operation_history(self.panel, self.agent)
+                db.execute('ROLLBACK TO mutation'); db.execute('RELEASE mutation')
+
+    def test_running_or_queued_work_blocks_capture(self):
+        for db, statement in [(self.panel, "UPDATE jobs SET status='queued' WHERE action_id='old'"),
+                              (self.panel, "UPDATE actions SET status='running' WHERE id='old'"),
+                              (self.agent, "UPDATE operations SET state='running' WHERE id='old'")]:
+            with self.subTest(statement=statement):
+                db.execute('SAVEPOINT mutation'); db.execute(statement)
+                with self.assertRaises(backup.CaptureError): backup._validate_operation_history(self.panel, self.agent)
+                db.execute('ROLLBACK TO mutation'); db.execute('RELEASE mutation')
+
 @unittest.skipUnless(os.name == 'posix' and os.geteuid() == 0 and pathlib.Path('/proc/self/fd').exists() and pathlib.Path(NODE).is_file() and pathlib.Path(APP, 'dist/server/store.js').is_file(), 'Requires isolated Linux, root and a built Servus image')
 class CaptureTest(unittest.TestCase):
     def setUp(self):
@@ -322,7 +375,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
 
     def test_failed_agent_rollback_is_refused(self):
         self.agent.execute("UPDATE operations SET state='failed',operation_stage='rolling_back'");self.agent.commit();self.fix_permissions()
-        with self.assertRaisesRegex(backup.CaptureError,'Unresolved agent'): self.capture()
+        with self.assertRaisesRegex(backup.CaptureError,'Unresolved failed operations'): self.capture()
         self.assertFalse((self.dst/'manifest.json').exists())
 
     def test_queued_panel_job_is_refused(self):
@@ -334,8 +387,28 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
     def test_failed_panel_job_is_refused(self):
         self.panel.execute("INSERT INTO actions(id,project_id,service_id,actor_id,type,status,phase,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(UUID,UUID,UUID,self.actor,'deploy','failed','failed','2020-01-01','2020-01-01'))
         self.panel.execute("INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)",(UUID,UUID,UUID,'{}','failed',1,'2020-01-01'));self.panel.commit();self.fix_permissions()
-        with self.assertRaisesRegex(backup.CaptureError,'Unresolved panel jobs'): self.capture()
+        with self.assertRaisesRegex(backup.CaptureError,'Unresolved failed operations'): self.capture()
         self.assertFalse((self.dst/'manifest.json').exists())
+
+    def test_capture_preserves_superseded_failed_deployment(self):
+        old='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        new='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+        for ident,status,phase,created,finished in (
+            (old,'failed','failed','2026-01-01T00:00:00.000Z','2026-01-01T00:01:00.000Z'),
+            (new,'succeeded','complete','2026-01-01T00:02:00.000Z','2026-01-01T00:03:00.000Z')):
+            self.panel.execute('INSERT INTO actions(id,project_id,service_id,actor_id,type,status,phase,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                               (ident,UUID,UUID,self.actor,'deploy',status,phase,created,finished,finished))
+            self.panel.execute('INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)',
+                               (ident,ident,UUID,'{}',status,1,created))
+            response=json.dumps({'state':'running'}) if status=='succeeded' else json.dumps({'error':{'code':'RUNTIME_FAILED'}})
+            self.agent.execute('INSERT INTO operations(id,request_hash,state,response,updated_at,service_id,operation_stage) VALUES(?,?,?,?,?,?,?)',
+                               (ident,'a'*64,status,response,finished,UUID,'applying' if status=='succeeded' else 'rolling_back'))
+        self.panel.commit(); self.agent.commit(); self.fix_permissions()
+        self.capture()
+        with closing(sqlite3.connect(f'file:{self.dst}/panel.sqlite?mode=ro&immutable=1',uri=True)) as panel:
+            self.assertEqual(panel.execute('SELECT status FROM actions WHERE id=?',(old,)).fetchone(),('failed',))
+        with closing(sqlite3.connect(f'file:{self.dst}/agent.sqlite?mode=ro&immutable=1',uri=True)) as agent:
+            self.assertEqual(agent.execute('SELECT state,operation_stage FROM operations WHERE id=?',(old,)).fetchone(),('failed','rolling_back'))
 
     def test_malformed_legacy_json_is_refused(self):
         self.agent.execute("UPDATE operations SET previous_spec='not-json'");self.agent.commit();self.fix_permissions()

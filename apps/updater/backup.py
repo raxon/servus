@@ -391,6 +391,45 @@ def _config_references(config, refs, service_id, owners, purposes=None, git_requ
             git_requirements.setdefault(reference,set()).add((service_id,repository,credential['username']))
             refs.add(reference)
 
+def _validate_operation_history(panel, agent):
+    # A failed operation remains historical evidence. A later full deployment
+    # can supersede it only when both durable journals agree on the outcome.
+    if panel.execute("SELECT 1 FROM jobs WHERE status NOT IN ('succeeded','failed') OR status IS NULL LIMIT 1").fetchone():
+        raise CaptureError('Unresolved panel jobs require recovery')
+    if panel.execute("SELECT 1 FROM actions WHERE status NOT IN ('succeeded','failed') OR status IS NULL LIMIT 1").fetchone():
+        raise CaptureError('Unresolved panel actions require recovery')
+    if agent.execute("SELECT 1 FROM operations WHERE state NOT IN ('succeeded','failed') OR state IS NULL LIMIT 1").fetchone():
+        raise CaptureError('Unresolved agent operations require recovery')
+
+    failures = panel.execute("SELECT id,service_id,type,phase,finished_at FROM actions WHERE status='failed'").fetchall()
+    failed_jobs = panel.execute("SELECT action_id,service_id,lease_until FROM jobs WHERE status='failed'").fetchall()
+    failed_agent = agent.execute("SELECT id,service_id FROM operations WHERE state='failed'").fetchall()
+    # Unmatched or inconsistent terminal records do not establish a safe state.
+    if len(failures) != len(failed_jobs) or len(failures) != len(failed_agent):
+        raise CaptureError('Unresolved failed operations require recovery')
+    jobs = {action: (service, lease) for action, service, lease in failed_jobs}
+    agents = {action: service for action, service in failed_agent}
+    if len(jobs) != len(failures) or len(agents) != len(failures):
+        raise CaptureError('Unresolved failed operations require recovery')
+    for action, service, kind, phase, finished in failures:
+        if not service or kind != 'deploy' or phase != 'failed' or not finished or jobs.get(action) != (service, None) or agents.get(action) != service:
+            raise CaptureError('Unresolved failed operations require recovery')
+        candidates = panel.execute("""SELECT a.id FROM actions a JOIN jobs j ON j.action_id=a.id
+            WHERE a.service_id=? AND j.service_id=a.service_id AND a.type='deploy'
+              AND a.status='succeeded' AND a.phase='complete' AND j.status='succeeded'
+              AND j.lease_until IS NULL AND a.created_at>? AND a.finished_at IS NOT NULL
+              AND a.finished_at>=a.created_at""", (service, finished)).fetchall()
+        recovered = False
+        for (candidate,) in candidates:
+            row = agent.execute("SELECT state,service_id,response FROM operations WHERE id=?", (candidate,)).fetchone()
+            if not row or row[0] != 'succeeded' or row[1] != service: continue
+            try: response = json.loads(row[2])
+            except (TypeError, ValueError): continue
+            if isinstance(response, dict) and response.get('state') == 'running':
+                recovered = True
+                break
+        if not recovered: raise CaptureError('Unresolved failed operations require recovery')
+
 def _validate_staging(dest_fd,node_fd):
     # Captures are serialized standalone databases, never live WAL databases.
     # A sidecar must not be silently ignored by immutable SQLite reads.
@@ -411,8 +450,6 @@ def _validate_staging(dest_fd,node_fd):
         if version==4: _schema(db,PANEL_SCHEMA,4)
         elif version==5: _schema(db,{**PANEL_SCHEMA,'service_secret_refs':PANEL_SCHEMA['service_secret_refs']|{'purpose'}},5)
         else: raise CaptureError('Unsupported database schema')
-        if db.execute("SELECT 1 FROM jobs WHERE status != 'succeeded' OR status IS NULL LIMIT 1").fetchone(): raise CaptureError('Unresolved panel jobs require recovery')
-        if db.execute("SELECT 1 FROM actions WHERE status != 'succeeded' OR status IS NULL LIMIT 1").fetchone(): raise CaptureError('Unresolved panel actions require recovery')
         owners=dict(db.execute('SELECT reference,service_id FROM service_secret_refs'))
         purposes=dict(db.execute('SELECT reference,purpose FROM service_secret_refs')) if version==5 else None
         if purposes is not None and any(value not in ('unclassified','environment','database','git','legacy_shared') for value in purposes.values()): raise CaptureError('Secret purpose metadata is invalid')
@@ -433,7 +470,8 @@ def _validate_staging(dest_fd,node_fd):
                     encrypted.append(_sealed(value,table=='central_pairings' and col=='redeemed_credentials'))
     with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/agent.sqlite?mode=ro&immutable=1',uri=True)) as db:
         _schema(db,AGENT_SCHEMA,0)
-        if db.execute("SELECT 1 FROM operations WHERE state != 'succeeded' OR state IS NULL LIMIT 1").fetchone(): raise CaptureError('Unresolved agent operations require recovery')
+        with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/panel.sqlite?mode=ro&immutable=1',uri=True)) as panel:
+            _validate_operation_history(panel, db)
         for (response,) in db.execute('SELECT response FROM operations'):
             try: parsed=json.loads(response)
             except (TypeError,ValueError): raise CaptureError('Agent response is invalid') from None
