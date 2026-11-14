@@ -53,6 +53,8 @@ jobs:
         env:
           SERVUS_LIFECYCLE_TEST_CONTEXT: default
         run: node --test tests/lifecycle-gate/gate.test.mjs
+      - name: Test installation file extraction with Docker
+        run: sudo python3 -I -B tests/extract-install/docker-e2e.py
       - name: Build workspace
         run: npm run build
       - name: Test control-plane capture and restore
