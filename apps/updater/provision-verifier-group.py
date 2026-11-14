@@ -6,6 +6,7 @@ fork/exit. The host operator must serialize other root group administration.
 An interrupted or ambiguous provisioning is never adopted automatically.
 """
 
+import argparse
 import fcntl
 import grp
 import importlib.util
@@ -54,7 +55,8 @@ def trusted_directory(path, mode):
         info = current.lstat()
         if info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISDIR(info.st_mode):
             raise ProvisionError('A required directory is not trusted')
-    if stat.S_IMODE(path.lstat().st_mode) != mode: raise ProvisionError('A required directory has unsafe permissions')
+    allowed = mode if isinstance(mode, tuple) else (mode,)
+    if stat.S_IMODE(path.lstat().st_mode) not in allowed: raise ProvisionError('A required directory has unsafe permissions')
     return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
 
@@ -111,19 +113,25 @@ def load_helper():
     return module
 
 
-def provision(helper, record_dir=RECORD_DIR, install_dir=INSTALL_DIR, groupadd=GROUPADD):
+def provision(helper, record_dir=RECORD_DIR, install_dir=INSTALL_DIR, groupadd=GROUPADD, *, inherited_lock=None):
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
         raise ProvisionError('Isolated root on Linux is required')
     helper.assert_host_systemd()
     trusted_file(groupadd, executable=True)
-    installfd = trusted_directory(install_dir, 0o755)
+    installfd = trusted_directory(install_dir, (0o700, 0o755))
     statefd = None
     lockfd = None
     try:
         lockfd = os.open('install.lock', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=installfd)
         info = os.fstat(lockfd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
             raise ProvisionError('Installer lock is unsafe')
+        if inherited_lock is not None:
+            if type(inherited_lock) is not int or inherited_lock < 3: raise ProvisionError('Invalid inherited installer lock')
+            inherited = os.fstat(inherited_lock)
+            if (inherited.st_dev,inherited.st_ino) != (info.st_dev,info.st_ino): raise ProvisionError('Inherited installer lock does not match')
+            duplicate = os.dup(inherited_lock)
+            os.close(lockfd);lockfd = duplicate
         fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         current = os.stat('install.lock', dir_fd=installfd, follow_symlinks=False)
         if (current.st_dev,current.st_ino) != (info.st_dev,info.st_ino): raise ProvisionError('Installer lock changed')
@@ -179,8 +187,14 @@ def provision(helper, record_dir=RECORD_DIR, install_dir=INSTALL_DIR, groupadd=G
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--install-lock-fd', type=int)
+    parser.add_argument('--install-dir', type=pathlib.Path, default=INSTALL_DIR)
+    parser.add_argument('--state-dir', type=pathlib.Path, default=RECORD_DIR)
+    args = parser.parse_args()
     try:
-        gid = provision(load_helper())
+        gid = provision(load_helper(), record_dir=args.state_dir, install_dir=args.install_dir,
+                        inherited_lock=args.install_lock_fd)
     except (OSError, RuntimeError, ProvisionError):
         print('Verifier group provisioning failed or requires manual recovery.', file=sys.stderr)
         return 1

@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -I
 """Exercise handoff lock ordering using real systemd units in the disposable VM."""
 import importlib.util
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -23,6 +24,22 @@ updater=load('fixture_updater','servus-updater.py')
 policy=load('fixture_policy','runtime-policy.py')
 root=Path('/run/servus-release-fixture');state=root/'handoff-state';state.mkdir(mode=0o700)
 install=Path('/opt/servus'); assert (install/'install.lock').is_file()
+provisioner=load('fixture_verifier_group','provision-verifier-group.py')
+held=os.open(install/'install.lock',os.O_RDONLY)
+try:
+    fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    try:provisioner.provision(provisioner.load_helper(),inherited_lock=held)
+    except provisioner.ProvisionError as error:
+        if str(error) != 'Existing provisioning record requires manual review':raise
+    else:raise AssertionError('Existing verifier group must not be replaced')
+    contender=os.open(install/'install.lock',os.O_RDONLY)
+    try:
+        try:fcntl.flock(contender,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:pass
+        else:raise AssertionError('Installer lock was released')
+    finally:os.close(contender)
+finally:os.close(held)
+print('PASS verifier provisioning accepts private install and inherited lock',flush=True)
 units=Path('/etc/systemd/system')
 for name in ('servus-supervisor.service','servus-updater.service'):
     path=units/name

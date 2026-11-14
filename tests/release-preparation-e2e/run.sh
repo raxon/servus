@@ -43,7 +43,7 @@ git archive HEAD | tar -xf - -C "$temp_dir/head"
 release_mode=head
 if [ "${SERVUS_TEST_WORKTREE:-0}" = 1 ]; then
   release_mode=worktree
-  for component in extract-install.py prepare-verified.py provision-host.py bootstrap-handoff.py; do
+  for component in extract-install.py prepare-verified.py provision-host.py bootstrap-handoff.py provision-verifier-group.py; do
     cp "apps/updater/$component" "$temp_dir/head/apps/updater/$component"
   done
 fi

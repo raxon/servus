@@ -2,6 +2,7 @@ import grp
 import builtins
 import ctypes
 import errno
+import fcntl
 import platform
 import threading
 import importlib.util
@@ -28,6 +29,13 @@ provisioner = load('group_provisioner', ROOT / 'apps/updater/provision-verifier-
 
 
 class GroupSafetyTest(unittest.TestCase):
+    def test_command_passes_installer_paths_and_lock_to_provisioner(self):
+        argv=['provision-verifier-group.py','--install-dir','/opt/custom','--state-dir','/var/lib/custom','--install-lock-fd','9']
+        with mock.patch.object(sys,'argv',argv), mock.patch.object(provisioner,'load_helper',return_value='helper'), \
+             mock.patch.object(provisioner,'provision',return_value=12345) as call, mock.patch('builtins.print'):
+            self.assertEqual(provisioner.main(),0)
+        call.assert_called_once_with('helper',record_dir=Path('/var/lib/custom'),install_dir=Path('/opt/custom'),inherited_lock=9)
+
     def test_mount_namespace_must_match_pid_one(self):
         own = types.SimpleNamespace(st_dev=4, st_ino=30)
         foreign = types.SimpleNamespace(st_dev=4, st_ino=31)
@@ -179,6 +187,22 @@ class RealGroupProvisionTest(unittest.TestCase):
             helper.assert_fresh_gid_provenance(gid)
         with mock.patch.object(helper, 'assert_host_systemd'), self.assertRaises(provisioner.ProvisionError):
             provisioner.provision(helper, self.state, self.install, Path('/usr/sbin/groupadd'))
+
+    def test_real_groupadd_accepts_private_install_and_borrows_installer_lock(self):
+        self.install.chmod(0o700);candidate=1073741947
+        held=os.open(self.install/'install.lock',os.O_RDONLY);wrong=os.open(self.state,os.O_RDONLY)
+        try:
+            fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            with mock.patch.object(helper,'assert_host_systemd'), mock.patch.object(provisioner.secrets,'randbelow',return_value=candidate-(1<<30)):
+                with self.assertRaises(provisioner.ProvisionError):
+                    provisioner.provision(helper,self.state,self.install,Path('/usr/sbin/groupadd'),inherited_lock=wrong)
+                self.assertFalse((self.state/'verifier-group.json').exists())
+                self.assertEqual(provisioner.provision(helper,self.state,self.install,Path('/usr/sbin/groupadd'),inherited_lock=held),candidate)
+            other=os.open(self.install/'install.lock',os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError):fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            finally:os.close(other)
+        finally:os.close(wrong);os.close(held)
 
 
 if __name__ == '__main__': unittest.main()
