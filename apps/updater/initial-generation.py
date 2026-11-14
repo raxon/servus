@@ -6,11 +6,16 @@ import importlib.util
 import os
 import pathlib
 import re
+import select
+import signal
 import socket
 import stat
 import struct
 import sys
+import threading
 import time
+
+UPDATER_DIR = '/run/servus-updater/control'
 
 
 class InitialGenerationError(Exception):
@@ -38,7 +43,52 @@ def check_supervisor(control_dir, supervisor):
         os.close(directory)
 
 
-def launch(journal, operation, active_env, docker_config, supervisor, daemon, extractor, backup, policy, *, inherited_lock=None, check=check_supervisor):
+def check_updater(updater_dir, supervisor):
+    """Check the unprivileged API path and require an updater with apply enabled."""
+    if threading.active_count() != 1:
+        raise InitialGenerationError('Updater check requires a single-threaded coordinator')
+    if updater_dir != UPDATER_DIR:
+        raise InitialGenerationError('Updater socket directory is not approved')
+    directory = supervisor._trusted_directory(updater_dir, 0o710)
+    try:
+        info=os.fstat(directory)
+        if info.st_gid != 1000: raise InitialGenerationError('Unsafe updater socket directory')
+        before=os.stat('updater.sock',dir_fd=directory,follow_symlinks=False)
+        if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0 or before.st_gid != 1000 or stat.S_IMODE(before.st_mode) != 0o660:
+            raise InitialGenerationError('Unsafe updater socket')
+        reader,writer=os.pipe()
+        try: pid=os.fork()
+        except BaseException: os.close(reader);os.close(writer);raise
+        if pid == 0:
+            os.close(reader)
+            try:
+                os.setgroups([]);os.setgid(1000);os.setuid(1000)
+                with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as conn:
+                    conn.settimeout(5);conn.connect(updater_dir+'/updater.sock')
+                    peer,uid,_=struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+                    if uid != 0 or peer <= 0: raise InitialGenerationError('Unsafe updater peer')
+                    deadline=time.monotonic()+5
+                    supervisor._send_message(conn,{'version':1,'action':'apply','operationId':'invalid'},deadline)
+                    response=supervisor._read_message(conn,deadline)
+                    if response != {'ok':False,'error':'invalid_request'}: raise InitialGenerationError('Updater cannot apply')
+                os.write(writer,b'1')
+            except BaseException: pass
+            finally: os.close(writer);os._exit(0)
+        os.close(writer)
+        try:
+            ready,_,_=select.select([reader],[],[],8)
+            if not ready:
+                os.kill(pid,signal.SIGKILL);raise InitialGenerationError('Updater check timed out')
+            if os.read(reader,2) != b'1': raise InitialGenerationError('Updater is not ready')
+            after=os.stat('updater.sock',dir_fd=directory,follow_symlinks=False)
+            if (before.st_dev,before.st_ino) != (after.st_dev,after.st_ino):
+                raise InitialGenerationError('Updater socket changed')
+        finally:
+            os.close(reader);os.waitpid(pid,0)
+    finally: os.close(directory)
+
+
+def launch(journal, operation, active_env, docker_config, supervisor, daemon, extractor, backup, policy, *, inherited_lock=None, check=check_supervisor, updater_check=check_updater):
     """Start exactly the verified initial image while preserving a durable recovery marker."""
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or not supervisor._uuid4(operation):
         raise InitialGenerationError('A valid isolated root operation is required')
@@ -86,6 +136,7 @@ def launch(journal, operation, active_env, docker_config, supervisor, daemon, ex
             finally: os.close(state)
         finally: os.close(gate)
         check(approved.control_dir,supervisor)
+        updater_check(approved.updater_dir,supervisor)
         if policy._docker(docker_config,'ps','-aq','--filter','label=com.docker.compose.project=servus','--no-trunc').strip():
             raise InitialGenerationError('Existing Servus containers require recovery')
         journal.db.execute("CREATE TABLE IF NOT EXISTS initial_generations (operation_id TEXT PRIMARY KEY, phase TEXT NOT NULL CHECK(phase IN ('starting','started','recovery_required')))")

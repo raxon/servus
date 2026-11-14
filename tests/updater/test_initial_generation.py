@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import socket
+import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -48,16 +49,16 @@ class InitialGenerationTest(unittest.TestCase):
         self.journal.db.execute('INSERT INTO preparations VALUES(?,?,?,?,?,?)',(self.op,self.attempt,self.nonce,self.prep,'prepared',str(self.stage)))
         self.env=str(self.root/'active.env');self.path=str(self.root/'policy');self.snapshot=str(self.root/'snapshot')
         self.journal.db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?,?,?,?,?,?,?)',(self.op,self.attempt,self.nonce,self.prep,self.digest,self.digest,self.path,self.snapshot,self.env,'active'))
-        self.approved=SimpleNamespace(install_dir=str(self.install),gate_dir=str(self.gate),control_dir=str(self.control),data_dir=str(self.data),image_reference='ghcr.io/raxon/servus@'+self.digest)
+        self.approved=SimpleNamespace(install_dir=str(self.install),gate_dir=str(self.gate),control_dir=str(self.control),data_dir=str(self.data),updater_dir='/run/servus-updater/control',image_reference='ghcr.io/raxon/servus@'+self.digest)
         self.daemon=SimpleNamespace(resolve_active_policy=mock.Mock(return_value=(self.path,self.snapshot,self.approved)))
         self.extractor=SimpleNamespace(MANIFEST_LIMIT=4096,MAX_FILE=4096,_manifest_files=lambda _: {'deployment/compose-supervised.yaml':(0o644,7,hashlib.sha256(b'fixture').hexdigest())})
         self.ids={role:{'id':letter*64} for role,letter in zip(supervisor.ROLES,'abc')}
-        self.check=mock.Mock();self.docker_call=mock.Mock(return_value=b'')
+        self.check=mock.Mock();self.updater_check=mock.Mock();self.docker_call=mock.Mock(return_value=b'')
 
     def tearDown(self):self.journal.close();self.temp.cleanup()
     def run_launch(self,**kwargs):
         with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace), mock.patch.object(supervisor,'inspect_servus',return_value=self.ids), mock.patch.object(supervisor,'_docker',return_value=b'') as start, mock.patch.object(policy,'_docker',self.docker_call):
-            result=initial.launch(self.journal,self.op,self.env,str(self.docker),supervisor,self.daemon,self.extractor,backup,policy,check=self.check,**kwargs)
+            result=initial.launch(self.journal,self.op,self.env,str(self.docker),supervisor,self.daemon,self.extractor,backup,policy,check=self.check,updater_check=self.updater_check,**kwargs)
             return result,start.call_args_list
 
     def test_starts_only_approved_created_containers_and_records_state(self):
@@ -86,16 +87,22 @@ class InitialGenerationTest(unittest.TestCase):
         with self.assertRaises(initial.InitialGenerationError):self.run_launch()
         self.docker_call.assert_not_called()
 
+    def test_unavailable_updater_stops_before_container_creation(self):
+        self.updater_check.side_effect=initial.InitialGenerationError('updater unavailable')
+        with self.assertRaises(initial.InitialGenerationError):self.run_launch()
+        self.docker_call.assert_not_called()
+        self.assertFalse(self.journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='initial_generations'").fetchone())
+
     def test_duplicate_container_ids_require_recovery_before_any_start(self):
         self.ids['worker']={'id':self.ids['api']['id']}
         with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace), mock.patch.object(supervisor,'inspect_servus',return_value=self.ids), mock.patch.object(supervisor,'_docker') as start, mock.patch.object(policy,'_docker',self.docker_call):
-            with self.assertRaises(initial.InitialGenerationError):initial.launch(self.journal,self.op,self.env,str(self.docker),supervisor,self.daemon,self.extractor,backup,policy,check=self.check)
+            with self.assertRaises(initial.InitialGenerationError):initial.launch(self.journal,self.op,self.env,str(self.docker),supervisor,self.daemon,self.extractor,backup,policy,check=self.check,updater_check=self.updater_check)
         start.assert_not_called()
         self.assertEqual(self.journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('recovery_required',))
 
     def test_failed_start_records_recovery(self):
         with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace), mock.patch.object(supervisor,'inspect_servus',return_value=self.ids), mock.patch.object(supervisor,'_docker',side_effect=OSError('fixture')), mock.patch.object(policy,'_docker',self.docker_call):
-            with self.assertRaises(OSError):initial.launch(self.journal,self.op,self.env,str(self.docker),supervisor,self.daemon,self.extractor,backup,policy,check=self.check)
+            with self.assertRaises(OSError):initial.launch(self.journal,self.op,self.env,str(self.docker),supervisor,self.daemon,self.extractor,backup,policy,check=self.check,updater_check=self.updater_check)
         self.assertEqual(self.journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('recovery_required',))
         with self.assertRaises(initial.InitialGenerationError):self.run_launch()
 
@@ -125,5 +132,38 @@ class InitialGenerationTest(unittest.TestCase):
             os.chmod(path,0o666)
             with self.assertRaises(initial.InitialGenerationError):initial.check_supervisor(str(self.control),supervisor)
         finally:listener.close();path.unlink()
+
+    def test_updater_check_requires_unprivileged_apply_enabled_endpoint(self):
+        request={'version':1,'action':'apply','operationId':'invalid'}
+        for allowed,expected in ((True,'invalid_request'),(False,'unavailable')):
+            with self.assertRaises(updater.ProtocolError) as error:updater.process(self.journal,request,allow_apply=allowed)
+            self.assertEqual(error.exception.code,expected)
+        with tempfile.TemporaryDirectory(dir='/run',prefix='servus-updater-test-') as temp:
+            root=Path(temp);root.chmod(0o755);control=root/'control';control.mkdir(mode=0o710)
+            os.chown(control,0,1000);control.chmod(0o710);path=control/'updater.sock'
+            listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);listener.bind(str(path))
+            os.chown(path,0,1000);os.chmod(path,0o660);listener.listen(1);listener.settimeout(4)
+            def serve(error):
+                connection,_=listener.accept()
+                with connection:
+                    _,uid,gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+                    if (uid,gid) != (1000,1000):return
+                    message=supervisor._read_message(connection,time.monotonic()+3)
+                    if message != {'version':1,'action':'apply','operationId':'invalid'}:return
+                    supervisor._send_message(connection,{'ok':False,'error':error},time.monotonic()+3)
+            try:
+                with mock.patch.object(initial,'UPDATER_DIR',str(control)):
+                    for error,accepted in (('invalid_request',True),('unavailable',False)):
+                        worker=os.fork()
+                        if worker == 0:
+                            try:serve(error)
+                            finally:os._exit(0)
+                        try:
+                            if accepted:initial.check_updater(str(control),supervisor)
+                            else:
+                                with self.assertRaises(initial.InitialGenerationError):initial.check_updater(str(control),supervisor)
+                        finally:
+                            _,status=os.waitpid(worker,0);self.assertEqual(status,0)
+            finally:listener.close();path.unlink()
 
 if __name__=='__main__':unittest.main()
