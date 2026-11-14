@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { SecretVault } from '../shared/secrets.js';
 import { buildSource } from './build.js';
-import { compileConfiguration, databaseKind, stateful, decodeDockerLogs } from './configuration.js';
+import { compileConfiguration, databaseKind, stateful, decodeDockerLogs, postgresScramVersion } from './configuration.js';
 import { serviceContainers, serviceMetrics, ownedContainer, outputBuffer, execOutput, ingressStatus } from './observability.js';
 import type { Service, RuntimeStatus, ServiceLogs, ContainerInfo, ServiceMetrics } from '../shared/types.js';
 import type { ApplyResult } from './client.js';
@@ -27,6 +27,27 @@ export interface RecoveryContext {
 interface RuntimeTask { Spec?: { ContainerSpec?: Docker.ContainerSpec }; Status?: { State?: string; Err?: string; Message?: string; ContainerStatus?: { ContainerID?: string } } }
 
 type ServiceInspection = { Spec: Docker.ServiceSpec; Version: { Index: number }; UpdateStatus?: { State?: string } };
+
+function assertSafePostgresDataPath(service: Service, ...specs: (Docker.ServiceSpec | null | undefined)[]): void {
+  const customConfig=service.kind==='postgres' && service.environment?.some(item=>item.name==='PGDATA');
+  const customRuntime=specs.some(spec=>spec && (service.kind==='postgres'||spec.Labels?.['panel.kind']==='postgres') && containerSpec(spec)?.Env?.some(entry=>entry.startsWith('PGDATA=') && !(spec.Labels?.['panel.postgres-auth']===postgresScramVersion && entry==='PGDATA=/var/lib/postgresql/data')));
+  if(customConfig||customRuntime)throw new Error('This PostgreSQL service uses a custom PGDATA path. Preserve its running container and arrange a backup and explicit storage migration before changing its runtime.');
+}
+
+function assertPostgresMountsUnchanged(previous: Docker.ServiceSpec, target: Docker.ServiceSpec): void {
+  const mounts=(spec:Docker.ServiceSpec)=>JSON.stringify((containerSpec(spec)?.Mounts??[]).map(mount=>({type:mount.Type,source:mount.Source,target:mount.Target,readOnly:!!mount.ReadOnly,subpath:mount.VolumeOptions?.Subpath??null})).sort((a,b)=>String(a.target).localeCompare(String(b.target))));
+  if(mounts(previous)!==mounts(target))throw new Error('PostgreSQL runtime mounts differ from the requested configuration. Back up the database and use an explicit storage migration.');
+}
+
+function assertPostgresImageUnchanged(previous: Docker.ServiceSpec, target: Docker.ServiceSpec): void {
+  const current=containerSpec(previous)?.Image, requested=containerSpec(target)?.Image;
+  if(!current||!requested||!/(?:^|@)sha256:[a-f0-9]{64}$/.test(current)||current!==requested)throw new Error('PostgreSQL runtime image differs from the requested image or is not pinned. Back up the database and use an explicit upgrade procedure.');
+}
+
+function assertPostgresImageReference(service: Service, spec: Docker.ServiceSpec): void {
+  const reference=spec.Labels?.['panel.image-reference']??containerSpec(spec)?.Image;
+  if(!reference||service.image!==reference)throw new Error('The saved PostgreSQL image reference cannot be verified against the running service. Recover its original configuration or perform an explicit migration.');
+}
 
 export class DockerRuntime {
   readonly docker: Docker;
@@ -89,11 +110,24 @@ export class DockerRuntime {
     return details.RepoDigests?.[0] || image;
   }
 
+  private async verifyProtectedPostgresVolume(serviceId: string, spec: Docker.ServiceSpec | null | undefined): Promise<void> {
+    if(!spec || spec.Labels?.['panel.postgres-auth']!==postgresScramVersion)return;
+    const reservation=spec.Labels['panel.volume-reservation'];
+    const mounts=containerSpec(spec)?.Mounts??[];
+    const expected=`panel-data-${serviceId}-database`;
+    if(!reservation || !/^[a-f0-9]{64}$/.test(reservation) || mounts.length!==1 || mounts[0]?.Type!=='volume' || mounts[0]?.Source!==expected || mounts[0]?.Target!=='/var/lib/postgresql/data' || mounts[0]?.ReadOnly)throw new Error('The protected PostgreSQL volume configuration cannot be verified.');
+    let inspected;
+    try {inspected=await this.docker.getVolume(expected).inspect();}
+    catch {throw new Error('The protected PostgreSQL data volume is unavailable.');}
+    if(inspected.Labels?.['panel.owner']!==OWNER || inspected.Labels?.['panel.service']!==serviceId || inspected.Labels?.['panel.volume-reservation']!==reservation)throw new Error('The protected PostgreSQL data volume identity does not match.');
+  }
+
   async apply(service: Service, type: string, operationId: string, recovery?: RecoveryContext): Promise<ApplyResult> {
     const name = `panel-app-${service.id}`;
     if (type === 'destroy') {
       const existing = await this.inspect(name);
       const previousSpec = recovery?.previousRecorded ? recovery.previousSpec : existing?.Spec ?? null;
+      if([existing?.Spec,previousSpec,recovery?.targetSpec].some(spec=>spec?.Labels?.['panel.postgres-auth']===postgresScramVersion))assertSafePostgresDataPath(service,existing?.Spec,previousSpec,recovery?.targetSpec);
       if (existing) {
         if (existing.Spec.Labels?.['panel.owner'] !== OWNER) throw new Error('Service ownership check failed.');
         if (!recovery?.previousRecorded) recovery?.recordPrevious(existing.Spec);
@@ -109,8 +143,10 @@ export class DockerRuntime {
     if (existing && existing.Spec.Labels?.['panel.owner'] !== OWNER) throw new Error('Service ownership check failed.');
     if (!existing && type !== 'deploy') throw new Error('No deployed service exists. Deploy the saved configuration before starting or restarting it.');
     const previousSpec = recovery?.previousRecorded ? recovery.previousSpec : existing?.Spec ?? null;
+    if([existing?.Spec,previousSpec,recovery?.targetSpec].some(spec=>spec?.Labels?.['panel.postgres-auth']===postgresScramVersion))assertSafePostgresDataPath(service,existing?.Spec,previousSpec,recovery?.targetSpec);
     if (!recovery?.previousRecorded) recovery?.recordPrevious(previousSpec ? structuredClone(previousSpec) : null);
     if (recovery?.stage === 'rolling_back') {
+      await this.verifyProtectedPostgresVolume(service.id, previousSpec);
       await this.restore(name, previousSpec, operationId);
       throw new Error(`Deployment failed; recovered the previous runtime configuration. ${recovery.previousError || 'Interrupted rollback.'}`);
     }
@@ -120,7 +156,12 @@ export class DockerRuntime {
     let sourceCommit = spec?.Labels?.['panel.sourceCommit'];
     if (!spec) {
       if (type === 'deploy') {
-        if (service.source?.type === 'git') {
+        if(service.kind==='postgres'&&!previousSpec&&service.deployedRevision===null&&(service.image!=='postgres:17-alpine'||service.source?.type==='git'))throw new Error('New PostgreSQL services require the managed postgres:17-alpine image.');
+        if (service.kind==='postgres'&&previousSpec?.Labels?.['panel.postgres-auth']===postgresScramVersion) {
+          imageDigest=containerSpec(previousSpec)?.Image;
+          if(!imageDigest||!/(?:^|@)sha256:[a-f0-9]{64}$/.test(imageDigest))throw new Error('The previous PostgreSQL image is not pinned. Back up the database and use an explicit upgrade procedure.');
+          assertPostgresImageReference(service,previousSpec);
+        } else if (service.source?.type === 'git') {
           const built = await buildSource(service, operationId, this.dataDir, this.socketPath, this.vault);
           const image = await this.docker.getImage(built.image).inspect();
           imageDigest = image.RepoDigests?.[0] || image.Id; sourceCommit = built.sourceCommit;
@@ -135,11 +176,22 @@ export class DockerRuntime {
           if (!isNotFound(error)) throw error;
           await this.docker.createNetwork({ Name: projectNetwork, Driver: 'overlay', Attachable: true, Labels: { 'panel.owner': OWNER, 'panel.project': service.projectId } });
         }
-        const configuration = await compileConfiguration(this.docker, service, this.vault, this.dataDir);
+        const previousPostgresAuth=previousSpec?.Labels?.['panel.postgres-auth'];
+        if(service.kind==='postgres' && previousPostgresAuth!==undefined && previousPostgresAuth!==postgresScramVersion)throw new Error('Unsupported PostgreSQL authentication policy. Update the agent before redeploying.');
+        const freshPostgres=service.kind==='postgres' && !previousSpec && service.deployedRevision===null;
+        const postgresScram=service.kind==='postgres' && (previousPostgresAuth===postgresScramVersion || freshPostgres);
+        const configuration = await compileConfiguration(this.docker, service, this.vault, this.dataDir, {postgresScram,freshPostgres});
         const key = service.id.replaceAll('-', '');
         const labels: Record<string, string> = { 'panel.owner': OWNER, 'panel.project': service.projectId, 'panel.service': service.id,
           'panel.revision': String(service.revision), 'panel.operation': operationId, 'panel.replicas': String(service.replicas), 'panel.kind': service.kind || 'app' };
+        if(postgresScram)labels['panel.image-reference']=service.image;
         if (sourceCommit) labels['panel.sourceCommit'] = sourceCommit;
+        if (postgresScram) {
+          labels['panel.postgres-auth'] = postgresScramVersion;
+          const reservation = configuration.postgresReservation ?? previousSpec?.Labels?.['panel.volume-reservation'];
+          if(!reservation || !/^[a-f0-9]{64}$/.test(reservation))throw new Error('PostgreSQL volume reservation is unavailable.');
+          labels['panel.volume-reservation'] = reservation;
+        }
         const domains = databaseKind(service) ? [] : service.domains ?? [{ hostname: service.hostname, port: service.port }];
         domains.forEach((domain, index) => {
           const route = `${key}-${index}`;
@@ -179,6 +231,19 @@ export class DockerRuntime {
       recovery?.recordTarget(structuredClone(spec));
     }
 
+    if(type==='deploy'&&service.kind==='postgres'&&[spec,previousSpec,existing?.Spec].some(item=>item?.Labels?.['panel.postgres-auth']===postgresScramVersion)) {
+      assertPostgresImageReference(service,spec);
+      if(previousSpec)assertPostgresImageReference(service,previousSpec);
+      if(existing?.Spec)assertPostgresImageReference(service,existing.Spec);
+      if(!/(?:^|@)sha256:[a-f0-9]{64}$/.test(containerSpec(spec)?.Image??''))throw new Error('PostgreSQL deployment requires an immutable image digest.');
+      if(previousSpec) {assertPostgresMountsUnchanged(previousSpec,spec);assertPostgresImageUnchanged(previousSpec,spec);}
+      if(existing?.Spec&&existing.Spec!==previousSpec) {assertPostgresMountsUnchanged(existing.Spec,spec);assertPostgresImageUnchanged(existing.Spec,spec);}
+    }
+    if(type!=='stop' && service.kind==='postgres' && spec.Labels?.['panel.postgres-auth']===postgresScramVersion) {
+      const reservation=spec.Labels['panel.volume-reservation'];
+      for(const prior of [previousSpec,existing?.Spec])if(prior?.Labels?.['panel.postgres-auth']===postgresScramVersion && prior.Labels['panel.volume-reservation']!==reservation)throw new Error('PostgreSQL volume reservation changed.');
+      await this.verifyProtectedPostgresVolume(service.id, spec);
+    }
     try {
       if (existing?.Spec.Labels?.['panel.operation'] === operationId) messages.push('Recovered a previously applied operation; inspecting its target tasks.');
       else if (existing) await this.docker.getService(name).update({ ...spec, version: existing.Version.Index });
@@ -193,7 +258,7 @@ export class DockerRuntime {
       if (isUncertainRuntimeError(error)) throw error;
       const failure = message(error);
       recovery?.beginRollback(failure);
-      try { await this.restore(name, previousSpec, operationId); }
+      try { await this.verifyProtectedPostgresVolume(service.id, previousSpec); await this.restore(name, previousSpec, operationId); }
       catch (rollbackError) {
         if (isUncertainRuntimeError(rollbackError)) throw rollbackError;
         throw new Error(`Operation failed: ${failure}. Recovery also failed: ${message(rollbackError)}`);

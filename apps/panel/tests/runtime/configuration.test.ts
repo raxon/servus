@@ -31,7 +31,7 @@ function fixture() {
   client.getNetwork=vi.fn(()=>({inspect:async()=>({Labels:{'panel.owner':OWNER}})}));
   client.info=vi.fn(async()=>({Swarm:{NodeID:'local-node'}}));
   client.getImage=vi.fn(()=>({inspect:async()=>({Id:'sha256:local'})}));
-  vi.spyOn(runtime,'ensureInfrastructure').mockResolvedValue();vi.spyOn(runtime,'pull').mockResolvedValue('image@sha256:digest');
+  vi.spyOn(runtime,'ensureInfrastructure').mockResolvedValue();vi.spyOn(runtime,'pull').mockResolvedValue(`image@sha256:${'a'.repeat(64)}`);
   vi.spyOn(runtime as any,'waitReady').mockResolvedValue();vi.spyOn(runtime as any,'verifyService').mockResolvedValue();
   vi.spyOn(runtime as any,'waitDestroyed').mockResolvedValue();
   return{runtime,client,vault,service,dataDir,volumes,secrets,current:()=>current};
@@ -47,7 +47,7 @@ describe('service configuration and protected storage',()=>{
   });
   it.each(['postgres','redis','mariadb'] as const)('compiles private %s storage, secret references and stop-first updates',async kind=>{
     const f=fixture(),password='database-password-secret';
-    Object.assign(f.service,{kind,database:{database:'example',user:'example',passwordSecretRef:f.vault.put(password)},domains:[],resources:{cpu:0.5,memoryMb:384}});
+    Object.assign(f.service,{kind,...(kind==='postgres'?{image:'postgres:17-alpine'}:{}),database:{database:'example',user:'example',passwordSecretRef:f.vault.put(password)},domains:[],resources:{cpu:0.5,memoryMb:384}});
     await f.runtime.apply(f.service,'deploy',randomUUID());
     const spec=f.current();
     expect(spec.Labels['traefik.enable']).toBeUndefined();expect(spec.TaskTemplate.Networks).toHaveLength(1);
@@ -56,11 +56,127 @@ describe('service configuration and protected storage',()=>{
     expect(spec.TaskTemplate.RestartPolicy.Condition).toBe('any');
     expect(spec.TaskTemplate.Resources.Limits).toEqual({MemoryBytes:384*1024*1024,NanoCPUs:500000000});
     expect(JSON.stringify(spec)).not.toContain(password);
-    expect(spec.TaskTemplate.ContainerSpec.Secrets.length).toBe(kind==='mariadb'?2:1);
+    expect(spec.TaskTemplate.ContainerSpec.Secrets.length).toBe(kind==='mariadb'||kind==='postgres'?2:1);
     expect(spec.TaskTemplate.ContainerSpec.Secrets.every((secret:any)=>typeof secret.SecretID==='string' && secret.SecretID.length>0)).toBe(true);
     expect(f.volumes.size).toBe(1);
     expect([...f.secrets.values()].some(value=>Buffer.from(value.Spec.Data,'base64').toString()===password)).toBe(true);
     expect((f.runtime as any).verifyService).toHaveBeenCalled();
+  });
+  it('requires SCRAM for new PostgreSQL services and retains the policy on redeploy',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    await f.runtime.apply(f.service,'deploy',randomUUID());
+    const first=f.current();
+    expect(first.Labels['panel.postgres-auth']).toBe('scram-v1');
+    expect(first.TaskTemplate.ContainerSpec.Env).toContain('POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256');
+    expect(first.TaskTemplate.ContainerSpec.Env).toContain('PGDATA=/var/lib/postgresql/data');
+    expect(first.TaskTemplate.ContainerSpec.Command).toEqual(['/bin/sh']);
+    expect(first.TaskTemplate.ContainerSpec.Args[1]).toContain('hba_file=/run/secrets/panel-pg-hba');
+    const hba=[...f.secrets.values()].map(item=>Buffer.from(item.Spec.Data,'base64').toString()).find(text=>text.includes('host all all 0.0.0.0/0'));
+    expect(hba).toBe('local all all scram-sha-256\nhost all all 0.0.0.0/0 scram-sha-256\nhost all all ::/0 scram-sha-256\n');
+    expect(JSON.stringify(first)).not.toContain('synthetic-password');
+    const volume=[...f.volumes.keys()][0];f.service.deployedRevision=1;f.service.revision=2;
+    await f.runtime.apply(f.service,'deploy',randomUUID());
+    expect(f.current().Labels['panel.postgres-auth']).toBe('scram-v1');expect([...f.volumes.keys()]).toEqual([volume]);
+    expect(f.current().TaskTemplate.ContainerSpec.Secrets.some((item:any)=>item.File.Name==='panel-pg-hba')).toBe(true);
+  });
+  it('rejects a custom image for a new managed PostgreSQL service',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'example/custom-postgres:latest',database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID())).rejects.toThrow('managed postgres:17-alpine image');
+    expect(f.client.createService).not.toHaveBeenCalled();
+  });
+  it('refuses a reused volume before changing PostgreSQL runtime',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    const name=`panel-data-${f.service.id}-database`;f.volumes.set(name,{Name:name,Labels:{'panel.owner':OWNER,'panel.service':f.service.id}});
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID())).rejects.toThrow('data volume already exists');
+    expect(f.client.createService).not.toHaveBeenCalled();expect(f.volumes.get(name).Labels['panel.volume-reservation']).toBeUndefined();
+  });
+  it('refuses a race that returns a different volume after the absence check',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    f.client.createVolume=vi.fn(async(config:any)=>{const existing={Name:config.Name,Labels:{'panel.owner':OWNER,'panel.service':f.service.id}};f.volumes.set(config.Name,existing);return existing;});
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID())).rejects.toThrow('exclusive PostgreSQL volume creation');
+    expect(f.client.createService).not.toHaveBeenCalled();
+  });
+  it('does not apply new PostgreSQL protection to an existing legacy service',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',deployedRevision:1,database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    const previous={Labels:{'panel.owner':OWNER,'panel.kind':'postgres'},TaskTemplate:{ContainerSpec:{Image:'legacy:tag',Env:['PGDATA=/legacy/db']}}};
+    const update=vi.fn();f.client.getService=vi.fn(()=>({inspect:async()=>({Spec:previous,Version:{Index:1}}),update}));
+    vi.spyOn(f.runtime as any,'waitStopped').mockResolvedValue();
+    await f.runtime.apply(f.service,'stop',randomUUID());expect(update).toHaveBeenCalled();
+  });
+  it('recovers an already recorded initial target without recreating its volume',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    await f.runtime.apply(f.service,'deploy',randomUUID());const target=structuredClone(f.current());
+    const initial={previousRecorded:true,previousSpec:null,targetSpec:target,stage:'applying',previousError:null,recordPrevious:vi.fn(),recordTarget:vi.fn(),beginRollback:vi.fn()} as any;
+    f.client.getService=vi.fn(()=>({inspect:async()=>{throw {statusCode:404};}}));
+    const created=f.client.createVolume.mock.calls.length;await f.runtime.apply(f.service,'deploy',randomUUID(),initial);
+    expect(f.client.createVolume.mock.calls.length).toBe(created);expect(f.client.createService).toHaveBeenCalledTimes(2);
+  });
+  it.each(['missing','replaced'])('refuses recovery when the saved PostgreSQL volume is %s',async mode=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    await f.runtime.apply(f.service,'deploy',randomUUID());const target=structuredClone(f.current());
+    const name=`panel-data-${f.service.id}-database`;
+    if(mode==='missing')f.volumes.delete(name);else f.volumes.set(name,{Name:name,Labels:{'panel.owner':OWNER,'panel.service':f.service.id,'panel.volume-reservation':'0'.repeat(64)}});
+    f.client.getService=vi.fn(()=>({inspect:async()=>{throw {statusCode:404};}}));
+    const initial={previousRecorded:true,previousSpec:null,targetSpec:target,stage:'applying',previousError:null,recordPrevious:vi.fn(),recordTarget:vi.fn(),beginRollback:vi.fn()} as any;
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID(),initial)).rejects.toThrow(mode==='missing'?'data volume is unavailable':'identity does not match');
+    expect(f.client.createService).toHaveBeenCalledTimes(1);
+  });
+  it.each(['missing','replaced'])('refuses interrupted protected rollback with %s volume',async mode=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    await f.runtime.apply(f.service,'deploy',randomUUID());const previous=structuredClone(f.current());
+    const name=`panel-data-${f.service.id}-database`;
+    if(mode==='missing')f.volumes.delete(name);else f.volumes.set(name,{Name:name,Labels:{'panel.owner':OWNER,'panel.service':f.service.id,'panel.volume-reservation':'0'.repeat(64)}});
+    const restore=vi.spyOn(f.runtime as any,'restore').mockResolvedValue();
+    const context={previousRecorded:true,previousSpec:previous,targetSpec:previous,stage:'rolling_back',previousError:'interrupted',recordPrevious:vi.fn(),recordTarget:vi.fn(),beginRollback:vi.fn()} as any;
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID(),context)).rejects.toThrow(mode==='missing'?'data volume is unavailable':'identity does not match');
+    expect(restore).not.toHaveBeenCalled();
+  });
+  it.each(['missing','replaced'])('refuses error-handler protected rollback if the %s volume changes during apply',async mode=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    await f.runtime.apply(f.service,'deploy',randomUUID());const previous=structuredClone(f.current());f.service.deployedRevision=1;
+    const name=`panel-data-${f.service.id}-database`;
+    vi.mocked((f.runtime as any).waitReady).mockImplementationOnce(async()=>{
+      if(mode==='missing')f.volumes.delete(name);else f.volumes.set(name,{Name:name,Labels:{'panel.owner':OWNER,'panel.service':f.service.id,'panel.volume-reservation':'0'.repeat(64)}});
+      throw new Error('synthetic failure');
+    });
+    const restore=vi.spyOn(f.runtime as any,'restore').mockResolvedValue();
+    const context={previousRecorded:true,previousSpec:previous,targetSpec:null,stage:'applying',previousError:null,recordPrevious:vi.fn(),recordTarget:vi.fn(),beginRollback:vi.fn()} as any;
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID(),context)).rejects.toThrow('Recovery also failed');expect(restore).not.toHaveBeenCalled();
+  });
+  it.each(['legacy','empty'])('preserves %s rollback without a protected volume',async mode=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',deployedRevision:1,database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    const previous=mode==='legacy'?{Labels:{'panel.owner':OWNER,'panel.kind':'postgres'},TaskTemplate:{ContainerSpec:{Image:'legacy:tag'}}}:null;
+    const restore=vi.spyOn(f.runtime as any,'restore').mockResolvedValue();
+    const context={previousRecorded:true,previousSpec:previous,targetSpec:null,stage:'rolling_back',previousError:'interrupted',recordPrevious:vi.fn(),recordTarget:vi.fn(),beginRollback:vi.fn()} as any;
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID(),context)).rejects.toThrow('recovered the previous runtime configuration');expect(restore).toHaveBeenCalled();
+  });
+  it.each(['deploy','start','restart','stop','destroy'])('keeps unlabelled legacy PostgreSQL %s behavior',async action=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',deployedRevision:1,environment:[{name:'PGDATA',value:'/legacy/db'}],database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    const previous={Labels:{'panel.owner':OWNER,'panel.kind':'postgres'},TaskTemplate:{ContainerSpec:{Image:'legacy:tag',Env:['PGDATA=/legacy/db']}}};
+    const update=vi.fn(),remove=vi.fn();f.client.getService=vi.fn(()=>({inspect:async()=>({Spec:previous,Version:{Index:1}}),update,remove}));
+    vi.spyOn(f.runtime as any,'waitStopped').mockResolvedValue();
+    await f.runtime.apply(f.service,action,randomUUID());
+    if(action==='destroy')expect(remove).toHaveBeenCalled();else expect(update).toHaveBeenCalled();
+    if(action==='deploy') {const spec=update.mock.calls[0]![0] as any;expect(spec.Labels['panel.postgres-auth']).toBeUndefined();expect(spec.TaskTemplate.ContainerSpec.Secrets).toHaveLength(1);expect(spec.TaskTemplate.ContainerSpec.Env).toContain('PGDATA=/legacy/db');}
+  });
+  it('keeps legacy rollback behavior without inspecting a protected volume',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',deployedRevision:1,environment:[{name:'PGDATA',value:'/legacy/db'}],database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    const previous={Labels:{'panel.owner':OWNER,'panel.kind':'postgres'},TaskTemplate:{ContainerSpec:{Image:'legacy:tag',Env:['PGDATA=/legacy/db']}}};
+    const restore=vi.spyOn(f.runtime as any,'restore').mockResolvedValue();
+    const context={previousRecorded:true,previousSpec:previous,targetSpec:null,stage:'rolling_back',previousError:'interrupted',recordPrevious:vi.fn(),recordTarget:vi.fn(),beginRollback:vi.fn()} as any;
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID(),context)).rejects.toThrow('recovered the previous runtime configuration');
+    expect(restore).toHaveBeenCalled();expect(f.client.getVolume).not.toHaveBeenCalled();
+  });
+  it('fails closed after interruption between initial volume creation and target recording',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.vault.put('synthetic-password')},domains:[]});
+    const operation=randomUUID();
+    const context={previousRecorded:false,previousSpec:null,targetSpec:null,stage:'applying',previousError:null,recordPrevious:vi.fn(),recordTarget:vi.fn(()=>{throw new Error('synthetic interruption');}),beginRollback:vi.fn()} as any;
+    await expect(f.runtime.apply(f.service,'deploy',operation,context)).rejects.toThrow('synthetic interruption');
+    const name=`panel-data-${f.service.id}-database`,volume=structuredClone(f.volumes.get(name));
+    expect(volume.Labels['panel.volume-reservation']).toMatch(/^[0-9a-f]{64}$/);expect(f.client.createService).not.toHaveBeenCalled();
+    const resumed={...context,previousRecorded:true,previousSpec:null,recordTarget:vi.fn()};
+    await expect(f.runtime.apply(f.service,'deploy',operation,resumed)).rejects.toThrow('data volume already exists');
+    expect(f.volumes.get(name)).toEqual(volume);expect(f.client.createService).not.toHaveBeenCalled();
   });
   it('rejects multiple replicas on writable storage',async()=>{
     const f=fixture();f.service.mounts=[{type:'volume',name:'uploads',target:'/uploads'}];f.service.replicas=2;

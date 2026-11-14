@@ -10,15 +10,18 @@ export const databaseKinds = new Set(['postgres', 'redis', 'mariadb']);
 export function databaseKind(service: Service) { return databaseKinds.has(service.kind || 'app'); }
 export function stateful(service: Service) { return databaseKind(service) || (service.mounts || []).some(mount => !mount.readOnly && mount.type !== 'file'); }
 export const databasePaths = { postgres: '/var/lib/postgresql/data', mariadb: '/var/lib/mysql', redis: '/data' };
+export const postgresScramVersion = 'scram-v1';
+const postgresHba = 'local all all scram-sha-256\nhost all all 0.0.0.0/0 scram-sha-256\nhost all all ::/0 scram-sha-256\n';
 
-export async function compileConfiguration(docker: Docker, service: Service, vault: SecretVault, dataDir: string): Promise<{
-  mounts: Docker.MountSettings[]; environment: string[]; secrets: NonNullable<Docker.ContainerSpec['Secrets']>; command?: string[]; args?: string[];
+export async function compileConfiguration(docker: Docker, service: Service, vault: SecretVault, dataDir: string, options: { postgresScram?: boolean; freshPostgres?: boolean } = {}): Promise<{
+  mounts: Docker.MountSettings[]; environment: string[]; secrets: NonNullable<Docker.ContainerSpec['Secrets']>; command?: string[]; args?: string[]; postgresReservation?: string;
 }> {
   if (stateful(service) && service.replicas !== 1) throw new Error('Writable storage and databases require a single replica.');
   const mounts: Docker.MountSettings[] = [];
   const environment = (service.environment || []).map(item => `${item.name}=${item.secretRef ? vault.get(item.secretRef) : item.value || ''}`);
   const secrets: NonNullable<Docker.ContainerSpec['Secrets']> = [];
   const configured = service.mounts || [];
+  if(options.freshPostgres && (!options.postgresScram || service.kind!=='postgres' || configured.length || service.environment?.some(item=>item.name==='PGDATA')))throw new Error('A new protected PostgreSQL service requires its default data volume and data path.');
   for (const mount of configured) {
     if (mount.type === 'volume') {
       const name = `panel-data-${service.id}-${mount.name}`;
@@ -39,7 +42,7 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
       mounts.push({ Type: 'bind', Source: source, Target: mount.target, ReadOnly: mount.readOnly || false });
     }
   }
-  let command: string[] | undefined, args: string[] | undefined;
+  let command: string[] | undefined, args: string[] | undefined, postgresReservation: string | undefined;
   if (databaseKind(service)) {
     const kind = service.kind as keyof typeof databasePaths;
     if (!service.database?.passwordSecretRef) throw new Error('The database password secret is missing.');
@@ -48,12 +51,25 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
     const passwordId = await swarmSecret(docker, passwordName, password, service.id);
     secrets.push({ SecretID: passwordId, SecretName: passwordName, File: { Name: 'panel-db-password', UID: '0', GID: '0', Mode: 0o444 } });
     if (!configured.some(mount => mount.target === databasePaths[kind])) {
-      const name = `panel-data-${service.id}-database`; await volume(docker, name, service.id);
+      const name = `panel-data-${service.id}-database`;
+      const result = await volume(docker, name, service.id, options.freshPostgres === true);
+      if(options.freshPostgres) { if(typeof result!=='string')throw new Error('Missing PostgreSQL volume reservation.'); postgresReservation=result; }
       mounts.push({ Type: 'volume', Source: name, Target: databasePaths[kind] });
     }
     const user = service.database.user, database = service.database.database;
     if (!/^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/.test(user) || !/^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/.test(database)) throw new Error('Invalid database or user identifier.');
-    if (kind === 'postgres') environment.push(`POSTGRES_DB=${database}`, `POSTGRES_USER=${user}`, 'POSTGRES_PASSWORD_FILE=/run/secrets/panel-db-password');
+    if (kind === 'postgres') {
+      environment.push(`POSTGRES_DB=${database}`, `POSTGRES_USER=${user}`, 'POSTGRES_PASSWORD_FILE=/run/secrets/panel-db-password');
+      if(options.postgresScram) {
+        environment.push('PGDATA=/var/lib/postgresql/data');
+        const authName = secretName('pg-hba', service.id, postgresScramVersion);
+        const authId = await swarmSecret(docker, authName, postgresHba, service.id);
+        secrets.push({ SecretID: authId, SecretName: authName, File: { Name: 'panel-pg-hba', UID: '0', GID: '0', Mode: 0o444 } });
+        environment.push('POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256', 'POSTGRES_HOST_AUTH_METHOD=scram-sha-256');
+        command = ['/bin/sh'];
+        args = ['-c', 'set -eu; PGPASSWORD="$(cat /run/secrets/panel-db-password)"; export PGPASSWORD; exec docker-entrypoint.sh postgres -c hba_file=/run/secrets/panel-pg-hba -c password_encryption=scram-sha-256'];
+      }
+    }
     if (kind === 'mariadb') {
       const rootDirectory = join(dataDir, 'database-roots'); mkdirSync(rootDirectory, { recursive: true, mode: 0o700 });
       const path = join(rootDirectory, service.id);
@@ -68,17 +84,25 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
     }
     if (kind === 'redis') { command = ['/bin/sh']; args = ['-c', 'exec docker-entrypoint.sh redis-server --appendonly yes --requirepass "$(cat /run/secrets/panel-db-password)"']; }
   }
-  return { mounts, environment, secrets, command, args };
+  return { mounts, environment, secrets, command, args, postgresReservation };
 }
 
-async function volume(docker: Docker, name: string, serviceId: string): Promise<boolean> {
+async function volume(docker: Docker, name: string, serviceId: string, requireFresh = false): Promise<boolean | string> {
   try {
     const existing = await docker.getVolume(name).inspect();
+    if (requireFresh) throw new Error('A PostgreSQL data volume already exists; recover its previous operation or migrate it explicitly.');
     if (existing.Labels?.['panel.owner'] !== 'self-hosted-panel' || existing.Labels?.['panel.service'] !== serviceId) throw new Error('Volume ownership check failed.');
     return false;
   } catch (error) { if (!notFound(error)) throw error; }
-  await docker.createVolume({ Name: name, Labels: { 'panel.owner': 'self-hosted-panel', 'panel.service': serviceId } });
-  return true;
+  const nonce = requireFresh ? randomBytes(32).toString('hex') : undefined;
+  const labels: Record<string,string> = { 'panel.owner': 'self-hosted-panel', 'panel.service': serviceId };
+  if(nonce) labels['panel.volume-reservation'] = nonce;
+  await docker.createVolume({ Name: name, Labels: labels });
+  if(nonce) {
+    const created = await docker.getVolume(name).inspect();
+    if(created.Labels?.['panel.owner']!=='self-hosted-panel' || created.Labels?.['panel.service']!==serviceId || created.Labels?.['panel.volume-reservation']!==nonce)throw new Error('Unable to verify exclusive PostgreSQL volume creation.');
+  }
+  return nonce || true;
 }
 function secretName(type:string, serviceId:string, reference:string) { return `panel-${type}-${createHash('sha256').update(`${serviceId}:${reference}`).digest('hex').slice(0,40)}`; }
 async function swarmSecret(docker: Docker, name: string, value: string, serviceId: string): Promise<string> {
