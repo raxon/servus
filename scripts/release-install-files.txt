@@ -2,6 +2,7 @@
 100644 apps/panel/package.json
 100644 apps/updater/backup.py
 100644 apps/updater/discover-release.py
+100644 apps/updater/extract-install.py
 100644 apps/updater/guarded-verifier.py
 100644 apps/updater/preflight.py
 100644 apps/updater/provision-verifier-group.py
