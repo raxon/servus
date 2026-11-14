@@ -35,6 +35,15 @@ jobs:
         run: npm run test:vps-harness
       - name: Test release discovery
         run: python3 -B -m unittest discover -s tests/updater -p 'test_discover_release.py'
+      - name: Test updater in isolated Linux
+        run: |
+          docker run --rm --network none \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --tmpfs /run:rw,nosuid,nodev,size=16m \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/apps/updater,target=/work/apps/updater,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/tests/updater,target=/work/tests/updater,readonly" \
+            --workdir /work python:3.12-slim \
+            python3 -I -B -m unittest discover -s tests/updater
       - name: Test lifecycle gate
         env:
           SERVUS_LIFECYCLE_TEST_CONTEXT: default
