@@ -31,6 +31,8 @@ export interface AppOptions {
   trustedProxySecret?: string;
   maintenance?: MaintenanceGate;
   updaterSocketPath?: string;
+  updaterApplyEnabled?: boolean;
+  updaterCurrentVersion?: string;
 }
 export async function createApp(options: AppOptions) {
   if(options.trustedProxySecret!==undefined && !/^[a-f0-9]{64}$/.test(options.trustedProxySecret))throw new Error('Invalid trusted proxy secret configuration');
@@ -158,7 +160,7 @@ export async function createApp(options: AppOptions) {
     if(auth.user.role!=='admin')throw new AppError('FORBIDDEN','Administrator access required',403);
     return auth.user;
   }
-  registerUpdates(app,{administrator,socketPath:options.updaterSocketPath});
+  registerUpdates(app,{administrator,socketPath:options.updaterSocketPath,applyEnabled:options.updaterApplyEnabled,currentVersion:options.updaterCurrentVersion ?? BUILD_INFO.version});
   app.get(`${prefix}/users`,async req=>{
     administrator(req);
     return {users:store.db.prepare('SELECT id,email,role,created_at AS createdAt FROM users ORDER BY email').all()};

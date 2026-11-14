@@ -8,13 +8,16 @@ const commit = z.string().regex(/^[0-9a-f]{40}$/);
 const digest = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 const tag = z.string().max(64).regex(/^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/);
 const operationSchema = z.strictObject({ operationId: uuid, commit, digest, tag, status: z.enum(['accepted', 'verifying', 'verified', 'verification_failed', 'recovery_required']), createdAt: z.string().regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/) });
+const preparationSchema = z.strictObject({ operationId: uuid, preparationId: uuid, status: z.enum(['preparing', 'prepared', 'completed', 'recovery_required']) });
+const applySchema = z.strictObject({ operationId: uuid, status: z.enum(['requested', 'dispatching', 'awaiting_completion', 'completed', 'recovery_required']) });
 const errorCode = z.enum(['invalid_request', 'unauthorized', 'idempotency_conflict', 'operation_in_progress', 'not_found', 'recovery_required', 'unavailable']);
-const responseSchema = z.union([z.strictObject({ ok: z.literal(true), operation: operationSchema }), z.strictObject({ ok: z.literal(false), error: errorCode })]);
 const submitSchema = z.strictObject({ operationId: uuid, commit, digest, tag });
 const maxResponseBytes = 4096;
 
 export type UpdateOperation = z.infer<typeof operationSchema>;
 export type UpdateSubmission = z.infer<typeof submitSchema>;
+export type UpdatePreparation = z.infer<typeof preparationSchema>;
+export type UpdateApplication = z.infer<typeof applySchema>;
 export type UpdateErrorCode = z.infer<typeof errorCode> | 'invalid_input' | 'connection_failed' | 'invalid_response' | 'timeout';
 export class UpdaterClientError extends Error {
   constructor(readonly code: UpdateErrorCode, readonly certainty: 'definitive' | 'uncertain') {
@@ -64,7 +67,7 @@ function parseUniqueJson(text: string): unknown {
   const parsed = value(0); whitespace(); if (position !== text.length) throw new Error('invalid JSON'); return parsed;
 }
 
-async function request(action: 'submit' | 'status' | 'retry', input: UpdateSubmission | { operationId: string }, options: UpdaterClientOptions): Promise<UpdateOperation> {
+async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'apply' | 'apply_status', input: UpdateSubmission | { operationId: string }, options: UpdaterClientOptions): Promise<UpdateOperation | UpdatePreparation | UpdateApplication> {
   const validInput = action === 'submit' ? submitSchema.safeParse(input) : z.strictObject({ operationId: uuid }).safeParse(input);
   const timeout = options.timeoutMs ?? 5000;
   if (!validInput.success || typeof options.socketPath !== 'string' || !isAbsolute(options.socketPath) || options.socketPath.includes('\0') || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120000) throw new UpdaterClientError('invalid_input', 'definitive');
@@ -73,7 +76,7 @@ async function request(action: 'submit' | 'status' | 'retry', input: UpdateSubmi
     let dispatched = false, settled = false, length = 0;
     const chunks: Buffer[] = [];
     const socket = createConnection({ path: options.socketPath });
-    const finish = (error?: UpdaterClientError, operation?: UpdateOperation) => {
+    const finish = (error?: UpdaterClientError, operation?: UpdateOperation | UpdatePreparation | UpdateApplication) => {
       if (settled) return;
       settled = true; clearTimeout(timer); socket.destroy();
       if (error) reject(error); else resolve(operation!);
@@ -92,6 +95,8 @@ async function request(action: 'submit' | 'status' | 'retry', input: UpdateSubmi
       let data: unknown;
       try { data = parseUniqueJson(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, -1))); }
       catch { fail('invalid_response'); return; }
+      const resultSchema = action === 'prepare' ? preparationSchema : action === 'apply' || action === 'apply_status' ? applySchema : operationSchema;
+      const responseSchema = z.union([z.strictObject({ ok: z.literal(true), operation: resultSchema }), z.strictObject({ ok: z.literal(false), error: errorCode })]);
       const parsed = responseSchema.safeParse(data);
       if (!parsed.success) { fail('invalid_response'); return; }
       if (!parsed.data.ok) {
@@ -99,7 +104,7 @@ async function request(action: 'submit' | 'status' | 'retry', input: UpdateSubmi
         finish(new UpdaterClientError(parsed.data.error, certainty)); return;
       }
       const operation = parsed.data.operation;
-      if (operation.operationId !== validInput.data.operationId || (action === 'submit' && (operation.commit !== (validInput.data as UpdateSubmission).commit || operation.digest !== (validInput.data as UpdateSubmission).digest || operation.tag !== (validInput.data as UpdateSubmission).tag))) { fail('invalid_response'); return; }
+      if (operation.operationId !== validInput.data.operationId || (action === 'submit' && (!('commit' in operation) || operation.commit !== (validInput.data as UpdateSubmission).commit || operation.digest !== (validInput.data as UpdateSubmission).digest || operation.tag !== (validInput.data as UpdateSubmission).tag))) { fail('invalid_response'); return; }
       finish(undefined, operation);
     });
     socket.once('error', () => fail('connection_failed'));
@@ -107,6 +112,9 @@ async function request(action: 'submit' | 'status' | 'retry', input: UpdateSubmi
   });
 }
 
-export function submitUpdate(input: UpdateSubmission, options: UpdaterClientOptions): Promise<UpdateOperation> { return request('submit', input, options); }
-export function updateStatus(operationId: string, options: UpdaterClientOptions): Promise<UpdateOperation> { return request('status', { operationId }, options); }
-export function retryUpdate(operationId: string, options: UpdaterClientOptions): Promise<UpdateOperation> { return request('retry', { operationId }, options); }
+export function submitUpdate(input: UpdateSubmission, options: UpdaterClientOptions): Promise<UpdateOperation> { return request('submit', input, options) as Promise<UpdateOperation>; }
+export function updateStatus(operationId: string, options: UpdaterClientOptions): Promise<UpdateOperation> { return request('status', { operationId }, options) as Promise<UpdateOperation>; }
+export function retryUpdate(operationId: string, options: UpdaterClientOptions): Promise<UpdateOperation> { return request('retry', { operationId }, options) as Promise<UpdateOperation>; }
+export function prepareUpdate(operationId: string, options: UpdaterClientOptions): Promise<UpdatePreparation> { return request('prepare', { operationId }, options) as Promise<UpdatePreparation>; }
+export function applyUpdate(operationId: string, options: UpdaterClientOptions): Promise<UpdateApplication> { return request('apply', { operationId }, options) as Promise<UpdateApplication>; }
+export function applyStatus(operationId: string, options: UpdaterClientOptions): Promise<UpdateApplication> { return request('apply_status', { operationId }, options) as Promise<UpdateApplication>; }

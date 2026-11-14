@@ -11,9 +11,9 @@ const id='12345678-1234-4123-8123-123456789abc';
 const release={operationId:id,commit:'a'.repeat(40),digest:`sha256:${'b'.repeat(64)}`,tag:'v1.2.3'};
 const cleanups:(()=>Promise<void>)[]=[];
 afterEach(async()=>{for(const cleanup of cleanups.splice(0).reverse())await cleanup();});
-async function fixture(withSocket=false) {
+async function fixture(withSocket=false, enabled=false, currentVersion='1.0.0') {
   const dir=mkdtempSync(join(tmpdir(),'servus-update-api-')),store=new Store(dir),socketPath=join(dir,'updater.sock');
-  const app=await createApp({dataDir:dir,store,updaterSocketPath:withSocket?socketPath:undefined});
+  const app=await createApp({dataDir:dir,store,updaterSocketPath:withSocket?socketPath:undefined,updaterApplyEnabled:enabled,updaterCurrentVersion:currentVersion});
   cleanups.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
   const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'admin@example.test',password:'12345678'}});
   const token=setup.cookies.find(c=>c.name==='panel_session')!.value;
@@ -32,6 +32,47 @@ async function serve(path:string, response:unknown, requests:string[]):Promise<v
 }
 
 describe('update management API',()=>{
+  it('sends each update stage only for an authorized administrator when explicitly enabled',async()=>{
+    const {app,headers,member,socketPath}=await fixture(true,true),requests:Record<string,unknown>[]=[];
+    const server=createServer(socket=>{let input='';socket.on('data',chunk=>{input+=chunk.toString();if(!input.includes('\n'))return;
+      const request=JSON.parse(input) as {action:string;operationId:string};requests.push(request);
+      const operation=request.action==='prepare' ? {operationId:id,preparationId:'12345678-1234-4123-8123-123456789abd',status:'prepared'} :
+        request.action==='apply'||request.action==='apply_status' ? {operationId:id,status:'requested'} : {...release,status:'verified',createdAt:'2026-11-14 12:00:00'};
+      socket.end(JSON.stringify({ok:true,operation})+'\n');
+    });});
+    await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(socketPath,resolve);});
+    cleanups.push(async()=>{await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));});
+    expect((await app.inject({url:'/api/v1/updates',headers})).json().applyAvailable).toBe(true);
+    expect((await app.inject({method:'POST',url:'/api/v1/updates',headers:member,payload:release})).statusCode).toBe(403);
+    expect((await app.inject({method:'POST',url:'/api/v1/updates',headers:{cookie:headers.cookie},payload:release})).statusCode).toBe(403);
+    expect((await app.inject({method:'POST',url:'/api/v1/updates',headers,payload:{...release,tag:'v1.0.0'}})).statusCode).toBe(400);
+    expect(requests).toHaveLength(0);
+    expect((await app.inject({method:'POST',url:'/api/v1/updates',headers,payload:release})).statusCode).toBe(200);
+    expect((await app.inject({method:'POST',url:`/api/v1/updates/${id}/prepare`,headers,payload:{}})).statusCode).toBe(200);
+    expect((await app.inject({method:'POST',url:`/api/v1/updates/${id}/apply`,headers,payload:{}})).statusCode).toBe(200);
+    expect((await app.inject({url:`/api/v1/updates/${id}/apply`,headers})).statusCode).toBe(200);
+    expect(requests.map(item=>item.action)).toEqual(['submit','status','prepare','status','apply','apply_status']);
+    expect(requests.slice(1).every(item=>Object.keys(item).sort().join(',')==='action,operationId,version')).toBe(true);
+  });
+  it('keeps update mutations disabled if the installed version is unknown',async()=>{
+    const {app,headers}=await fixture(true,true,'unknown');
+    expect((await app.inject({url:'/api/v1/updates',headers})).json().applyAvailable).toBe(false);
+    expect((await app.inject({method:'POST',url:'/api/v1/updates',headers,payload:release})).statusCode).toBe(503);
+  });
+  it('blocks unauthorized stages and prepared downgrades before dispatch',async()=>{
+    const {app,headers,member,socketPath}=await fixture(true,true,'2.0.0'),requests:string[]=[];
+    await serve(socketPath,{ok:true,operation:{...release,status:'verified',createdAt:'2026-11-14 12:00:00'}},requests);
+    for(const action of ['prepare','apply']){
+      const request={method:'POST' as const,url:`/api/v1/updates/${id}/${action}`,payload:{}};
+      expect((await app.inject({...request,headers:member})).statusCode).toBe(403);
+      expect((await app.inject({...request,headers:{cookie:headers.cookie}})).statusCode).toBe(403);
+      expect((await app.inject({...request,headers:{...headers,origin:'https://attacker.example'}})).statusCode).toBe(403);
+    }
+    expect(requests).toEqual([]);
+    for(const action of ['prepare','apply'])
+      expect((await app.inject({method:'POST',url:`/api/v1/updates/${id}/${action}`,headers,payload:{}})).statusCode).toBe(400);
+    expect(requests.map(value=>JSON.parse(value).action)).toEqual(['status','status']);
+  });
   it('requires an administrator and exposes only the configured status capability',async()=>{
     const {app,headers,member}=await fixture();
     expect((await app.inject({url:'/api/v1/updates'})).statusCode).toBe(401);

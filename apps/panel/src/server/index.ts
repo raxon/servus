@@ -17,6 +17,8 @@ const app = await createApp({
   secureCookies: process.env.PANEL_SECURE_COOKIES === 'true',
   trustedProxySecret: loadTrustedProxySecret(process.env),
   maintenance,
+  updaterSocketPath: process.env.PANEL_UPDATER_SOCKET,
+  updaterApplyEnabled: process.env.PANEL_UPDATER_APPLY_ENABLED === 'true',
 });
 await app.listen({host:process.env.PANEL_HOST ?? '127.0.0.1',port:Number(process.env.PANEL_PORT ?? 4180)});
 const control = startSupervisorControl(controlConfig, 'api', timeout => maintenance!.drain(timeout));

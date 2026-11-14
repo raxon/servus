@@ -2,7 +2,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { submitUpdate, updateStatus, retryUpdate, UpdaterClientError, type UpdateSubmission } from '../../src/server/updater-client.js';
+import { submitUpdate, updateStatus, retryUpdate, prepareUpdate, applyUpdate, applyStatus, UpdaterClientError, type UpdateSubmission } from '../../src/server/updater-client.js';
 
 const input: UpdateSubmission = { operationId: '12345678-1234-4123-8123-123456789abc', commit: 'a'.repeat(40), digest: `sha256:${'b'.repeat(64)}`, tag: 'v1.2.3' };
 const operation = { ...input, status: 'accepted', createdAt: '2026-11-14 10:00:00' };
@@ -35,6 +35,24 @@ async function failure(promise: Promise<unknown>, code: string, certainty: strin
 }
 
 describe('updater Unix socket client', () => {
+  it('validates preparation and apply responses against their specific protocol', async () => {
+    const prepared = { operationId: input.operationId, preparationId: '12345678-1234-4123-8123-123456789abd', status: 'prepared' };
+    const options = await fixture((socket, request) => {
+      expect(JSON.parse(request)).toEqual({version: 1, action: 'prepare', operationId: input.operationId});
+      socket.end(JSON.stringify({ok: true, operation: prepared}) + '\n');
+    });
+    await expect(prepareUpdate(input.operationId, options)).resolves.toEqual(prepared);
+    for (const action of ['apply', 'apply_status'] as const) {
+      const result = {operationId: input.operationId, status: 'awaiting_completion'};
+      const endpoint = await fixture((socket, request) => {
+        expect(JSON.parse(request)).toEqual({version: 1, action, operationId: input.operationId});
+        socket.end(JSON.stringify({ok: true, operation: result}) + '\n');
+      });
+      await expect(action === 'apply' ? applyUpdate(input.operationId, endpoint) : applyStatus(input.operationId, endpoint)).resolves.toEqual(result);
+    }
+    const wrong = await fixture(socket => socket.end(JSON.stringify({ok: true, operation: prepared}) + '\n'));
+    await failure(applyStatus(input.operationId, wrong), 'invalid_response', 'uncertain');
+  });
   it('sends the v1 submission and accepts a response split across packets', async () => {
     const options = await fixture((socket, request) => {
       expect(JSON.parse(request)).toEqual({ version: 1, action: 'submit', ...input });
