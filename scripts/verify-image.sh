@@ -41,10 +41,14 @@ if (( ! ready )); then
   exit 1
 fi
 python3 - "$scratch/health.json" <<'PY'
-import json, pathlib, sys
+import json, os, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
 if value.get('status') != 'ok' or not isinstance(value.get('version'), str):
     raise SystemExit('Image health response was invalid')
+if os.environ.get('EXPECTED_REVISION') and value.get('revision') != os.environ['EXPECTED_REVISION']:
+    raise SystemExit('Image revision does not match the expected commit')
+if os.environ.get('EXPECTED_VERSION') and value.get('version') != os.environ['EXPECTED_VERSION'].removeprefix('v'):
+    raise SystemExit('Image version does not match the expected version')
 PY
 curl --silent --show-error --fail --max-time 5 "$base/" > "$scratch/index.html"
 python3 - "$scratch/index.html" <<'PY'

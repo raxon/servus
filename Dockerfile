@@ -8,6 +8,9 @@ COPY apps/panel/package.json ./apps/panel/package.json
 COPY apps/website/package.json ./apps/website/package.json
 RUN npm ci --workspace=@servus/panel --include-workspace-root=false --no-audit --no-fund
 COPY apps/panel ./apps/panel
+ARG SERVUS_BUILD_VERSION=unknown
+ARG SERVUS_BUILD_REVISION=unknown
+RUN node apps/panel/src/server/write-build-info.mjs apps/panel/package.json apps/panel/src/server/generated-build-info.ts
 RUN npm run build --workspace=@servus/panel && npm prune --omit=dev --workspace=@servus/panel --include-workspace-root=false --no-audit --no-fund
 
 FROM node:24-bookworm-slim

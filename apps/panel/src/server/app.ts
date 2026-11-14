@@ -14,6 +14,7 @@ import { nameSchema, normalizeServiceInput, parseServicePatch } from './configur
 import { agentRequest as defaultAgentRequest, AgentRequestError } from '../agent/client.js';
 import { registerConsole } from './console.js';
 import { registerCentralAuth } from './central-auth.js';
+import { BUILD_INFO } from './generated-build-info.js';
 
 const prefix = '/api/v1';
 const cookieName = 'panel_session';
@@ -75,8 +76,8 @@ export async function createApp(options: AppOptions) {
     return {user,csrfToken:created.csrfToken};
   }
 
-  app.get(`${prefix}/health`, async () => ({status:'ok',version:'0.1.0'}));
-  app.get('/health', async () => ({status:'ok',version:'0.1.0'}));
+  app.get(`${prefix}/health`, async () => ({status:'ok',...BUILD_INFO}));
+  app.get('/health', async () => ({status:'ok',...BUILD_INFO}));
   app.get(`${prefix}/setup`, async () => ({required:!store.isSetup()}));
   app.post(`${prefix}/setup`, {config:{rateLimit:{max:5,timeWindow:'1 minute'}}}, async (req,reply) => {
     const input = credentials.strict().parse(req.body);
