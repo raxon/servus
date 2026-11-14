@@ -22,7 +22,8 @@ class InitialGenerationError(Exception):
     pass
 
 
-def check_supervisor(control_dir, supervisor):
+def check_supervisor(control_dir, supervisor, *, expected='waiting'):
+    if expected not in ('waiting','ready'):raise InitialGenerationError('Invalid supervisor state')
     directory = supervisor._trusted_directory(control_dir, 0o750)
     try:
         before = os.stat('command', dir_fd=directory, follow_symlinks=False)
@@ -37,8 +38,8 @@ def check_supervisor(control_dir, supervisor):
                 raise InitialGenerationError('Supervisor identity changed')
             deadline = time.monotonic() + 5
             supervisor._send_message(conn, {'version':1,'type':'status'}, deadline)
-            if supervisor._read_message(conn, deadline) != {'version':1,'status':'waiting'}:
-                raise InitialGenerationError('Supervisor is not awaiting the first generation')
+            if supervisor._read_message(conn, deadline) != {'version':1,'status':expected}:
+                raise InitialGenerationError('Supervisor is not in the expected state')
     finally:
         os.close(directory)
 

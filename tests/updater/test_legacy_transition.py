@@ -1,5 +1,7 @@
 import fcntl
+import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -7,6 +9,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 import uuid
+from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'apps/updater'))
@@ -18,6 +21,8 @@ def load(name,filename):
 
 transition=load('legacy_transition','legacy-transition.py')
 updater=load('legacy_transition_updater','servus-updater.py')
+policy=load('legacy_transition_policy','runtime-policy.py')
+backup=load('legacy_transition_backup','backup.py')
 
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
 class LegacyTransitionTest(unittest.TestCase):
@@ -47,7 +52,9 @@ class LegacyTransitionTest(unittest.TestCase):
                                    ensure_no_mount_aliases=lambda *_:None,ensure_no_open_data=lambda *_:None,ensure_no_uid_writers=lambda *_:None)
         self.fence=SimpleNamespace(journal=self.journal,operation=self.operation,active_env=self.active,source=self.source,old_ids=self.old)
         self.lock=os.open(self.install/'install.lock',os.O_RDONLY);fcntl.flock(self.lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    def tearDown(self):os.close(self.lock);self.journal.close();self.temp.cleanup()
+    def tearDown(self):
+        if self.lock>=0:os.close(self.lock)
+        self.journal.close();self.temp.cleanup()
     def run_transition(self):
         return transition.transition(self.journal,self.operation,self.active,self.source,'image','image-id',self.old,'/old-env','/old-compose',
                '/recovery','/snapshot',self.parent,-1,str(self.docker_config),supervisor,object(),self.adoption,object(),self.quiet,
@@ -99,5 +106,63 @@ class LegacyTransitionTest(unittest.TestCase):
                 supervisor,object(),self.adoption,object(),self.quiet,object(),self.legacy,install_lock=self.lock)
         self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('recovery_required',))
         self.assertTrue((self.install/transition.MARKER).is_file())
+    def completion_fixture(self):
+        parent=Path(self.parent);parent.mkdir(mode=0o711)
+        target=Path(self.approved.data_dir);target.mkdir(mode=0o700);os.chown(target,1000,1000)
+        source=self.root/'original';source.mkdir(mode=0o700);old=os.stat(source);new=os.stat(target)
+        saved=self.root/'recovery';saved.mkdir(mode=0o700)
+        (saved/'legacy.env').write_bytes(b'fixture env');(saved/'compose.yaml').write_bytes(b'fixture compose')
+        for name in ('legacy.env','compose.yaml'):(saved/name).chmod(0o600)
+        env_digest='sha256:'+hashlib.sha256(b'fixture env').hexdigest();compose_digest='sha256:'+hashlib.sha256(b'fixture compose').hexdigest()
+        digest='sha256:'+'d'*64;marker=self.install/transition.MARKER
+        marker.write_text('servus-legacy-migration-v1 '+self.operation+'\n');marker.chmod(0o600)
+        db=self.journal.db
+        db.executescript('''CREATE TABLE legacy_transitions(operation_id TEXT,phase TEXT);
+        CREATE TABLE initial_generations(operation_id TEXT,phase TEXT);
+        CREATE TABLE legacy_removals(operation_id TEXT,state TEXT);
+        CREATE TABLE legacy_snapshots(operation_id TEXT,path TEXT,digest TEXT,state TEXT);
+        CREATE TABLE legacy_protections(operation_id TEXT,source TEXT,source_dev INTEGER,source_ino INTEGER,snapshot_digest TEXT,target_dev INTEGER,target_ino INTEGER,state TEXT);
+        CREATE TABLE initial_adoptions(operation_id TEXT,snapshot_path TEXT,snapshot_digest TEXT,data_parent TEXT,data_dev INTEGER,data_ino INTEGER,state TEXT);
+        CREATE TABLE legacy_migration_fences(operation_id TEXT,source TEXT,source_dev INTEGER,source_ino INTEGER,old_ids TEXT,state TEXT);
+        CREATE TABLE legacy_stop_operations(operation_id TEXT,source TEXT,source_dev INTEGER,source_ino INTEGER,old_ids TEXT,state TEXT);
+        CREATE TABLE legacy_recovery(operation_id TEXT,path TEXT,env_digest TEXT,compose_digest TEXT,state TEXT);''')
+        for table,value in (('legacy_transitions','started'),('initial_generations','started'),('legacy_removals','removed')):
+            db.execute('INSERT INTO '+table+' VALUES(?,?)',(self.operation,value))
+        db.execute("INSERT INTO preparations(operation_id,attempt_id,attempt_nonce,preparation_id,status) VALUES(?,?,?,?,?)",(self.operation,str(uuid.uuid4()),'a'*64,str(uuid.uuid4()),'completed'))
+        db.execute("INSERT INTO legacy_snapshots VALUES(?,?,?,'verified')",(self.operation,'/snapshot',digest))
+        db.execute("INSERT INTO legacy_protections VALUES(?,?,?,?,?,?,?,'protected')",(self.operation,str(source),old.st_dev,old.st_ino,digest,new.st_dev,new.st_ino))
+        db.execute("INSERT INTO initial_adoptions VALUES(?,?,?,?,?,?,'consumed')",(self.operation,'/snapshot',digest,self.parent,new.st_dev,new.st_ino))
+        ids=json.dumps(self.old,sort_keys=True,separators=(',',':'))
+        db.execute("INSERT INTO legacy_migration_fences VALUES(?,?,?,?,?,'fenced')",(self.operation,str(source),old.st_dev,old.st_ino,ids))
+        db.execute("INSERT INTO legacy_stop_operations VALUES(?,?,?,?,?,'stopped')",(self.operation,str(source),old.st_dev,old.st_ino,ids))
+        db.execute("INSERT INTO legacy_recovery VALUES(?,?,?,?,'verified')",(self.operation,str(saved),env_digest,compose_digest))
+        daemon=SimpleNamespace(resolve_active_policy=lambda *_:('/policy','/accepted',self.approved))
+        initial=SimpleNamespace(check_supervisor=mock.Mock(),check_updater=mock.Mock())
+        coordinator=SimpleNamespace(verify_snapshot=mock.Mock(),_pairs=dict)
+        def service(*args,**kwargs):return (0,'active') if args[0]=='is-active' else (0,'')
+        def run(service_call=service):
+            with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace),mock.patch.object(supervisor,'inspect_servus',return_value={role:{'id':letter*64} for role,letter in zip(supervisor.ROLES,'def')}):
+                return transition.complete(self.journal,self.operation,self.active,-1,supervisor,daemon,policy,initial,backup,coordinator,service=service_call)
+        return run,marker,saved,initial
+    def test_completion_enables_services_and_removes_marker_after_verification(self):
+        run,marker,_,initial=self.completion_fixture()
+        os.close(self.lock);self.lock=-1
+        run()
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('completed',))
+        self.assertEqual(initial.check_supervisor.call_count,2)
+    def test_completion_failure_keeps_marker_and_durable_state(self):
+        run,marker,_,_=self.completion_fixture()
+        os.close(self.lock);self.lock=-1
+        def service(*args,**kwargs):return (1,'') if args[0]=='enable' else (0,'active')
+        with self.assertRaises(transition.TransitionError):run(service)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('completing',))
+    def test_completion_refuses_changed_recovery_before_enabling(self):
+        run,marker,saved,_=self.completion_fixture();(saved/'legacy.env').write_bytes(b'changed')
+        os.close(self.lock);self.lock=-1
+        with self.assertRaises(transition.TransitionError):run()
+        self.assertTrue(marker.is_file())
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('started',))
 
 if __name__=='__main__':unittest.main()

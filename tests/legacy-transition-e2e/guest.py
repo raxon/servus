@@ -37,6 +37,7 @@ quiet=load('fixture_quiet','quiescence.py')
 initial_module=load('fixture_initial','initial-generation.py');extractor=load('fixture_extractor','extract-install.py')
 daemon_module=load('fixture_daemon','supervisor-daemon.py')
 bootstrap_module=load('fixture_bootstrap','bootstrap-initial.py')
+handoff_module=load('fixture_handoff','bootstrap-handoff.py')
 verifier=load('fixture_verifier','verify-release.py')
 OLD='ghcr.io/raxon/servus@sha256:32f7cccf97841716ffae6bbff4f4234d5c3575e3b3ad9daa61dcf5afba72a13c'
 NEW='ghcr.io/raxon/servus@sha256:68e56744e3a81249154e90012a7440041f87b965686f1c52e5e31bf3be0113c4'
@@ -203,7 +204,12 @@ def main():
                 time.sleep(1)
             discovery=request('/updates/discovery')
             if not isinstance(discovery.get('discovery'),dict):raise RuntimeError('Updater discovery is unavailable')
-            print('PASS signed release, supervisor completion, updater discovery and retained login',flush=True)
+            transition.complete(journal,op,active,node_fd,supervisor,daemon,runtime,initial_module,backup,coordinator,service=handoff_module.systemctl)
+            if (install/transition.MARKER).exists() or journal.db.execute('SELECT phase FROM legacy_transitions').fetchone()!=('completed',):
+                raise RuntimeError('Migration was not finalized')
+            for unit in ('servus-supervisor.service','servus-updater.service','servus-updater-socket.service'):
+                run('/usr/bin/systemctl','is-enabled','--quiet',unit)
+            print('PASS signed release, supervisor completion, updater discovery, service enablement and retained login',flush=True)
             return
         script="import {Store} from '/app/dist/server/store.js';const s=new Store('/fixture');if(!s.db.prepare('SELECT 1 FROM projects WHERE id=?').get(process.argv[1]))process.exit(2);s.close()"
         command('run','--rm','--network','none','--platform','linux/amd64','--user','node','--mount','type=bind,src='+approved.data_dir+',dst=/fixture',
