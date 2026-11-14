@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
-import { parseArgs, readCredentials, runHarness, probeIngress, terminal } from '../scripts/test-vps.mjs';
+import { parseArgs, readCredentials, runHarness, probeIngress, terminal, wordpressRequest } from '../scripts/test-vps.mjs';
 
 const args=['--confirm-vps-test','--url','http://localhost:4180','--credentials','/tmp/file','--ingress-url','http://127.0.0.1:18080'];
 test('requires consent, explicit URL, credentials and loopback ingress', () => {
@@ -22,6 +22,19 @@ test('requires consent, explicit URL, credentials and loopback ingress', () => {
   assert.throws(()=>parseArgs([...args,'--phases','postgres','--memory-mb','127']),/PostgreSQL phase requires/);
   assert.throws(()=>parseArgs([...args,'--phases','mariadb']),/MariaDB phase requires/);
   assert.deepEqual(parseArgs([...args,'--phases','postgres,mariadb','--memory-mb','192']).phases,['postgres','mariadb']);
+  assert.throws(()=>parseArgs(['--confirm-vps-test','--url','https://panel.test','--credentials','x','--phases','wordpress','--memory-mb','192']),/loopback ingress/);
+  assert.throws(()=>parseArgs([...args,'--phases','wordpress']),/192 MB/);
+});
+
+test('WordPress requests stay on the loopback origin and pass the requested Host',async()=>{
+  let host='',payload='';const server=createServer((request,response)=>{host=request.headers.host;request.on('data',chunk=>payload+=chunk);request.on('end',()=>response.end('ok'));});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try {
+    const base=`http://127.0.0.1:${server.address().port}`;
+    const result=await wordpressRequest({base,path:'/wp-login.php',hostname:'fixture.localhost',method:'POST',body:'synthetic',timeoutMs:2000});
+    assert.equal(result.status,200);assert.equal(host,'fixture.localhost');assert.equal(payload,'synthetic');
+    assert.throws(()=>wordpressRequest({base,path:'//attacker.test/',hostname:'fixture.localhost',timeoutMs:1000}),/fixture path/);
+  } finally {await new Promise(resolve=>server.close(resolve));}
 });
 test('credentials require a regular owned file with exactly mode 0600', () => {
   const dir=mkdtempSync(join(tmpdir(),'vps-test-'));
@@ -33,6 +46,62 @@ test('credentials require a regular owned file with exactly mode 0600', () => {
     const getuid=process.getuid;try {process.getuid=()=>getuid()+1;assert.throws(()=>readCredentials(path),/owned by the current user/);} finally {process.getuid=getuid;}
     writeFileSync(path,'not-json synthetic-secret');assert.throws(()=>readCredentials(path),error=>error.message==='Credentials file is not valid JSON');
   } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('WordPress fixture installs, authenticates and checks persisted post and media after both restarts',async()=>{
+  const mock=fakeApi(),calls=[],logs=[];let username='',title='',content='',image,adminLost=false,contentLost=false,postFailed=false;
+  const request=async input=>{
+    calls.push(input);
+    const headers={};let status=200,body=Buffer.from('');
+    if(input.path==='/wp-admin/install.php')body=Buffer.from('WordPress');
+    else if(input.path==='/wp-admin/install.php?step=2') {const form=new URLSearchParams(input.body);username=form.get('user_name');body=Buffer.from('Success!');}
+    else if(input.path==='/wp-login.php' && input.method==='GET')headers['set-cookie']=['wordpress_test_cookie=fixture; Path=/'];
+    else if(input.path==='/wp-login.php' && input.method==='POST'){assert.match(input.headers.cookie,/wordpress_test_cookie=/);status=302;headers['set-cookie']=['wordpress_logged_in_fixture=fixture; Path=/'];}
+    else if(input.path==='/?rest_route=/wp/v2/posts'){assert.match(input.headers.authorization,/^Basic /);assert.equal(input.headers.cookie,undefined);({title,content}=JSON.parse(input.body));status=postFailed?403:201;body=Buffer.from(JSON.stringify(postFailed?{code:'synthetic_secret_123'}:{id:1,title:{rendered:title}}));}
+    else if(input.path==='/?rest_route=/wp/v2/media'){image=input.body;status=201;body=Buffer.from(JSON.stringify({id:2,source_url:`http://${input.hostname}/wp-content/uploads/fixture.png`}));}
+    else if(input.path==='/?rest_route=/wp/v2/posts/1')body=Buffer.from(JSON.stringify({id:1,title:{rendered:title},content:{rendered:contentLost?'missing':`<p>${content}</p>`}}));
+    else if(input.path==='/wp-content/uploads/fixture.png')body=image;
+    else if(input.path==='/?rest_route=/wp/v2/users/me')body=Buffer.from(JSON.stringify({slug:username}));
+    else if(input.path==='/wp-admin/'){assert.match(input.headers.cookie,/wordpress_logged_in_/);if(adminLost)status=302;else body=Buffer.from('wp-admin-bar-my-account');}
+    else throw new Error('Unexpected fixture route');
+    return {status,body,headers};
+  };
+  const options=parseArgs([...args,'--phases','wordpress','--memory-mb','192']), credentials={email:'x',password:'y'};
+  const dependencies={
+    fetch:mock.fetcher,ingress:mock.ingress,wordpressRequest:request,sleep:async()=>{},log:value=>logs.push(value),
+    terminal:async input=>{const prefix=input.command.match(/SERVUS_WP_AUTH_[a-f0-9]{16}=/)?.[0];assert(prefix);return `\r\n${prefix}abcdefghijklmnopqrstuvwx\r\n${input.marker}\r\n`;}
+  };
+  await runHarness(options,credentials,dependencies);
+  assert.equal(calls.filter(call=>call.path==='/?rest_route=/wp/v2/posts/1').length,2);
+  assert.equal(calls.filter(call=>call.path==='/wp-content/uploads/fixture.png').length,2);
+  assert.equal(calls.filter(call=>call.path==='/wp-admin/').length,2);
+  const restart=mock.requests.filter(item=>item.path.endsWith('/restart')).map(item=>item.path);
+  assert.deepEqual(restart,[`/api/v1/services/${mock.nginx}/restart`,`/api/v1/services/${mock.mariadb}/restart`]);
+  assert(logs.some(line=>line.includes('PASS WordPress installation')));
+  for(const secret of [new URLSearchParams(calls.find(call=>call.path==='/wp-admin/install.php?step=2').body).get('admin_password'),mock.requests.find(item=>item.body?.kind==='mariadb').body.database.password]) {
+    assert(secret);assert.equal(logs.some(line=>line.includes(secret)),false);
+  }
+  adminLost=true;
+  await assert.rejects(runHarness(options,credentials,dependencies),/cookie session did not persist/);
+  adminLost=false;contentLost=true;
+  await assert.rejects(runHarness(options,credentials,dependencies),/WordPress post did not become ready/);
+  contentLost=false;postFailed=true;
+  await assert.rejects(runHarness(options,credentials,dependencies),error=>{assert.equal(error.message,'WordPress post creation failed (HTTP 403)');assert.doesNotMatch(error.message,/synthetic_secret_123/);return true;});
+  assert.equal(logs.some(line=>line.includes('synthetic_secret_123')),false);
+});
+
+test('WordPress installation failure removes only fixture services and does not expose response data',async()=>{
+  const mock=fakeApi(),logs=[];
+  const request=async input=>input.path==='/wp-admin/install.php'
+    ?{status:200,body:Buffer.from('WordPress'),headers:{}}
+    :{status:500,body:Buffer.from('private fixture error detail'),headers:{}};
+  await assert.rejects(runHarness(parseArgs([...args,'--phases','wordpress','--memory-mb','192']),{email:'x',password:'y'}, {
+    fetch:mock.fetcher,wordpressRequest:request,sleep:async()=>{},log:value=>logs.push(value),terminal:async()=>{}
+  }),error=>{assert.equal(error.message,'WordPress installation failed');assert.doesNotMatch(error.message,/private fixture/);return true;});
+  assert.deepEqual(mock.requests.filter(item=>item.method==='DELETE').map(item=>item.path),[
+    `/api/v1/services/${mock.nginx}`,`/api/v1/services/${mock.mariadb}`,`/api/v1/projects/${mock.projectId}`
+  ]);
+  assert.equal(logs.some(line=>line.includes('private fixture')),false);
 });
 function fakeApi({ failAction=false, badService=false, unrelatedService=false, incorrectNginx=false, oversizedNginx=false, incorrectMarker=false, databaseHasRoute=false, ingressStatuses=[] }={}) {
   const projectId='11111111-1111-4111-8111-111111111111', nginx='22222222-2222-4222-8222-222222222222', redis='33333333-3333-4333-8333-333333333333', postgres='44444444-4444-4444-8444-444444444444', mariadb='55555555-5555-4555-8555-555555555555';

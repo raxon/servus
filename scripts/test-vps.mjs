@@ -6,7 +6,7 @@ import { WebSocket } from 'ws';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 
-const usage = 'Usage: node scripts/test-vps.mjs --confirm-vps-test --url URL --credentials FILE --ingress-url URL [--phases nginx,redis,postgres,mariadb] [--timeout-seconds 60..900] [--memory-mb 64..256]';
+const usage = 'Usage: node scripts/test-vps.mjs --confirm-vps-test --url URL --credentials FILE --ingress-url URL [--phases nginx,redis,postgres,mariadb,wordpress] [--timeout-seconds 60..900] [--memory-mb 64..256]';
 const idPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function requireId(value) { if (typeof value !== 'string' || !idPattern.test(value)) throw new Error('Unexpected resource identifier'); return value; }
 function normalizeUrl(value, ingress = false) {
@@ -32,12 +32,13 @@ export function parseArgs(argv) {
     if (arg==='--memory-mb') out.memoryMb=Number(value);
   }
   if (!out.confirmed || !out.url || !out.credentials) throw new Error('Explicit confirmation, API URL and credentials file are required');
-  if (!out.phases.length || new Set(out.phases).size !== out.phases.length || out.phases.some(p=>!['nginx','redis','postgres','mariadb'].includes(p))) throw new Error('Phases must contain only nginx, redis, postgres or mariadb');
-  if (out.phases.includes('nginx') && !out.ingressUrl) throw new Error('Nginx phase requires a loopback ingress URL');
+  if (!out.phases.length || new Set(out.phases).size !== out.phases.length || out.phases.some(p=>!['nginx','redis','postgres','mariadb','wordpress'].includes(p))) throw new Error('Phases must contain only nginx, redis, postgres, mariadb or wordpress');
+  if ((out.phases.includes('nginx') || out.phases.includes('wordpress')) && !out.ingressUrl) throw new Error('Nginx and WordPress phases require a loopback ingress URL');
   if (!Number.isInteger(out.timeoutSeconds) || out.timeoutSeconds<60 || out.timeoutSeconds>900) throw new Error('Timeout must be 60 to 900 seconds');
   if (!Number.isInteger(out.memoryMb) || out.memoryMb<64 || out.memoryMb>256) throw new Error('Memory limit must be 64 to 256 MB per service');
   if (out.phases.includes('postgres') && out.memoryMb<128) throw new Error('PostgreSQL phase requires at least 128 MB');
   if (out.phases.includes('mariadb') && out.memoryMb<192) throw new Error('MariaDB phase requires at least 192 MB');
+  if (out.phases.includes('wordpress') && out.memoryMb<192) throw new Error('WordPress phase requires at least 192 MB for MariaDB');
   return out;
 }
 export function readCredentials(path) {
@@ -80,12 +81,33 @@ export function probeIngress({ base, path, hostname, timeoutMs }) {
   });
 }
 
+// Send requests only through the explicit loopback ingress; redirects are never followed.
+export function wordpressRequest({base,path,hostname,method='GET',headers={},body,timeoutMs}) {
+  const url=new URL(path,base);
+  if(url.origin!==new URL(base).origin || !path.startsWith('/'))throw new Error('Invalid WordPress fixture path');
+  const request=url.protocol==='https:'?httpsRequest:httpRequest;
+  return new Promise((resolve,reject)=>{
+    const req=request(url,{method,headers:{...headers,host:hostname},timeout:timeoutMs},response=>{
+      let size=0,finished=false;const chunks=[];
+      response.on('data',chunk=>{size+=chunk.length;if(size>1048576){finished=true;response.destroy();reject(new Error('WordPress response exceeds the size limit'));}else chunks.push(chunk);});
+      response.on('end',()=>{if(!finished){finished=true;resolve({status:response.statusCode??0,body:Buffer.concat(chunks),headers:response.headers});}});
+      response.on('error',()=>{if(!finished){finished=true;reject(new Error('WordPress response failed'));}});
+    });
+    const timer=setTimeout(()=>req.destroy(new Error('WordPress request timed out')),timeoutMs);
+    req.on('close',()=>clearTimeout(timer));
+    req.on('timeout',()=>req.destroy(new Error('WordPress request timed out')));
+    req.on('error',()=>reject(new Error('WordPress request failed')));
+    if(body!==undefined)req.write(body);
+    req.end();
+  });
+}
+
 export async function terminal({ base, serviceId, ticket, cookie, command, marker, timeoutMs }) {
   const url=new URL(`/api/v1/services/${serviceId}/console`,base);url.protocol=url.protocol==='https:'?'wss:':'ws:';
   return new Promise((resolve,reject)=>{
     const socket=new WebSocket(url,{headers:{Cookie:cookie,Origin:new URL(base).origin},handshakeTimeout:Math.min(timeoutMs,10000),maxPayload:65536});
     let output='',settled=false,ready=false;
-    const finish=(err)=>{if(settled)return;settled=true;clearTimeout(timer);socket.terminate();err?reject(err):resolve();};
+    const finish=(err)=>{if(settled)return;settled=true;clearTimeout(timer);socket.terminate();err?reject(err):resolve(output);};
     const timer=setTimeout(()=>finish(new Error('Terminal check timed out')),timeoutMs);
     socket.on('open',()=>socket.send(JSON.stringify({type:'authenticate',ticket})));
     socket.on('message',(data,isBinary)=>{
@@ -101,7 +123,7 @@ export async function terminal({ base, serviceId, ticket, cookie, command, marke
   });
 }
 export async function runHarness(options, credentials, overrides = {}) {
-  const fetcher=overrides.fetch ?? fetch, consoleCheck=overrides.terminal ?? terminal, ingress=overrides.ingress ?? probeIngress, sleep=overrides.sleep ?? pause, log=overrides.log ?? console.log;
+  const fetcher=overrides.fetch ?? fetch, consoleCheck=overrides.terminal ?? terminal, ingress=overrides.ingress ?? probeIngress, wpRequest=overrides.wordpressRequest ?? wordpressRequest, sleep=overrides.sleep ?? pause, log=overrides.log ?? console.log;
   const runId=randomBytes(8).toString('hex'), prefix=`vps-test-${runId}`, projectName=prefix, hostname=`${prefix}.localhost`;
   const deadline=Date.now()+options.timeoutSeconds*1000;
   let cookie='',csrf='',projectId='',nginxId='',redisId='',cleanupFailed=false;
@@ -131,7 +153,7 @@ export async function runHarness(options, credentials, overrides = {}) {
     if(!container || !/^[a-f0-9]{12,64}$/.test(container.id))throw new Error('Fixture container is unavailable');
     const grant=await api(`/services/${id}/console-ticket`,{method:'POST',body:{containerId:container.id,shell:'/bin/sh'}});
     if(typeof grant.ticket!=='string'||!/^[a-f0-9]{64}$/.test(grant.ticket))throw new Error('Invalid terminal grant');
-    try { await consoleCheck({base:options.url,serviceId:id,ticket:grant.ticket,cookie,command:cmd,marker,timeoutMs:Math.min(remaining(),15000)}); }
+    try { return await consoleCheck({base:options.url,serviceId:id,ticket:grant.ticket,cookie,command:cmd,marker,timeoutMs:Math.min(remaining(),15000)}); }
     catch (error) { const phase=marker.replace(/_[a-f0-9]{16}$/, ''); throw new Error(`${phase}: ${error instanceof Error ? error.message : 'Terminal check failed'}`); }
   }
   try {
@@ -220,6 +242,73 @@ export async function runHarness(options, credentials, overrides = {}) {
       }
       await action(id,'stop');log(`PASS ${kind} rejects missing and invalid credentials, accepts valid credentials and retains data after restart`);
       log(`${kind} API exposes no HTTP domains; host-port isolation requires independent Docker inspection.`);
+    }
+    if(options.phases.includes('wordpress')) {
+      const dbPassword=randomBytes(24).toString('base64url'), adminPassword=randomBytes(24).toString('base64url');
+      const wpHost=`wp-${prefix}.localhost`, wpUrl=`http://${wpHost}`, username=`fixture${runId}`;
+      const db=await createService('database',{kind:'mariadb',replicas:1,database:{database:'app',user:'app',password:dbPassword},resources:{cpu:0.2,memoryMb:192}});
+      const wp=await createService('wordpress',{kind:'app',image:'wordpress:php8.3-apache',port:80,hostname:wpHost,replicas:1,
+        environment:[{name:'WORDPRESS_DB_HOST',value:'database:3306'},{name:'WORDPRESS_DB_USER',value:'app'},
+          {name:'WORDPRESS_DB_NAME',value:'app'},{name:'WORDPRESS_DB_PASSWORD',value:dbPassword,secret:true},
+          {name:'WORDPRESS_CONFIG_EXTRA',value:"define('WP_ENVIRONMENT_TYPE', 'local');"}],
+        mounts:[{type:'volume',name:'wordpress',target:'/var/www/html'}],resources:{cpu:0.4,memoryMb:256}});
+      const cookies=new Map();
+      async function wpCall(path,{method='GET',headers={},body}={}) {
+        const cookie=[...cookies].map(([key,value])=>`${key}=${value}`).join('; ');
+        const response=await wpRequest({base:options.ingressUrl,path,hostname:wpHost,method,headers:{...headers,...(cookie&&!headers.authorization?{cookie}:{})},body,timeoutMs:remaining()});
+        for(const item of response.headers?.['set-cookie']??[]) {
+          const pair=item.split(';',1)[0],index=pair.indexOf('=');
+          if(index>0 && /^[A-Za-z0-9_-]+$/.test(pair.slice(0,index)) && /^[\x21-\x7e]*$/.test(pair.slice(index+1))) {
+            const key=pair.slice(0,index),value=pair.slice(index+1);if(value)cookies.set(key,value);else cookies.delete(key);
+          }
+        }
+        return response;
+      }
+      async function ready(path,check,label) {
+        for(let attempt=0;attempt<60;attempt++) {
+          let response;try {response=await wpCall(path);}catch {response=null;}
+          if(response&&check(response))return response;
+          remaining();await sleep(1000);
+        }
+        throw new Error(`${label} did not become ready`);
+      }
+      await ready('/wp-admin/install.php',response=>response.status===200&&response.body.toString('utf8').includes('WordPress'),'WordPress installer');
+      const setup=new URLSearchParams({weblog_title:`Servus fixture ${runId}`,user_name:username,admin_password:adminPassword,admin_password2:adminPassword,admin_email:'fixture@example.test',blog_public:'0'}).toString();
+      const installed=await wpCall('/wp-admin/install.php?step=2',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:setup});
+      if(installed.status!==200||!installed.body.toString('utf8').includes('Success!'))throw new Error('WordPress installation failed');
+      const loginPage=await wpCall('/wp-login.php');if(loginPage.status!==200)throw new Error('WordPress login page failed');
+      const loginBody=new URLSearchParams({log:username,pwd:adminPassword,'wp-submit':'Log In',redirect_to:`${wpUrl}/wp-admin/`,testcookie:'1'}).toString();
+      const loggedIn=await wpCall('/wp-login.php',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:loginBody});
+      if(![302,303].includes(loggedIn.status)||![...cookies.keys()].some(key=>key.startsWith('wordpress_logged_in_')))throw new Error('WordPress login failed');
+      const marker=`SERVUS_WP_AUTH_DONE_${runId}`,authPrefix=`SERVUS_WP_AUTH_${runId}=`;
+      const authOutput=await serviceCommand(wp,`php -r 'require "/var/www/html/wp-load.php"; $u=get_user_by("login","${username}"); if(!$u) exit(1); $p=WP_Application_Passwords::create_new_application_password($u->ID,["name"=>"Fixture"]); if(is_wp_error($p)) exit(1); echo "${authPrefix}".str_replace(" ","",$p[0]).PHP_EOL;' && printf '\\n${marker}\\n'`,marker);
+      const appPassword=String(authOutput??'').match(new RegExp(`${authPrefix}([a-z0-9]{24})(?:\\r|\\n)`, 'i'))?.[1];
+      if(!appPassword)throw new Error(`WordPress application password unavailable (terminal bytes: ${Buffer.byteLength(String(authOutput??''))}, prefix occurrences: ${String(authOutput??'').split(authPrefix).length-1})`);
+      const restHeaders={authorization:`Basic ${Buffer.from(`${username}:${appPassword}`).toString('base64')}`};
+      const title=`Servus fixture ${runId}`, content=`Persistent content ${runId}`;
+      const posted=await wpCall('/?rest_route=/wp/v2/posts',{method:'POST',headers:{...restHeaders,'content-type':'application/json'},body:JSON.stringify({title,content,status:'publish'})});
+      let post;try {post=JSON.parse(posted.body.toString('utf8'));}catch {throw new Error('WordPress post response invalid');}
+      if(posted.status!==201||!Number.isInteger(post.id)||post.title?.rendered!==title)throw new Error(`WordPress post creation failed (HTTP ${posted.status})`);
+      const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a4WQAAAAASUVORK5CYII=','base64');
+      const uploaded=await wpCall('/?rest_route=/wp/v2/media',{method:'POST',headers:{...restHeaders,'content-type':'image/png','content-disposition':`attachment; filename="servus-${runId}.png"`},body:png});
+      let media;try {media=JSON.parse(uploaded.body.toString('utf8'));}catch {throw new Error('WordPress media response invalid');}
+      let mediaUrl;try {mediaUrl=new URL(media.source_url);}catch {throw new Error('WordPress media URL invalid');}
+      if(uploaded.status!==201||!Number.isInteger(media.id)||mediaUrl.hostname!==wpHost||mediaUrl.protocol!=='http:'||mediaUrl.search||mediaUrl.hash)throw new Error('WordPress media upload failed');
+      const checkData=async()=>{
+        await ready(`/?rest_route=/wp/v2/posts/${post.id}`,response=>{
+          if(response.status!==200)return false;
+          try {const result=JSON.parse(response.body.toString('utf8'));return result.id===post.id&&result.title?.rendered===title&&typeof result.content?.rendered==='string'&&result.content.rendered.includes(content);}catch {return false;}
+        },'WordPress post');
+        await ready(mediaUrl.pathname,response=>response.status===200&&response.body.equals(png),'WordPress media');
+        const me=await wpCall('/?rest_route=/wp/v2/users/me',{headers:restHeaders});
+        let user;try {user=JSON.parse(me.body.toString('utf8'));}catch {throw new Error('WordPress login response invalid');}
+        if(me.status!==200||user.slug!==username)throw new Error('WordPress application password did not persist');
+        const admin=await wpCall('/wp-admin/');
+        if(admin.status!==200||!admin.body.toString('utf8').includes('wp-admin-bar-my-account'))throw new Error('WordPress cookie session did not persist');
+      };
+      await checkData();await action(wp,'restart');await action(db,'restart');await checkData();
+      await action(wp,'stop');await action(db,'stop');
+      log('PASS WordPress installation, login, post and media survive application and database restarts');
     }
   } finally {
     if(projectId) {
