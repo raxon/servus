@@ -128,3 +128,46 @@ def capture(journal,operation,active_env,old_env,compose_path,destination,superv
             except BaseException:pass
             raise
     finally:os.close(destination_fd)
+
+
+def verify(journal,operation,active_env,supervisor,daemon,adoption,policy,backup,*,install_lock):
+    """Revalidate the protected recovery files under the installation lock."""
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or not supervisor._uuid4(operation):
+        raise RecoveryError('Isolated Linux root is required')
+    path,accepted,approved,binding=adoption._binding(journal,operation,active_env,supervisor,daemon)
+    install=supervisor._trusted_directory(approved.install_dir,0o700)
+    try:
+        expected=supervisor._open_root_file(install,'install.lock',0o600)
+        try:
+            held,named=os.fstat(install_lock),os.fstat(expected)
+            if (held.st_dev,held.st_ino)!=(named.st_dev,named.st_ino):raise RecoveryError('Installation lock does not match')
+            supervisor._assert_exclusive_flock(install_lock)
+        finally:os.close(expected)
+    finally:os.close(install)
+    row=journal.db.execute('SELECT preparation_id,attempt_id,nonce,root_digest,config_digest,policy_path,accepted_env,active_env,source,old_image,state FROM legacy_stop_operations WHERE operation_id=?',(operation,)).fetchone()
+    evidence=journal.db.execute('SELECT path,env_digest,compose_digest,state FROM legacy_recovery WHERE operation_id=?',(operation,)).fetchone()
+    if not row or row[:8]!=(*binding,path,accepted,active_env) or row[-1]!='stopped' or not evidence or evidence[-1]!='verified':
+        raise RecoveryError('Recovery evidence does not match')
+    recovery_path,env_digest,compose_digest,_=evidence
+    if any(not isinstance(value,str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',value) for value in (env_digest,compose_digest)):
+        raise RecoveryError('Recovery digest is invalid')
+    directory=supervisor._trusted_directory(recovery_path,0o700)
+    try:
+        if os.fstat(directory).st_gid!=0 or set(os.listdir(directory))!={'legacy.env','compose.yaml'}:raise RecoveryError('Recovery inventory differs')
+        content={}
+        for name,digest in (('legacy.env',env_digest),('compose.yaml',compose_digest)):
+            fd=supervisor._open_root_file(directory,name,0o600)
+            try:
+                before=os.fstat(fd);value=backup._read(fd,1024*1024);after=os.fstat(fd);named=os.stat(name,dir_fd=directory,follow_symlinks=False)
+                if ((before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=
+                    (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns) or
+                    (before.st_dev,before.st_ino)!=(named.st_dev,named.st_ino) or 'sha256:'+hashlib.sha256(value).hexdigest()!=digest):
+                    raise RecoveryError('Recovery file changed')
+                content[name]=value
+            finally:os.close(fd)
+        values=policy._env(content['legacy.env'])
+        if values.get('SERVUS_IMAGE')!=row[9] or values.get('SERVUS_DATA_DIR')!=row[8]:raise RecoveryError('Recovery configuration differs')
+        if adoption._binding(journal,operation,active_env,supervisor,daemon)!=(path,accepted,approved,binding) or journal.db.execute('SELECT path,env_digest,compose_digest,state FROM legacy_recovery WHERE operation_id=?',(operation,)).fetchone()!=evidence:
+            raise RecoveryError('Recovery evidence changed')
+        return evidence[:3]
+    finally:os.close(directory)

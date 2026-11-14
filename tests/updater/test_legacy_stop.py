@@ -23,6 +23,7 @@ updater=load('legacy_stop_updater','servus-updater.py')
 recovery=load('legacy_recovery','legacy-recovery.py')
 policy=load('legacy_recovery_policy','runtime-policy.py')
 backup=load('legacy_recovery_backup','backup.py')
+fence_module=load('legacy_removal_fence','migration-fence.py')
 
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
 class LegacyStopTest(unittest.TestCase):
@@ -51,7 +52,7 @@ class LegacyStopTest(unittest.TestCase):
         def call(*args,**kwargs):
             self.calls.append(args)
             if self.failure==args[0]:raise RuntimeError('fixture failure')
-            if args[0]=='ps':return ('\n'.join(self.items)+'\n').encode()
+            if args[0]=='ps':return ('\n'.join(self.items)+('\n' if self.items else '')).encode()
             if args[0]=='update':self.items[args[-1]]['HostConfig']['RestartPolicy']['Name']='no'
             if args[0]=='stop':self.items[args[-1]]['State']['Running']=False
             return b''
@@ -143,6 +144,10 @@ class LegacyStopTest(unittest.TestCase):
         self.assertEqual((destination/'compose.yaml').read_bytes(),compose.read_bytes())
         self.assertEqual((destination/'legacy.env').stat().st_mode & 0o777,0o600)
         self.assertEqual(self.journal.db.execute('SELECT env_digest,compose_digest,state FROM legacy_recovery').fetchone(),(env_hash,compose_hash,'verified'))
+        self.assertEqual(recovery.verify(self.journal,self.operation,'/active',supervisor,object(),self.adoption,policy,backup,install_lock=self.lock),(str(destination),env_hash,compose_hash))
+        (destination/'compose.yaml').write_text('changed')
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.verify(self.journal,self.operation,'/active',supervisor,object(),self.adoption,policy,backup,install_lock=self.lock)
         with self.assertRaises(recovery.RecoveryError):run()
     def test_recovery_rejects_mismatched_compose_before_writing(self):
         run,_,_,destination,services=self.recovery_fixture()
@@ -154,5 +159,43 @@ class LegacyStopTest(unittest.TestCase):
         with mock.patch.object(policy,'_publish_private',side_effect=OSError('fixture')):
             with self.assertRaises(OSError):run()
         self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_recovery').fetchone(),('recovery_required',))
+    def removal_fixture(self):
+        run,_,_,destination,_=self.recovery_fixture();run()
+        source=os.stat(self.source);os.chown(self.source,0,0)
+        self.journal.db.execute('CREATE TABLE legacy_snapshots(operation_id TEXT,path TEXT,digest TEXT,state TEXT)')
+        self.journal.db.execute("INSERT INTO legacy_snapshots VALUES(?,?,?,'verified')",(self.operation,'/snapshot','sha256:'+'9'*64))
+        self.journal.db.execute('CREATE TABLE legacy_protections(operation_id TEXT,source TEXT,source_dev INTEGER,source_ino INTEGER,snapshot_digest TEXT,target_dev INTEGER,target_ino INTEGER,state TEXT)')
+        self.journal.db.execute("INSERT INTO legacy_protections VALUES(?,?,?,?,?,?,?,'protected')",(self.operation,str(self.source),source.st_dev,source.st_ino,'sha256:'+'9'*64,11,12))
+        restored=SimpleNamespace(verify_staged=mock.Mock(return_value=(11,12)))
+        fence=fence_module.MigrationFence(self.journal,self.operation,'/active',str(self.source),self.old,supervisor,object(),self.adoption,self.quiet,self.docker)
+        original=self.docker.call
+        def call(*args,**kwargs):
+            if args[0]=='rm':
+                if self.failure=='rm' and args[-1]==self.old['worker']:raise RuntimeError('removal failed')
+                del self.items[args[-1]];return b''
+            return original(*args,**kwargs)
+        self.docker.call=call
+        def execute():
+            return legacy.remove(self.journal,self.operation,'/active','/parent',-1,supervisor,object(),self.adoption,policy,self.quiet,self.docker,backup,SimpleNamespace(_pairs=dict),restored,recovery,fence,install_lock=self.lock)
+        return execute,fence,destination
+    def test_removal_requires_recovery_files_and_records_fence(self):
+        run,fence,_=self.removal_fixture();run()
+        self.assertEqual(self.items,{})
+        self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_removals').fetchone(),('removed',))
+        self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_migration_fences').fetchone(),('fenced',))
+        fence.assert_locked(self.operation,self.lock)
+        self.assertEqual(os.stat(self.source).st_uid,0)
+    def test_interrupted_removal_requires_recovery(self):
+        run,fence,_=self.removal_fixture();self.failure='rm'
+        with self.assertRaisesRegex(RuntimeError,'removal failed'):run()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_removals').fetchone(),('recovery_required',))
+        self.assertNotIn(self.old['api'],self.items);self.assertIn(self.old['worker'],self.items)
+        self.assertIsNone(self.journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='legacy_migration_fences'").fetchone())
+    def test_changed_recovery_files_block_removal(self):
+        run,fence,destination=self.removal_fixture()
+        (destination/'compose.yaml').write_text('changed')
+        with self.assertRaises(recovery.RecoveryError):run()
+        self.assertEqual(len(self.items),3)
+        self.assertIsNone(self.journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='legacy_migration_fences'").fetchone())
 
 if __name__=='__main__':unittest.main()
