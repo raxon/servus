@@ -15,7 +15,7 @@ import sys
 MODULES = (
     'adoption-proof.py','backup.py','bootstrap-handoff.py','bootstrap-initial.py','bootstrap-policy.py','bootstrap-release.py',
     'discover-release.py','extract-install.py','guarded-verifier.py','initial-generation.py',
-    'install-gh.py','install-host.py','migration-fence.py','preflight.py','prepare-verified.py','preparation-fence.py',
+    'install-gh.py','install-host.py','legacy-stop.py','migration-fence.py','preflight.py','prepare-verified.py','preparation-fence.py',
     'provision-verifier-group.py','provision-socket.py','provision-host.py','quiescence.py',
     'restore-snapshot.py','runtime-policy.py','servus-updater.py','supervisor-daemon.py','supervisor.py',
     'update-coordinator.py','validate-compose.py','verification-executor.py',
