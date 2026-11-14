@@ -229,6 +229,7 @@ class RuntimePolicy:
     environments: dict
     host_configs: dict
     healthchecks: dict
+    updater_dir: str | None = None
 
     def __post_init__(self):
         # Validate detached values so later mutations of caller-owned objects are harmless.
@@ -253,11 +254,19 @@ class RuntimePolicy:
             if (not isinstance(value, str) or not value.startswith('/') or value == '/' or
                 os.path.normpath(value) != value or '\0' in value or '\n' in value):
                 raise SupervisorError('Runtime policy is invalid')
+        if self.updater_dir is not None:
+            value = self.updater_dir
+            if value != '/run/servus-updater/control' or os.path.realpath(value) != value:
+                raise SupervisorError('Runtime policy is invalid')
+            for protected in (self.install_dir, self.data_dir, self.gate_dir, self.control_dir, *self.secret_sources.values()):
+                if value == protected or value.startswith(protected + '/') or protected.startswith(value + '/'):
+                    raise SupervisorError('Runtime policy is invalid')
         # Data binds may not replace host or container critical paths, including aliases.
         critical = ('/app', '/bin', '/boot', '/dev', '/etc', '/home/node', '/lib', '/lib64', '/proc', '/root',
                     '/run', '/sbin', '/sys', '/tmp', '/usr', '/var/run', '/var/tmp', '/var/log',
                     '/var/spool', '/var/lib/docker', '/var/lib/containerd', '/var/lib/systemd',
-                    self.install_dir, self.gate_dir, self.control_dir, *self.secret_sources.values())
+                    self.install_dir, self.gate_dir, self.control_dir, *self.secret_sources.values(),
+                    *((self.updater_dir,) if self.updater_dir is not None else ()))
         if os.path.realpath(self.data_dir) != self.data_dir:
             raise SupervisorError('Runtime policy is invalid')
         for protected in critical:
@@ -314,6 +323,12 @@ class RuntimePolicy:
             if (not isinstance(environment, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in environment.items()) or
                 environment.get('PANEL_DATA_DIR') != self.data_dir or any(key in environment for key in ('LD_PRELOAD', 'LD_AUDIT', 'LD_LIBRARY_PATH', 'NODE_OPTIONS'))):
                 raise SupervisorError('Runtime policy is invalid')
+        for role in ROLES:
+            environment = self.environments[role]
+            updater = {key: environment[key] for key in ('PANEL_UPDATER_SOCKET', 'PANEL_UPDATER_APPLY_ENABLED') if key in environment}
+            expected = {'PANEL_UPDATER_SOCKET': '/run/servus-updater/updater.sock', 'PANEL_UPDATER_APPLY_ENABLED': 'true'} if role == 'api' and self.updater_dir is not None else {}
+            if updater != expected:
+                raise SupervisorError('Runtime policy has invalid updater access')
         for name in ('secret_sources', 'config_hashes', 'environments', 'host_configs', 'healthchecks'):
             object.__setattr__(self, name, _freeze_json(getattr(self, name)))
 
@@ -326,6 +341,8 @@ class RuntimePolicy:
         ]
         if role == 'agent':
             entries.append(('bind', '/var/run/docker.sock', '/var/run/docker.sock', True))
+        if role == 'api' and self.updater_dir is not None:
+            entries.append(('bind', self.updater_dir, '/run/servus-updater', False))
         return set(entries)
 
 

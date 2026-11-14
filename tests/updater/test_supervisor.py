@@ -70,6 +70,33 @@ class RuntimePolicyImmutabilityTest(unittest.TestCase):
             with self.assertRaises(supervisor.SupervisorError):
                 create('/var/lib/servus/link')
 
+    def test_updater_socket_is_restricted_to_api_and_read_only_mount(self):
+        def create(directory, environments):
+            return supervisor.RuntimePolicy(
+                image_reference=POLICY.image_reference, image_id=POLICY.image_id,
+                install_dir=POLICY.install_dir, data_dir=POLICY.data_dir, gate_dir=POLICY.gate_dir,
+                control_dir=POLICY.control_dir, secret_sources={role: '/etc/servus/secrets/' + role for role in supervisor.ROLES},
+                config_hashes={role: 'c' * 64 for role in supervisor.ROLES}, environments=environments,
+                host_configs=copy.deepcopy(HOST_CONFIGS), healthchecks={role: copy.deepcopy(HEALTHCHECK) for role in supervisor.ROLES},
+                updater_dir=directory)
+        environments = {role: {'PANEL_DATA_DIR': '/var/lib/servus'} for role in supervisor.ROLES}
+        environments['api'].update({'PANEL_UPDATER_SOCKET': '/run/servus-updater/updater.sock', 'PANEL_UPDATER_APPLY_ENABLED': 'true'})
+        directory='/run/servus-updater/control'
+        with mock.patch.object(supervisor.os.path, 'realpath', side_effect=lambda path: path):
+            approved=create(directory, environments)
+            self.assertIn(('bind', directory, '/run/servus-updater', False), approved.mounts_for('api'))
+            for role in ('worker', 'agent'):
+                self.assertFalse(any(entry[2] == '/run/servus-updater' for entry in approved.mounts_for(role)))
+            for bad in ('/', '/var/lib/servus/child', '/run/servus-supervisor', '/etc/servus', '/opt/servus/child', '/run/../etc', '/etc/passwd', '/run/other'):
+                with self.subTest(path=bad), self.assertRaises(supervisor.SupervisorError): create(bad,environments)
+            for role, key, value in (('api','PANEL_UPDATER_SOCKET','/tmp/forged'), ('api','PANEL_UPDATER_APPLY_ENABLED','false'),
+                                     ('worker','PANEL_UPDATER_SOCKET','/run/servus-updater/updater.sock')):
+                altered=copy.deepcopy(environments);altered[role][key]=value
+                with self.subTest(role=role,key=key), self.assertRaises(supervisor.SupervisorError): create(directory,altered)
+            with self.assertRaises(supervisor.SupervisorError): create(None,environments)
+            missing=copy.deepcopy(environments); del missing['api']['PANEL_UPDATER_SOCKET']
+            with self.assertRaises(supervisor.SupervisorError): create(directory,missing)
+
     def test_unsafe_expected_host_configuration_is_rejected(self):
         def create(hosts):
             return supervisor.RuntimePolicy(

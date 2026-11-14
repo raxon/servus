@@ -59,9 +59,12 @@ def load_policy(path):
         os.close(directory)
     if (not isinstance(document, dict) or set(document) != {'version', 'policy'} or
             type(document['version']) is not int or document['version'] != 1 or not isinstance(document['policy'], dict) or
-            set(document['policy']) != {'image_reference', 'image_id', 'install_dir', 'data_dir', 'gate_dir',
-                                       'control_dir', 'secret_sources', 'config_hashes', 'environments',
-                                       'host_configs', 'healthchecks'}):
+            set(document['policy']) not in ({'image_reference', 'image_id', 'install_dir', 'data_dir', 'gate_dir',
+                                           'control_dir', 'secret_sources', 'config_hashes', 'environments',
+                                           'host_configs', 'healthchecks'},
+                                          {'image_reference', 'image_id', 'install_dir', 'data_dir', 'gate_dir',
+                                           'control_dir', 'secret_sources', 'config_hashes', 'environments',
+                                           'host_configs', 'healthchecks', 'updater_dir'})):
         raise supervisor.SupervisorError('Invalid policy document')
     try:
         return supervisor.RuntimePolicy(**document['policy'])

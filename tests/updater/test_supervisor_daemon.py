@@ -450,6 +450,23 @@ class DaemonTest(unittest.TestCase):
                 os.close(fd)
             self.assertFalse((control / 'socket').exists())
 
+    def test_load_policy_accepts_optional_updater_directory_only(self):
+        with tempfile.TemporaryDirectory(dir='/root') as temporary:
+            path = Path(temporary) / 'policy.json'
+            fields = {name: {} for name in ('secret_sources', 'config_hashes', 'environments', 'host_configs', 'healthchecks')}
+            fields.update({name: '/fixture' for name in ('image_reference', 'image_id', 'install_dir', 'data_dir', 'gate_dir', 'control_dir')})
+            path.write_text(json.dumps({'version': 1, 'policy': fields})); path.chmod(0o600)
+            with mock.patch.object(supervisor, 'RuntimePolicy', return_value=object()) as validate:
+                daemon.load_policy(str(path))
+                self.assertNotIn('updater_dir', validate.call_args.kwargs)
+                fields['updater_dir'] = '/run/servus-updater/control'
+                path.write_text(json.dumps({'version': 1, 'policy': fields}))
+                daemon.load_policy(str(path))
+                self.assertEqual(validate.call_args.kwargs['updater_dir'], fields['updater_dir'])
+                fields['unrecognized'] = True
+                path.write_text(json.dumps({'version': 1, 'policy': fields}))
+                with self.assertRaises(supervisor.SupervisorError): daemon.load_policy(str(path))
+
     def test_policy_must_be_root_owned_private_regular_file(self):
         with tempfile.TemporaryDirectory(dir='/root') as temporary:
             path = Path(temporary) / 'policy.json'

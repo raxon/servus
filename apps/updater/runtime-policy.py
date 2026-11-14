@@ -424,6 +424,8 @@ def produce(journal, operation_id, staging_parent, accepted_env_path, install_di
                         ('bind', env['SERVUS_SUPERVISOR_SECRET_DIR'] + '/' + role, '/run/servus-control/token', False)}
             if role == 'agent':
                 expected.add(('bind', '/var/run/docker.sock', '/var/run/docker.sock', True))
+            if role == 'api' and 'SERVUS_UPDATER_SOCKET_DIR' in env:
+                expected.add(('bind', env['SERVUS_UPDATER_SOCKET_DIR'], '/run/servus-updater', False))
             if len(entries) != len(expected) or set(entries) != expected:
                 raise PolicyError('Unexpected probe mounts')
             host = record.get('HostConfig')
@@ -454,6 +456,7 @@ def produce(journal, operation_id, staging_parent, accepted_env_path, install_di
                   'control_dir': env['SERVUS_SUPERVISOR_CONTROL_DIR'],
                   'secret_sources': {role: env['SERVUS_SUPERVISOR_SECRET_DIR'] + '/' + role for role in ROLES},
                   'config_hashes': hashes, 'environments': environments, 'host_configs': hosts, 'healthchecks': healthchecks}
+        if 'SERVUS_UPDATER_SOCKET_DIR' in env: policy['updater_dir'] = env['SERVUS_UPDATER_SOCKET_DIR']
         supervisor.RuntimePolicy(**policy)
         # Remove exact probe objects before publishing policy. Network removal is
         # constrained to the random Compose project created above.
