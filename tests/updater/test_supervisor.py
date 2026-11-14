@@ -231,6 +231,17 @@ class SupervisorTest(unittest.TestCase):
             with self.assertRaises(supervisor.SupervisorError): hub.drain(5000, ids)
         self.assertEqual(diagnostics.getvalue(), 'servus drain failure role=api outcome=invalid_response\n')
 
+    def test_drain_channel_error_does_not_log_exception_content(self):
+        hub = supervisor.DrainHub(mock.Mock(), TOKENS, 1000, POLICY, IDENTITIES)
+        hub.connections = {role: mock.Mock() for role in supervisor.ROLES}
+        ids = {role: str(uuid.uuid4()) for role in supervisor.ROLES}
+        diagnostics = io.StringIO()
+        with mock.patch.object(supervisor, 'inspect_servus', return_value=IDENTITIES), \
+             mock.patch.object(supervisor, '_send_message', side_effect=OSError('private-exception-content')), \
+             mock.patch.object(supervisor.sys, 'stderr', diagnostics):
+            with self.assertRaises(OSError): hub.drain(5000, ids)
+        self.assertEqual(diagnostics.getvalue(), 'servus drain failure role=api outcome=channel_error\n')
+
     def test_stops_only_authenticated_ids_and_never_reports_snapshot(self):
         ids = {role: {'id': char * 64, 'pid': 123, 'cgroup': '/docker/' + char * 64} for role, char in zip(supervisor.ROLES, 'abc')}
         hub = mock.create_autospec(supervisor.DrainHub, instance=True)
