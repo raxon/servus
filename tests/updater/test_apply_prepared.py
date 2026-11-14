@@ -43,7 +43,9 @@ class ApplyPreparedTest(unittest.TestCase):
         self.control_fd = os.open(self.control, os.O_RDONLY | os.O_DIRECTORY)
         self.node_fd = os.open(os.path.realpath(sys.executable), os.O_RDONLY)
         self.ownership = SimpleNamespace(directory=self.control_fd, assert_held=mock.Mock())
-        self.hub = mock.create_autospec(supervisor.DrainHub, instance=True); self.hub.policy = object()
+        self.hub = mock.create_autospec(supervisor.DrainHub, instance=True); self.hub.policy = SimpleNamespace(data_dir='/var/lib/servus')
+        self.hub.identities = {role: {'id': character * 64} for role, character in zip(supervisor.ROLES, 'abc')}
+        self.quiescence = mock.Mock()
         self.owner = mock.create_autospec(supervisor.MaintenanceSupervisor, instance=True); self.owner.install_lock = 42
         self.lease = object()
         self.window = mock.MagicMock(); self.window.__enter__.return_value = self.lease
@@ -59,7 +61,7 @@ class ApplyPreparedTest(unittest.TestCase):
     def execute(self):
         return coordinator.apply_prepared_update(self.journal, self.op, self.hub, self.owner, self.ownership,
             str(self.state / 'journal.sqlite'), '/root/active-env', str(self.backup), str(self.policies),
-            '/root/docker-config', self.node_fd, supervisor, self.daemon, object(), self.runtime, object(), object())
+            '/root/docker-config', self.node_fd, supervisor, self.daemon, object(), self.runtime, self.quiescence, object())
 
     def test_runs_all_stages_in_order_under_same_drain(self):
         events = []
