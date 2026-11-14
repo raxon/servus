@@ -15,6 +15,7 @@ def load(name, path):
 
 updater = load('updater', ROOT / 'apps/updater/servus-updater.py')
 fence = load('preparation_fence', ROOT / 'apps/updater/preparation-fence.py')
+policy = load('runtime_policy', ROOT / 'apps/updater/runtime-policy.py')
 OP = '12345678-1234-4123-8123-123456789abc'
 DIGEST = 'sha256:' + 'b' * 64
 
@@ -130,7 +131,7 @@ class PreparationFenceTest(unittest.TestCase):
         staged = '/run/servus-install-' + 'd' * 32
         self.journal.stage_preparation(operation, staged)
         self.journal.finish_preparation(operation, staged)
-        self.journal.db.execute("UPDATE preparations SET status='preparing' WHERE operation_id=?", (OP,))
+        policy._record_identity(self.journal.db, OP)
         launched = []
         worker = updater.PreparationWorker(self.journal, pathlib.Path(self.tmp.name), lambda item: launched.append(item))
         worker.tick()
