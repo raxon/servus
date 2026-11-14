@@ -1,0 +1,19 @@
+[Unit]
+Description=Servus host maintenance supervisor
+Requires=docker.service
+After=docker.service
+Before=servus.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/etc/servus/supervisor.env
+ExecStart=/usr/bin/python3 -I /opt/servus/updater/supervisor-daemon.py --policy ${SERVUS_POLICY} --install-dir ${SERVUS_INSTALL_DIR} --gate-dir ${SERVUS_GATE_DIR} --journal-dir ${SERVUS_JOURNAL_DIR} --secret-dir ${SERVUS_SECRET_DIR} --socket-dir ${SERVUS_SOCKET_DIR} --uid ${SERVUS_COMPONENT_UID} --gid ${SERVUS_COMPONENT_GID}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -158,6 +158,24 @@ def _freeze_json(value):
     return value
 
 
+def _normalize_host_config(host):
+    """Normalize Docker's unordered mount list without weakening its checks."""
+    if not isinstance(host, dict):
+        raise SupervisorError('Runtime configuration is invalid')
+    host = dict(host)
+    mounts = host.get('Mounts')
+    if mounts is not None:
+        if not isinstance(mounts, list):
+            raise SupervisorError('Runtime mounts are invalid')
+        destinations = set()
+        for mount in mounts:
+            if not isinstance(mount, dict) or not isinstance(mount.get('Target'), str) or not mount['Target'] or mount['Target'] in destinations:
+                raise SupervisorError('Runtime mounts are invalid')
+            destinations.add(mount['Target'])
+        host['Mounts'] = sorted(mounts, key=lambda mount: mount['Target'])
+    return host
+
+
 @dataclass(frozen=True)
 class RuntimePolicy:
     """Expected values come from protected, independently verified configuration."""
@@ -247,7 +265,7 @@ class RuntimePolicy:
                 except ValueError as error:
                     raise SupervisorError('Runtime policy violates port requirements') from error
             try:
-                snapshots[role] = (json.dumps(host, sort_keys=True, separators=(',', ':'), allow_nan=False),
+                snapshots[role] = (json.dumps(_normalize_host_config(host), sort_keys=True, separators=(',', ':'), allow_nan=False),
                                    json.dumps(health, sort_keys=True, separators=(',', ':'), allow_nan=False))
             except (TypeError, ValueError, RecursionError) as error:
                 raise SupervisorError('Runtime policy is invalid') from error
@@ -310,7 +328,7 @@ def inspect_servus(policy):
         if not isinstance(host, dict):
             raise SupervisorError('Servus runtime configuration is not trusted')
         try:
-            actual_runtime = (json.dumps(host, sort_keys=True, separators=(',', ':'), allow_nan=False),
+            actual_runtime = (json.dumps(_normalize_host_config(host), sort_keys=True, separators=(',', ':'), allow_nan=False),
                               json.dumps(config.get('Healthcheck'), sort_keys=True, separators=(',', ':'), allow_nan=False))
         except (TypeError, ValueError, RecursionError) as error:
             raise SupervisorError('Servus runtime configuration is not trusted') from error
@@ -499,29 +517,13 @@ def _uuid4(value):
         return False
 
 
-class MaintenanceSupervisor:
-    """Stop only verified Servus containers after authenticated component drain.
+class ComponentEndpoint:
+    """Own component credentials and a listener without acquiring the install lock."""
 
-    This is intentionally not a backup or update executor.  Any interruption
-    after intent is durable requires explicit local reconciliation.  The old
-    installer and unrelated root/Docker operators are outside the lock model.
-    """
-
-    def __init__(self, install_dir, gate_dir, journal_dir):
+    def __init__(self):
         if os.geteuid() != 0 or not hasattr(socket, 'SO_PEERCRED'):
             raise SupervisorError('A Linux root supervisor is required')
-        self.install = self.gate = self.journal = self.install_lock = self.gate_lock = None
         self.listener = self.socket_dir = self.socket_identity = None
-        try:
-            self.install = _trusted_directory(install_dir)
-            self.gate = _trusted_directory(gate_dir, 0o755)
-            self.journal = _trusted_directory(journal_dir, 0o700)
-            self.install_lock = _open_root_file(self.install, 'install.lock', 0o600)
-            fcntl.flock(self.install_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.gate_lock = _open_root_file(self.gate, 'lock', 0o644)
-        except BaseException:
-            self.close()
-            raise
 
     def close(self):
         if self.listener is not None:
@@ -536,17 +538,6 @@ class MaintenanceSupervisor:
                 pass
             os.close(self.socket_dir)
             self.socket_dir = None
-        for attribute in ('gate_lock', 'install_lock', 'journal', 'gate', 'install'):
-            fd = getattr(self, attribute, None)
-            if fd is not None:
-                os.close(fd)
-                setattr(self, attribute, None)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        self.close()
 
     def read_component_tokens(self, secret_dir, gid):
         """Read three separately mounted host credentials without logging them."""
@@ -622,6 +613,44 @@ class MaintenanceSupervisor:
             else:
                 os.close(directory)
             raise
+
+class MaintenanceSupervisor(ComponentEndpoint):
+    """Stop only verified Servus containers after authenticated component drain.
+
+    This is intentionally not a backup or update executor.  Any interruption
+    after intent is durable requires explicit local reconciliation.  The old
+    installer and unrelated root/Docker operators are outside the lock model.
+    """
+
+    def __init__(self, install_dir, gate_dir, journal_dir):
+        if os.geteuid() != 0 or not hasattr(socket, 'SO_PEERCRED'):
+            raise SupervisorError('A Linux root supervisor is required')
+        self.install = self.gate = self.journal = self.install_lock = self.gate_lock = None
+        super().__init__()
+        try:
+            self.install = _trusted_directory(install_dir)
+            self.gate = _trusted_directory(gate_dir, 0o755)
+            self.journal = _trusted_directory(journal_dir, 0o700)
+            self.install_lock = _open_root_file(self.install, 'install.lock', 0o600)
+            fcntl.flock(self.install_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.gate_lock = _open_root_file(self.gate, 'lock', 0o644)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        super().close()
+        for attribute in ('gate_lock', 'install_lock', 'journal', 'gate', 'install'):
+            fd = getattr(self, attribute, None)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, attribute, None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
 
     def _record(self, request_id, state, request_ids, timeout_ms):
         if not _uuid4(request_id) or state not in ('intent', 'maintenance', 'drained', 'stopping', 'stopped_unverified', 'recovery_required'):
