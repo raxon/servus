@@ -80,10 +80,15 @@ def verify_staged(snapshot, digest, parent_path, operation, backup, node_fd, sup
             if fd is not None: os.close(fd)
 
 
-def stage(snapshot, digest, parent_path, operation, backup, node_fd, supervisor, coordinator):
+def stage(snapshot, digest, parent_path, operation, backup, node_fd, supervisor, coordinator, *, reuse_empty=False):
+    """Stage a snapshot; reuse requires a root-owned empty probe directory.
+
+    Callers opting into reuse must already hold a durable operation marker and
+    exclude writers. A partially populated directory is never reused.
+    """
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
         raise RestoreError('An isolated Linux root coordinator is required')
-    if not supervisor._uuid4(operation):
+    if not supervisor._uuid4(operation) or type(reuse_empty) is not bool:
         raise RestoreError('Invalid migration identity')
     coordinator.verify_snapshot(snapshot, digest, backup, node_fd, supervisor)
     source = supervisor._trusted_directory(snapshot, 0o700)
@@ -107,9 +112,16 @@ def stage(snapshot, digest, parent_path, operation, backup, node_fd, supervisor,
         if info.st_gid != 0:
             raise RestoreError('Unsafe migration parent')
         name = 'restore-' + operation
-        os.mkdir(name, 0o700, dir_fd=parent)
+        try:os.mkdir(name, 0o700, dir_fd=parent);created=True
+        except FileExistsError:
+            if not reuse_empty:raise
+            created=False
         target = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-        os.fchown(target, 0, 0); os.fchmod(target, 0o700); os.fsync(parent)
+        info=os.fstat(target);named=os.stat(name,dir_fd=parent,follow_symlinks=False)
+        if ((info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))!=(0,0,0o700) or
+            (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino) or os.listdir(target)):
+            raise RestoreError('Existing staging directory is not empty and protected')
+        if created:os.fsync(parent)
         for folder in ('secrets', 'database-roots'):
             os.mkdir(folder, 0o700, dir_fd=target)
         def copy_file(source_dir, destination_dir, filename, expected, limit):

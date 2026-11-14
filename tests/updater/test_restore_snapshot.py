@@ -61,10 +61,10 @@ class RestoreSnapshotTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_stage(self):
+    def run_stage(self,**kwargs):
         with mock.patch.object(backup, '_validate_staging'):
             return Path(restore.stage(str(self.source), self.digest, str(self.parent), self.operation,
-                                      backup, -1, supervisor, coordinator))
+                                      backup, -1, supervisor, coordinator,**kwargs))
 
     def verify_stage(self):
         with mock.patch.object(backup, '_validate_staging'):
@@ -114,6 +114,22 @@ class RestoreSnapshotTest(unittest.TestCase):
         (target / 'sentinel').write_text('existing')
         with self.assertRaises(FileExistsError): self.run_stage()
         self.assertEqual((target / 'sentinel').read_text(), 'existing')
+
+    def test_explicitly_reuses_only_an_empty_protected_directory(self):
+        target=self.parent/('restore-'+self.operation);target.mkdir(mode=0o700)
+        before=target.stat().st_ino
+        self.assertEqual(self.run_stage(reuse_empty=True),target)
+        self.assertEqual(target.stat().st_ino,before)
+        self.assertEqual(target.stat().st_uid,1000)
+
+    def test_reuse_rejects_nonempty_or_untrusted_directories(self):
+        target=self.parent/('restore-'+self.operation);target.mkdir(mode=0o700)
+        (target/'sentinel').write_text('existing')
+        with self.assertRaises(restore.RestoreError):self.run_stage(reuse_empty=True)
+        (target/'sentinel').unlink();target.chmod(0o755)
+        with self.assertRaises(restore.RestoreError):self.run_stage(reuse_empty=True)
+        target.chmod(0o700);os.chown(target,1000,1000)
+        with self.assertRaises(restore.RestoreError):self.run_stage(reuse_empty=True)
 
     def test_failed_second_verification_keeps_partial_directory_root_owned(self):
         verifier = coordinator.verify_snapshot

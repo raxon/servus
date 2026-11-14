@@ -97,6 +97,7 @@ def main():
     journal.db.execute('INSERT INTO preparations VALUES(?,?,?,?,?,?)',(op,attempt,nonce,prep,'prepared','/fixture'))
     journal.db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?,?,?,?,?,?,?)',(op,attempt,nonce,prep,root_digest,config_digest,'/policy','/accepted','/active','active'))
     approved=SimpleNamespace(install_dir=str(install),data_dir=str(parent/('restore-'+op)),control_dir='/control',updater_dir='/updater',image_reference=NEW)
+    Path(approved.data_dir).mkdir(mode=0o700)
     daemon=SimpleNamespace(resolve_active_policy=lambda *_:('/policy','/accepted',approved))
     fence=fence_module.MigrationFence(journal,op,'/active',str(data),old_ids,supervisor,daemon,adoption,quiet,docker)
     node_fd=os.open(BASE/'node',os.O_RDONLY|os.O_NOFOLLOW);lock=os.open(install/'install.lock',os.O_RDONLY)

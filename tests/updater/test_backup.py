@@ -387,6 +387,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
             journal.db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?,?,?,?,?,?,?)',(UUID,attempt,nonce,prep,image,config,'/policy','/accepted','/active','active'))
             approved=SimpleNamespace(install_dir=str(install),data_dir=str(parent/('restore-'+UUID)),gate_dir=str(gate),
                                      control_dir='/control',updater_dir='/updater',image_reference='ghcr.io/raxon/servus@'+image)
+            pathlib.Path(approved.data_dir).mkdir(mode=0o700)
             daemon=SimpleNamespace(resolve_active_policy=lambda *_:('/policy','/accepted',approved))
             old_ids={role:letter*64 for role,letter in zip(('api','worker','agent'),'abc')};items={};services={}
             for role,cid in old_ids.items():
