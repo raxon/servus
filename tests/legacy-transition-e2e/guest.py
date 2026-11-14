@@ -155,25 +155,14 @@ def main():
             '/usr/local/libexec/servus/bootstrap-release.py','--operation',op,'--commit','5c82968ef6ab05d416d95d301078d37c9d11cc36',
             '--digest',root_digest,'--tag','v0.1.7',timeout=960)
         run('/usr/bin/systemctl','stop','servus-updater-bootstrap.service')
-        service_lock=os.open(state/'service.lock',os.O_RDONLY|os.O_NOFOLLOW)
-        fcntl.flock(service_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        policy_journal=updater.Journal(state)
-        try:
-            def resolve_child(root_digest,expected_config):
-                registry=verifier.Registry(time.monotonic()+verifier.TOTAL_SECONDS);registry.authenticate()
-                return verifier.revalidate_amd64_identity(registry,root_digest,expected_config)
-            row=policy_journal.db.execute('SELECT preparation_id,staging_path FROM preparations WHERE operation_id=? AND status=\'prepared\'',(op,)).fetchone()
-            if not row:raise RuntimeError('Verified preparation is unavailable')
-            candidate=state/'policies'/('candidate-'+row[0]+'.json');policy_path=state/'policies'/('policy-'+op+'.json')
-            runtime.produce(policy_journal,op,str(Path(row[1]).parent),active,str(install),str(candidate),extractor,supervisor,resolve_child=resolve_child)
-            transition_lock=os.open(install/'install.lock',os.O_RDONLY);fcntl.flock(transition_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            try:
-                transition.prepare_stop(policy_journal,op,active,str(state/'policies'),str(data),OLD,old_image_id,old_ids,
-                    supervisor,daemon_module,adoption,runtime,quiet,docker,legacy,install_lock=transition_lock,trusted_ingress=trusted)
-                runtime.activate(policy_journal,op,active,str(candidate),str(policy_path),str(install),str(config/'supervisor-control'),
-                                 extractor,supervisor,inherited_lock=transition_lock)
-            finally:os.close(transition_lock)
-        finally:policy_journal.close();os.close(service_lock)
+        invalid=subprocess.run(['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-prepare.py','--operation',str(uuid.uuid4()),'--old-env',str(old_env)],
+            stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+        if invalid.returncode==0 or request('/health').get('version')!='0.1.5':raise RuntimeError('Unknown preparation stopped the legacy panel')
+        wrong_env=config/'wrong-old.env';wrong_env.write_text(old_env.read_text().replace(OLD,'ghcr.io/raxon/servus@sha256:'+'0'*64));wrong_env.chmod(0o600)
+        invalid=subprocess.run(['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-prepare.py','--operation',op,'--old-env',str(wrong_env)],
+            stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+        if invalid.returncode==0 or request('/health').get('version')!='0.1.5':raise RuntimeError('Wrong legacy image was accepted')
+        run('/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-prepare.py','--operation',op,'--old-env',str(old_env),timeout=600)
         run('/usr/bin/python3','-I','/usr/local/libexec/servus/provision-host.py','--finalize',timeout=180)
         run('/usr/bin/systemctl','start','servus-supervisor.service')
         run('/usr/bin/systemctl','start','servus-updater.service')
