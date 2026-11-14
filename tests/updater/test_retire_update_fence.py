@@ -76,5 +76,14 @@ class RetireFenceTest(unittest.TestCase):
         self.assertFalse((self.root/'state'/('retired-update-'+fixture.OP)).exists())
         self.assertEqual(self.db.execute('SELECT phase FROM update_transactions').fetchone(),('recovery_required',))
 
+    def test_failed_preflight_does_not_archive_or_mutate(self):
+        def fail():raise RuntimeError('Incorrect updater')
+        with mock.patch.object(fence,'assert_no_probe_resources'):
+            with self.assertRaises(RuntimeError):
+                retire.archive_restored(self.db,fixture.OP,*self.fds,'/journal','/env',IMAGE,
+                                        fence,journal,self.supervisor,self.daemon,execute=self.execute,preflight=fail)
+        self.assertFalse((self.root/'state'/('retired-update-'+fixture.OP)).exists())
+        self.assertEqual(self.db.execute('SELECT phase FROM update_transactions').fetchone(),('recovery_required',))
+
 
 if __name__=='__main__':unittest.main()

@@ -65,12 +65,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--operation', required=True)
     parser.add_argument('--fixed-updater-sha256', required=True)
+    parser.add_argument('--retire-restored', action='store_true')
+    parser.add_argument('--expected-image')
     args = parser.parse_args()
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
         raise RuntimeError('Isolated Linux root is required')
     if not re.fullmatch(r'[a-f0-9]{64}', args.fixed_updater_sha256):
         raise RuntimeError('Invalid updater checksum')
-    base = state = install = policies = binary_dir = None
+    if args.retire_restored != (args.expected_image is not None):
+        raise RuntimeError('The restored image must be specified for retirement')
+    base = state = install = policies = binary_dir = gate = None
     try:
         base = trusted_directory(str(pathlib.Path(__file__).resolve().parent), 0o700)
         journal = load_module(base, 'reconcile-policy-journal.py')
@@ -92,13 +96,30 @@ def main():
         os.close(db_fd)
         db = sqlite3.connect('/proc/self/fd/' + str(state) + '/journal.sqlite', isolation_level=None, timeout=2)
         try:
-            fence.fenced_reconcile(db, args.operation, state, install, policies, state, journal, preflight=verify_fixed_updater)
+            if args.retire_restored:
+                retire = load_module(base, 'retire-update-fence.py')
+                gate = trusted_directory('/etc/servus/lifecycle', 0o755)
+                for name in ('supervisor.py', 'supervisor-daemon.py'):
+                    fd = trusted_file(binary_dir, name, 0o644)
+                    os.close(fd)
+                sys.path.insert(0, '/usr/local/libexec/servus')
+                import supervisor
+                daemon_spec = importlib.util.spec_from_file_location('servus_recovery_daemon', '/usr/local/libexec/servus/supervisor-daemon.py')
+                if daemon_spec is None or daemon_spec.loader is None:
+                    raise RuntimeError('Supervisor module is unavailable')
+                daemon = importlib.util.module_from_spec(daemon_spec)
+                daemon_spec.loader.exec_module(daemon)
+                retire.archive_restored(db, args.operation, state, install, gate,
+                    '/var/lib/servus-updater/journal.sqlite', '/etc/servus/servus.env', args.expected_image,
+                    fence, journal, supervisor, daemon, preflight=verify_fixed_updater)
+            else:
+                fence.fenced_reconcile(db, args.operation, state, install, policies, state, journal, preflight=verify_fixed_updater)
         finally:
             db.close()
     finally:
-        for fd in (binary_dir, policies, install, state, base):
+        for fd in (gate, binary_dir, policies, install, state, base):
             if fd is not None: os.close(fd)
-    print('Policy recovery was queued; start the supervisor before the updater.')
+    print('Failed update was archived.' if args.retire_restored else 'Policy recovery was queued; start the supervisor before the updater.')
 
 
 if __name__ == '__main__':

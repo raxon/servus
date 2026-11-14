@@ -51,7 +51,7 @@ def assert_restored(db, operation_id, state_fd, gate_fd, journal_path, active_en
 
 
 def archive_restored(db, operation_id, state_fd, install_fd, gate_fd, journal_path,
-                     active_env, expected_image, fence, journal, supervisor, daemon, *, execute=None):
+                     active_env, expected_image, fence, journal, supervisor, daemon, *, execute=None, preflight=None):
     """Back up and retire the failed transaction only under host fences."""
     with fence.hold_locks(state_fd, install_fd):
         # Check database invariants without changing either durable state or files.
@@ -63,6 +63,8 @@ def archive_restored(db, operation_id, state_fd, install_fd, gate_fd, journal_pa
             check.close()
         assert_restored(db, operation_id, state_fd, gate_fd, journal_path, active_env,
                         expected_image, fence, supervisor, daemon, execute=execute)
+        if preflight is not None:
+            preflight()
         archive_name = 'retired-update-' + operation_id
         os.mkdir(archive_name, 0o700, dir_fd=state_fd)
         os.fsync(state_fd)
