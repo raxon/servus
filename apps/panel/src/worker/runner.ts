@@ -10,6 +10,7 @@ export interface WorkerOptions {
   wait?: (milliseconds: number) => Promise<void>;
   retryDelayMs?: number;
 }
+export type WorkerDrainResult = {status:'drained'|'uncertain'|'timeout'|'stopped'};
 function freezeSnapshot<T extends object>(value:T):T {
   for(const child of Object.values(value))if(child&&typeof child==='object')freezeSnapshot(child);
   return Object.freeze(value);
@@ -22,6 +23,10 @@ export class Worker {
   private readonly readState;
   private readonly wait;
   private readonly retryDelayMs;
+  private draining = false;
+  private active: Promise<boolean> | undefined;
+  private readonly uncertainActions = new Set<string>();
+  private claimUncertain = false;
   constructor(readonly store: Store, readonly leaseMs = 60000, options: WorkerOptions = {}) {
     this.apply = options.apply ?? applyService;
     this.readState = options.readState ?? ((serviceId: string) => agentRequest<{state:ServiceState;deployedRevision?:number}>(`/services/${serviceId}/state`));
@@ -29,10 +34,39 @@ export class Worker {
     this.retryDelayMs = options.retryDelayMs ?? 1000;
   }
 
-  async once(): Promise<boolean> {
-    if(this.stopping) return false;
-    const job = this.store.claimNextJob(this.id,this.leaseMs);
+  once(): Promise<boolean> {
+    if(this.active) return this.active;
+    if(this.stopping || this.draining) return Promise.resolve(false);
+    const active = Promise.resolve().then(() => this.processOne());
+    this.active = active;
+    void active.then(() => { if(this.active===active)this.active=undefined; }, () => { if(this.active===active)this.active=undefined; });
+    return active;
+  }
+
+  // This reports only this worker's drain; callers must also verify durable jobs and other writers.
+  async drain(timeoutMs: number): Promise<WorkerDrainResult> {
+    if(!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2147483647)throw new Error('Invalid drain timeout');
+    this.draining = true;
+    const active = this.active;
+    if(active) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<'timeout'>(resolve => {timer=setTimeout(()=>resolve('timeout'),timeoutMs);});
+      const result = await Promise.race([active.then(()=> 'finished' as const,()=> 'finished' as const),timeout]);
+      if(timer)clearTimeout(timer);
+      if(result==='timeout')return {status:'timeout'};
+    }
+    if(this.claimUncertain || this.uncertainActions.size)return {status:'uncertain'};
+    if(this.stopping)return {status:'stopped'};
+    return {status:'drained'};
+  }
+
+  private async processOne(): Promise<boolean> {
+    if(this.stopping || this.draining) return false;
+    let job: ReturnType<Store['claimNextJob']>;
+    try { job = this.store.claimNextJob(this.id,this.leaseMs); }
+    catch(error) { this.claimUncertain=true; throw error; }
     if(!job) return false;
+    this.uncertainActions.add(job.actionId);
     const snapshot = freezeSnapshot(job.snapshot);
     let ownsLease = true;
     const renew = () => {
@@ -55,13 +89,14 @@ export class Worker {
           if(!renew()) return true;
           if(!this.store.setActionPhase(job.actionId,this.id,'checking')) return true;
           for(const line of result.messages) if(!event('info',line)) return true;
-          this.store.completeAction(job.actionId,this.id,{...result,lastError:null});
+          if(this.store.completeAction(job.actionId,this.id,{...result,lastError:null}))this.uncertainActions.delete(job.actionId);
           return true;
         } catch(error) {
           if(!renew()) return true;
           if(error instanceof AgentRequestError && error.certainty === 'definitive') {
             const accepted = this.store.failAction(job.actionId,this.id,error.message);
             if(accepted) {
+              this.uncertainActions.delete(job.actionId);
               try {
                 const observed = await this.readState(job.serviceId);
                 this.store.updateServiceRuntime(job.serviceId,{...observed,lastError:error.message},job.actionId);

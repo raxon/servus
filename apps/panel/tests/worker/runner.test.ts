@@ -104,3 +104,78 @@ describe('worker uncertain operation reconciliation',()=>{
     expect(store.getService(service.id)!.state).toBe('running');expect(store.getService(service.id)!.lastError).toBeNull();
   });
 });
+
+describe('worker drain',()=>{
+  function deferred<T>() {
+    let resolve!: (value:T)=>void;
+    const promise=new Promise<T>(done=>{resolve=done;});
+    return {promise,resolve};
+  }
+  it('prevents a scheduled claim and is idempotent',async()=>{
+    const {store,action}=fixture();
+    const worker=new Worker(store,60000,{apply:async()=>success});
+    const scheduled=worker.once();
+    expect(await worker.drain(500)).toEqual({status:'drained'});
+    expect(await scheduled).toBe(false);
+    expect(await worker.drain(500)).toEqual({status:'drained'});
+    expect(await worker.once()).toBe(false);
+    expect(store.getAction(action.id)!.status).toBe('queued');
+  });
+  it('waits for an active operation and prevents concurrent claims',async()=>{
+    const {store,action}=fixture();
+    const entered=deferred<void>(),release=deferred<void>();let calls=0;
+    const worker=new Worker(store,1000,{apply:async()=>{calls++;entered.resolve();await release.promise;return success;}});
+    const first=worker.once();await entered.promise;
+    expect(worker.once()).toBe(first);
+    const draining=worker.drain(1000);
+    expect(await worker.drain(10)).toEqual({status:'timeout'});
+    release.resolve();
+    expect(await first).toBe(true);
+    expect(await draining).toEqual({status:'drained'});
+    expect(calls).toBe(1);expect(store.getAction(action.id)!.status).toBe('succeeded');
+    expect(await worker.once()).toBe(false);
+  });
+  it('retains the lease and retries an uncertain outcome while draining',async()=>{
+    const {store,action}=fixture();
+    const waiting=deferred<void>(),resume=deferred<void>();let calls=0;
+    const worker=new Worker(store,100,{apply:async()=>{if(++calls===1)throw new AgentRequestError('Timeout','uncertain');return success;},wait:async()=>{waiting.resolve();await resume.promise;}});
+    const running=worker.once();await waiting.promise;
+    const draining=worker.drain(1000);
+    await delay(150);
+    expect(store.claimNextJob('another-worker',100)).toBeNull();
+    resume.resolve();await running;
+    expect(await draining).toEqual({status:'drained'});
+    expect(calls).toBe(2);expect(store.getAction(action.id)!.status).toBe('succeeded');
+  });
+  it('does not report drained after a lease is lost',async()=>{
+    const {store,action}=fixture();
+    const entered=deferred<void>(),release=deferred<void>();
+    const worker=new Worker(store,60000,{apply:async()=>{entered.resolve();await release.promise;return success;}});
+    const running=worker.once();await entered.promise;
+    store.db.prepare("UPDATE jobs SET worker_id='different-owner',lease_until=? WHERE action_id=?").run(new Date(Date.now()+60000).toISOString(),action.id);
+    const draining=worker.drain(500);
+    release.resolve();await running;
+    expect(await draining).toEqual({status:'uncertain'});
+    expect(await worker.drain(500)).toEqual({status:'uncertain'});
+    expect(store.getAction(action.id)!.status).toBe('running');
+  });
+  it('does not report drained when shutdown leaves an uncertain operation',async()=>{
+    const {store,action}=fixture();
+    const waiting=deferred<void>(),resume=deferred<void>();
+    const worker=new Worker(store,60000,{apply:async()=>{throw new AgentRequestError('Timeout','uncertain');},wait:async()=>{waiting.resolve();await resume.promise;}});
+    const running=worker.once();await waiting.promise;
+    const draining=worker.drain(500);worker.stopping=true;resume.resolve();await running;
+    expect(await draining).toEqual({status:'uncertain'});
+    expect(store.getAction(action.id)!.status).toBe('running');
+  });
+  it('fails closed if claiming a job throws and validates the timeout',async()=>{
+    const {store}=fixture();
+    const worker=new Worker(store);
+    store.claimNextJob=()=>{throw new Error('claim failure');};
+    await expect(worker.once()).rejects.toThrow('claim failure');
+    await expect(worker.drain(-1)).rejects.toThrow('Invalid drain timeout');
+    expect(await worker.drain(100)).toEqual({status:'uncertain'});
+    const stopped=new Worker(store);stopped.stopping=true;
+    expect(await stopped.drain(100)).toEqual({status:'stopped'});
+  });
+});
