@@ -120,6 +120,11 @@ def launch(journal, operation, active_env, docker_config, supervisor, daemon, ex
         if manifest.get('deployment/compose-supervised.yaml') != (0o644,len(content),hashlib.sha256(content).hexdigest()):
             raise InitialGenerationError('Prepared Compose file changed')
         supervisor._verify_data_directory(approved.data_dir)
+        # An adoption record is a durable recovery boundary even if the target
+        # directory was subsequently emptied. Never treat it as a new install.
+        if (journal.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='initial_adoptions'").fetchone() and
+            journal.db.execute('SELECT 1 FROM initial_adoptions LIMIT 1').fetchone()):
+            raise InitialGenerationError('Existing migration requires recovery')
         data = os.open(approved.data_dir,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
         try:
             if os.listdir(data): raise InitialGenerationError('Existing data requires a verified migration')

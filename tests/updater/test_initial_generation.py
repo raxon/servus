@@ -78,6 +78,16 @@ class InitialGenerationTest(unittest.TestCase):
         with self.assertRaises(initial.InitialGenerationError):self.run_launch()
         self.docker_call.assert_not_called()
 
+    def test_empty_data_does_not_bypass_existing_migration_evidence(self):
+        self.journal.db.execute('CREATE TABLE initial_adoptions(operation_id TEXT,state TEXT)')
+        for state in ('ready','consumed','recovery_required'):
+            with self.subTest(state=state):
+                self.journal.db.execute('DELETE FROM initial_adoptions')
+                self.journal.db.execute('INSERT INTO initial_adoptions VALUES(?,?)',(self.op,state))
+                with self.assertRaisesRegex(initial.InitialGenerationError,'migration requires recovery'):self.run_launch()
+                self.docker_call.assert_not_called()
+                self.assertFalse(self.journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='initial_generations'").fetchone())
+
     def test_existing_containers_and_changed_policy_are_rejected(self):
         self.docker_call.return_value=b'existing\n'
         with self.assertRaises(initial.InitialGenerationError):self.run_launch()
