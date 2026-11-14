@@ -43,7 +43,7 @@ git archive HEAD | tar -xf - -C "$temp_dir/head"
 release_mode=head
 if [ "${SERVUS_TEST_WORKTREE:-0}" = 1 ]; then
   release_mode=worktree
-  for component in extract-install.py prepare-verified.py provision-host.py bootstrap-handoff.py bootstrap-initial.py provision-verifier-group.py provision-socket.py install-host.py; do
+  for component in extract-install.py prepare-verified.py provision-host.py bootstrap-handoff.py bootstrap-initial.py provision-verifier-group.py provision-socket.py install-gh.py install-host.py verification-executor.py verify-release.py; do
     cp "apps/updater/$component" "$temp_dir/head/apps/updater/$component"
   done
 fi
@@ -94,6 +94,10 @@ guest sudo install -d -m 700 /run/servus-release-fixture/source
 COPYFILE_DISABLE=1 tar -cf - -C "$temp_dir/head" apps/updater deployment/systemd | guest sudo tar --warning=no-unknown-keyword --no-same-owner -xf - -C /run/servus-release-fixture/source
 guest sudo tee /run/servus-release-fixture/install-real-host.py < tests/release-preparation-e2e/install-real-host.py > /dev/null
 guest sudo /usr/bin/python3 -I /run/servus-release-fixture/install-real-host.py
+guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/install-gh.py
+guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/install-gh.py
+guest sudo mv /usr/bin/gh /usr/bin/gh-legacy-fixture
+guest sudo /usr/local/libexec/servus/bin/gh --version
 guest sudo /usr/bin/python3 -I -B /run/servus-release-fixture/flow.py "$release_mode"
 guest sudo tee /usr/local/libexec/servus/provision-socket.py < "$temp_dir/head/apps/updater/provision-socket.py" > /dev/null
 guest sudo chmod 644 /usr/local/libexec/servus/provision-socket.py

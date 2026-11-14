@@ -38,7 +38,7 @@ MAX_BUNDLE = 4 * 1024 * 1024
 MAX_GH_OUTPUT = 8 * 1024 * 1024
 MAX_RESULT = 16384
 TOTAL_SECONDS = 90
-GH_CANDIDATES = ('/usr/bin/gh', '/usr/local/bin/gh', '/opt/homebrew/bin/gh')
+GH_CANDIDATES = ('/usr/local/libexec/servus/bin/gh', '/usr/bin/gh', '/usr/local/bin/gh', '/opt/homebrew/bin/gh')
 CA_CANDIDATES = ('/etc/ssl/certs/ca-certificates.crt', '/etc/ssl/cert.pem')
 
 class VerificationError(Exception):

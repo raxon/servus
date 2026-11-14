@@ -9,6 +9,7 @@
 100644 apps/updater/extract-install.py
 100644 apps/updater/guarded-verifier.py
 100644 apps/updater/initial-generation.py
+100644 apps/updater/install-gh.py
 100644 apps/updater/install-host.py
 100644 apps/updater/preflight.py
 100644 apps/updater/prepare-verified.py
