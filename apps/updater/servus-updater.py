@@ -20,6 +20,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 MAX_REQUEST = 4096
@@ -110,7 +111,7 @@ class Journal:
                     raise RuntimeError('Existing journal has unknown operations')
                 self.db.execute('DROP INDEX IF EXISTS one_active_operation')
                 self.db.execute('ALTER TABLE operations RENAME TO operations_old')
-            elif table and version not in (2, 3, 4, 5, 6, 7):
+            elif table and version not in (2, 3, 4, 5, 6, 7, 8):
                 raise RuntimeError('Unsupported updater journal version')
             elif not table and version != 0:
                 raise RuntimeError('Invalid updater journal')
@@ -138,7 +139,9 @@ class Journal:
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_extraction_probe ON extraction_probes ((1)) WHERE status='intent'")
             self.db.execute("CREATE TABLE IF NOT EXISTS update_transactions (operation_id TEXT PRIMARY KEY REFERENCES operations(id), preparation_id TEXT NOT NULL, attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, root_digest TEXT NOT NULL, backup_path TEXT, backup_manifest_digest TEXT, phase TEXT NOT NULL CHECK(phase IN ('intent','snapshotting','snapshot_verified','switching','starting','completed','recovery_required')))")
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_update ON update_transactions ((1)) WHERE phase != 'completed'")
-            self.db.execute('PRAGMA user_version=7')
+            self.db.execute("CREATE TABLE IF NOT EXISTS apply_requests (operation_id TEXT PRIMARY KEY REFERENCES operations(id), state TEXT NOT NULL CHECK(state IN ('requested','dispatching','awaiting_completion','completed','recovery_required')))")
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_apply_request ON apply_requests ((1)) WHERE state != 'completed'")
+            self.db.execute('PRAGMA user_version=8')
             self.db.execute('COMMIT')
         except BaseException:
             self.db.execute('ROLLBACK')
@@ -159,6 +162,47 @@ class Journal:
         # An interrupted Docker operation cannot be proven stopped by this journal.
         self.db.execute("UPDATE preparations SET status='recovery_required' WHERE status='preparing'")
         self.db.execute("UPDATE update_transactions SET phase='recovery_required' WHERE phase NOT IN ('completed','recovery_required')")
+        self.db.execute("UPDATE apply_requests SET state='completed' WHERE state IN ('dispatching','awaiting_completion') AND EXISTS (SELECT 1 FROM update_transactions t WHERE t.operation_id=apply_requests.operation_id AND t.phase='completed')")
+        self.db.execute("UPDATE apply_requests SET state='recovery_required' WHERE state IN ('dispatching','awaiting_completion')")
+
+    def request_apply(self, operation_id):
+        """Queue one previously verified, fully prepared update exactly once."""
+        if not valid_uuid(operation_id): raise ProtocolError('invalid_request')
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            existing = self.db.execute('SELECT state FROM apply_requests WHERE operation_id=?', (operation_id,)).fetchone()
+            if existing:
+                self.db.execute('COMMIT')
+                return {'operationId': operation_id, 'status': existing[0]}
+            row = self.db.execute("SELECT 1 FROM operations o JOIN preparations p ON p.operation_id=o.id WHERE o.id=? AND o.status='verified' AND p.status='prepared' AND o.attempt_id=p.attempt_id AND o.attempt_nonce=p.attempt_nonce", (operation_id,)).fetchone()
+            if not row: raise ProtocolError('not_found')
+            if self.db.execute("SELECT 1 FROM apply_requests WHERE state != 'completed' LIMIT 1").fetchone() or self.db.execute("SELECT 1 FROM update_transactions WHERE phase != 'completed' LIMIT 1").fetchone():
+                raise ProtocolError('operation_in_progress')
+            self.db.execute("INSERT INTO apply_requests(operation_id,state) VALUES(?,'requested')", (operation_id,))
+            self.db.execute('COMMIT')
+            return {'operationId': operation_id, 'status': 'requested'}
+        except BaseException:
+            if self.db.in_transaction: self.db.execute('ROLLBACK')
+            raise
+
+    def apply_status(self, operation_id):
+        if not valid_uuid(operation_id): raise ProtocolError('invalid_request')
+        row = self.db.execute('SELECT state FROM apply_requests WHERE operation_id=?', (operation_id,)).fetchone()
+        if not row: raise ProtocolError('not_found')
+        return {'operationId': operation_id, 'status': row[0]}
+
+    def claim_apply_request(self):
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            row = self.db.execute("SELECT operation_id FROM apply_requests WHERE state='requested'").fetchone()
+            if row:
+                cursor = self.db.execute("UPDATE apply_requests SET state='dispatching' WHERE operation_id=? AND state='requested'", row)
+                if cursor.rowcount != 1: raise RuntimeError('Apply request changed')
+            self.db.execute('COMMIT')
+            return row[0] if row else None
+        except BaseException:
+            if self.db.in_transaction: self.db.execute('ROLLBACK')
+            raise
 
     def claim_update(self, operation_id):
         """Persist update intent for one verified, prepared release."""
@@ -877,7 +921,66 @@ class PreparationWorker:
         if self.operation is not None: self.fail()
 
 
-def process(journal, request):
+def dispatch_apply(socket_path, operation_id):
+    """Send only an operation identity to the protected root supervisor."""
+    if not valid_uuid(operation_id) or not isinstance(socket_path, str) or not os.path.isabs(socket_path) or os.path.normpath(socket_path) != socket_path:
+        raise RuntimeError('Invalid supervisor command')
+    path = pathlib.Path(socket_path)
+    trusted_directory(path.parent, 0o750)
+    before = path.lstat()
+    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) != 0o600:
+        raise RuntimeError('Supervisor command socket is not trusted')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(1800)
+        peer.connect(socket_path)
+        _pid, uid, _gid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+        after = path.lstat()
+        if uid != 0 or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise RuntimeError('Supervisor command peer is not trusted')
+        peer.sendall(json.dumps({'version': 1, 'type': 'apply', 'operationId': operation_id}, separators=(',', ':')).encode() + b'\n')
+        value = receive(peer, time.monotonic() + 1800)
+        if value != {'version': 1, 'status': 'starting'}:
+            raise RuntimeError('Supervisor did not confirm startup')
+
+
+class ApplyWorker:
+    """Dispatch a durable request once; uncertain outcomes require recovery."""
+
+    def __init__(self, journal, socket_path, sender=dispatch_apply):
+        self.journal, self.socket_path, self.sender = journal, socket_path, sender
+        self.thread = self.operation = None
+        self.failure = None
+
+    def _dispatch(self, operation_id):
+        try:
+            self.sender(self.socket_path, operation_id)
+        except Exception:
+            self.failure = True
+
+    def tick(self):
+        self.journal.db.execute("UPDATE apply_requests SET state='completed' WHERE state IN ('dispatching','awaiting_completion','recovery_required') AND EXISTS (SELECT 1 FROM update_transactions t WHERE t.operation_id=apply_requests.operation_id AND t.phase='completed')")
+        self.journal.db.execute("UPDATE apply_requests SET state='recovery_required' WHERE state='awaiting_completion' AND EXISTS (SELECT 1 FROM update_transactions t WHERE t.operation_id=apply_requests.operation_id AND t.phase='recovery_required')")
+        if self.thread is not None:
+            if self.thread.is_alive(): return
+            state = 'recovery_required' if self.failure else 'awaiting_completion'
+            self.journal.db.execute("UPDATE apply_requests SET state=? WHERE operation_id=? AND state='dispatching'", (state, self.operation))
+            self.thread = self.operation = None
+        operation = self.journal.claim_apply_request()
+        if operation is not None:
+            self.operation, self.failure = operation, None
+            self.thread = threading.Thread(target=self._dispatch, args=(operation,), daemon=True)
+            try:
+                self.thread.start()
+            except RuntimeError:
+                self.journal.db.execute("UPDATE apply_requests SET state='recovery_required' WHERE operation_id=? AND state='dispatching'", (operation,))
+                self.thread = self.operation = None
+
+    def close(self):
+        if self.operation is not None:
+            self.journal.db.execute("UPDATE apply_requests SET state='recovery_required' WHERE operation_id=? AND state='dispatching'", (self.operation,))
+
+
+def process(journal, request, *, allow_apply=False):
     if not isinstance(request, dict) or request.get('version') != 1 or type(request.get('version')) is not int:
         raise ProtocolError('invalid_request')
     action = request.get('action')
@@ -902,6 +1005,11 @@ def process(journal, request):
             journal.claim_preparation(operation_id)
             status = journal.preparation_status(operation_id)
         return status
+    if action == 'apply' and set(request) == {'version', 'action', 'operationId'}:
+        if not allow_apply: raise ProtocolError('unavailable')
+        return journal.request_apply(request['operationId'])
+    if action == 'apply_status' and set(request) == {'version', 'action', 'operationId'}:
+        return journal.apply_status(request['operationId'])
     raise ProtocolError('invalid_request')
 
 
@@ -926,11 +1034,13 @@ def receive(client, deadline):
         raise ProtocolError('invalid_request') from None
 
 
-def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None):
+def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, supervisor_socket=None):
     if sys.platform != 'linux' or not hasattr(socket, 'SO_PEERCRED') or os.geteuid() != 0 or not sys.flags.isolated:
         raise RuntimeError('Linux with isolated root-owned updater is required')
     if allowed_uid <= 0 or socket_gid < 0:
         raise RuntimeError('An unprivileged peer UID and valid socket group are required')
+    if supervisor_socket is not None and (not isinstance(supervisor_socket, str) or not os.path.isabs(supervisor_socket) or os.path.normpath(supervisor_socket) != supervisor_socket):
+        raise RuntimeError('Supervisor socket path is invalid')
     state = trusted_directory(state_dir, 0o700)
     directory = trusted_directory(socket_dir, 0o710, socket_gid)
     if state == directory:
@@ -951,6 +1061,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None):
                 except (OSError, RuntimeError): pass
         worker = VerificationWorker(journal, launcher, (lambda _: None) if launcher else None, (lambda _: None) if launcher else None)
         preparation_worker = PreparationWorker(journal, state)
+        apply_worker = ApplyWorker(journal, supervisor_socket) if supervisor_socket is not None else None
         socket_path = directory / 'updater.sock'
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         bound_inode = None
@@ -990,6 +1101,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None):
             while not stopping:
                 worker.tick()
                 preparation_worker.tick()
+                if apply_worker is not None: apply_worker.tick()
                 try:
                     client, _ = server.accept()
                 except TimeoutError:
@@ -1000,7 +1112,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None):
                         _pid, uid, _gid = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
                         if uid != allowed_uid:
                             raise ProtocolError('unauthorized')
-                        value = process(journal, receive(client, deadline))
+                        value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None)
                         response = {'ok': True, 'operation': value}
                     except ProtocolError as error:
                         response = {'ok': False, 'error': error.code}
@@ -1013,6 +1125,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None):
         finally:
             worker.close()
             preparation_worker.close()
+            if apply_worker is not None: apply_worker.close()
             server.close()
             try:
                 info = socket_path.lstat()
@@ -1031,10 +1144,11 @@ def main():
     parser.add_argument('--socket-dir', required=True)
     parser.add_argument('--peer-uid', required=True, type=int)
     parser.add_argument('--socket-gid', required=True, type=int)
+    parser.add_argument('--supervisor-socket')
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        run(args.state_dir, args.socket_dir, args.peer_uid, args.socket_gid)
+        run(args.state_dir, args.socket_dir, args.peer_uid, args.socket_gid, supervisor_socket=args.supervisor_socket)
     except (OSError, RuntimeError, sqlite3.Error):
         print('Updater could not start with the supplied protected configuration.', file=sys.stderr)
         return 1

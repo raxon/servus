@@ -43,7 +43,7 @@ class JournalContractTest(unittest.TestCase):
         journal.close()
         journal = self.module.Journal(self.state)
         try:
-            self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 7)
+            self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 8)
             journal.claim_update(UUID)
             row = journal.db.execute('SELECT operation_id,preparation_id,attempt_id,attempt_nonce,root_digest,backup_path,backup_manifest_digest,phase FROM update_transactions').fetchone()
             self.assertEqual(row, (UUID, UUID, OTHER_UUID, 'a' * 64, REQUEST['digest'], None, None, 'intent'))
