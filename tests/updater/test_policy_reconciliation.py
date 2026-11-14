@@ -185,5 +185,49 @@ class ReconciliationTest(unittest.TestCase):
             self.assertTrue((root / 'recovery' / ('policy-recovery-' + PREP) / 'journal.sqlite').exists())
 
 
+class AbandonedUpdateTest(unittest.TestCase):
+    def setUp(self):
+        self.db=sqlite3.connect(':memory:',isolation_level=None)
+        self.db.executescript('''
+        CREATE TABLE operations(id TEXT,status TEXT,attempt_id TEXT,attempt_nonce TEXT,digest TEXT,config_digest TEXT);
+        CREATE TABLE preparations(operation_id TEXT,preparation_id TEXT,attempt_id TEXT,attempt_nonce TEXT,status TEXT);
+        CREATE TABLE update_transactions(operation_id TEXT,preparation_id TEXT,attempt_id TEXT,attempt_nonce TEXT,root_digest TEXT,phase TEXT,backup_path TEXT,backup_manifest_digest TEXT);
+        CREATE TABLE apply_requests(operation_id TEXT,state TEXT);
+        CREATE TABLE extraction_probes(operation_id TEXT,status TEXT);
+        CREATE TABLE policy_probes(operation_id TEXT,attempt_id TEXT,attempt_nonce TEXT,preparation_id TEXT,state TEXT);
+        CREATE TABLE policy_approvals(operation_id TEXT,attempt_id TEXT,attempt_nonce TEXT,preparation_id TEXT,root_digest TEXT,image_config_digest TEXT,state TEXT);
+        ''')
+        self.db.execute('INSERT INTO operations VALUES(?,?,?,?,?,?)',(OP,'verified',ATTEMPT,NONCE,'root','config'))
+        self.db.execute('INSERT INTO preparations VALUES(?,?,?,?,?)',(OP,PREP,ATTEMPT,NONCE,'prepared'))
+        self.db.execute('INSERT INTO update_transactions VALUES(?,?,?,?,?,?,?,?)',(OP,PREP,ATTEMPT,NONCE,'root','recovery_required',None,None))
+        self.db.execute('INSERT INTO apply_requests VALUES(?,?)',(OP,'recovery_required'))
+        self.db.execute('INSERT INTO extraction_probes VALUES(?,?)',(OP,'removed'))
+        self.db.execute('INSERT INTO policy_probes VALUES(?,?,?,?,?)',(OP,ATTEMPT,NONCE,PREP,'removed'))
+        self.db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?,?,?,?)',(OP,ATTEMPT,NONCE,PREP,'root','config','candidate'))
+        self.db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?,?,?,?)',('old','old-attempt','old-nonce','old-prep','old-root','old-config','active'))
+
+    def tearDown(self): self.db.close()
+
+    def test_preserves_evidence_and_only_retires_failed_attempt(self):
+        recovery.archive_failed_before_snapshot(self.db,OP)
+        evidence=self.db.execute('SELECT evidence_json FROM abandoned_updates WHERE operation_id=?',(OP,)).fetchone()[0]
+        self.assertIn('recovery_required',evidence)
+        for table in ('update_transactions','apply_requests','preparations','policy_approvals'):
+            self.assertEqual(self.db.execute('SELECT count(*) FROM '+table+' WHERE operation_id=?',(OP,)).fetchone(),(0,))
+        self.assertEqual(self.db.execute("SELECT operation_id FROM policy_approvals WHERE state='active'").fetchone(),('old',))
+        self.assertEqual(self.db.execute('SELECT status FROM operations WHERE id=?',(OP,)).fetchone(),('verified',))
+
+    def test_rejects_snapshot_activation_and_unresolved_probes(self):
+        for sql in ("UPDATE update_transactions SET backup_path='/backup'", "UPDATE update_transactions SET backup_manifest_digest='digest'",
+                    "UPDATE policy_approvals SET state='activating' WHERE operation_id='"+OP+"'",
+                    "UPDATE policy_probes SET state='intent'", "UPDATE extraction_probes SET status='intent'",
+                    "UPDATE preparations SET status='recovery_required'", "UPDATE apply_requests SET state='dispatching'"):
+            with self.subTest(sql=sql):
+                self.db.execute('SAVEPOINT fixture');self.db.execute(sql);self.db.execute('RELEASE fixture')
+                with self.assertRaises(recovery.ReconciliationError): recovery.archive_failed_before_snapshot(self.db,OP)
+                self.assertEqual(self.db.execute('SELECT count(*) FROM update_transactions WHERE operation_id=?',(OP,)).fetchone(),(1,))
+                self.tearDown();self.setUp()
+
+
 if __name__ == '__main__':
     unittest.main()

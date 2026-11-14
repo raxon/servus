@@ -17,6 +17,58 @@ class ReconciliationError(RuntimeError):
     pass
 
 
+def archive_failed_before_snapshot(db, operation_id):
+    """Retire an explicitly restored failed update while retaining its evidence.
+
+    The caller must independently fence the host and prove the old generation
+    is running unchanged, maintenance is clear, and no Docker work remains.
+    This function does not itself prove any host-side recovery condition.
+    """
+    if not isinstance(operation_id, str) or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', operation_id):
+        raise ReconciliationError('Invalid operation identity')
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        row = db.execute("SELECT t.preparation_id,t.attempt_id,t.attempt_nonce,t.root_digest,t.phase,t.backup_path,t.backup_manifest_digest,p.status,o.status,o.digest,o.config_digest FROM update_transactions t JOIN preparations p ON p.operation_id=t.operation_id JOIN operations o ON o.id=t.operation_id WHERE t.operation_id=? AND p.preparation_id=t.preparation_id AND p.attempt_id=t.attempt_id AND p.attempt_nonce=t.attempt_nonce AND o.attempt_id=t.attempt_id AND o.attempt_nonce=t.attempt_nonce", (operation_id,)).fetchone()
+        if not row or row[4:9] != ('recovery_required', None, None, 'prepared', 'verified') or row[3] != row[9]:
+            raise ReconciliationError('Failure is not a verified pre-snapshot attempt')
+        if db.execute("SELECT state FROM apply_requests WHERE operation_id=?", (operation_id,)).fetchone() != ('recovery_required',):
+            raise ReconciliationError('Dispatch is not awaiting recovery')
+        if (db.execute("SELECT 1 FROM update_transactions WHERE operation_id != ? AND phase != 'completed'", (operation_id,)).fetchone() or
+                db.execute("SELECT 1 FROM apply_requests WHERE operation_id != ? AND state != 'completed'", (operation_id,)).fetchone() or
+                db.execute("SELECT 1 FROM operations WHERE status IN ('accepted','verifying','recovery_required')").fetchone() or
+                db.execute("SELECT 1 FROM preparations WHERE operation_id != ? AND status IN ('preparing','prepared','recovery_required')", (operation_id,)).fetchone() or
+                db.execute("SELECT 1 FROM extraction_probes WHERE status != 'removed'").fetchone() or
+                db.execute("SELECT 1 FROM policy_probes WHERE state != 'removed'").fetchone() or
+                db.execute("SELECT 1 FROM policy_approvals WHERE state IN ('activating','recovery_required')").fetchone()):
+            raise ReconciliationError('Another operation may still be active')
+        approval = db.execute("SELECT attempt_id,attempt_nonce,preparation_id,root_digest,image_config_digest,state FROM policy_approvals WHERE operation_id=?", (operation_id,)).fetchone()
+        if approval != (row[1], row[2], row[0], row[3], row[10], 'candidate'):
+            raise ReconciliationError('Candidate approval changed')
+        probe = db.execute("SELECT attempt_id,attempt_nonce,preparation_id,state FROM policy_probes WHERE operation_id=?", (operation_id,)).fetchone()
+        if probe != (row[1], row[2], row[0], 'removed'):
+            raise ReconciliationError('Policy probe is not reconciled')
+        active = db.execute("SELECT operation_id FROM policy_approvals WHERE state='active'").fetchall()
+        if len(active) != 1 or active[0][0] == operation_id:
+            raise ReconciliationError('Previous active generation is unavailable')
+        evidence = {}
+        for table in ('update_transactions', 'apply_requests', 'preparations', 'policy_approvals'):
+            cursor = db.execute('SELECT * FROM ' + table + ' WHERE operation_id=?', (operation_id,))
+            records = cursor.fetchall()
+            if len(records) != 1:
+                raise ReconciliationError('Recovery evidence is incomplete')
+            evidence[table] = dict(zip((column[0] for column in cursor.description), records[0]))
+        db.execute('CREATE TABLE IF NOT EXISTS abandoned_updates (operation_id TEXT PRIMARY KEY, evidence_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+        db.execute('INSERT INTO abandoned_updates(operation_id,evidence_json) VALUES(?,?)', (operation_id, json.dumps(evidence, separators=(',', ':'), sort_keys=True)))
+        for table in ('update_transactions', 'apply_requests', 'policy_approvals', 'preparations'):
+            if db.execute('DELETE FROM ' + table + ' WHERE operation_id=?', (operation_id,)).rowcount != 1:
+                raise ReconciliationError('Recovery evidence changed')
+        db.execute('COMMIT')
+    except BaseException:
+        if db.in_transaction:
+            db.execute('ROLLBACK')
+        raise
+
+
 def requeue_unstarted(db, operation_id):
     """Retry a failed dispatch only when policy creation never began."""
     if not isinstance(operation_id, str) or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', operation_id):
