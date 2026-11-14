@@ -113,6 +113,13 @@ def assert_stopped(db, operation_id, *, execute=run):
     for unit in ('servus-updater.service', 'servus-supervisor.service'):
         _unit_inactive(unit, execute)
     _unit_inactive('servus-prepare-' + prep.replace('-', '') + '.service', execute, allow_missing=True)
+    assert_no_probe_resources(db, operation_id, execute=execute)
+
+
+def assert_no_probe_resources(db, operation_id, *, execute=run):
+    """Require recorded extraction and policy probes to be absent from Docker."""
+    if not isinstance(operation_id, str) or not UUID.fullmatch(operation_id):
+        raise FenceError('Invalid operation identity')
     rows = db.execute('SELECT name,status FROM extraction_probes WHERE operation_id=?', (operation_id,)).fetchall()
     if not rows or any(not isinstance(name, str) or not PROBE.fullmatch(name) or status != 'removed' for name, status in rows):
         raise FenceError('Extraction evidence is incomplete')
