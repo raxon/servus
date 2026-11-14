@@ -31,5 +31,7 @@ jobs:
         run: npm run test:panel
       - name: Test installer
         run: npm run test:installer
+      - name: Test VPS harness
+        run: npm run test:vps-harness
       - name: Build workspace
         run: npm run build

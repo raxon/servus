@@ -15,13 +15,15 @@ interface ConsoleOptions {
 }
 interface Ticket {serviceId:string;containerId:string;shell:string;sessionToken:string;expiresAt:number}
 const consoleInput=z.object({containerId:z.string().regex(/^[a-f0-9]{12,64}$/),shell:z.enum(['/bin/sh','/bin/bash']).default('/bin/sh')}).strict();
+const consoleAuthentication=z.object({type:z.literal('authenticate'),ticket:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
 const terminalInput=z.discriminatedUnion('type',[
   z.object({type:z.literal('input'),data:z.string().max(32768)}).strict(),
   z.object({type:z.literal('resize'),cols:z.number().int().min(1).max(500),rows:z.number().int().min(1).max(300)}).strict(),
 ]);
 
 export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
-  const {store,serviceAccess}=options,tickets=new Map<string,Ticket>(),accepted=new WeakMap<FastifyRequest,Ticket>(),cleanup=new Set<()=>void>();
+  const {store,serviceAccess}=options,tickets=new Map<string,Ticket>(),cleanup=new Set<()=>void>();
+  let pendingConnections=0;
   const prefix='/api/v1/services/:id';
   app.post<{Params:{id:string}}>(`${prefix}/console-ticket`,async req=>{
     const {auth}=serviceAccess(req,req.params.id,true);
@@ -35,51 +37,80 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
     store.recordAudit(auth.user.id,'console.grant',req.params.id);
     return {ticket};
   });
-  app.get<{Params:{id:string};Querystring:{ticket?:string}}>(`${prefix}/console`,{
+  app.get<{Params:{id:string}}>(`${prefix}/console`,{
     websocket:true,
     preValidation:async req=>{
       if(!req.headers.origin||!options.allowedOrigins.has(req.headers.origin))throw new AppError('ORIGIN_DENIED','This console origin is not allowed',403);
-      const raw=z.string().regex(/^[a-f0-9]{64}$/).parse(req.query.ticket),key=hashToken(raw),ticket=tickets.get(key);
-      tickets.delete(key);
-      if(!ticket||ticket.expiresAt<=Date.now()||ticket.serviceId!==req.params.id||!req.cookies.panel_session||hashToken(ticket.sessionToken)!==hashToken(req.cookies.panel_session))throw new AppError('CONSOLE_TICKET','Console grant is missing or expired',403);
-      const auth=store.getSession(req.cookies.panel_session),service=store.getService(req.params.id);
-      if(!auth||!service||!store.canAccess(auth.user,service.projectId,true))throw new AppError('NOT_FOUND','Service not found',404);
-      accepted.set(req,ticket);
+      if(req.raw.url?.includes('?'))throw new AppError('INVALID_CONSOLE','Console URL must not contain query parameters',400);
+      if(!req.cookies.panel_session||!store.getSession(req.cookies.panel_session))throw new AppError('UNAUTHORIZED','Sign in to continue',401);
     },
   },(socket,req)=>{
-    const ticket=accepted.get(req);accepted.delete(req);
-    if(!ticket){socket.close(1008,'Console grant is unavailable');return;}
-    const config=options.agentConnection??agentConfig();
-    const query=new URLSearchParams({containerId:ticket.containerId,shell:ticket.shell});
-    const upstream=new WebSocket(`ws://localhost/services/${ticket.serviceId}/console?${query}`,{
-      createConnection:()=>connect(config.socketPath),headers:{authorization:`Bearer ${config.token}`},handshakeTimeout:5000,maxPayload:65536,
-    });
-    const pending:string[]=[];
-    let closed=false;
+    if(pendingConnections>=100){socket.close(1013,'Too many pending console connections');return;}
+    pendingConnections++;
+    let phase:'authentication'|'connecting'|'ready'='authentication',pendingSlot=true,closed=false,ticket:Ticket|undefined,upstream:WebSocket|undefined;
+    let checkSession:ReturnType<typeof setInterval>|undefined;
+    const releasePending=()=>{if(pendingSlot){pendingSlot=false;pendingConnections--;}};
+    const timeout=setTimeout(()=>{socket.close(1008,'Console connection timed out');close();},5000);
+    timeout.unref();
     const close=()=>{
-      if(closed)return;closed=true;clearInterval(checkSession);cleanup.delete(close);
+      if(closed)return;closed=true;clearTimeout(timeout);releasePending();if(checkSession)clearInterval(checkSession);cleanup.delete(close);
       if(socket.readyState===WebSocket.OPEN)socket.close(1000,'Console ended');
-      if(upstream.readyState===WebSocket.OPEN)upstream.close();else if(upstream.readyState===WebSocket.CONNECTING)upstream.terminate();
+      if(upstream?.readyState===WebSocket.OPEN)upstream.close();else if(upstream?.readyState===WebSocket.CONNECTING)upstream.terminate();
     };
-    const checkSession=setInterval(()=>{
-      const auth=store.getSession(ticket.sessionToken);
-      if(!auth||!store.canAccess(auth.user,store.getService(ticket.serviceId)?.projectId??'',true))close();
-    },1000);
     cleanup.add(close);
     socket.on('error',close);socket.on('close',close);
-    upstream.on('error',close);upstream.on('close',close);
-    upstream.on('open',()=>{for(const item of pending.splice(0))upstream.send(item);});
-    upstream.on('message',(data,isBinary)=>{if(socket.readyState===WebSocket.OPEN)socket.send(data,{binary:isBinary});});
     socket.on('message',(data,isBinary)=>{
+      try {
       if(closed)return;
       if(isBinary){socket.close(1008,'Send terminal commands as JSON');return;}
+      const payload=Array.isArray(data)?Buffer.concat(data):data instanceof ArrayBuffer?Buffer.from(data):data;
+      if(phase!=='ready'&&payload.length>256){socket.close(1008,'Invalid console authentication');return;}
       let parsed:unknown;
-      try{parsed=JSON.parse(data.toString());}catch{socket.close(1008,'Invalid terminal command');return;}
+      try{parsed=JSON.parse(payload.toString('utf8'));}catch{socket.close(1008,'Invalid terminal command');return;}
+      if(phase==='connecting'){socket.close(1008,'Console is not ready');return;}
+      if(phase==='authentication'){
+        const credentials=consoleAuthentication.safeParse(parsed);
+        if(!credentials.success){socket.close(1008,'Console authentication required');return;}
+        const key=hashToken(credentials.data.ticket);
+        ticket=tickets.get(key);tickets.delete(key);
+        if(!ticket||ticket.expiresAt<=Date.now()||ticket.serviceId!==req.params.id||!req.cookies.panel_session||hashToken(ticket.sessionToken)!==hashToken(req.cookies.panel_session)){
+          socket.close(1008,'Console grant is missing or expired');return;
+        }
+        const auth=store.getSession(req.cookies.panel_session),service=store.getService(req.params.id);
+        if(!auth||!service||!store.canAccess(auth.user,service.projectId,true)){socket.close(1008,'Console grant is unavailable');return;}
+        phase='connecting';
+        try {
+          const config=options.agentConnection??agentConfig();
+          const query=new URLSearchParams({containerId:ticket.containerId,shell:ticket.shell});
+          upstream=new WebSocket(`ws://localhost/services/${ticket.serviceId}/console?${query}`,{
+            createConnection:()=>connect(config.socketPath),headers:{authorization:`Bearer ${config.token}`},handshakeTimeout:5000,maxPayload:65536,
+          });
+        } catch { socket.close(1011,'Console is unavailable');return; }
+        const activeTicket=ticket;
+        checkSession=setInterval(()=>{
+          try {
+            const current=store.getSession(activeTicket.sessionToken);
+            if(!current||!store.canAccess(current.user,store.getService(activeTicket.serviceId)?.projectId??'',true))close();
+          } catch {if(socket.readyState===WebSocket.OPEN)socket.close(1011,'Console is unavailable');close();}
+        },1000);
+        const upstreamFailed=()=>{if(socket.readyState===WebSocket.OPEN)socket.close(1011,'Console is unavailable');close();};
+        upstream.on('error',upstreamFailed);upstream.on('close',code=>{if(phase==='ready'&&code===1000)close();else upstreamFailed();});
+        upstream.on('open',()=>{
+          try {
+            const current=store.getSession(activeTicket.sessionToken),service=store.getService(activeTicket.serviceId);
+            if(!current||!service||!store.canAccess(current.user,service.projectId,true)){socket.close(1008,'Console grant is unavailable');close();return;}
+            if(closed||socket.readyState!==WebSocket.OPEN){close();return;}
+            phase='ready';clearTimeout(timeout);releasePending();socket.send(JSON.stringify({type:'ready'}),error=>{if(error)close();});
+          } catch {upstreamFailed();}
+        });
+        upstream.on('message',(chunk,binary)=>{if(socket.readyState===WebSocket.OPEN)socket.send(chunk,{binary});});
+        return;
+      }
       const valid=terminalInput.safeParse(parsed);if(!valid.success){socket.close(1008,'Invalid terminal command');return;}
       const encoded=JSON.stringify(valid.data);
-      if(upstream.readyState===WebSocket.OPEN)upstream.send(encoded);
-      else if(pending.length<10)pending.push(encoded);
+      if(upstream?.readyState===WebSocket.OPEN)upstream.send(encoded);
       else socket.close(1008,'Console is not ready');
+      } catch {if(socket.readyState===WebSocket.OPEN)socket.close(1011,'Console is unavailable');close();}
     });
   });
 

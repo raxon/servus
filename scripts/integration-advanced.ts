@@ -34,17 +34,34 @@ await report.check('real-console-command-and-resize', async () => {
   const current = containers.find((container: any) => container.state === 'running'); assert(current);
   const { ticket } = await api.call(`/services/${id}/console-ticket`, { containerId: current.id, shell: '/bin/sh' });
   const output = await new Promise<string>((resolvePromise, reject) => {
-    const socket = new WebSocket(`ws://localhost:4180/api/v1/services/${id}/console?ticket=${ticket}`, { headers: { Cookie: api.cookie, Origin: 'http://localhost:4180' } });
-    let received = ''; const timer = setTimeout(() => { socket.terminate(); reject(new Error('Console output was not received')); }, 15000);
-    socket.on('open', () => { socket.send(JSON.stringify({ type: 'resize', cols: 97, rows: 31 })); socket.send(JSON.stringify({ type: 'input', data: `printf 'PARITY_%s\\n' 'CONSOLE_${runId}'; stty size; exit\n` })); });
-    socket.on('message', data => { received += data.toString(); });
-    socket.on('close', () => { clearTimeout(timer); resolvePromise(received); });
+    const socket = new WebSocket(`ws://localhost:4180/api/v1/services/${id}/console`, { headers: { Cookie: api.cookie, Origin: 'http://localhost:4180' } });
+    let received = ''; let ready = false; const timer = setTimeout(() => { socket.terminate(); reject(new Error('Console output was not received')); }, 15000);
+    socket.on('open', () => socket.send(JSON.stringify({ type: 'authenticate', ticket })));
+    socket.on('message', data => {
+      if (!ready) {
+        let message: unknown;
+        try { message = JSON.parse(data.toString()); } catch { socket.terminate(); reject(new Error('Invalid console readiness message')); return; }
+        if (!message || typeof message !== 'object' || !('type' in message) || message.type !== 'ready') { socket.terminate(); reject(new Error('Console was not ready')); return; }
+        ready = true;
+        socket.send(JSON.stringify({ type: 'resize', cols: 97, rows: 31 }));
+        socket.send(JSON.stringify({ type: 'input', data: `printf 'PARITY_%s\\n' 'CONSOLE_${runId}'; stty size; exit\n` }));
+        return;
+      }
+      received += data.toString();
+    });
+    socket.on('close', () => { clearTimeout(timer); if (ready) resolvePromise(received); else reject(new Error('Console closed before authentication')); });
     socket.on('error', error => { clearTimeout(timer); reject(error); });
   });
   assert(output.includes(`PARITY_CONSOLE_${runId}`), 'The shell did not execute the marker command');
   assert(/31\s+97/.test(output), 'The PTY did not accept the resize');
-  const replay = new WebSocket(`ws://localhost:4180/api/v1/services/${id}/console?ticket=${ticket}`, { headers: { Cookie: api.cookie, Origin: 'http://localhost:4180' } });
-  await new Promise<void>((resolvePromise, reject) => { replay.once('unexpected-response', (_request, response) => { response.resume(); assert.equal(response.statusCode, 403); resolvePromise(); }); replay.once('open', () => { replay.close(); reject(new Error('Console ticket was reusable')); }); replay.once('error', () => {}); });
+  const replay = new WebSocket(`ws://localhost:4180/api/v1/services/${id}/console`, { headers: { Cookie: api.cookie, Origin: 'http://localhost:4180' } });
+  await new Promise<void>((resolvePromise, reject) => {
+    const timer = setTimeout(() => { replay.terminate(); reject(new Error('Console replay was not rejected')); }, 10000);
+    replay.once('open', () => replay.send(JSON.stringify({ type: 'authenticate', ticket })));
+    replay.once('message', () => { clearTimeout(timer); replay.terminate(); reject(new Error('Console ticket was reusable')); });
+    replay.once('close', code => { clearTimeout(timer); if (code === 1008) resolvePromise(); else reject(new Error(`Unexpected console replay close code: ${code}`)); });
+    replay.once('error', () => { clearTimeout(timer); reject(new Error('Console replay connection failed')); });
+  });
 });
 
 await report.check('live-log-stream', async () => {

@@ -225,10 +225,70 @@ describe('runtime reads and console grants',()=>{
     const {app,store,auth,headers,create}=await fixture();const {service}=(await create(appInput)).json();
     const grant=async()=> (await app.inject({method:'POST',url:`/api/v1/services/${service.id}/console-ticket`,headers,payload:{containerId}})).json().ticket;
     const bound=await grant(),other=store.createSession(auth.user.id);
-    await expect(app.injectWS(`/api/v1/services/${service.id}/console?ticket=${bound}`,{headers:{cookie:`panel_session=${other.token}`,origin:'http://localhost:4180'}})).rejects.toThrow();
-    const expiring=await grant(),clock=vi.spyOn(Date,'now').mockReturnValue(Date.now()+31000);
-    try{await expect(app.injectWS(`/api/v1/services/${service.id}/console?ticket=${expiring}`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}})).rejects.toThrow();}
+    const wrong=await app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:`panel_session=${other.token}`,origin:'http://localhost:4180'}});
+    wrong.send(JSON.stringify({type:'authenticate',ticket:bound}));
+    await vi.waitFor(()=>expect(wrong.readyState).toBe(WebSocket.CLOSED));
+    const expiring=await grant();
+    const ws=await app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}});
+    const clock=vi.spyOn(Date,'now').mockReturnValue(Date.now()+31000);
+    try{ws.send(JSON.stringify({type:'authenticate',ticket:expiring}));await vi.waitFor(()=>expect(ws.readyState).toBe(WebSocket.CLOSED));}
     finally{clock.mockRestore();}
+  });
+  it('closes unauthenticated console connections after the deadline',async()=>{
+    const {app,headers,create}=await fixture();const {service}=(await create(appInput)).json();
+    const ws=await app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}});
+    await vi.waitFor(()=>expect(ws.readyState).toBe(WebSocket.CLOSED),{timeout:7000,interval:100});
+  },10000);
+  it('limits connections waiting for console authentication',async()=>{
+    const {app,headers,create}=await fixture();const {service}=(await create(appInput)).json();
+    const sockets=await Promise.all(Array.from({length:101},()=>app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}})));
+    try {
+      await vi.waitFor(()=>expect(sockets.filter(socket=>socket.readyState===WebSocket.CLOSED).length).toBeGreaterThanOrEqual(1));
+      expect(sockets.filter(socket=>socket.readyState===WebSocket.OPEN)).toHaveLength(100);
+    } finally { for(const ws of sockets)ws.terminate(); }
+  });
+  it('does not accept terminal input before the agent connection is ready',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-console-wait-')),socketPath=join(dir,'upstream.sock'),server=createServer();
+    let upgradeSeen=false;const connections=new Set<import('node:stream').Duplex>();
+    server.on('upgrade',(_req,socket)=>{upgradeSeen=true;connections.add(socket);socket.on('error',()=>{});socket.on('close',()=>connections.delete(socket));});
+    await new Promise<void>(resolve=>server.listen(socketPath,resolve));
+    cleanup.push(async()=>{for(const socket of connections)socket.destroy();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));rmSync(dir,{recursive:true,force:true});});
+    const {app,headers,create}=await fixture({agentConnection:{socketPath,token:'local-agent-token'}});const {service}=(await create(appInput)).json();
+    const ticket=(await app.inject({method:'POST',url:`/api/v1/services/${service.id}/console-ticket`,headers,payload:{containerId}})).json().ticket;
+    const messages:string[]=[];
+    const ws=await app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}},{onInit:socket=>socket.on('message',data=>messages.push(data.toString()))});
+    ws.send(JSON.stringify({type:'authenticate',ticket}));
+    await vi.waitFor(()=>expect(upgradeSeen).toBe(true));expect(messages).not.toContain(JSON.stringify({type:'ready'}));
+    ws.send(JSON.stringify({type:'input',data:'not ready'}));
+    await vi.waitFor(()=>expect(ws.readyState).toBe(WebSocket.CLOSED));expect(messages).not.toContain(JSON.stringify({type:'ready'}));
+  });
+  it('reports an agent connection failure without a ready frame',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-console-missing-'));
+    cleanup.push(async()=>rmSync(dir,{recursive:true,force:true}));
+    const {app,headers,create}=await fixture({agentConnection:{socketPath:join(dir,'missing.sock'),token:'local-agent-token'}});const {service}=(await create(appInput)).json();
+    const ticket=(await app.inject({method:'POST',url:`/api/v1/services/${service.id}/console-ticket`,headers,payload:{containerId}})).json().ticket;
+    const messages:string[]=[],codes:number[]=[];
+    const ws=await app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}},{onInit:socket=>{socket.on('message',data=>messages.push(data.toString()));socket.on('close',code=>codes.push(code));}});
+    ws.send(JSON.stringify({type:'authenticate',ticket}));
+    await vi.waitFor(()=>expect(ws.readyState).toBe(WebSocket.CLOSED));
+    expect(codes).toContain(1011);expect(messages).not.toContain(JSON.stringify({type:'ready'}));
+  });
+  it('distinguishes a clean shell exit from an upstream failure',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-console-exit-')),socketPath=join(dir,'upstream.sock'),server=createServer(),wss=new WebSocketServer({noServer:true});
+    let exitCode=1000;
+    server.on('upgrade',(req,socket,head)=>wss.handleUpgrade(req,socket,head,upstream=>{setTimeout(()=>upstream.close(exitCode,'internal detail'),100);}));
+    await new Promise<void>(resolve=>server.listen(socketPath,resolve));
+    cleanup.push(async()=>{for(const ws of wss.clients)ws.terminate();wss.close();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));rmSync(dir,{recursive:true,force:true});});
+    const {app,headers,create}=await fixture({agentConnection:{socketPath,token:'local-agent-token'}});const {service}=(await create(appInput)).json();
+    const connect=async()=>{
+      const ticket=(await app.inject({method:'POST',url:`/api/v1/services/${service.id}/console-ticket`,headers,payload:{containerId}})).json().ticket;
+      const codes:number[]=[],reasons:string[]=[],messages:string[]=[];
+      const ws=await app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}},{onInit:client=>{client.on('close',(code,reason)=>{codes.push(code);reasons.push(reason.toString());});client.on('message',data=>messages.push(data.toString()));}});
+      ws.send(JSON.stringify({type:'authenticate',ticket}));await vi.waitFor(()=>expect(ws.readyState).toBe(WebSocket.CLOSED));
+      return {codes,reasons,messages};
+    };
+    const normal=await connect();expect(normal.codes).toEqual([1000]);expect(normal.messages).toContain(JSON.stringify({type:'ready'}));
+    exitCode=1011;const failed=await connect();expect(failed.codes).toEqual([1011]);expect(failed.reasons.join(' ')).not.toContain('internal detail');expect(failed.messages).toContain(JSON.stringify({type:'ready'}));
   });
   it('streams redacted runtime logs and closes the stream when its session is revoked',async()=>{
     const secret='stream-token-987654';
@@ -255,12 +315,21 @@ describe('runtime reads and console grants',()=>{
     const {app,headers,create}=await fixture({agentConnection:{socketPath,token:'local-agent-token'}});const {service}=((await create(appInput)).json());
     const grant=async()=> (await app.inject({method:'POST',url:`/api/v1/services/${service.id}/console-ticket`,headers,payload:{containerId,shell:'/bin/sh'}})).json().ticket;
     const deniedTicket=await grant();
-    await expect(app.injectWS(`/api/v1/services/${service.id}/console?ticket=${deniedTicket}`,{headers:{cookie:headers.cookie,origin:'https://attacker.test'}})).rejects.toThrow();
+    await expect(app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'https://attacker.test'}})).rejects.toThrow();
+    await expect(app.injectWS(`/api/v1/services/${service.id}/console?ticket=${deniedTicket}`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}})).rejects.toThrow();
+    const unauth=await app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}});
+    unauth.send(JSON.stringify({type:'input',data:'do not execute'}));
+    await vi.waitFor(()=>expect(unauth.readyState).toBe(WebSocket.CLOSED));expect(wss.clients.size).toBe(0);
     const ticket=await grant(),chunks:string[]=[];
-    const ws=await app.injectWS(`/api/v1/services/${service.id}/console?ticket=${ticket}`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}},{onInit:socket=>socket.on('message',data=>chunks.push(data.toString()))});
+    const ws=await app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}},{onInit:socket=>socket.on('message',data=>chunks.push(data.toString()))});
+    expect(wss.clients.size).toBe(0);
+    ws.send(JSON.stringify({type:'authenticate',ticket}));
+    await vi.waitFor(()=>expect(chunks).toContain(JSON.stringify({type:'ready'})));
     await vi.waitFor(()=>expect(chunks).toContain('terminal-ready'));
+    expect(chunks.indexOf(JSON.stringify({type:'ready'}))).toBeLessThan(chunks.indexOf('terminal-ready'));
     ws.send(JSON.stringify({type:'input',data:'echo hello\r'}));await vi.waitFor(()=>expect(received).toHaveLength(1));
-    await expect(app.injectWS(`/api/v1/services/${service.id}/console?ticket=${ticket}`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}})).rejects.toThrow();
+    const replay=await app.injectWS(`/api/v1/services/${service.id}/console`,{headers:{cookie:headers.cookie,origin:'http://localhost:4180'}});
+    replay.send(JSON.stringify({type:'authenticate',ticket}));await vi.waitFor(()=>expect(replay.readyState).toBe(WebSocket.CLOSED));
     await app.inject({method:'POST',url:'/api/v1/auth/logout',headers});await vi.waitFor(()=>expect(ws.readyState).toBe(WebSocket.CLOSED),{timeout:3000});
   });
 });

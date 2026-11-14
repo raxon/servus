@@ -13,6 +13,8 @@ export default function ServiceConsole({ service }: { service: Service }) {
   const terminal = useRef<BrowserTerminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
   const socket = useRef<WebSocket | null>(null);
+  const ready = useRef(false);
+  const handshakeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const generation = useRef(0);
   const [selected, setSelected] = useState("");
   const [status, setStatus] = useState<
@@ -58,15 +60,17 @@ export default function ServiceConsole({ service }: { service: Service }) {
     observer.observe(target.current);
     const frame = requestAnimationFrame(resize);
     const input = term.onData((data) => {
-      if (socket.current?.readyState === WebSocket.OPEN)
+      if (ready.current && socket.current?.readyState === WebSocket.OPEN)
         socket.current.send(JSON.stringify({ type: "input", data }));
     });
     const size = term.onResize(({ cols, rows }) => {
-      if (socket.current?.readyState === WebSocket.OPEN)
+      if (ready.current && socket.current?.readyState === WebSocket.OPEN)
         socket.current.send(JSON.stringify({ type: "resize", cols, rows }));
     });
     return () => {
       generation.current++;
+      ready.current = false;
+      if (handshakeTimer.current) clearTimeout(handshakeTimer.current);
       socket.current?.close();
       socket.current = null;
       observer.disconnect();
@@ -81,6 +85,7 @@ export default function ServiceConsole({ service }: { service: Service }) {
 
   async function connect() {
     const attempt = ++generation.current;
+    ready.current = false;
     setError(null);
     setStatus("connecting");
     try {
@@ -91,29 +96,46 @@ export default function ServiceConsole({ service }: { service: Service }) {
       if (attempt !== generation.current) return;
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(
-        `${protocol}//${location.host}/api/v1/services/${service.id}/console?ticket=${encodeURIComponent(result.ticket)}`,
+        `${protocol}//${location.host}/api/v1/services/${service.id}/console`,
       );
       socket.current?.close();
       socket.current = ws;
+      handshakeTimer.current = setTimeout(() => {
+        if (attempt !== generation.current || ready.current) return;
+        setError(new Error("The console connection timed out. Try again."));
+        ws.close();
+      }, 10_000);
       ws.onopen = () => {
         if (attempt !== generation.current) {
           ws.close();
           return;
         }
-        setStatus("connected");
-        terminal.current?.clear();
-        fit.current?.fit();
-        ws.send(
-          JSON.stringify({
-            type: "resize",
-            cols: terminal.current?.cols ?? 80,
-            rows: terminal.current?.rows ?? 24,
-          }),
-        );
-        terminal.current?.focus();
+        ws.send(JSON.stringify({ type: "authenticate", ticket: result.ticket }));
       };
       ws.onmessage = async (event) => {
         if (attempt !== generation.current) return;
+        if (!ready.current) {
+          let message: unknown;
+          try {
+            message = typeof event.data === "string" ? JSON.parse(event.data) : null;
+          } catch {
+            message = null;
+          }
+          if (!message || typeof message !== "object" || !("type" in message) || message.type !== "ready") {
+            setError(new Error("The console connection failed. Request a new connection to try again."));
+            ws.close();
+            return;
+          }
+          if (handshakeTimer.current) clearTimeout(handshakeTimer.current);
+          handshakeTimer.current = null;
+          ready.current = true;
+          setStatus("connected");
+          terminal.current?.clear();
+          fit.current?.fit();
+          ws.send(JSON.stringify({ type: "resize", cols: terminal.current?.cols ?? 80, rows: terminal.current?.rows ?? 24 }));
+          terminal.current?.focus();
+          return;
+        }
         const value =
           typeof event.data === "string"
             ? event.data
@@ -130,8 +152,15 @@ export default function ServiceConsole({ service }: { service: Service }) {
             ),
           );
       };
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         if (attempt !== generation.current) return;
+        if (handshakeTimer.current) clearTimeout(handshakeTimer.current);
+        handshakeTimer.current = null;
+        if (event.code !== 1000 && event.code !== 1001)
+          setError((current) => current ?? new Error(ready.current
+            ? "The console connection ended unexpectedly. Try connecting again."
+            : "The console connection failed. Request a new connection to try again."));
+        ready.current = false;
         setStatus("disconnected");
         terminal.current?.writeln("\r\n[Console disconnected]");
         socket.current = null;
