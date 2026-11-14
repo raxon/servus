@@ -1,0 +1,17 @@
+100644 Dockerfile
+100644 apps/panel/package.json
+100644 apps/updater/backup.py
+100644 apps/updater/discover-release.py
+100644 apps/updater/guarded-verifier.py
+100644 apps/updater/preflight.py
+100644 apps/updater/provision-verifier-group.py
+100755 apps/updater/servus-updater.py
+100644 apps/updater/supervisor-daemon.py
+100644 apps/updater/supervisor.py
+100644 apps/updater/verification-executor.py
+100644 apps/updater/verification-fence.py
+100644 apps/updater/verify-release.py
+100644 deployment/compose.yaml
+100644 deployment/lifecycle-gate.sh
+100644 deployment/systemd/servus-supervisor.service
+100755 scripts/install.sh
