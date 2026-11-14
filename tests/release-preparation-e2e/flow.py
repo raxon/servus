@@ -154,12 +154,18 @@ if mode == 'tag':
 
 try:
     helper, state_dir = start('valid')
-    operation = submit_verified()
-    result = request('prepare',operation)
-    assert result.get('ok') and result['operation']['status'] in ('preparing','prepared')
-    outcome = until(lambda: (s if (s := prepare_state(operation)) in ('prepared','recovery_required') else None), 'real release preparation', 300)
-    assert outcome == 'prepared', 'Signed legacy release did not prepare'
-    if mode != 'tag':
+    if mode == 'tag':
+        operation = submit_verified()
+        result = request('prepare',operation)
+        assert result.get('ok') and result['operation']['status'] in ('preparing','prepared')
+        outcome = until(lambda: (s if (s := prepare_state(operation)) in ('prepared','recovery_required') else None), 'real release preparation', 300)
+        assert outcome == 'prepared', 'Signed legacy release did not prepare'
+    else:
+        operation = str(uuid.uuid4())
+        command('/usr/bin/setpriv','--reuid=65534','--regid=65534','--clear-groups',
+                '/usr/bin/python3','-I',str(BASE / 'bootstrap-release.py'), '--operation', operation,
+                '--commit', COMMIT, '--digest', DIGEST, '--tag', TAG, timeout=600)
+        assert state(operation) == 'verified' and prepare_state(operation) == 'prepared'
         denied = request('apply', operation)
         assert denied == {'ok': False, 'error': 'unavailable'}, 'Bootstrap updater must not apply a release'
     assert_bundle(state_dir,operation)

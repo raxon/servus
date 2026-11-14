@@ -82,4 +82,6 @@ install_modules() {
 install_modules tag
 guest sudo /usr/bin/python3 -I -B /run/servus-release-fixture/flow.py tag
 install_modules head
+guest sudo tee /usr/local/libexec/servus/bootstrap-release.py < "$temp_dir/head/apps/updater/bootstrap-release.py" > /dev/null
+guest sudo chmod 644 /usr/local/libexec/servus/bootstrap-release.py
 guest sudo /usr/bin/python3 -I -B /run/servus-release-fixture/flow.py "$release_mode"
