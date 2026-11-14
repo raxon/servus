@@ -37,7 +37,9 @@ def run(args,**kwargs):
             assert (install/bootstrap.MARKER).is_file()
         return
     return bootstrap.command(args,**kwargs)
-bootstrap.bootstrap(op,commit,digest,'v0.1.5',str(install),str(config),str(state),supervisor,policy,run=run)
+owned_lock=os.open(install/'install.lock',os.O_RDONLY)
+fcntl.flock(owned_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+bootstrap.bootstrap(op,commit,digest,'v0.1.5',str(install),str(config),str(state),supervisor,policy,run=run,take_lock_fd=owned_lock)
 assert events==['bootstrap-policy.py','provision-host.py','bootstrap-handoff.py']
 assert not (install/bootstrap.MARKER).exists()
 print('PASS real systemd bootstrap verified and prepared signed release before policy handoff',flush=True)

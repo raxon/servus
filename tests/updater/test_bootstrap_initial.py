@@ -47,15 +47,31 @@ class BootstrapInitialTest(unittest.TestCase):
         self.run=mock.Mock(side_effect=run);self.ready=mock.Mock();self.inactive=mock.Mock(return_value=True)
 
     def tearDown(self):self.tmp.cleanup()
-    def execute(self):
+    def execute(self,**kwargs):
         with mock.patch.object(policy,'_docker',return_value=b''):
-            return initial.bootstrap(self.op,self.commit,self.digest,self.tag,str(self.install),str(self.config),str(self.state),supervisor,policy,run=self.run,ready=self.ready,is_inactive=self.inactive)
+            return initial.bootstrap(self.op,self.commit,self.digest,self.tag,str(self.install),str(self.config),str(self.state),supervisor,policy,run=self.run,ready=self.ready,is_inactive=self.inactive,**kwargs)
 
     def test_verification_policy_and_handoff_run_in_order(self):
         self.execute()
         self.assertEqual([event[1] if event[0]=='/usr/bin/systemctl' else Path(event[2] if event[0]=='/usr/bin/python3' else event[6]).name for event in self.events],
                          ['daemon-reload','start','start','bootstrap-release.py','stop','bootstrap-policy.py','provision-host.py','bootstrap-handoff.py'])
         self.assertFalse((self.install/initial.MARKER).exists());self.ready.assert_called_once()
+
+    def test_takes_installer_lock_and_releases_it_for_handoff(self):
+        fd=os.open(self.install/'install.lock',os.O_RDONLY)
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        self.execute(take_lock_fd=fd)
+        with self.assertRaises(OSError):os.fstat(fd)
+        self.assertFalse((self.install/initial.MARKER).exists())
+
+    def test_wrong_inherited_lock_is_not_consumed(self):
+        other=self.root/'other.lock';other.touch(mode=0o600)
+        fd=os.open(other,os.O_RDONLY)
+        try:
+            with self.assertRaises(policy.PolicyError):self.execute(take_lock_fd=fd)
+            os.fstat(fd)
+            self.run.assert_not_called()
+        finally:os.close(fd)
 
     def test_verification_failure_stops_bootstrap_and_preserves_marker(self):
         def fail(args,**kwargs):

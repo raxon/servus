@@ -63,7 +63,7 @@ def wait_socket(path, supervisor, timeout=30):
     finally:os.close(directory)
 
 
-def bootstrap(operation,commit,digest,tag,install_dir,config_dir,state_dir,supervisor,policy,*,run=command,ready=wait_socket,is_inactive=inactive):
+def bootstrap(operation,commit,digest,tag,install_dir,config_dir,state_dir,supervisor,policy,*,run=command,ready=wait_socket,is_inactive=inactive,take_lock_fd=None):
     """Execute one verified first-install transition with durable exclusion."""
     if (sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or not supervisor._uuid4(operation) or
         not isinstance(commit,str) or not re.fullmatch(r'[a-f0-9]{40}',commit) or
@@ -74,7 +74,10 @@ def bootstrap(operation,commit,digest,tag,install_dir,config_dir,state_dir,super
     marker=('servus-bootstrap-verification-v1 '+operation+'\n').encode('ascii');identity=None
     base='/usr/local/libexec/servus';active=config_dir+'/servus.env'
     try:
-        lock=policy._installation_lock(install,supervisor)
+        lock=policy._installation_lock(install,supervisor,take_lock_fd)
+        # Ownership must be transferred by an exec, not by a parent retaining
+        # another copy of this open file description. Handoff later releases it.
+        if take_lock_fd is not None:os.close(take_lock_fd)
         config=policy._read_private_file(active,65536);env=policy._env(config)
         if env.get('SERVUS_IMAGE')!='ghcr.io/raxon/servus@'+digest:
             raise BootstrapError('Accepted image does not match the release')
@@ -143,6 +146,7 @@ def bootstrap(operation,commit,digest,tag,install_dir,config_dir,state_dir,super
 def main():
     parser=argparse.ArgumentParser()
     for name in ('operation','commit','digest','tag'):parser.add_argument('--'+name,required=True)
+    parser.add_argument('--take-install-lock-fd',type=int,help='Take ownership of the installation lock passed by an exec')
     args=parser.parse_args()
     if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated:
         print('Initial bootstrap requires isolated Linux root.',file=sys.stderr);return 1
@@ -160,7 +164,7 @@ def main():
         if not spec or not spec.loader:raise BootstrapError('Module unavailable')
         initial=importlib.util.module_from_spec(spec);spec.loader.exec_module(initial)
         supervisor,_,_,_,policy,_=initial.trusted_modules()
-        bootstrap(args.operation,args.commit,args.digest,args.tag,'/opt/servus','/etc/servus','/var/lib/servus-updater',supervisor,policy)
+        bootstrap(args.operation,args.commit,args.digest,args.tag,'/opt/servus','/etc/servus','/var/lib/servus-updater',supervisor,policy,take_lock_fd=args.take_install_lock_fd)
         return 0
     except Exception:
         print('Initial bootstrap failed or requires recovery.',file=sys.stderr);return 1
