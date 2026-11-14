@@ -73,9 +73,10 @@ def after_reboot():
 
 
 def main():
-    if sys.argv[1:] not in ([],['--full'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
+    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
     if sys.argv[1:]==['--after-reboot']:return after_reboot()
-    full=sys.argv[1:]==['--full']
+    recover_check=sys.argv[1:]==['--recover-check']
+    full=sys.argv[1:] in (['--full'],['--recover-check'])
     for path in ('/opt/servus','/etc/servus','/var/lib/servus','/var/lib/servus-updater'):
         if Path(path).exists():raise RuntimeError('Fixture requires an empty host')
     install=Path('/opt/servus');install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
@@ -214,6 +215,18 @@ def main():
             return transition.transition(journal,op,active,str(data),OLD,old_image_id,old_ids,str(old_env),str(compose),str(recovery_dir),str(snapshot),str(parent),node_fd,
                 str(docker_config),supervisor,daemon,adoption,runtime,quiet,docker,backup,coordinator,restore,recovery,legacy,initial,extractor,fence,
                 install_lock=lock,trusted_ingress=trusted,**options)
+        if recover_check:
+            with mock.patch.object(adoption,'record',side_effect=RuntimeError('fixture interruption')):
+                try:execute()
+                except RuntimeError as error:
+                    if str(error)!='fixture interruption':raise
+                else:raise RuntimeError('Interruption was not injected')
+            transition.assess_rollback(journal,op,active,str(parent),node_fd,supervisor,daemon,adoption,runtime,
+                quiet,docker,backup,coordinator,restore,recovery,fence,install_lock=lock)
+            if journal.db.execute('SELECT phase FROM legacy_transitions').fetchone()!=('recovery_required',):
+                raise RuntimeError('Interrupted migration was not preserved')
+            print('PASS interrupted signed migration has a verified pre-start rollback checkpoint',flush=True)
+            return
         if full:result=execute()
         else:
             with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace):result=execute()

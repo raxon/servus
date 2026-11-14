@@ -106,6 +106,41 @@ class LegacyTransitionTest(unittest.TestCase):
                 supervisor,object(),self.adoption,object(),self.quiet,object(),self.legacy,install_lock=self.lock)
         self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('recovery_required',))
         self.assertTrue((self.install/transition.MARKER).is_file())
+    def rollback_fixture(self):
+        _,marker,_,_=self.completion_fixture()
+        db=self.journal.db
+        db.execute("UPDATE legacy_transitions SET phase='recovery_required'")
+        db.execute('DELETE FROM initial_generations')
+        self.fence.source=db.execute('SELECT source FROM legacy_protections').fetchone()[0]
+        self.fence.assert_locked=mock.Mock()
+        target=db.execute('SELECT target_dev,target_ino FROM legacy_protections').fetchone()
+        self.restore.verify_staged=mock.Mock(return_value=target)
+        self.recovery.verify=mock.Mock(return_value=('/recovery','env-digest','compose-digest'))
+        def run():
+            return transition.assess_rollback(self.journal,self.operation,self.active,self.parent,-1,supervisor,object(),
+                self.adoption,object(),self.quiet,object(),object(),object(),self.restore,self.recovery,self.fence,install_lock=self.lock)
+        return run,marker
+    def test_rollback_assessment_checks_evidence_without_mutation(self):
+        run,marker=self.rollback_fixture()
+        result=run()
+        self.assertEqual(result[0],('/snapshot','sha256:'+'d'*64))
+        self.assertEqual(self.fence.assert_locked.call_count,2)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('recovery_required',))
+    def test_rollback_assessment_refuses_any_new_generation(self):
+        run,_=self.rollback_fixture()
+        for phase in ('starting','started','recovery_required'):
+            with self.subTest(phase=phase):
+                self.journal.db.execute('INSERT INTO initial_generations VALUES(?,?)',(self.operation,phase))
+                with self.assertRaisesRegex(transition.TransitionError,'may have written'):run()
+                self.journal.db.execute('DELETE FROM initial_generations')
+        self.fence.assert_locked.assert_not_called()
+    def test_rollback_assessment_rejects_changed_data_or_marker(self):
+        run,marker=self.rollback_fixture()
+        self.restore.verify_staged.return_value=(1,2)
+        with self.assertRaisesRegex(transition.TransitionError,'Staged data identity'):run()
+        marker.write_text('wrong')
+        with self.assertRaisesRegex(transition.TransitionError,'marker'):run()
     def completion_fixture(self):
         parent=Path(self.parent);parent.mkdir(mode=0o711)
         target=Path(self.approved.data_dir);target.mkdir(mode=0o700);os.chown(target,1000,1000)

@@ -21,6 +21,67 @@ class TransitionError(Exception):
     pass
 
 
+def assess_rollback(journal,operation,active_env,restore_parent,node_fd,supervisor,daemon,adoption,policy,
+                    quiescence,docker,backup,coordinator,restore,recovery,fence,*,install_lock):
+    """Validate a pre-start rollback checkpoint without changing the installation.
+
+    This is a prerequisite, not authorization to start legacy containers. The
+    caller must retain the installation lock and writer fence until recovery.
+    """
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or not supervisor._uuid4(operation):
+        raise TransitionError('Isolated Linux root is required')
+    path,accepted,approved,binding=adoption._binding(journal,operation,active_env,supervisor,daemon)
+    if (fence.journal is not journal or fence.operation!=operation or fence.active_env!=active_env or
+        approved.data_dir!=os.path.join(restore_parent,'restore-'+operation)):
+        raise TransitionError('Rollback identity differs')
+    install=supervisor._trusted_directory(approved.install_dir,0o700)
+    try:
+        lock=supervisor._open_root_file(install,'install.lock',0o600)
+        try:
+            held,named=os.fstat(install_lock),os.fstat(lock)
+            if (held.st_dev,held.st_ino)!=(named.st_dev,named.st_ino):raise TransitionError('Installation lock does not match')
+            supervisor._assert_exclusive_flock(install_lock)
+        finally:os.close(lock)
+        marker=supervisor._open_root_file(install,MARKER,0o600)
+        try:
+            opened=os.fstat(marker);named=os.stat(MARKER,dir_fd=install,follow_symlinks=False)
+            expected=('servus-legacy-migration-v1 '+operation+'\n').encode('ascii')
+            if (opened.st_dev,opened.st_ino)!=(named.st_dev,named.st_ino) or os.read(marker,len(expected)+1)!=expected:
+                raise TransitionError('Migration marker changed')
+        finally:os.close(marker)
+        db=journal.db
+        if db.execute('SELECT operation_id,phase FROM legacy_transitions').fetchall()!=[(operation,'recovery_required')]:
+            raise TransitionError('Migration does not require recovery')
+        exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='initial_generations'").fetchone()
+        if exists and db.execute('SELECT 1 FROM initial_generations LIMIT 1').fetchone():
+            raise TransitionError('A new generation may have written data')
+        if db.execute('SELECT operation_id,state FROM legacy_removals').fetchall()!=[(operation,'removed')]:
+            raise TransitionError('Legacy removal is incomplete')
+        snapshot=db.execute('SELECT path,digest,state FROM legacy_snapshots WHERE operation_id=?',(operation,)).fetchone()
+        protection=db.execute('SELECT source,source_dev,source_ino,snapshot_digest,target_dev,target_ino,state FROM legacy_protections WHERE operation_id=?',(operation,)).fetchone()
+        if not snapshot or snapshot[2]!='verified' or not protection or protection[6]!='protected' or protection[3]!=snapshot[1] or protection[0]!=fence.source:
+            raise TransitionError('Rollback evidence differs')
+        fence.assert_locked(operation,install_lock)
+        source=os.stat(protection[0],follow_symlinks=False)
+        if (source.st_dev,source.st_ino)!=(protection[1],protection[2]):raise TransitionError('Original data identity changed')
+        quiescence.ensure_host_namespaces()
+        quiescence.ensure_no_data_mounts(docker,approved.data_dir)
+        quiescence.ensure_no_mount_aliases(docker,approved.data_dir)
+        quiescence.ensure_no_open_data(approved.data_dir)
+        quiescence.ensure_no_uid_writers(1000)
+        saved=recovery.verify(journal,operation,active_env,supervisor,daemon,adoption,policy,backup,install_lock=install_lock)
+        target=restore.verify_staged(snapshot[0],snapshot[1],restore_parent,operation,backup,node_fd,supervisor,coordinator)
+        if target!=tuple(protection[4:6]):raise TransitionError('Staged data identity changed')
+        fence.assert_locked(operation,install_lock)
+        if adoption._binding(journal,operation,active_env,supervisor,daemon)!=(path,accepted,approved,binding):
+            raise TransitionError('Approved release changed')
+        exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='initial_generations'").fetchone()
+        if exists and db.execute('SELECT 1 FROM initial_generations LIMIT 1').fetchone():
+            raise TransitionError('A new generation may have written data')
+        return snapshot[:2],saved
+    finally:os.close(install)
+
+
 def prepare_stop(journal,operation,active_env,policy_root,source,old_image,old_image_id,old_ids,supervisor,daemon,adoption,policy,quiescence,docker,legacy,
                  *,install_lock,trusted_ingress=None):
     """Stop the legacy generation against a verified candidate before activation."""

@@ -2,7 +2,7 @@
 # Run the legacy migration fixture only on a new disposable Colima VM.
 set -euo pipefail
 umask 077
-[ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = '--full' ]; }
+[ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && { [ "$1" = '--full' ] || [ "$1" = '--recover-check' ]; }; }
 cd "$(dirname "$0")/../.."
 for tool in colima docker openssl git; do command -v "$tool" >/dev/null; done
 profile="servus-legacy-e2e-$(openssl rand -hex 8)"
