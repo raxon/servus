@@ -305,6 +305,32 @@ def complete_healthy_preparation(hub, approval_journal, operation_id, policy_pat
         raise supervisor.SupervisorError('Preparation cannot be completed') from error
 
 
+def finalize_initial_preparation(hub, operation, policy_path, approval_journal, accepted_env):
+    """Complete the initial generation after all authenticated components are healthy."""
+    state = supervisor._open_root_file(operation.gate, 'state', 0o644)
+    try:
+        if os.read(state, 64) != b'servus-lifecycle-v1 normal\n':
+            raise supervisor.SupervisorError('Startup gate is not open')
+    finally:
+        os.close(state)
+    try:
+        uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=ro'
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
+            if db.execute("SELECT 1 FROM update_transactions WHERE phase != 'completed' OR phase IS NULL LIMIT 1").fetchone():
+                return False
+            rows = db.execute("SELECT a.operation_id FROM policy_approvals a JOIN preparations p ON p.operation_id=a.operation_id WHERE a.state='active' AND a.policy_path=? AND a.accepted_env_path=? AND p.status='prepared' AND NOT EXISTS (SELECT 1 FROM update_transactions t WHERE t.operation_id=a.operation_id)", (policy_path, accepted_env)).fetchall()
+        if not rows: return False
+        if len(rows) != 1 or not supervisor._uuid4(rows[0][0]):
+            raise supervisor.SupervisorError('Initial preparation is invalid')
+        operation_id = rows[0][0]
+        if load_approved_policy(policy_path, approval_journal, accepted_env, expected_operation_id=operation_id) != hub.policy:
+            raise supervisor.SupervisorError('Active policy changed')
+        complete_healthy_preparation(hub, approval_journal, operation_id, policy_path, accepted_env, maintenance=operation)
+        return True
+    except (sqlite3.Error, OSError, ValueError) as error:
+        raise supervisor.SupervisorError('Initial preparation cannot be completed') from error
+
+
 def finalize_started_update(hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env):
     """Finalize only a matching durable start after every new role reconnects."""
     if (hub is None or hub.used or set(hub.connections) != set(supervisor.ROLES) or
@@ -314,7 +340,7 @@ def finalize_started_update(hub, install_dir, gate_dir, journal_dir, policy_path
         try:
             marker_fd = supervisor._open_root_file(operation.journal, 'maintenance.json', 0o600)
         except FileNotFoundError:
-            return False
+            return finalize_initial_preparation(hub, operation, policy_path, approval_journal, accepted_env)
         try:
             marker = json.loads(os.read(marker_fd, 4097), object_pairs_hook=supervisor._pairs)
         finally:

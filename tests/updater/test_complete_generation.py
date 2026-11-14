@@ -96,6 +96,34 @@ class CompleteGenerationTest(unittest.TestCase):
             self.complete()
         self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone(), ('completed',))
 
+    def test_initial_generation_completes_automatically_after_healthy_connections(self):
+        self.journal.db.execute('DELETE FROM update_transactions')
+        (self.maintenance / 'maintenance.json').unlink()
+        self.owner.close()
+        with mock.patch.object(supervisor, 'inspect_servus', return_value=self.identities), \
+             mock.patch.object(supervisor, '_docker', return_value=json.dumps(self.records).encode()), \
+             mock.patch.object(daemon, 'load_approved_policy', return_value=self.hub.policy):
+            self.assertTrue(daemon.finalize_started_update(self.hub, str(self.install), str(self.gate), str(self.maintenance), '/root/policy', str(self.state / 'journal.sqlite'), '/root/env'))
+            self.assertFalse(daemon.finalize_started_update(self.hub, str(self.install), str(self.gate), str(self.maintenance), '/root/policy', str(self.state / 'journal.sqlite'), '/root/env'))
+        self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone(), ('completed',))
+
+    def test_initial_generation_rejects_unhealthy_or_unapproved_components(self):
+        self.journal.db.execute('DELETE FROM update_transactions')
+        (self.maintenance / 'maintenance.json').unlink()
+        self.owner.close()
+        with mock.patch.object(supervisor, 'inspect_servus', return_value=self.identities), \
+             mock.patch.object(supervisor, '_docker', return_value=json.dumps(self.records).encode()), \
+             mock.patch.object(daemon, 'load_approved_policy', return_value=object()):
+            with self.assertRaises(supervisor.SupervisorError):
+                daemon.finalize_started_update(self.hub, str(self.install), str(self.gate), str(self.maintenance), '/root/policy', str(self.state / 'journal.sqlite'), '/root/env')
+        self.records[0]['State']['Health']['Status']='unhealthy'
+        with mock.patch.object(supervisor, 'inspect_servus', return_value=self.identities), \
+             mock.patch.object(supervisor, '_docker', return_value=json.dumps(self.records).encode()), \
+             mock.patch.object(daemon, 'load_approved_policy', return_value=self.hub.policy):
+            with self.assertRaises(supervisor.SupervisorError):
+                daemon.finalize_started_update(self.hub, str(self.install), str(self.gate), str(self.maintenance), '/root/policy', str(self.state / 'journal.sqlite'), '/root/env')
+        self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone(), ('prepared',))
+
     def test_automatic_finalization_requires_all_authenticated_roles(self):
         self.owner.close()
         missing = self.hub.connections.pop('worker')
