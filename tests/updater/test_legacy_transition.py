@@ -37,7 +37,8 @@ class LegacyTransitionTest(unittest.TestCase):
                 if self.failure==name:raise RuntimeError(name+' failed')
                 return result
             return run
-        self.adoption=SimpleNamespace(_binding=lambda *_:('/policy','/accepted',self.approved,self.binding),record=action('adopt'))
+        self.adoption=SimpleNamespace(_binding=lambda *_:('/policy','/accepted',self.approved,self.binding),
+                                      prepared_binding=lambda *_:('/policy','/accepted',self.approved,self.binding),record=action('adopt'))
         self.legacy=SimpleNamespace(stop=action('stop'),capture=action('capture','sha256:'+'d'*64),protect=action('protect'),remove=action('remove'))
         self.recovery=SimpleNamespace(capture=action('save'))
         self.restore=SimpleNamespace(stage=action('stage',self.approved.data_dir))
@@ -83,5 +84,20 @@ class LegacyTransitionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'target mounted'):self.run_transition()
         self.assertEqual(self.events,['stop','save','capture'])
         self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('recovery_required',))
+    def test_prepared_stop_resumes_after_policy_activation_without_stopping_twice(self):
+        transition.prepare_stop(self.journal,self.operation,self.active,'/policies',self.source,'image','image-id',self.old,
+            supervisor,object(),self.adoption,object(),self.quiet,object(),self.legacy,install_lock=self.lock)
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('stopped',))
+        self.journal.db.execute('CREATE TABLE legacy_stop_operations(operation_id TEXT,preparation_id TEXT,attempt_id TEXT,nonce TEXT,root_digest TEXT,config_digest TEXT,policy_path TEXT,accepted_env TEXT,active_env TEXT,source TEXT,old_image TEXT,old_image_id TEXT,old_ids TEXT,state TEXT)')
+        self.journal.db.execute('INSERT INTO legacy_stop_operations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(self.operation,*self.binding,'/policy','/accepted',self.active,self.source,'image','image-id',__import__('json').dumps(self.old,sort_keys=True,separators=(',',':')),'stopped'))
+        self.assertEqual(self.run_transition(),{'api':'started'})
+        self.assertEqual(self.events,['stop','save','capture','stage','protect','remove','adopt','launch'])
+    def test_prepared_stop_failure_leaves_durable_recovery_marker(self):
+        self.failure='stop'
+        with self.assertRaises(RuntimeError):
+            transition.prepare_stop(self.journal,self.operation,self.active,'/policies',self.source,'image','image-id',self.old,
+                supervisor,object(),self.adoption,object(),self.quiet,object(),self.legacy,install_lock=self.lock)
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('recovery_required',))
+        self.assertTrue((self.install/transition.MARKER).is_file())
 
 if __name__=='__main__':unittest.main()

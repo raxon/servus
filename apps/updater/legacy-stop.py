@@ -17,7 +17,7 @@ class LegacyStopError(Exception):
 
 
 def stop(journal,operation,active_env,source,old_image,old_image_id,old_ids,supervisor,daemon,adoption,quiescence,docker,
-         *,install_lock,trusted_ingress=None):
+         *,install_lock,trusted_ingress=None,candidate_policy=None):
     """Stop only the recorded legacy containers, leaving durable recovery state."""
     if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated:raise LegacyStopError('Isolated Linux root is required')
     if (not supervisor._uuid4(operation) or not isinstance(source,str) or not source.startswith('/') or source=='/' or os.path.normpath(source)!=source or
@@ -26,7 +26,12 @@ def stop(journal,operation,active_env,source,old_image,old_image_id,old_ids,supe
         not isinstance(old_ids,dict) or set(old_ids)!={'api','worker','agent'} or
         any(not isinstance(value,str) or not re.fullmatch(r'[a-f0-9]{64}',value) for value in old_ids.values()) or len(set(old_ids.values()))!=3):
         raise LegacyStopError('Invalid legacy installation identity')
-    policy_path,accepted,approved,binding=adoption._binding(journal,operation,active_env,supervisor,daemon)
+    if candidate_policy is None:
+        def resolve():return adoption._binding(journal,operation,active_env,supervisor,daemon)
+    else:
+        if not isinstance(candidate_policy,tuple) or len(candidate_policy)!=2:raise LegacyStopError('Invalid candidate policy')
+        def resolve():return adoption.prepared_binding(journal,operation,active_env,candidate_policy[0],supervisor,candidate_policy[1])
+    policy_path,accepted,approved,binding=resolve()
     if source==approved.data_dir or source.startswith(approved.data_dir+'/') or approved.data_dir.startswith(source+'/'):
         raise LegacyStopError('Migration data paths overlap')
     install=supervisor._trusted_directory(approved.install_dir,0o700)
@@ -37,6 +42,12 @@ def stop(journal,operation,active_env,source,old_image,old_image_id,old_ids,supe
             if (held.st_dev,held.st_ino)!=(named.st_dev,named.st_ino):raise LegacyStopError('Installation lock does not match')
             supervisor._assert_exclusive_flock(install_lock)
         finally:os.close(expected)
+        if candidate_policy is not None:
+            marker=supervisor._open_root_file(install,'.legacy-migration-v1',0o600)
+            try:
+                value=('servus-legacy-migration-v1 '+operation+'\n').encode('ascii')
+                if os.read(marker,len(value)+1)!=value:raise LegacyStopError('Migration marker does not match')
+            finally:os.close(marker)
     finally:os.close(install)
     quiescence.ensure_host_namespaces()
     supervisor._verify_data_directory(source)
@@ -74,7 +85,7 @@ def stop(journal,operation,active_env,source,old_image,old_image_id,old_ids,supe
             named=os.stat(source,follow_symlinks=False);current=os.fstat(source_fd)
             if (named.st_dev,named.st_ino)!=(current.st_dev,current.st_ino) or (current.st_dev,current.st_ino)!=identity or (current.st_uid,current.st_gid,stat.S_IMODE(current.st_mode))!=(1000,1000,0o700):
                 raise LegacyStopError('Legacy data directory changed')
-            if adoption._binding(journal,operation,active_env,supervisor,daemon)!=(policy_path,accepted,approved,binding):raise LegacyStopError('Approved release changed')
+            if resolve()!=(policy_path,accepted,approved,binding):raise LegacyStopError('Approved release changed')
             return {item['Id']:item for item in records}
         inspect(initial=True)
         db=journal.db;db.execute('BEGIN IMMEDIATE')

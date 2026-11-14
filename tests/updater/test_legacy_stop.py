@@ -89,6 +89,17 @@ class LegacyStopTest(unittest.TestCase):
         with self.assertRaises(legacy.LegacyStopError):self.stop()
         self.assertFalse(any(args[0] in ('update','stop') for args in self.calls))
         self.assertIsNone(self.journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='legacy_stop_operations'").fetchone())
+    def test_prepared_policy_can_stop_only_with_matching_marker(self):
+        self.adoption.prepared_binding=mock.Mock(return_value=('/policy','/accepted',self.approved,self.binding))
+        def stop():
+            return legacy.stop(self.journal,self.operation,'/active',str(self.source),self.image,self.image.split('@')[1],self.old,
+                               supervisor,object(),self.adoption,self.quiet,self.docker,install_lock=self.lock,candidate_policy=('/policies',policy))
+        with self.assertRaises(FileNotFoundError):stop()
+        self.assertFalse(any(args[0] in ('update','stop') for args in self.calls))
+        marker=self.install/'.legacy-migration-v1';marker.write_text('servus-legacy-migration-v1 '+self.operation+'\n');marker.chmod(0o600)
+        stop()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_stop_operations').fetchone(),('stopped',))
+        self.adoption._binding.assert_not_called()
     def test_writer_after_stop_requires_recovery(self):
         self.quiet.ensure_no_uid_writers.side_effect=RuntimeError('writer')
         with self.assertRaises(RuntimeError):self.stop()

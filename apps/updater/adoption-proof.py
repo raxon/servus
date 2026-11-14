@@ -5,6 +5,7 @@ The caller must establish and maintain a durable writer and startup fence for
 both the old and restored data. This module records evidence only; it does not
 stop services, authorize container startup or perform recovery.
 """
+import hashlib
 import os
 import re
 import sys
@@ -12,6 +13,47 @@ import sys
 
 class AdoptionError(Exception):
     pass
+
+
+def prepared_binding(journal, operation, active_env, policy_root, supervisor, runtime):
+    """Resolve a verified candidate before stopping an unsupervised installation.
+
+    This is evidence for preparing the stop only. It does not activate policy,
+    permit startup, or replace the separate durable migration fence.
+    """
+    if not supervisor._uuid4(operation) or not isinstance(policy_root,str) or not policy_root.startswith('/') or os.path.normpath(policy_root)!=policy_root:
+        raise AdoptionError('Invalid prepared migration')
+    root=supervisor._trusted_directory(policy_root,0o700);os.close(root)
+    row=journal.db.execute("""SELECT p.preparation_id,p.attempt_id,p.attempt_nonce,o.digest,o.config_digest,
+        a.candidate_path,a.candidate_digest,a.accepted_env_path,a.env_digest
+        FROM preparations p JOIN operations o ON o.id=p.operation_id JOIN policy_approvals a ON a.operation_id=o.id
+        WHERE o.id=? AND o.status='verified' AND p.status='prepared' AND a.state='candidate' AND a.policy_path IS NULL
+          AND a.source_env_path=? AND p.attempt_id=o.attempt_id AND p.attempt_nonce=o.attempt_nonce
+          AND a.attempt_id=o.attempt_id AND a.attempt_nonce=o.attempt_nonce AND a.preparation_id=p.preparation_id
+          AND a.root_digest=o.digest AND a.image_config_digest=o.config_digest
+          AND NOT EXISTS(SELECT 1 FROM update_transactions) AND NOT EXISTS(SELECT 1 FROM extraction_probes WHERE status='intent')
+          AND NOT EXISTS(SELECT 1 FROM policy_approvals WHERE state IN ('active','activating','recovery_required'))
+          AND EXISTS(SELECT 1 FROM policy_probes WHERE operation_id=o.id AND preparation_id=p.preparation_id AND attempt_id=o.attempt_id AND attempt_nonce=o.attempt_nonce
+                     AND config_digest=a.env_digest AND state='removed')""",(operation,active_env)).fetchone()
+    if (not row or not supervisor._uuid4(row[0]) or not supervisor._uuid4(row[1]) or
+        not isinstance(row[2],str) or not re.fullmatch(r'[0-9a-f]{64}',row[2]) or
+        any(not isinstance(value,str) or not re.fullmatch(r'sha256:[0-9a-f]{64}',value) for value in (row[3],row[4],row[6],row[8])) or
+        row[5]!=os.path.join(policy_root,'candidate-'+row[0]+'.json') or
+        row[7]!=os.path.join(policy_root,'env-'+row[0]+'.env')):
+        raise AdoptionError('Verified policy candidate is unavailable')
+    candidate=runtime._read_private_file(row[5],1024*1024)
+    original=runtime._read_private_file(active_env,65536)
+    snapshot=runtime._read_private_file(row[7],65536)
+    if ('sha256:'+hashlib.sha256(candidate).hexdigest()!=row[6] or
+        'sha256:'+hashlib.sha256(original).hexdigest()!=row[8] or original!=snapshot):
+        raise AdoptionError('Prepared policy or environment changed')
+    document=runtime._json(candidate)
+    if not isinstance(document,dict) or set(document)!={'version','policy'} or type(document['version']) is not int or document['version']!=1 or not isinstance(document['policy'],dict):
+        raise AdoptionError('Prepared policy is invalid')
+    approved=supervisor.RuntimePolicy(**document['policy'])
+    if approved.image_reference!='ghcr.io/raxon/servus@'+row[3] or runtime._env(original).get('SERVUS_IMAGE')!=approved.image_reference:
+        raise AdoptionError('Prepared release does not match')
+    return os.path.join(policy_root,'policy-'+operation+'.json'),row[7],approved,row[:5]
 
 
 def _binding(journal, operation, active_env, supervisor, daemon):

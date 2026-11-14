@@ -6,6 +6,7 @@ host supervisor, protected recovery paths and a trusted Docker client. It leaves
 the durable marker in place until a separate health and recovery handoff ends.
 """
 import os
+import json
 import sys
 from types import SimpleNamespace
 
@@ -15,6 +16,43 @@ MARKER='.legacy-migration-v1'
 
 class TransitionError(Exception):
     pass
+
+
+def prepare_stop(journal,operation,active_env,policy_root,source,old_image,old_image_id,old_ids,supervisor,daemon,adoption,policy,quiescence,docker,legacy,
+                 *,install_lock,trusted_ingress=None):
+    """Stop the legacy generation against a verified candidate before activation."""
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or not supervisor._uuid4(operation):
+        raise TransitionError('Isolated Linux root is required')
+    _,_,approved,_=adoption.prepared_binding(journal,operation,active_env,policy_root,supervisor,policy)
+    install=supervisor._trusted_directory(approved.install_dir,0o700)
+    try:
+        expected=supervisor._open_root_file(install,'install.lock',0o600)
+        try:
+            held,named=os.fstat(install_lock),os.fstat(expected)
+            if (held.st_dev,held.st_ino)!=(named.st_dev,named.st_ino):raise TransitionError('Installation lock does not match')
+            supervisor._assert_exclusive_flock(install_lock)
+        finally:os.close(expected)
+        db=journal.db
+        db.execute("CREATE TABLE IF NOT EXISTS legacy_transitions(operation_id TEXT PRIMARY KEY, phase TEXT NOT NULL CHECK(phase IN ('starting','stopped','recovery_saved','snapshot_verified','restored','protected','removed','adopted','started','recovery_required'))) ")
+        if db.execute('SELECT 1 FROM legacy_transitions LIMIT 1').fetchone():raise TransitionError('Existing migration requires recovery')
+        marker=('servus-legacy-migration-v1 '+operation+'\n').encode('ascii')
+        fd=os.open(MARKER,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=install)
+        try:
+            os.fchmod(fd,0o600)
+            with os.fdopen(fd,'wb',closefd=False) as output:output.write(marker);output.flush();os.fsync(fd)
+        finally:os.close(fd)
+        os.fsync(install)
+        db.execute("INSERT INTO legacy_transitions VALUES(?,'starting')",(operation,))
+        try:
+            legacy.stop(journal,operation,active_env,source,old_image,old_image_id,old_ids,supervisor,daemon,adoption,quiescence,docker,
+                        install_lock=install_lock,trusted_ingress=trusted_ingress,candidate_policy=(policy_root,policy))
+            if db.execute("UPDATE legacy_transitions SET phase='stopped' WHERE operation_id=? AND phase='starting'",(operation,)).rowcount!=1:
+                raise TransitionError('Migration state changed')
+        except BaseException:
+            try:db.execute("UPDATE legacy_transitions SET phase='recovery_required' WHERE operation_id=? AND phase='starting'",(operation,))
+            except BaseException:pass
+            raise
+    finally:os.close(install)
 
 
 def transition(journal,operation,active_env,source,old_image,old_image_id,old_ids,old_env,old_compose,
@@ -46,14 +84,27 @@ def transition(journal,operation,active_env,source,old_image,old_image_id,old_id
         if adoption._binding(journal,operation,active_env,supervisor,daemon)!=(policy_path,accepted,approved,binding):raise TransitionError('Approved release changed')
         db=journal.db
         db.execute("CREATE TABLE IF NOT EXISTS legacy_transitions(operation_id TEXT PRIMARY KEY, phase TEXT NOT NULL CHECK(phase IN ('starting','stopped','recovery_saved','snapshot_verified','restored','protected','removed','adopted','started','recovery_required'))) ")
-        if db.execute('SELECT 1 FROM legacy_transitions LIMIT 1').fetchone():raise TransitionError('Existing migration requires recovery')
-        fd=os.open(MARKER,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=install)
-        try:
-            os.fchmod(fd,0o600)
-            with os.fdopen(fd,'wb',closefd=False) as output:output.write(marker);output.flush();os.fsync(fd)
-            info=os.fstat(fd);marker_identity=(info.st_dev,info.st_ino)
-        finally:os.close(fd)
-        os.fsync(install)
+        existing=db.execute('SELECT operation_id,phase FROM legacy_transitions').fetchall()
+        resumed=existing==[(operation,'stopped')]
+        if existing and not resumed:raise TransitionError('Existing migration requires recovery')
+        if resumed:
+            stopped=db.execute('SELECT preparation_id,attempt_id,nonce,root_digest,config_digest,policy_path,accepted_env,active_env,source,old_image,old_image_id,old_ids,state FROM legacy_stop_operations WHERE operation_id=?',(operation,)).fetchone()
+            if (not stopped or stopped[:9]!=(*binding,policy_path,accepted,active_env,source) or
+                stopped[9:12]!=(old_image,old_image_id,json.dumps(old_ids,sort_keys=True,separators=(',',':'))) or stopped[-1]!='stopped'):
+                raise TransitionError('Stopped legacy installation does not match')
+            fd=supervisor._open_root_file(install,MARKER,0o600)
+            try:
+                info=os.fstat(fd);marker_identity=(info.st_dev,info.st_ino)
+                if os.read(fd,len(marker)+1)!=marker:raise TransitionError('Migration marker changed')
+            finally:os.close(fd)
+        else:
+            fd=os.open(MARKER,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=install)
+            try:
+                os.fchmod(fd,0o600)
+                with os.fdopen(fd,'wb',closefd=False) as output:output.write(marker);output.flush();os.fsync(fd)
+                info=os.fstat(fd);marker_identity=(info.st_dev,info.st_ino)
+            finally:os.close(fd)
+            os.fsync(install)
         def verify_marker():
             supervisor._assert_exclusive_flock(install_lock)
             fd=supervisor._open_root_file(install,MARKER,0o600)
@@ -62,15 +113,16 @@ def transition(journal,operation,active_env,source,old_image,old_image_id,old_id
                 if ((opened.st_dev,opened.st_ino)!=marker_identity or (named.st_dev,named.st_ino)!=marker_identity or
                     os.read(fd,len(marker)+1)!=marker):raise TransitionError('Migration marker changed')
             finally:os.close(fd)
-        db.execute('BEGIN IMMEDIATE')
-        try:
-            verify_marker()
-            if db.execute('SELECT 1 FROM legacy_transitions LIMIT 1').fetchone():raise TransitionError('Existing migration requires recovery')
-            db.execute("INSERT INTO legacy_transitions VALUES(?,'starting')",(operation,));db.execute('COMMIT')
-        except BaseException:
-            if db.in_transaction:db.execute('ROLLBACK')
-            raise
-        phase='starting'
+        if not resumed:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                verify_marker()
+                if db.execute('SELECT 1 FROM legacy_transitions LIMIT 1').fetchone():raise TransitionError('Existing migration requires recovery')
+                db.execute("INSERT INTO legacy_transitions VALUES(?,'starting')",(operation,));db.execute('COMMIT')
+            except BaseException:
+                if db.in_transaction:db.execute('ROLLBACK')
+                raise
+        phase='stopped' if resumed else 'starting'
         def advance(next_phase):
             nonlocal phase
             verify_marker()
@@ -78,9 +130,10 @@ def transition(journal,operation,active_env,source,old_image,old_image_id,old_id
                 raise TransitionError('Migration state changed')
             phase=next_phase
         try:
-            legacy.stop(journal,operation,active_env,source,old_image,old_image_id,old_ids,supervisor,daemon,adoption,quiescence,docker,
-                        install_lock=install_lock,trusted_ingress=trusted_ingress)
-            advance('stopped')
+            if not resumed:
+                legacy.stop(journal,operation,active_env,source,old_image,old_image_id,old_ids,supervisor,daemon,adoption,quiescence,docker,
+                            install_lock=install_lock,trusted_ingress=trusted_ingress)
+                advance('stopped')
             recovery.capture(journal,operation,active_env,old_env,old_compose,recovery_dir,supervisor,daemon,adoption,policy,backup,quiescence,docker,
                              install_lock=install_lock,trusted_ingress=trusted_ingress)
             advance('recovery_saved')
