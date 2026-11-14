@@ -25,6 +25,80 @@ spec.loader.exec_module(daemon)
 
 @unittest.skipUnless(sys.platform == 'linux' and os.geteuid() == 0, 'Requires isolated Linux root')
 class DaemonTest(unittest.TestCase):
+    def test_host_apply_requires_protected_config_and_pinned_node(self):
+        with tempfile.TemporaryDirectory(dir='/root') as temporary:
+            root = Path(temporary)
+            for name in ('backup', 'policy', 'docker'):
+                (root / name).mkdir(mode=0o700)
+            node = Path(os.path.realpath(sys.executable))
+            node_hash = daemon.hashlib.sha256(node.read_bytes()).hexdigest()
+            config = {'backupRoot': str(root / 'backup'), 'policyRoot': str(root / 'policy'),
+                      'dockerConfig': str(root / 'docker'), 'nodePath': str(node),
+                      'nodeSha256': node_hash, 'trustedIngress': None}
+            path = root / 'apply.json'; path.write_text(json.dumps(config)); path.chmod(0o600)
+            runner = daemon.HostApply(str(path), str(root / 'journal.sqlite'), '/root/active', object())
+            fd = runner._node(); os.close(fd)
+            runner.config['nodeSha256'] = 'a' * 64
+            with self.assertRaises(supervisor.SupervisorError): runner._node()
+            path.chmod(0o644)
+            with self.assertRaises(supervisor.SupervisorError):
+                daemon.HostApply(str(path), str(root / 'journal.sqlite'), '/root/active', object())
+
+    def test_host_apply_uses_only_host_configuration_and_closes_resources(self):
+        with tempfile.TemporaryDirectory(dir='/root') as temporary:
+            root = Path(temporary)
+            for name in ('backup', 'policy', 'docker'):
+                (root / name).mkdir(mode=0o700)
+            node = Path(os.path.realpath(sys.executable))
+            config = {'backupRoot': str(root / 'backup'), 'policyRoot': str(root / 'policy'),
+                      'dockerConfig': str(root / 'docker'), 'nodePath': str(node),
+                      'nodeSha256': daemon.hashlib.sha256(node.read_bytes()).hexdigest(), 'trustedIngress': None}
+            path = root / 'apply.json'; path.write_text(json.dumps(config)); path.chmod(0o600)
+            runner = daemon.HostApply(str(path), str(root / 'journal.sqlite'), '/root/active', object())
+            journal = mock.Mock()
+            updater_module = SimpleNamespace(Journal=mock.Mock(return_value=journal))
+            apply = mock.Mock(return_value={'fixture': True})
+            modules = {'servus-updater': updater_module, 'update-coordinator': SimpleNamespace(apply_prepared_update=apply),
+                       'runtime-policy': object(), 'extract-install': object(), 'quiescence': object(), 'backup': object()}
+            def load(_module_name, filename, mode):
+                return modules[filename.removesuffix('.py')]
+            operation = str(uuid.uuid4()); hub = object(); maintenance = object()
+            with mock.patch.object(runner, '_load', side_effect=load):
+                self.assertEqual(runner(operation, hub, maintenance), {'fixture': True})
+            self.assertEqual(apply.call_args.args[1:4], (operation, hub, maintenance))
+            self.assertEqual(apply.call_args.args[5:10], (str(root / 'journal.sqlite'), '/root/active', str(root / 'backup'), str(root / 'policy'), str(root / 'docker')))
+            journal.close.assert_called_once()
+            with self.assertRaises(OSError): os.fstat(apply.call_args.args[10])
+
+    def test_apply_command_requires_enabled_handler_exact_fields_and_approved_hub(self):
+        operation_id = str(uuid.uuid4())
+        policy = object()
+        for scenario in ('allowed', 'disabled', 'extra', 'changed_policy'):
+            with self.subTest(scenario=scenario):
+                server, client = socket.socketpair()
+                listener = SimpleNamespace(accept=lambda: (server, None))
+                hub = SimpleNamespace(used=False, connections={role: object() for role in supervisor.ROLES}, policy=policy)
+                state = {'locked': False}
+                class Operation:
+                    def __enter__(self): state['locked'] = True; return self
+                    def __exit__(self, *_): state['locked'] = False
+                def run_update(value, passed_hub, _operation):
+                    self.assertTrue(state['locked'])
+                    self.assertEqual(value, operation_id)
+                    self.assertIs(passed_hub, hub)
+                apply = mock.Mock(side_effect=run_update)
+                request = {'version': 1, 'type': 'apply', 'operationId': operation_id}
+                if scenario == 'extra': request['image'] = 'untrusted'
+                client.sendall(json.dumps(request).encode() + b'\n')
+                try:
+                    approved = object() if scenario == 'changed_policy' else policy
+                    with mock.patch.object(supervisor, 'MaintenanceSupervisor', return_value=Operation()), mock.patch.object(daemon, 'load_approved_policy', return_value=approved):
+                        daemon.handle_command(listener, hub, '/install', '/gate', '/journal', '/policy', '/approval', '/env', apply=None if scenario == 'disabled' else apply)
+                    self.assertEqual(json.loads(client.recv(4096))['status'], 'starting' if scenario == 'allowed' else 'failed')
+                    self.assertEqual(apply.call_count, 1 if scenario == 'allowed' else 0)
+                finally:
+                    client.close()
+
     def test_resolves_current_policy_generation_and_rejects_drift(self):
         with tempfile.TemporaryDirectory(dir='/root') as temporary:
             path = Path(temporary) / 'journal.sqlite'

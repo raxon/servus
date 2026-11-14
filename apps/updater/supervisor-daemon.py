@@ -10,8 +10,10 @@ from contextlib import closing
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
+import pathlib
 import select
 import signal
 import socket
@@ -21,6 +23,7 @@ import struct
 import sys
 import time
 import urllib.parse
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import supervisor
@@ -149,6 +152,87 @@ def resolve_active_policy(approval_journal, active_env):
         return path, accepted_env, policy
     except (sqlite3.Error, ValueError, OSError) as error:
         raise supervisor.SupervisorError('Active policy generation is unavailable') from error
+
+
+class HostApply:
+    """Load update inputs only from root-owned host configuration."""
+
+    def __init__(self, config_path, approval_journal, active_env, ownership):
+        try:
+            config = json.loads(_private_file(config_path, 65536), object_pairs_hook=supervisor._pairs)
+            required = {'backupRoot', 'policyRoot', 'dockerConfig', 'nodePath', 'nodeSha256', 'trustedIngress'}
+            if (not isinstance(config, dict) or set(config) != required or
+                any(not isinstance(config[key], str) or not os.path.isabs(config[key]) or os.path.normpath(config[key]) != config[key]
+                    for key in ('backupRoot', 'policyRoot', 'dockerConfig', 'nodePath')) or
+                not isinstance(config['nodeSha256'], str) or not supervisor.HEX64.fullmatch(config['nodeSha256']) or
+                (config['trustedIngress'] is not None and (not isinstance(config['trustedIngress'], list) or len(config['trustedIngress']) != 4 or
+                 not all(isinstance(item, str) and item for item in config['trustedIngress']) or
+                 not supervisor.CONTAINER.fullmatch(config['trustedIngress'][0]) or
+                 not supervisor.IMAGE_ID.fullmatch(config['trustedIngress'][3])))):
+                raise supervisor.SupervisorError('Invalid host update configuration')
+            if not isinstance(approval_journal, str) or os.path.basename(approval_journal) != 'journal.sqlite' or not active_env:
+                raise supervisor.SupervisorError('Invalid host update configuration')
+            self.config, self.approval_journal, self.active_env, self.ownership = config, approval_journal, active_env, ownership
+            self.module_dir = os.path.dirname(os.path.realpath(__file__))
+            for key in ('backupRoot', 'policyRoot', 'dockerConfig'):
+                fd = supervisor._trusted_directory(config[key], 0o700)
+                os.close(fd)
+        except (OSError, ValueError, TypeError, RecursionError) as error:
+            raise supervisor.SupervisorError('Invalid host update configuration') from error
+
+    def _load(self, name, filename, mode=0o644):
+        directory = supervisor._trusted_directory(self.module_dir)
+        try:
+            fd = supervisor._open_root_file(directory, filename, mode)
+            os.close(fd)
+        finally:
+            os.close(directory)
+        spec = importlib.util.spec_from_file_location(name, os.path.join(self.module_dir, filename))
+        if not spec or not spec.loader:
+            raise supervisor.SupervisorError('Host update module is unavailable')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _node(self):
+        parent, name = os.path.split(self.config['nodePath'])
+        directory = supervisor._trusted_directory(parent)
+        try:
+            fd = supervisor._open_root_file(directory, name, 0o755)
+        finally:
+            os.close(directory)
+        try:
+            digest = hashlib.sha256()
+            while chunk := os.read(fd, 65536):
+                digest.update(chunk)
+            if digest.hexdigest() != self.config['nodeSha256']:
+                raise supervisor.SupervisorError('Host Node executable does not match configuration')
+            os.lseek(fd, 0, os.SEEK_SET)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def __call__(self, operation_id, hub, maintenance):
+        modules = {name: self._load('servus_host_' + name.replace('-', '_'), name + '.py', 0o755 if name == 'servus-updater' else 0o644)
+                   for name in ('servus-updater', 'update-coordinator', 'runtime-policy', 'extract-install', 'quiescence', 'backup')}
+        node_fd = self._node()
+        journal = None
+        try:
+            state = pathlib.Path(self.approval_journal).parent
+            state_fd = supervisor._trusted_directory(str(state), 0o700)
+            os.close(state_fd)
+            journal = modules['servus-updater'].Journal(state)
+            daemon = SimpleNamespace(resolve_active_policy=resolve_active_policy, approved_policy_binding=approved_policy_binding)
+            ingress = tuple(self.config['trustedIngress']) if self.config['trustedIngress'] is not None else None
+            return modules['update-coordinator'].apply_prepared_update(journal, operation_id, hub, maintenance,
+                self.ownership, self.approval_journal, self.active_env, self.config['backupRoot'], self.config['policyRoot'],
+                self.config['dockerConfig'], node_fd, supervisor, daemon, modules['extract-install'], modules['runtime-policy'],
+                modules['quiescence'], modules['backup'], trusted_ingress=ingress)
+        finally:
+            if journal is not None:
+                journal.close()
+            os.close(node_fd)
 
 
 def complete_healthy_preparation(hub, approval_journal, operation_id, policy_path, accepted_env, *, maintenance=None):
@@ -336,7 +420,7 @@ def command_listener(directory):
         raise
 
 
-def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env):
+def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env, *, apply=None):
     connection, _ = listener.accept()
     try:
         _, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
@@ -362,7 +446,8 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
                 (kind == 'stop' and (set(request) != {'version', 'type', 'operationId', 'timeoutMs'} or
                  type(request['timeoutMs']) is not int or not 1 <= request['timeoutMs'] <= 60000)) or
                 (kind == 'complete' and set(request) != {'version', 'type', 'operationId'}) or
-                kind not in ('stop', 'complete')):
+                (kind == 'apply' and (set(request) != {'version', 'type', 'operationId'} or apply is None)) or
+                kind not in ('stop', 'complete', 'apply')):
             raise supervisor.SupervisorError('Invalid or unavailable command')
         with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
             # The installation lock remains held through validation and drain.
@@ -375,10 +460,13 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
             if kind == 'complete':
                 complete_healthy_preparation(hub, approval_journal, request['operationId'], policy_path, accepted_env, maintenance=operation)
                 result = 'completed'
+            elif kind == 'apply':
+                apply(request['operationId'], hub, operation)
+                result = 'starting'
             else:
                 result = operation.stop_after_drain(hub, request['operationId'], request['timeoutMs'])
         supervisor._send_message(connection, {'version': 1, 'status': result}, time.monotonic() + 5)
-    except (supervisor.SupervisorError, OSError, ValueError):
+    except Exception:
         try:
             supervisor._send_message(connection, {'version': 1, 'status': 'failed'}, time.monotonic() + 1)
         except (supervisor.SupervisorError, OSError):
@@ -401,6 +489,8 @@ def run(args):
     try:
         ownership = DaemonOwnership(args.socket_dir, args.journal_dir, args.gid)
         active_env = getattr(args, 'active_env', None)
+        apply_config = getattr(args, 'apply_config', None)
+        host_apply = HostApply(apply_config, args.approval_journal, active_env, ownership) if apply_config else None
         with supervisor.MaintenanceSupervisor(args.install_dir, args.gate_dir, args.journal_dir):
             if active_env:
                 policy_path, accepted_env, policy = resolve_active_policy(args.approval_journal, active_env)
@@ -434,7 +524,7 @@ def run(args):
                 continue
             if control in ready:
                 handle_command(control, hub, args.install_dir, args.gate_dir, args.journal_dir,
-                               policy_path, args.approval_journal, accepted_env)
+                               policy_path, args.approval_journal, accepted_env, apply=host_apply)
                 if hub and hub.used:
                     hub.close()
                     hub = None
@@ -472,6 +562,7 @@ def main():
     for name in ('policy', 'install-dir', 'gate-dir', 'journal-dir', 'secret-dir', 'socket-dir', 'approval-journal', 'accepted-env'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--active-env')
+    parser.add_argument('--apply-config')
     parser.add_argument('--uid', type=int, required=True)
     parser.add_argument('--gid', type=int, required=True)
     try:
