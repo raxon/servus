@@ -93,16 +93,16 @@ class PreparationFenceTest(unittest.TestCase):
 
     def test_success_is_published_only_after_unit_exits(self):
         operation = self.journal.claim_preparation(OP)
-        probe = self.journal.record_extraction_probe(operation, 'prepare')
-        self.journal.complete_extraction_probe(operation, probe)
-        staged = '/run/servus-install-' + 'd' * 32
-        self.journal.stage_preparation(operation, staged)
         class Process:
             result = None
             def poll(self): return self.result
         process = Process()
         worker = updater.PreparationWorker(self.journal, pathlib.Path(self.tmp.name), lambda _: process)
         worker.tick()
+        probe = self.journal.record_extraction_probe(operation, 'prepare')
+        self.journal.complete_extraction_probe(operation, probe)
+        staged = '/run/servus-install-' + 'd' * 32
+        self.journal.stage_preparation(operation, staged)
         worker.tick()
         self.assertEqual(self.journal.preparation_status(OP)['status'], 'preparing')
         process.result = 0
@@ -111,16 +111,31 @@ class PreparationFenceTest(unittest.TestCase):
 
     def test_failed_unit_keeps_staging_path_for_recovery(self):
         operation = self.journal.claim_preparation(OP)
+        class Process:
+            def poll(self): return 1
+        worker = updater.PreparationWorker(self.journal, pathlib.Path(self.tmp.name), lambda _: Process())
+        worker.tick()
         probe = self.journal.record_extraction_probe(operation, 'prepare')
         self.journal.complete_extraction_probe(operation, probe)
         staged = '/run/servus-install-' + 'd' * 32
         self.journal.stage_preparation(operation, staged)
-        class Process:
-            def poll(self): return 1
-        worker = updater.PreparationWorker(self.journal, pathlib.Path(self.tmp.name), lambda _: Process())
-        worker.tick(); worker.tick()
+        worker.tick()
         row = self.journal.db.execute('SELECT status,staging_path FROM preparations WHERE operation_id=?', (OP,)).fetchone()
         self.assertEqual(row, ('recovery_required', staged))
+
+    def test_policy_preparation_does_not_launch_a_second_extractor(self):
+        operation = self.journal.claim_preparation(OP)
+        probe = self.journal.record_extraction_probe(operation, 'prepare')
+        self.journal.complete_extraction_probe(operation, probe)
+        staged = '/run/servus-install-' + 'd' * 32
+        self.journal.stage_preparation(operation, staged)
+        self.journal.finish_preparation(operation, staged)
+        self.journal.db.execute("UPDATE preparations SET status='preparing' WHERE operation_id=?", (OP,))
+        launched = []
+        worker = updater.PreparationWorker(self.journal, pathlib.Path(self.tmp.name), lambda item: launched.append(item))
+        worker.tick()
+        self.assertEqual(launched, [])
+        self.assertEqual(self.journal.preparation_status(OP)['status'], 'preparing')
 
 
 if __name__ == '__main__':

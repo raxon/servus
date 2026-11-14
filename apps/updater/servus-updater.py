@@ -252,7 +252,7 @@ class Journal:
         cursor = self.db.execute("UPDATE preparations SET status=?,staging_path=CASE WHEN ?='prepared' THEN ? ELSE staging_path END WHERE operation_id=? AND status='preparing' AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND EXISTS (SELECT 1 FROM operations WHERE id=? AND status='verified' AND attempt_id=? AND attempt_nonce=? AND config_digest=?) AND (? != 'prepared' OR (NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM extraction_probes WHERE operation_id=? AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND purpose='prepare' AND status='removed')))", (status, status, staging_path, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['configDigest'], status, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId']))
         if cursor.rowcount != 1: raise RuntimeError('Unexpected preparation state')
 
-    def preparing(self, operation_id=None, preparation_id=None):
+    def preparing(self, operation_id=None, preparation_id=None, *, unstaged_only=False):
         """Return a pending claim only while its verified attempt still matches."""
         if operation_id is not None and not valid_uuid(operation_id):
             raise ValueError('Invalid operation identity')
@@ -263,6 +263,8 @@ class Journal:
                  "WHERE p.status='preparing' AND o.status='verified' AND p.attempt_id=o.attempt_id "
                  "AND p.attempt_nonce=o.attempt_nonce AND o.config_digest IS NOT NULL")
         params = []
+        if unstaged_only:
+            query += ' AND p.staging_path IS NULL'
         if operation_id is not None:
             query += ' AND o.id=?'; params.append(operation_id)
         if preparation_id is not None:
@@ -893,7 +895,7 @@ class PreparationWorker:
 
     def tick(self):
         if self.process is None:
-            operation = self.journal.preparing()
+            operation = self.journal.preparing(unstaged_only=True)
             if operation is None: return
             self.operation = operation
             try:
