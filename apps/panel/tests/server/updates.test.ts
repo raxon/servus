@@ -59,6 +59,15 @@ describe('update management API',()=>{
     expect((await app.inject({url:'/api/v1/updates',headers})).json().applyAvailable).toBe(false);
     expect((await app.inject({method:'POST',url:'/api/v1/updates',headers,payload:release})).statusCode).toBe(503);
   });
+  it('discovers releases with the installed version and rejects non-admin access',async()=>{
+    const {app,headers,member,socketPath}=await fixture(true,true),requests:string[]=[];
+    const candidate={status:'candidate',verified:false,tag:release.tag,commit:release.commit,digest:release.digest};
+    await serve(socketPath,{ok:true,operation:candidate},requests);
+    expect((await app.inject({url:'/api/v1/updates/discovery',headers:member})).statusCode).toBe(403);
+    const response=await app.inject({url:'/api/v1/updates/discovery',headers});
+    expect(response.statusCode).toBe(200); expect(response.json().discovery).toEqual(candidate);
+    expect(JSON.parse(requests[0]!)).toEqual({version:1,action:'discover',current:'v1.0.0'});
+  });
   it('blocks unauthorized stages and prepared downgrades before dispatch',async()=>{
     const {app,headers,member,socketPath}=await fixture(true,true,'2.0.0'),requests:string[]=[];
     await serve(socketPath,{ok:true,operation:{...release,status:'verified',createdAt:'2026-11-14 12:00:00'}},requests);

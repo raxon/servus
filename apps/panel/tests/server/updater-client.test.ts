@@ -2,7 +2,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { submitUpdate, updateStatus, retryUpdate, prepareUpdate, applyUpdate, applyStatus, UpdaterClientError, type UpdateSubmission } from '../../src/server/updater-client.js';
+import { submitUpdate, updateStatus, retryUpdate, prepareUpdate, applyUpdate, applyStatus, discoverUpdate, UpdaterClientError, type UpdateSubmission } from '../../src/server/updater-client.js';
 
 const input: UpdateSubmission = { operationId: '12345678-1234-4123-8123-123456789abc', commit: 'a'.repeat(40), digest: `sha256:${'b'.repeat(64)}`, tag: 'v1.2.3' };
 const operation = { ...input, status: 'accepted', createdAt: '2026-11-14 10:00:00' };
@@ -35,6 +35,15 @@ async function failure(promise: Promise<unknown>, code: string, certainty: strin
 }
 
 describe('updater Unix socket client', () => {
+  it('accepts only a correctly shaped discovery result for the requested version', async () => {
+    const options = await fixture((socket, request) => {
+      expect(JSON.parse(request)).toEqual({version: 1, action: 'discover', current: 'v1.0.0'});
+      socket.end(JSON.stringify({ok: true, operation: {status: 'no_newer_version', current: 'v1.0.0', latest: 'v1.0.0'}}) + '\n');
+    });
+    await expect(discoverUpdate('v1.0.0', options)).resolves.toMatchObject({status: 'no_newer_version'});
+    const wrong = await fixture(socket => socket.end(JSON.stringify({ok: true, operation: {status: 'no_newer_version', current: 'v2.0.0', latest: 'v2.0.0'}}) + '\n'));
+    await failure(discoverUpdate('v1.0.0', wrong), 'invalid_response', 'uncertain');
+  });
   it('validates preparation and apply responses against their specific protocol', async () => {
     const prepared = { operationId: input.operationId, preparationId: '12345678-1234-4123-8123-123456789abd', status: 'prepared' };
     const options = await fixture((socket, request) => {

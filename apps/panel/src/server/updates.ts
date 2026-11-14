@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { AppError } from './errors.js';
-import { updateStatus, submitUpdate, retryUpdate, prepareUpdate, applyUpdate, applyStatus, UpdaterClientError } from './updater-client.js';
+import { updateStatus, submitUpdate, retryUpdate, prepareUpdate, applyUpdate, applyStatus, discoverUpdate, UpdaterClientError } from './updater-client.js';
 
 const operationId = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const submission = z.strictObject({
@@ -55,6 +55,16 @@ export function registerUpdates(app: FastifyInstance, options: UpdateRoutesOptio
   app.get('/api/v1/updates', { config: { rateLimit } }, async request => {
     options.administrator(request);
     return { applyAvailable: enabled, verificationStatusConfigured: Boolean(options.socketPath) };
+  });
+  app.get('/api/v1/updates/discovery', { config: { rateLimit } }, async request => {
+    options.administrator(request);
+    const endpoint = socket(), current = `v${options.currentVersion!.replace(/^v/, '')}`;
+    try {
+      const discovery = await discoverUpdate(current, endpoint);
+      if ((discovery.status === 'candidate' || discovery.status === 'release_pending') && !newerRelease(discovery.tag, current))
+        throw new AppError('UPDATER_UNAVAILABLE', 'The release information is inconsistent', 503);
+      return {discovery};
+    } catch (error) { if (error instanceof AppError) throw error; updateError(error); }
   });
   app.get<{Params:{operationId:string}}>('/api/v1/updates/:operationId', { config: { rateLimit } }, async request => {
     options.administrator(request);

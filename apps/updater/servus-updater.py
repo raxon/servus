@@ -26,6 +26,7 @@ import time
 MAX_REQUEST = 4096
 EXECUTOR = pathlib.Path('/usr/local/libexec/servus/verification-executor.py')
 PREPARATION_FENCE = pathlib.Path('/usr/local/libexec/servus/preparation-fence.py')
+DISCOVERY_EXECUTOR = pathlib.Path('/usr/local/libexec/servus/discover-release.py')
 FENCE_MODULE = pathlib.Path('/usr/local/libexec/servus/verification-fence.py')
 FENCE_ROOT = pathlib.Path('/run/servus-updater/fences')
 NSS_CONFIG = pathlib.Path('/etc/nsswitch.conf')
@@ -980,10 +981,87 @@ class ApplyWorker:
             self.journal.db.execute("UPDATE apply_requests SET state='recovery_required' WHERE operation_id=? AND state='dispatching'", (self.operation,))
 
 
-def process(journal, request, *, allow_apply=False):
+class DiscoveryWorker:
+    """Run bounded release discovery without blocking updater requests."""
+
+    def __init__(self, launcher=None):
+        self.launcher = launcher or self._launch
+        self.process = None
+        self.current = None
+        self.started = 0.0
+        self.result = None
+        self.finished = 0.0
+
+    @staticmethod
+    def _launch(current):
+        trusted_root_file(DISCOVERY_EXECUTOR)
+        python = pathlib.Path(PYTHON).resolve(strict=True)
+        trusted_root_file(python)
+        return subprocess.Popen([str(python), '-I', '-B', str(DISCOVERY_EXECUTOR), '--current', current],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd='/', env=CLEAN_ENV, close_fds=True)
+
+    def request(self, current):
+        if not isinstance(current, str) or len(current) > 64 or not TAG_PATTERN.fullmatch(current):
+            raise ProtocolError('invalid_request')
+        if self.process is not None:
+            return {'status': 'checking'}
+        if self.current == current and self.result is not None and time.monotonic() - self.finished < 30:
+            return self.result
+        self.current, self.result, self.started = current, None, time.monotonic()
+        try:
+            self.process = self.launcher(current)
+        except (OSError, RuntimeError, ValueError):
+            self.result, self.finished = {'status': 'unavailable'}, time.monotonic()
+            return self.result
+        return {'status': 'checking'}
+
+    def tick(self):
+        if self.process is None:
+            return
+        if self.process.poll() is None and time.monotonic() - self.started < 50:
+            return
+        try:
+            if self.process.poll() is None:
+                self.process.kill()
+            output, _ = self.process.communicate(timeout=3)
+            value = json.loads(output, object_pairs_hook=no_duplicate_keys) if self.process.returncode == 0 and len(output) <= 8192 else None
+            if not isinstance(value, dict):
+                raise ValueError()
+            kind = value.get('status')
+            valid_tag = lambda tag: isinstance(tag, str) and len(tag) <= 64 and TAG_PATTERN.fullmatch(tag) is not None
+            if kind in ('no_newer_version', 'ahead'):
+                valid = set(value) == {'status', 'current', 'latest'} and value['current'] == self.current and valid_tag(value['latest'])
+            elif kind == 'release_pending':
+                valid = (set(value) == {'status', 'verified', 'tag', 'commit', 'reason'} and value['verified'] is False and
+                         valid_tag(value['tag']) and isinstance(value['commit'], str) and COMMIT_PATTERN.fullmatch(value['commit']) is not None and value['reason'] == 'manifest_not_available')
+            elif kind == 'candidate':
+                valid = (set(value) == {'status', 'verified', 'tag', 'commit', 'digest'} and value['verified'] is False and
+                         valid_tag(value['tag']) and isinstance(value['commit'], str) and COMMIT_PATTERN.fullmatch(value['commit']) is not None and
+                         isinstance(value['digest'], str) and DIGEST_PATTERN.fullmatch(value['digest']) is not None)
+            else:
+                valid = False
+            self.result = value if valid else {'status': 'unavailable'}
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            self.result = {'status': 'unavailable'}
+        finally:
+            self.process = None
+            self.finished = time.monotonic()
+
+    def close(self):
+        if self.process is not None:
+            self.process.kill()
+            try: self.process.communicate(timeout=3)
+            except subprocess.SubprocessError: pass
+            self.process = None
+
+
+def process(journal, request, *, allow_apply=False, discovery=None):
     if not isinstance(request, dict) or request.get('version') != 1 or type(request.get('version')) is not int:
         raise ProtocolError('invalid_request')
     action = request.get('action')
+    if action == 'discover' and set(request) == {'version', 'action', 'current'}:
+        if discovery is None: raise ProtocolError('unavailable')
+        return discovery.request(request['current'])
     if action == 'submit' and set(request) == {'version', 'action', 'operationId', 'commit', 'digest', 'tag'}:
         operation_id, commit, digest, tag = request['operationId'], request['commit'], request['digest'], request['tag']
         if not valid_uuid(operation_id) or not isinstance(commit, str) or not COMMIT_PATTERN.fullmatch(commit) or not isinstance(digest, str) or not DIGEST_PATTERN.fullmatch(digest) or not isinstance(tag, str) or len(tag) > 64 or not TAG_PATTERN.fullmatch(tag):
@@ -1062,6 +1140,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
         worker = VerificationWorker(journal, launcher, (lambda _: None) if launcher else None, (lambda _: None) if launcher else None)
         preparation_worker = PreparationWorker(journal, state)
         apply_worker = ApplyWorker(journal, supervisor_socket) if supervisor_socket is not None else None
+        discovery_worker = DiscoveryWorker() if supervisor_socket is not None else None
         socket_path = directory / 'updater.sock'
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         bound_inode = None
@@ -1102,6 +1181,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
                 worker.tick()
                 preparation_worker.tick()
                 if apply_worker is not None: apply_worker.tick()
+                if discovery_worker is not None: discovery_worker.tick()
                 try:
                     client, _ = server.accept()
                 except TimeoutError:
@@ -1112,7 +1192,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
                         _pid, uid, _gid = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
                         if uid != allowed_uid:
                             raise ProtocolError('unauthorized')
-                        value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None)
+                        value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None, discovery=discovery_worker)
                         response = {'ok': True, 'operation': value}
                     except ProtocolError as error:
                         response = {'ok': False, 'error': error.code}
@@ -1126,6 +1206,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
             worker.close()
             preparation_worker.close()
             if apply_worker is not None: apply_worker.close()
+            if discovery_worker is not None: discovery_worker.close()
             server.close()
             try:
                 info = socket_path.lstat()
