@@ -73,14 +73,16 @@ def main():
                         calls.append('synthetic-pull')
                         return b''
                     if args[:2] == ('image', 'inspect') and args[-1] == reference:
-                        actual = json.loads(original('image', 'inspect', '--platform=linux/amd64', '--format', '{{json .}}', image_id))
+                        platform = ('--platform=linux/amd64',) if '--platform=linux/amd64' in args else ()
+                        actual = json.loads(original('image', 'inspect', *platform, '--format', '{{json .}}', image_id))
                         actual['RepoDigests'] = [reference]
                         calls.append('synthetic-registry-identity')
                         return json.dumps(actual).encode()
                     calls.append(args[0])
                     return original(*args, **kwargs)
                 extractor._docker = fake_registry
-                stage = pathlib.Path(prepare.prepare_verified(journal, operation_id, str(staging), extractor))
+                selected_id = json.loads(original('image', 'inspect', '--platform=linux/amd64', '--format', '{{json .}}', image_id))['Id']
+                stage = pathlib.Path(prepare.prepare_verified(journal, operation_id, str(staging), extractor, resolve_child=lambda _root, _config: selected_id))
                 assert journal.db.execute('SELECT status,staging_path FROM preparations').fetchone() == ('prepared', str(stage))
                 assert set(str(p.relative_to(stage)) for p in stage.rglob('*') if p.is_file()) == set(extractor.FILES)
                 for name in extractor.FILES:

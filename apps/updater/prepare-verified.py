@@ -18,7 +18,7 @@ class PreparationError(Exception):
     """A prepared image could not be established safely."""
 
 
-def prepare_verified(journal, operation_id, staging_parent, extractor):
+def prepare_verified(journal, operation_id, staging_parent, extractor, *, resolve_child=None):
     """Stage installation files for a durable, previously verified operation.
 
     The caller must provide trusted journal and extractor instances loaded from
@@ -42,18 +42,30 @@ def prepare_verified(journal, operation_id, staging_parent, extractor):
         # A timeout or interruption can leave daemon-side work in progress.
         # Journal recovery remains fail-closed until a coordinator reconciles it.
         extractor._docker('pull', '--platform=linux/amd64', reference, timeout=900, limit=4 * 1024 * 1024)
-        raw = extractor._docker('image', 'inspect', '--platform=linux/amd64', '--format', '{{json .}}', reference)
+        raw = extractor._docker('image', 'inspect', '--format', '{{json .}}', reference)
+        selected_raw = extractor._docker('image', 'inspect', '--platform=linux/amd64', '--format', '{{json .}}', reference)
         try:
             image = json.loads(raw)
+            selected = json.loads(selected_raw)
         except (ValueError, UnicodeError, RecursionError) as error:
             raise PreparationError('Pulled image inspection failed') from error
-        if not isinstance(image, dict):
+        if not isinstance(image, dict) or not isinstance(selected, dict):
             raise PreparationError('Pulled image inspection failed')
         image_id, references = image.get('Id'), image.get('RepoDigests')
         if (image_id not in (root_digest, config_digest) or not isinstance(references, list) or
-                reference not in references or image.get('Os') != 'linux' or image.get('Architecture') != 'amd64'):
+                reference not in references or not isinstance(selected.get('Id'), str) or
+                not DIGEST.fullmatch(selected['Id']) or selected.get('Os') != 'linux' or selected.get('Architecture') != 'amd64'):
             raise PreparationError('Pulled image identity rejected')
-        stage = extractor.extract(image_id, staging_parent)
+        selected_id = selected['Id']
+        verified_ids = {root_digest, config_digest}
+        if selected_id not in verified_ids:
+            if resolve_child is None:
+                raise PreparationError('Verified platform manifest is required')
+            child = resolve_child(root_digest, config_digest)
+            if not isinstance(child, str) or not DIGEST.fullmatch(child) or child != selected_id:
+                raise PreparationError('Platform image identity rejected')
+            verified_ids.add(child)
+        stage = extractor.extract(image_id, staging_parent, verified_platform_ids=tuple(sorted(verified_ids - {image_id})))
         journal.finish_preparation(operation, stage)
         return stage
     except BaseException:

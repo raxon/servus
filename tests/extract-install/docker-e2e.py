@@ -43,6 +43,7 @@ def main():
         (context / 'Dockerfile').write_text('FROM scratch\nCOPY inputs/ /opt/servus/install/\n')
         docker('build', '--platform=linux/amd64', '--network=none', '--pull=false', '--tag', image, str(context))
         image_id = docker('image', 'inspect', '--format', '{{.Id}}', image)
+        selected_id = image_id if unsupported else docker('image', 'inspect', '--platform=linux/amd64', '--format', '{{.Id}}', image)
         staging = pathlib.Path(temporary, 'staging')
         staging.mkdir(mode=0o700)
         def tracked(*args, **kwargs):
@@ -55,15 +56,15 @@ def main():
         extractor._docker = tracked
         if unsupported:
             try:
-                extractor.extract(image_id, str(staging))
+                extractor.extract(image_id, str(staging), verified_platform_ids=(selected_id,))
             except extractor.ExtractionError:
                 pass
             else:
                 raise AssertionError('Unsupported Docker must reject extraction')
-            assert commands == ['image'] and not observed and not list(staging.iterdir())
+            assert commands == ['image', 'image'] and not observed and not list(staging.iterdir())
             print('Unsupported Docker rejected extraction without creating a probe')
             return
-        result = pathlib.Path(extractor.extract(image_id, str(staging)))
+        result = pathlib.Path(extractor.extract(image_id, str(staging), verified_platform_ids=(selected_id,)))
         assert len(observed) == 1
         assert subprocess.run(['/usr/bin/docker', 'inspect', observed[0]], stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, env=extractor.ENV).returncode != 0

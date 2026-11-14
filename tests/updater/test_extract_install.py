@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import shutil
@@ -110,7 +111,8 @@ class ExtractTest(unittest.TestCase):
     def docker(self, *args, **_kwargs):
         self.commands.append(args)
         if args[:2] == ('image', 'inspect'):
-            return (b'{}' if '{{json .Config}}' in args else (self.image + '\n').encode())
+            return (json.dumps({'Id': self.image, 'Os': 'linux', 'Architecture': 'amd64', 'Config': {}}).encode()
+                    if '{{json .}}' in args else (self.image + '\n').encode())
         if args[0] == 'create': return (self.cid + '\n').encode()
         if args[0] == 'inspect': return (self.image + ' created\n').encode()
         if args[0] == 'cp': return make_archive()
@@ -123,7 +125,8 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(pathlib.Path(result, 'scripts/install.sh').read_bytes(), b'fixture:scripts/install.sh')
         self.assertEqual(stat_mode(pathlib.Path(result, 'scripts/install.sh')), 0o755)
         self.assertEqual(self.commands[-1], ('rm', '-v', self.cid))
-        self.assertTrue(all('--platform=linux/amd64' in cmd for cmd in self.commands[:2]))
+        self.assertNotIn('--platform=linux/amd64', self.commands[0])
+        self.assertIn('--platform=linux/amd64', self.commands[1])
         self.assertIn('--network=none', self.commands[2])
         self.assertIn('--platform=linux/amd64', self.commands[2])
         self.assertIn('--pull=never', self.commands[2])
@@ -146,11 +149,30 @@ class ExtractTest(unittest.TestCase):
 
     def test_rejects_extra_volumes_and_no_probe_created(self):
         def volumes(*args, **kwargs):
-            if '{{json .Config}}' in args: return b'{"Volumes":{"/data":{}}}'
+            if '{{json .}}' in args: return json.dumps({'Id':self.image,'Os':'linux','Architecture':'amd64','Config':{'Volumes':{'/data':{}}}}).encode()
             return self.docker(*args, **kwargs)
         with mock.patch.object(extractor, '_docker', side_effect=volumes):
             with self.assertRaises(extractor.ExtractionError): extractor.extract(self.image, self.parent)
         self.assertFalse(any(args[0] == 'create' for args in self.commands))
+
+    def test_index_accepts_only_the_platform_selected_by_docker(self):
+        child = 'sha256:' + 'c' * 64
+        def index(*args, **kwargs):
+            if args[:2] == ('image', 'inspect') and '{{json .}}' in args:
+                return json.dumps({'Id':child,'Os':'linux','Architecture':'amd64','Config':{}}).encode()
+            if args[0] == 'inspect': return (child + ' created\n').encode()
+            return self.docker(*args, **kwargs)
+        with mock.patch.object(extractor, '_docker', side_effect=index):
+            result = extractor.extract(self.image, self.parent, verified_platform_ids=(child,))
+        self.assertTrue(pathlib.Path(result).is_dir())
+        shutil.rmtree(result)
+        def foreign(*args, **kwargs):
+            if args[0] == 'inspect': return ('sha256:' + 'd' * 64 + ' created\n').encode()
+            return index(*args, **kwargs)
+        with mock.patch.object(extractor, '_docker', side_effect=foreign), self.assertRaises(extractor.ExtractionError):
+            extractor.extract(self.image, self.parent, verified_platform_ids=(child,))
+        with mock.patch.object(extractor, '_docker', side_effect=index), self.assertRaises(extractor.ExtractionError):
+            extractor.extract(self.image, self.parent)
 
     def test_fails_closed_if_probe_removal_fails(self):
         def bad_rm(*args, **kwargs):

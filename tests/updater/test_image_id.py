@@ -89,6 +89,22 @@ class ImageIdTests(unittest.TestCase):
         with self.assertRaises(module.VerificationError): module.decode_oci_json(b'{"os":"linux","os":"windows"}')
         with self.assertRaises(module.VerificationError): module.decode_oci_json(b'{"x":NaN}')
 
+    def test_revalidation_binds_root_child_and_config(self):
+        registry = Registry(True)
+        self.assertEqual(module.revalidate_amd64_identity(registry, registry.image_digest, registry.config_id), registry.child_id)
+        with self.assertRaises(module.VerificationError):
+            module.revalidate_amd64_identity(registry, registry.image_digest, 'sha256:' + 'f'*64)
+        original = registry.child
+        registry.child = original + b' '
+        with self.assertRaises(module.VerificationError):
+            module.revalidate_amd64_identity(registry, registry.image_digest, registry.config_id)
+        registry.child = original
+        registry.config += b' '
+        with self.assertRaises(module.VerificationError):
+            module.revalidate_amd64_identity(registry, registry.image_digest, registry.config_id)
+        direct = Registry(False)
+        self.assertEqual(module.revalidate_amd64_identity(direct, direct.image_digest, direct.config_id), direct.image_digest)
+
 
 if __name__ == '__main__':
     unittest.main()

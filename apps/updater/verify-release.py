@@ -114,8 +114,8 @@ def verify_bytes(data, digest, size=None):
     if hashlib.sha256(data).hexdigest() != digest[7:]:
         raise VerificationError('OCI content digest mismatch')
 
-def resolve_amd64_config_digest(registry, image):
-    """Resolve an authenticated image manifest to its Docker config digest."""
+def _resolve_amd64(registry, image):
+    child_digest = None
     if image.get('mediaType') in (OCI_INDEX, DOCKER_INDEX):
         manifests = image.get('manifests')
         if not isinstance(manifests, list) or len(manifests) > 64:
@@ -135,6 +135,7 @@ def resolve_amd64_config_digest(registry, image):
             raise VerificationError('Invalid image descriptor')
         data = registry.manifest(ref)
         verify_bytes(data, ref, size)
+        child_digest = ref
         image = decode_oci_json(data)
         if not isinstance(image, dict) or image.get('mediaType') != descriptor['mediaType']:
             raise VerificationError('Image descriptor media type mismatch')
@@ -153,7 +154,27 @@ def resolve_amd64_config_digest(registry, image):
     parsed = decode_oci_json(data)
     if not isinstance(parsed, dict) or parsed.get('os') != 'linux' or parsed.get('architecture') != 'amd64':
         raise VerificationError('Image config platform mismatch')
-    return ref
+    return child_digest, ref
+
+def resolve_amd64_config_digest(registry, image):
+    """Resolve an authenticated image manifest to its Docker config digest."""
+    return _resolve_amd64(registry, image)[1]
+
+def revalidate_amd64_identity(registry, root_digest, config_digest):
+    """Bind the selected manifest to a previously authenticated root and config.
+
+    This does not verify an attestation. The caller must already have verified
+    the root digest and must enforce the registry's bounded process deadline.
+    """
+    if (not isinstance(root_digest, str) or not DIGEST_PATTERN.fullmatch(root_digest) or
+        not isinstance(config_digest, str) or not DIGEST_PATTERN.fullmatch(config_digest)):
+        raise VerificationError('Invalid verified image identity')
+    data = registry.manifest(root_digest)
+    verify_bytes(data, root_digest)
+    child, observed = _resolve_amd64(registry, decode_oci_json(data))
+    if observed != config_digest:
+        raise VerificationError('Image config differs from verified release')
+    return child or root_digest
 
 def decode_oci_json(data):
     def unique(pairs):

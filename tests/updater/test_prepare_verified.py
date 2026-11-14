@@ -27,7 +27,7 @@ class FakeExtractor:
             if self.fail: raise self.ExtractionError('pull failed')
             return b''
         return json.dumps(self.image).encode()
-    def extract(self, image_id, parent):
+    def extract(self, image_id, parent, **kwargs):
         self.calls.append(('extract', image_id))
         if self.fail: raise self.ExtractionError('extract failed')
         return os.path.join(parent, 'servus-install-' + 'f' * 32)
@@ -47,8 +47,8 @@ class PreparationTests(unittest.TestCase):
         attempt = self.journal.claim()
         self.journal.finish(attempt, 'verified', CONFIG)
         return attempt
-    def run_prepare(self, extractor):
-        return preparer.prepare_verified(self.journal, ID, self.tmp.name, extractor)
+    def run_prepare(self, extractor, **kwargs):
+        return preparer.prepare_verified(self.journal, ID, self.tmp.name, extractor, **kwargs)
     def test_pulls_only_attested_digest_and_binds_prepared_to_attempt(self):
         for image_id in (DIGEST, CONFIG):
             with self.subTest(image_id=image_id):
@@ -67,6 +67,54 @@ class PreparationTests(unittest.TestCase):
         extractor = FakeExtractor()
         with self.assertRaises(self.mod.ProtocolError): self.run_prepare(extractor)
         self.assertEqual(extractor.calls, [])
+    def test_index_uses_attested_root_id_when_platform_inspection_returns_child(self):
+        self.verified()
+        extractor = FakeExtractor(DIGEST)
+        original = extractor._docker
+        def inspect(*args, **kwargs):
+            if args[:2] == ('image', 'inspect') and '--platform=linux/amd64' in args:
+                result = json.loads(original(*args, **kwargs))
+                result['Id'] = 'sha256:' + 'e' * 64
+                return json.dumps(result).encode()
+            return original(*args, **kwargs)
+        extractor._docker = inspect
+        resolved = []
+        def resolve(root, config):
+            resolved.append((root, config))
+            return 'sha256:' + 'e' * 64
+        self.run_prepare(extractor, resolve_child=resolve)
+        self.assertEqual(resolved, [(DIGEST, CONFIG)])
+        self.assertEqual(extractor.calls[-1], ('extract', DIGEST))
+    def test_index_rejects_unverified_child(self):
+        self.verified()
+        extractor = FakeExtractor(DIGEST)
+        original = extractor._docker
+        def inspect(*args, **kwargs):
+            if args[:2] == ('image', 'inspect') and '--platform=linux/amd64' in args:
+                value = json.loads(original(*args, **kwargs)); value['Id'] = 'sha256:' + 'd' * 64
+                return json.dumps(value).encode()
+            return original(*args, **kwargs)
+        extractor._docker = inspect
+        with self.assertRaises(preparer.PreparationError):
+            self.run_prepare(extractor, resolve_child=lambda root, config: 'sha256:' + 'c' * 64)
+        self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone()[0], 'recovery_required')
+    def test_index_without_resolver_and_nonobject_platform_fail_closed(self):
+        for bad in ('missing_resolver', 'nonobject'):
+            with self.subTest(bad=bad):
+                self.verified()
+                extractor = FakeExtractor(DIGEST)
+                original = extractor._docker
+                def inspect(*args, **kwargs):
+                    if args[:2] == ('image', 'inspect') and '--platform=linux/amd64' in args:
+                        if bad == 'nonobject': return b'[]'
+                        value = json.loads(original(*args, **kwargs)); value['Id'] = 'sha256:' + 'e' * 64
+                        return json.dumps(value).encode()
+                    return original(*args, **kwargs)
+                extractor._docker = inspect
+                with self.assertRaises(preparer.PreparationError): self.run_prepare(extractor)
+                self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone()[0], 'recovery_required')
+                self.journal.db.execute('DELETE FROM preparations')
+                self.journal.db.execute('DELETE FROM operations')
     def test_incorrect_local_identity_fails_closed(self):
         variants = [
             {'Id':'sha256:' + 'd' * 64}, {'RepoDigests':[]},
