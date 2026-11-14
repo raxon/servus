@@ -21,4 +21,5 @@
 100644 deployment/compose.yaml
 100644 deployment/lifecycle-gate.sh
 100644 deployment/systemd/servus-supervisor.service
+100644 deployment/systemd/servus-updater.service
 100755 scripts/install.sh
