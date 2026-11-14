@@ -141,6 +141,42 @@ class LegacyTransitionTest(unittest.TestCase):
         with self.assertRaisesRegex(transition.TransitionError,'Staged data identity'):run()
         marker.write_text('wrong')
         with self.assertRaisesRegex(transition.TransitionError,'marker'):run()
+    def test_rollback_refuses_started_generation_before_service_changes(self):
+        self.rollback_fixture()
+        self.journal.db.execute("INSERT INTO initial_generations VALUES(?,'starting')",(self.operation,))
+        service=mock.Mock()
+        with self.assertRaisesRegex(transition.TransitionError,'may have written'):
+            transition.rollback_before_start(self.journal,self.operation,self.active,self.parent,str(self.root/'work'),-1,
+                supervisor,object(),self.adoption,object(),self.quiet,object(),object(),object(),self.restore,self.recovery,self.fence,
+                install_lock=self.lock,service=service)
+        service.assert_not_called()
+    def test_rollback_rejects_changed_image_before_service_changes(self):
+        self.rollback_fixture()
+        self.journal.db.execute('ALTER TABLE legacy_stop_operations ADD COLUMN old_image TEXT')
+        self.journal.db.execute('ALTER TABLE legacy_stop_operations ADD COLUMN old_image_id TEXT')
+        self.journal.db.execute("UPDATE legacy_stop_operations SET old_image='image',old_image_id='expected'")
+        service=mock.Mock();docker=SimpleNamespace(call=lambda *args,**kwargs:b'[{"Id":"different"}]')
+        with self.assertRaisesRegex(transition.TransitionError,'image identity'):
+            transition.rollback_before_start(self.journal,self.operation,self.active,self.parent,str(self.root/'work'),-1,
+                supervisor,object(),self.adoption,policy,self.quiet,docker,object(),object(),self.restore,self.recovery,self.fence,
+                install_lock=self.lock,service=service)
+        service.assert_not_called()
+    def test_failed_service_stop_keeps_recovery_state(self):
+        self.rollback_fixture()
+        self.journal.db.execute('ALTER TABLE legacy_stop_operations ADD COLUMN old_image TEXT')
+        self.journal.db.execute('ALTER TABLE legacy_stop_operations ADD COLUMN old_image_id TEXT')
+        self.journal.db.execute("UPDATE legacy_stop_operations SET old_image='image',old_image_id='expected'")
+        work=self.root/'work';work.mkdir(mode=0o700)
+        labels={'org.opencontainers.image.version':'v0.1.5','org.opencontainers.image.revision':'a'*40}
+        docker=SimpleNamespace(call=lambda *args,**kwargs:json.dumps([{'Id':'expected','Config':{'Labels':labels}}]).encode())
+        service=mock.Mock(return_value=(1,''))
+        with mock.patch.object(policy,'_read_private_file',return_value=b'fixture'):
+            with self.assertRaisesRegex(transition.TransitionError,'could not be stopped'):
+                transition.rollback_before_start(self.journal,self.operation,self.active,self.parent,str(work),-1,
+                    supervisor,object(),self.adoption,policy,self.quiet,docker,object(),object(),self.restore,self.recovery,self.fence,
+                    install_lock=self.lock,service=service)
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_rollbacks').fetchone(),('recovery_required',))
+        self.assertTrue((self.install/transition.MARKER).exists())
     def completion_fixture(self):
         parent=Path(self.parent);parent.mkdir(mode=0o711)
         target=Path(self.approved.data_dir);target.mkdir(mode=0o700);os.chown(target,1000,1000)

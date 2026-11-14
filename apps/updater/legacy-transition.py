@@ -82,6 +82,105 @@ def assess_rollback(journal,operation,active_env,restore_parent,node_fd,supervis
     finally:os.close(install)
 
 
+def rollback_before_start(journal,operation,active_env,restore_parent,work_dir,node_fd,supervisor,daemon,adoption,policy,
+                          quiescence,docker,backup,coordinator,restore,recovery,fence,*,install_lock,service,timeout=180):
+    """Restore the old generation after a verified interruption before startup.
+
+    A failed or interrupted recovery retains its journal and migration marker.
+    It must be reconciled manually; this function deliberately cannot replay it.
+    """
+    if type(timeout) is not int or not 1<=timeout<=300:raise TransitionError('Invalid recovery timeout')
+    args=(journal,operation,active_env,restore_parent,node_fd,supervisor,daemon,adoption,policy,
+          quiescence,docker,backup,coordinator,restore,recovery,fence)
+    _,saved=assess_rollback(*args,install_lock=install_lock)
+    db=journal.db
+    stopped=db.execute('SELECT source,source_dev,source_ino,old_image,old_image_id FROM legacy_stop_operations WHERE operation_id=? AND state=\'stopped\'',(operation,)).fetchone()
+    if not stopped or stopped[0]!=fence.source:raise TransitionError('Legacy image evidence is unavailable')
+    source,dev,ino,image,image_id=stopped
+    try:images=policy._json(docker.call('image','inspect',image,timeout=30))
+    except (ValueError,TypeError) as error:raise TransitionError('Legacy image is unavailable') from error
+    if not isinstance(images,list) or len(images)!=1 or not isinstance(images[0],dict) or images[0].get('Id')!=image_id:
+        raise TransitionError('Legacy image identity changed')
+    labels=(images[0].get('Config') or {}).get('Labels') or {}
+    version=labels.get('org.opencontainers.image.version');revision=labels.get('org.opencontainers.image.revision')
+    if not isinstance(version,str) or not version.startswith('v') or not isinstance(revision,str) or len(revision)!=40 or any(c not in '0123456789abcdef' for c in revision):
+        raise TransitionError('Legacy image metadata is invalid')
+    environment=policy._read_private_file(os.path.join(saved[0],'legacy.env'),65536)
+    current=policy._read_private_file(active_env,65536)
+    work=supervisor._trusted_directory(work_dir,0o700)
+    try:
+        if os.fstat(work).st_gid!=0 or os.listdir(work):raise TransitionError('Recovery work directory is not empty')
+        db.execute("CREATE TABLE IF NOT EXISTS legacy_rollbacks(operation_id TEXT PRIMARY KEY,phase TEXT NOT NULL CHECK(phase IN ('intent','services_stopped','ownership_restored','starting','healthy','recovery_required'))) ")
+        if db.execute('SELECT 1 FROM legacy_rollbacks LIMIT 1').fetchone():raise TransitionError('Existing rollback requires inspection')
+        db.execute("INSERT INTO legacy_rollbacks VALUES(?,'intent')",(operation,))
+        phase='intent'
+        def advance(next_phase):
+            nonlocal phase
+            if db.execute('UPDATE legacy_rollbacks SET phase=? WHERE operation_id=? AND phase=?',(next_phase,operation,phase)).rowcount!=1:
+                raise TransitionError('Rollback state changed')
+            phase=next_phase
+        try:
+            policy._publish_private(work,'previous-active.env',current)
+            policy._publish_private(work,'restart-disabled.yaml',b'services:\n  api:\n    restart: "no"\n  worker:\n    restart: "no"\n  agent:\n    restart: "no"\n')
+            units=('servus-updater.service','servus-updater-socket.service','servus-supervisor.service')
+            if service('disable','--now',*units,timeout=45)[0]!=0:raise TransitionError('Host services could not be stopped')
+            if any(service('is-active',unit)!=(3,'inactive') for unit in units):raise TransitionError('Host services are still active')
+            assess_rollback(*args,install_lock=install_lock)
+            advance('services_stopped')
+            source_fd=supervisor._trusted_directory(source,0o700)
+            try:
+                info=os.fstat(source_fd)
+                if (info.st_dev,info.st_ino,info.st_uid,info.st_gid)!=(dev,ino,0,0):raise TransitionError('Original data changed')
+                os.fchown(source_fd,1000,1000);os.fsync(source_fd)
+            finally:os.close(source_fd)
+            advance('ownership_restored')
+            parent,name=os.path.split(active_env);config=supervisor._trusted_directory(parent,0o700)
+            try:
+                if policy._read_private_file(active_env,65536)!=current:raise TransitionError('Active configuration changed')
+                policy._replace_private(config,name,environment)
+            finally:os.close(config)
+            advance('starting')
+            compose=os.path.join(saved[0],'compose.yaml');old_env=os.path.join(saved[0],'legacy.env')
+            override=os.path.join(work_dir,'restart-disabled.yaml');ids={};deadline=time.monotonic()+timeout
+            for role in ('agent','api','worker'):
+                docker.call('compose','--env-file',old_env,'-f',compose,'-f',override,'-p','servus','up','-d','--no-deps','--pull','never',role,timeout=120)
+                raw=docker.call('compose','--env-file',old_env,'-f',compose,'-f',override,'-p','servus','ps','-aq','--no-trunc',role,timeout=30).decode('ascii').splitlines()
+                if len(raw)!=1 or not supervisor.CONTAINER.fullmatch(raw[0]) or raw[0] in ids.values():raise TransitionError('Recovered container identity is invalid')
+                ids[role]=raw[0]
+                while True:
+                    items=docker.inspect(raw[0]);item=items[0] if isinstance(items,list) and len(items)==1 else None
+                    if not isinstance(item,dict) or item.get('Id')!=raw[0] or item.get('Image')!=image_id or (item.get('Config') or {}).get('Image')!=image:
+                        raise TransitionError('Recovered image identity differs')
+                    state=item.get('State') or {};restart=((item.get('HostConfig') or {}).get('RestartPolicy') or {}).get('Name')
+                    health=state.get('Health');status=health.get('Status') if isinstance(health,dict) else None
+                    if restart!='no':raise TransitionError('Recovered container restart policy is unsafe')
+                    if state.get('Running') is not True:
+                        status=state.get('Status')
+                        if status=='created' and time.monotonic()<deadline:
+                            time.sleep(1);continue
+                        raise TransitionError('Recovered '+role+' container is not running: '+str(status)+' (exit '+str(state.get('ExitCode'))+')')
+                    if role=='worker' or status=='healthy':break
+                    if status=='unhealthy' or time.monotonic()>=deadline:raise TransitionError('Recovered container did not become healthy')
+                    time.sleep(1)
+            script="fetch('http://127.0.0.1:4180/api/v1/health').then(r=>r.json()).then(v=>process.exit(v.status==='ok'&&v.version===process.argv[1]&&v.revision===process.argv[2]?0:1)).catch(()=>process.exit(1))"
+            docker.call('exec',ids['api'],'node','-e',script,version[1:],revision,timeout=30)
+            for role in ('agent','api','worker'):docker.call('update','--restart=unless-stopped',ids[role],timeout=30)
+            items=docker.inspect(*ids.values())
+            if not isinstance(items,list) or len(items)!=3 or {item.get('Id') for item in items if isinstance(item,dict)}!=set(ids.values()):
+                raise TransitionError('Recovered container inventory changed')
+            for item in items:
+                if (item.get('Image')!=image_id or (item.get('State') or {}).get('Running') is not True or
+                    ((item.get('HostConfig') or {}).get('RestartPolicy') or {}).get('Name')!='unless-stopped'):
+                    raise TransitionError('Recovered container is not ready for restart')
+            advance('healthy')
+            return ids
+        except BaseException:
+            try:db.execute("UPDATE legacy_rollbacks SET phase='recovery_required' WHERE operation_id=? AND phase=?",(operation,phase))
+            except BaseException:pass
+            raise
+    finally:os.close(work)
+
+
 def prepare_stop(journal,operation,active_env,policy_root,source,old_image,old_image_id,old_ids,supervisor,daemon,adoption,policy,quiescence,docker,legacy,
                  *,install_lock,trusted_ingress=None):
     """Stop the legacy generation against a verified candidate before activation."""
