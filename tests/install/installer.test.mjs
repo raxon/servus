@@ -413,3 +413,15 @@ test('unfinished origin migration blocks installation, including a dangling syml
     assert.equal(existsSync(join(f.env.SERVUS_DATA_DIR,'dependencies')),false);
   }
 });
+
+test('unfinished initial handoff blocks installation, including a dangling symlink', () => {
+  for(const symlink of [false,true]) {
+    const f=fixture();for(const path of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(path);
+    writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+    const pending=join(f.env.SERVUS_INSTALL_DIR,'.initial-handoff-v1');
+    if(symlink)symlinkSync(join(f.root,'absent'),pending);else writeFileSync(pending,'pending');
+    const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { touch "$SERVUS_DATA_DIR/dependencies"; }; main "$@"');
+    fails(result,/initial handoff requires recovery/);
+    assert.equal(existsSync(join(f.env.SERVUS_DATA_DIR,'dependencies')),false);
+  }
+});

@@ -337,6 +337,7 @@ main() {
   command -v flock >/dev/null || fail 'Install util-linux (flock), then retry.'
   exec 9> "$install_dir/install.lock"
   flock -n 9 || fail 'Another Servus installation is running.'
+  [[ ! -e $install_dir/.initial-handoff-v1 && ! -L $install_dir/.initial-handoff-v1 ]] || fail 'An interrupted initial handoff requires recovery before installation.'
   [[ ! -e $config_dir/servus-origin-migration.pending && ! -L $config_dir/servus-origin-migration.pending ]] || fail 'An unfinished origin migration requires recovery before installation.'
   [[ ! -L $config_dir/servus.env ]] || fail 'Configuration must not be a symlink.'
   if [[ $bind_address == 0.0.0.0 && ! -f $config_dir/servus.env ]]; then

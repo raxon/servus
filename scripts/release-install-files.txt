@@ -1,6 +1,7 @@
 100644 Dockerfile
 100644 apps/panel/package.json
 100644 apps/updater/backup.py
+100644 apps/updater/bootstrap-handoff.py
 100644 apps/updater/bootstrap-policy.py
 100644 apps/updater/bootstrap-release.py
 100644 apps/updater/discover-release.py
