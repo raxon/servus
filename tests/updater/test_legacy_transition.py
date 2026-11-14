@@ -42,12 +42,14 @@ class LegacyTransitionTest(unittest.TestCase):
         self.recovery=SimpleNamespace(capture=action('save'))
         self.restore=SimpleNamespace(stage=action('stage',self.approved.data_dir))
         self.initial=SimpleNamespace(launch=action('launch',{'api':'started'}))
+        self.quiet=SimpleNamespace(ensure_host_namespaces=lambda:None,ensure_no_data_mounts=lambda *_:None,
+                                   ensure_no_mount_aliases=lambda *_:None,ensure_no_open_data=lambda *_:None,ensure_no_uid_writers=lambda *_:None)
         self.fence=SimpleNamespace(journal=self.journal,operation=self.operation,active_env=self.active,source=self.source,old_ids=self.old)
         self.lock=os.open(self.install/'install.lock',os.O_RDONLY);fcntl.flock(self.lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     def tearDown(self):os.close(self.lock);self.journal.close();self.temp.cleanup()
     def run_transition(self):
         return transition.transition(self.journal,self.operation,self.active,self.source,'image','image-id',self.old,'/old-env','/old-compose',
-               '/recovery','/snapshot',self.parent,-1,str(self.docker_config),supervisor,object(),self.adoption,object(),object(),
+               '/recovery','/snapshot',self.parent,-1,str(self.docker_config),supervisor,object(),self.adoption,object(),self.quiet,
                object(),object(),object(),self.restore,self.recovery,self.legacy,self.initial,object(),self.fence,
                install_lock=self.lock,check=lambda *_:None,updater_check=lambda *_:None)
     def test_runs_all_stages_in_order_and_keeps_marker_for_health_handoff(self):
@@ -75,5 +77,11 @@ class LegacyTransitionTest(unittest.TestCase):
         (self.install/transition.MARKER).write_text('previous')
         with self.assertRaises(FileExistsError):self.run_transition()
         self.assertEqual(self.events,[])
+    def test_mounted_target_blocks_restore_and_requires_recovery(self):
+        def reject(*_):raise RuntimeError('target mounted')
+        self.quiet.ensure_no_data_mounts=reject
+        with self.assertRaisesRegex(RuntimeError,'target mounted'):self.run_transition()
+        self.assertEqual(self.events,['stop','save','capture'])
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM legacy_transitions').fetchone(),('recovery_required',))
 
 if __name__=='__main__':unittest.main()

@@ -412,7 +412,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
             docker=SimpleNamespace(call=call,inspect=lambda *ids:[items[cid] for cid in ids])
             quiet=SimpleNamespace(ensure_host_namespaces=lambda:None,ensure_restart_fenced=quiescence.ensure_restart_fenced,
                   ensure_no_other_data_mounts=quiescence.ensure_no_other_data_mounts,ensure_no_mount_aliases=lambda *_:None,
-                  ensure_no_open_data=lambda *_:None,ensure_no_uid_writers=lambda *_:None)
+                  ensure_no_open_data=lambda *_:None,ensure_no_uid_writers=lambda *_:None,ensure_no_data_mounts=quiescence.ensure_no_data_mounts)
             fence=fence_module.MigrationFence(journal,UUID,'/active',str(self.src),old_ids,supervisor,daemon,adoption,quiet,docker)
             extractor=SimpleNamespace(MANIFEST_LIMIT=4096,MAX_FILE=4096,_manifest_files=lambda _:{'deployment/compose-supervised.yaml':(0o644,7,hashlib.sha256(b'fixture').hexdigest())})
             new_ids={role:{'id':letter*64} for role,letter in zip(('api','worker','agent'),'456')}

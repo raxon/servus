@@ -14,6 +14,31 @@ class QuiescenceError(Exception):
     pass
 
 
+def ensure_no_data_mounts(docker, data_dir):
+    """Reject every container mount overlapping a protected staging directory.
+
+    The caller must separately prevent new mounts and host writers.
+    """
+    if not isinstance(data_dir,str) or not data_dir.startswith('/') or data_dir=='/' or os.path.normpath(data_dir)!=data_dir:
+        raise QuiescenceError('Invalid data directory')
+    try:ids=docker.call('ps','-aq','--no-trunc').decode('ascii').splitlines()
+    except (UnicodeError,ValueError):raise QuiescenceError('Container inventory is unavailable') from None
+    if len(ids)!=len(set(ids)) or not all(re.fullmatch(r'[a-f0-9]{64}',item) for item in ids):
+        raise QuiescenceError('Container inventory is unavailable')
+    items=docker.inspect(*ids) if ids else []
+    if (not isinstance(items,list) or len(items)!=len(ids) or any(not isinstance(item,dict) for item in items) or
+        {item.get('Id') for item in items}!=set(ids)):
+        raise QuiescenceError('Container inspection is unavailable')
+    data=os.path.realpath(data_dir)
+    for item in items:
+        mounts=item.get('Mounts')
+        if not isinstance(mounts,list):raise QuiescenceError('Container mounts are unavailable')
+        for mount in mounts:
+            if not isinstance(mount,dict) or not isinstance(mount.get('Source'),str) or not mount['Source'].startswith('/'):
+                raise QuiescenceError('Container mounts are unavailable')
+            if _overlap(os.path.realpath(mount['Source']),data):raise QuiescenceError('A container can access staging data')
+
+
 def ensure_restart_fenced(docker, expected):
     """Check stopped legacy containers cannot restart through Docker policy.
 

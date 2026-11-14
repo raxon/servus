@@ -87,8 +87,16 @@ def transition(journal,operation,active_env,source,old_image,old_image_id,old_id
             digest=legacy.capture(journal,operation,active_env,snapshot_dir,node_fd,supervisor,daemon,adoption,quiescence,docker,backup,coordinator,
                                   install_lock=install_lock,trusted_ingress=trusted_ingress)
             advance('snapshot_verified')
+            quiescence.ensure_host_namespaces()
+            quiescence.ensure_no_data_mounts(docker,approved.data_dir)
+            quiescence.ensure_no_mount_aliases(docker,approved.data_dir)
+            quiescence.ensure_no_open_data(approved.data_dir)
+            quiescence.ensure_no_uid_writers(1000)
             restored=restore.stage(snapshot_dir,digest,restore_parent,operation,backup,node_fd,supervisor,coordinator,reuse_empty=True)
             if restored!=approved.data_dir:raise TransitionError('Restored path changed')
+            quiescence.ensure_no_data_mounts(docker,approved.data_dir)
+            quiescence.ensure_no_open_data(approved.data_dir)
+            quiescence.ensure_no_uid_writers(1000)
             advance('restored')
             legacy.protect(journal,operation,active_env,restore_parent,node_fd,supervisor,daemon,adoption,quiescence,docker,backup,coordinator,restore,
                            install_lock=install_lock,trusted_ingress=trusted_ingress)

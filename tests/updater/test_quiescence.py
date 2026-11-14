@@ -119,6 +119,15 @@ class DockerInventoryTest(unittest.TestCase):
             with self.assertRaises(module.QuiescenceError):
                 module.ensure_no_mount_aliases(self.docker, '/var/lib/servus')
 
+    def test_staging_directory_must_not_be_mounted_by_any_container(self):
+        module.ensure_no_data_mounts(self.docker, '/var/lib/staging')
+        self.items[0]['Mounts']=[{'Source':'/var/lib/staging/data','RW':False}]
+        with self.assertRaises(module.QuiescenceError):module.ensure_no_data_mounts(self.docker, '/var/lib/staging')
+        self.items[0]['Mounts']=[{'Source':'/var/lib','RW':True}]
+        with self.assertRaises(module.QuiescenceError):module.ensure_no_data_mounts(self.docker, '/var/lib/staging')
+        self.docker.inspect.return_value=self.items[:-1]
+        with self.assertRaises(module.QuiescenceError):module.ensure_no_data_mounts(self.docker, '/var/lib/staging')
+
     def test_restart_fence_requires_stopped_unmanaged_containers(self):
         roles = self.items[:-1]
         for item in roles:
