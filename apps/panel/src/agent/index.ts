@@ -1,7 +1,11 @@
 import { existsSync, unlinkSync, chmodSync } from 'node:fs';
 import { createAgent } from './app.js';
 import { agentConfig } from './config.js';
+import { AgentMaintenanceGate } from './maintenance.js';
+import { startSupervisorControl, supervisorConfig } from '../shared/supervisor-entrypoint.js';
 
+const controlConfig = supervisorConfig(process.env);
+const maintenance = controlConfig ? new AgentMaintenanceGate() : undefined;
 const config = agentConfig();
 if (existsSync(config.socketPath)) {
   const { connect } = await import('node:net');
@@ -13,8 +17,9 @@ if (existsSync(config.socketPath)) {
   if (live) throw new Error('A local agent is already listening.');
   unlinkSync(config.socketPath);
 }
-const app = await createAgent(config);
+const app = await createAgent(config, undefined, maintenance);
 await app.listen({ path: config.socketPath });
 chmodSync(config.socketPath, 0o600);
+const control = startSupervisorControl(controlConfig, 'agent', timeout => maintenance!.drain(timeout));
 console.log(`Local agent listening on ${config.socketPath}`);
-for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, async () => { await app.close(); process.exit(0); });
+for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, async () => { control?.abort(); await app.close(); process.exit(process.exitCode || 0); });
