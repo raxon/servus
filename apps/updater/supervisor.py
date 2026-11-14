@@ -329,9 +329,9 @@ class RuntimePolicy:
         return set(entries)
 
 
-def inspect_servus(policy):
-    """Collect exactly one running container per role from the trusted daemon."""
-    if not isinstance(policy, RuntimePolicy):
+def inspect_servus(policy, *, created=False):
+    """Inspect exactly one approved running or never-started container per role."""
+    if not isinstance(policy, RuntimePolicy) or type(created) is not bool:
         raise SupervisorError('Verified runtime policy is required')
     _verify_data_directory(policy.data_dir)
     try:
@@ -354,7 +354,15 @@ def inspect_servus(policy):
         role, cid, pid = labels.get('com.docker.compose.service'), item.get('Id'), state.get('Pid')
         if (labels.get('com.docker.compose.project') != 'servus' or labels.get('com.docker.compose.oneoff') != 'False' or
             labels.get('com.docker.compose.container-number') != '1' or role not in ROLES or role in output or
-            cid not in ids or state.get('Running') is not True or type(pid) is not int or pid <= 1):
+            cid not in ids):
+            raise SupervisorError('Unexpected Servus container set')
+        if created:
+            if (state.get('Status') != 'created' or state.get('Running') is not False or
+                state.get('Paused') is not False or state.get('Restarting') is not False or
+                state.get('Dead') is not False or type(pid) is not int or pid != 0 or
+                state.get('StartedAt') != '0001-01-01T00:00:00Z'):
+                raise SupervisorError('A candidate container has already started')
+        elif state.get('Running') is not True or type(pid) is not int or pid <= 1:
             raise SupervisorError('Unexpected Servus container set')
         expected_command = ['dist/' + ('server' if role == 'api' else role) + '/index.js']
         if (item.get('Image') != policy.image_id or config.get('Image') != policy.image_reference or
@@ -385,10 +393,13 @@ def inspect_servus(policy):
             actual.append((mount.get('Type'), mount.get('Source'), mount.get('Destination'), mount['RW']))
         if len(actual) != len(policy.mounts_for(role)) or set(actual) != policy.mounts_for(role):
             raise SupervisorError('Servus runtime mounts are not trusted')
-        cgroup = _cgroup(pid)
-        if cid not in cgroup:
-            raise SupervisorError('Container cgroup cannot be identified')
-        output[role] = {'id': cid, 'pid': pid, 'cgroup': cgroup}
+        if created:
+            output[role] = {'id': cid}
+        else:
+            cgroup = _cgroup(pid)
+            if cid not in cgroup:
+                raise SupervisorError('Container cgroup cannot be identified')
+            output[role] = {'id': cid, 'pid': pid, 'cgroup': cgroup}
     if set(output) != set(ROLES):
         raise SupervisorError('Unexpected Servus container set')
     return output

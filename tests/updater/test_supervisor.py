@@ -296,10 +296,10 @@ class SupervisorTest(unittest.TestCase):
                 'Mounts': [{'Type': kind, 'Source': source, 'Destination': dest, 'RW': rw}
                            for kind, source, dest, rw in POLICY.mounts_for(role)],
             })
-        def inspect(items):
+        def inspect(items, *, created=False):
             ids = ('\n'.join(item['Id'] for item in items) + '\n').encode()
             with mock.patch.object(supervisor, '_docker', side_effect=[ids, json.dumps(items).encode()]), mock.patch.object(supervisor, '_verify_data_directory'), mock.patch.object(supervisor, '_cgroup', side_effect=['/docker/' + item['Id'] for item in items]):
-                return supervisor.inspect_servus(POLICY)
+                return supervisor.inspect_servus(POLICY, created=created)
         self.assertEqual(set(inspect(records)), set(supervisor.ROLES))
         for mutation in (
             lambda x: x[0]['Config'].__setitem__('Entrypoint', ['node']),
@@ -320,6 +320,19 @@ class SupervisorTest(unittest.TestCase):
         ):
             changed = copy.deepcopy(records); mutation(changed)
             with self.assertRaises(supervisor.SupervisorError): inspect(changed)
+        candidates = copy.deepcopy(records)
+        for item in candidates:
+            item['State'] = {'Status': 'created', 'Pid': 0, 'Running': False, 'Paused': False,
+                             'Restarting': False, 'Dead': False, 'StartedAt': '0001-01-01T00:00:00Z'}
+        self.assertEqual(set(inspect(candidates, created=True)), set(supervisor.ROLES))
+        for field, value in (('Status', 'exited'), ('Pid', 1), ('Running', True), ('Paused', True),
+                             ('Restarting', True), ('Dead', True), ('StartedAt', '2026-01-01T00:00:00Z')):
+            changed = copy.deepcopy(candidates); changed[0]['State'][field] = value
+            with self.subTest(field=field), self.assertRaises(supervisor.SupervisorError):
+                inspect(changed, created=True)
+        changed = copy.deepcopy(candidates); changed[0]['Config']['Env'].append('EXTRA=unapproved')
+        with self.assertRaises(supervisor.SupervisorError): inspect(changed, created=True)
+        with self.assertRaises(supervisor.SupervisorError): inspect(candidates)
 
     def test_oom_default_normalization_preserves_enabled_and_other_settings(self):
         base = {'OomKillDisable': False, 'Privileged': False}
