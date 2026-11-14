@@ -11,6 +11,7 @@
 100644 apps/updater/preparation-fence.py
 100644 apps/updater/provision-verifier-group.py
 100644 apps/updater/provision-socket.py
+100644 apps/updater/provision-host.py
 100644 apps/updater/quiescence.py
 100644 apps/updater/runtime-policy.py
 100755 apps/updater/servus-updater.py
