@@ -21,6 +21,23 @@ class ProvisionError(Exception):
     pass
 
 
+# Official traefik:3.7.13 index and the amd64/arm64 image configurations.
+# The accepted values are versioned with the signed host release.
+TRUSTED_INGRESS_IMAGE_IDS = frozenset({
+    'sha256:24841fe2de7304c149343d877d2923b4c8800a38ba015dea9174c23b20e344a0',
+    'sha256:f9309349d2c1477b15d04728f38882ba2e9a50b7f76729541121a7ee60d53490',
+    'sha256:be6691ff1ae3497f9d0e7673138f4fc840672bb1c797d0e02e22a2bb8f0aa4e6',
+})
+TRUSTED_INGRESS_ARGS = [
+    '--providers.swarm.endpoint=unix:///var/run/docker.sock',
+    '--providers.swarm.exposedbydefault=false',
+    '--providers.swarm.network=panel-ingress',
+    '--entrypoints.web.address=:8080',
+    '--api.dashboard=false',
+    '--log.level=WARN',
+]
+
+
 def directory(path, mode=None):
     if not isinstance(path, str) or not path.startswith('/') or os.path.normpath(path) != path:
         raise ProvisionError('Invalid directory path')
@@ -269,14 +286,17 @@ def trusted_ingress(docker_config, runtime):
     item = item[0]; config = item.get('Config') or {}; labels = config.get('Labels') or {}; host = item.get('HostConfig') or {}
     mounts = item.get('Mounts'); image = item.get('Image'); state = item.get('State') or {}
     if (item.get('Id') != ids[0] or labels.get('com.docker.swarm.service.name') != 'panel-ingress' or
-        config.get('Image') != 'traefik:3.7.13' or not isinstance(image, str) or not re.fullmatch(r'sha256:[a-f0-9]{64}', image) or
+        config.get('Image') != 'traefik:3.7.13' or not isinstance(image, str) or image not in TRUSTED_INGRESS_IMAGE_IDS or
+        config.get('Entrypoint') != ['/entrypoint.sh'] or config.get('Cmd') != TRUSTED_INGRESS_ARGS or
+        config.get('Env') != ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'] or config.get('User') not in ('', None) or
         state.get('Running') is not True or host.get('Privileged') is not False or host.get('PidMode') == 'host' or
         host.get('CapAdd') not in (None, []) or host.get('Devices') not in (None, []) or host.get('DeviceRequests') not in (None, []) or
         not isinstance(mounts, list)):
         raise ProvisionError('Untrusted ingress identity')
     socket_path = os.path.realpath('/var/run/docker.sock')
     matching = [mount for mount in mounts if isinstance(mount, dict) and isinstance(mount.get('Source'), str) and os.path.realpath(mount['Source']) == socket_path]
-    if len(matching) != 1 or matching[0].get('RW') is not False:
+    if (len(mounts) != 1 or len(matching) != 1 or matching[0].get('RW') is not False or
+        matching[0].get('Destination') != '/var/run/docker.sock'):
         raise ProvisionError('Untrusted ingress socket')
     return [ids[0], 'panel-ingress', config['Image'], image]
 

@@ -234,18 +234,25 @@ class HostProvisioningTest(unittest.TestCase):
         self.assertEqual(changed.read_text(),'changed\n')
 
     def test_ingress_identity_requires_exact_image_and_readonly_socket(self):
-        identifier='a'*64;image='sha256:'+'b'*64
+        identifier='a'*64;image='sha256:24841fe2de7304c149343d877d2923b4c8800a38ba015dea9174c23b20e344a0'
         entry={'Id':identifier,'Image':image,'State':{'Running':True},
-               'Config':{'Image':'traefik:3.7.13','Labels':{'com.docker.swarm.service.name':'panel-ingress'}},
+               'Config':{'Image':'traefik:3.7.13','Labels':{'com.docker.swarm.service.name':'panel-ingress'},
+                         'Entrypoint':['/entrypoint.sh'],'Cmd':list(module.TRUSTED_INGRESS_ARGS),
+                         'Env':['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'],'User':''},
                'HostConfig':{'Privileged':False,'PidMode':'','CapAdd':None,'Devices':None,'DeviceRequests':None},
-               'Mounts':[{'Source':'/var/run/docker.sock','RW':False}]}
+               'Mounts':[{'Source':'/var/run/docker.sock','Destination':'/var/run/docker.sock','RW':False}]}
         runtime=SimpleNamespace(_docker=mock.Mock(side_effect=[(identifier+'\n').encode(),json.dumps([entry]).encode()]),_json=json.loads)
         self.assertEqual(module.trusted_ingress('/root/docker',runtime),[identifier,'panel-ingress','traefik:3.7.13',image])
-        for change in ('writable','wrong_image','privileged'):
+        for change in ('writable','wrong_image','wrong_digest','privileged','command','environment','entrypoint','extra_mount'):
             bad=json.loads(json.dumps(entry))
             if change=='writable': bad['Mounts'][0]['RW']=True
             if change=='wrong_image': bad['Config']['Image']='other:latest'
+            if change=='wrong_digest': bad['Image']='sha256:'+'b'*64
             if change=='privileged': bad['HostConfig']['Privileged']=True
+            if change=='command': bad['Config']['Cmd'].append('--api.insecure=true')
+            if change=='environment': bad['Config']['Env'].append('TRAEFIK_API_INSECURE=true')
+            if change=='entrypoint': bad['Config']['Entrypoint']=['/bin/sh']
+            if change=='extra_mount': bad['Mounts'].append({'Source':'/tmp','Destination':'/etc/traefik','RW':False})
             runtime=SimpleNamespace(_docker=mock.Mock(side_effect=[(identifier+'\n').encode(),json.dumps([bad]).encode()]),_json=json.loads)
             with self.subTest(change=change), self.assertRaises(module.ProvisionError): module.trusted_ingress('/root/docker',runtime)
 

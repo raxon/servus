@@ -59,7 +59,8 @@ class DaemonTest(unittest.TestCase):
             updater_module = SimpleNamespace(Journal=mock.Mock(return_value=journal))
             apply = mock.Mock(return_value={'fixture': True})
             modules = {'servus-updater': updater_module, 'update-coordinator': SimpleNamespace(apply_prepared_update=apply),
-                       'runtime-policy': object(), 'extract-install': object(), 'quiescence': object(), 'backup': object(), 'verify-release': object()}
+                       'runtime-policy': object(), 'extract-install': object(), 'quiescence': object(), 'backup': object(), 'verify-release': object(),
+                       'provision-host': SimpleNamespace(trusted_ingress=mock.Mock(return_value=None))}
             def load(_module_name, filename, mode):
                 return modules[filename.removesuffix('.py')]
             operation = str(uuid.uuid4()); hub = object(); maintenance = object()
@@ -69,6 +70,22 @@ class DaemonTest(unittest.TestCase):
             self.assertEqual(apply.call_args.args[5:10], (str(root / 'journal.sqlite'), '/root/active', str(root / 'backup'), str(root / 'policy'), str(root / 'docker')))
             journal.close.assert_called_once()
             with self.assertRaises(OSError): os.fstat(apply.call_args.args[10])
+
+    def test_ingress_created_after_install_and_recreated_task_are_resolved(self):
+        runner=object.__new__(daemon.HostApply)
+        image='sha256:24841fe2de7304c149343d877d2923b4c8800a38ba015dea9174c23b20e344a0'
+        current=['a'*64,'panel-ingress','traefik:3.7.13',image]
+        provision=SimpleNamespace(trusted_ingress=mock.Mock(return_value=current))
+        runtime=object()
+        runner.config={'dockerConfig':'/root/docker','trustedIngress':None}
+        self.assertEqual(runner._current_ingress(provision,runtime),tuple(current))
+        provision.trusted_ingress.assert_called_with('/root/docker',runtime)
+        runner.config['trustedIngress']=['b'*64,*current[1:]]
+        self.assertEqual(runner._current_ingress(provision,runtime),tuple(current))
+        runner.config['trustedIngress']=['b'*64,current[1],current[2],'sha256:'+'c'*64]
+        with self.assertRaises(supervisor.SupervisorError): runner._current_ingress(provision,runtime)
+        provision.trusted_ingress.return_value=None
+        self.assertIsNone(runner._current_ingress(provision,runtime))
 
     def test_apply_command_requires_enabled_handler_exact_fields_and_approved_hub(self):
         operation_id = str(uuid.uuid4())

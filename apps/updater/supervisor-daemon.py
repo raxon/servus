@@ -216,9 +216,19 @@ class HostApply:
             os.close(fd)
             raise
 
+    def _current_ingress(self, provision, runtime):
+        """Resolve the pinned ingress identity immediately before maintenance."""
+        current = provision.trusted_ingress(self.config['dockerConfig'], runtime)
+        previous = self.config['trustedIngress']
+        if current is None:
+            return None
+        if previous is not None and (current[1] != previous[1] or current[2] != previous[2] or current[3] != previous[3]):
+            raise supervisor.SupervisorError('Ingress image differs from the approved installation')
+        return tuple(current)
+
     def __call__(self, operation_id, hub, maintenance):
         modules = {name: self._load('servus_host_' + name.replace('-', '_'), name + '.py', 0o755 if name == 'servus-updater' else 0o644)
-                   for name in ('servus-updater', 'update-coordinator', 'runtime-policy', 'extract-install', 'quiescence', 'backup', 'verify-release')}
+                   for name in ('servus-updater', 'update-coordinator', 'runtime-policy', 'extract-install', 'quiescence', 'backup', 'verify-release', 'provision-host')}
         node_fd = self._node()
         journal = None
         try:
@@ -227,7 +237,7 @@ class HostApply:
             os.close(state_fd)
             journal = modules['servus-updater'].Journal(state)
             daemon = SimpleNamespace(resolve_active_policy=resolve_active_policy, approved_policy_binding=approved_policy_binding)
-            ingress = tuple(self.config['trustedIngress']) if self.config['trustedIngress'] is not None else None
+            ingress = self._current_ingress(modules['provision-host'], modules['runtime-policy'])
             def resolve_child(root, config):
                 verifier = modules['verify-release']
                 registry = verifier.Registry(time.monotonic() + verifier.TOTAL_SECONDS)
