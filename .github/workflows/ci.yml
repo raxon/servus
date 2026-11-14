@@ -35,5 +35,9 @@ jobs:
         run: npm run test:vps-harness
       - name: Test release discovery
         run: python3 -B -m unittest discover -s tests/updater -p 'test_discover_release.py'
+      - name: Test lifecycle gate
+        env:
+          SERVUS_LIFECYCLE_TEST_CONTEXT: default
+        run: node --test tests/lifecycle-gate/gate.test.mjs
       - name: Build workspace
         run: npm run build
