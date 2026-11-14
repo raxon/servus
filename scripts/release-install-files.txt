@@ -14,6 +14,7 @@
 100644 apps/updater/install-host.py
 100644 apps/updater/legacy-bootstrap.py
 100644 apps/updater/legacy-early-recovery.py
+100644 apps/updater/legacy-host-bootstrap.py
 100644 apps/updater/legacy-migrate.py
 100644 apps/updater/legacy-prepare.py
 100644 apps/updater/legacy-recovery.py

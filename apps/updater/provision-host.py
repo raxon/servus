@@ -112,9 +112,48 @@ def prepare(config_dir, state_dir):
         os.close(config)
 
 
-def prepare_runtime(config_dir, install_dir, supervisor, *, inherited_lock=None):
+def validate_legacy_runtime(config_dir,install_fd,supervisor,runtime,docker_config):
+    """Check an existing managed panel before preparing migration credentials."""
+    if runtime is None:raise ProvisionError('Legacy runtime inspection is unavailable')
+    marker=supervisor._open_root_file(install_fd,'.servus-install',0o600)
+    try:
+        if os.read(marker,64)!=b'servus-installer-v1\n':raise ProvisionError('Legacy installation marker differs')
+    finally:os.close(marker)
+    environment=runtime._read_private_file(config_dir+'/servus.env',65536);values=runtime._env(environment)
+    source=values.get('SERVUS_DATA_DIR');image=values.get('SERVUS_IMAGE')
+    if (not isinstance(source,str) or not source.startswith('/') or source=='/' or os.path.normpath(source)!=source or
+        not isinstance(image,str) or not re.fullmatch(r'ghcr\.io/raxon/servus@sha256:[a-f0-9]{64}',image)):
+        raise ProvisionError('Legacy configuration is invalid')
+    supervisor._verify_data_directory(source)
+    try:ids=runtime._docker(docker_config,'ps','-aq','--no-trunc','--filter','label=com.docker.compose.project=servus').decode('ascii').splitlines()
+    except (ValueError,UnicodeError) as error:raise ProvisionError('Legacy inventory is invalid') from error
+    if len(ids)!=3 or len(set(ids))!=3 or any(not supervisor.CONTAINER.fullmatch(cid) for cid in ids):
+        raise ProvisionError('Legacy inventory is invalid')
+    records=runtime._json(runtime._docker(docker_config,'inspect',*ids))
+    if not isinstance(records,list) or len(records)!=3 or {item.get('Id') for item in records if isinstance(item,dict)}!=set(ids):
+        raise ProvisionError('Legacy inventory differs')
+    roles=set();image_ids=set()
+    for item in records:
+        config=item.get('Config') or {};labels=config.get('Labels') or {};state=item.get('State') or {};mounts=item.get('Mounts')
+        role=labels.get('com.docker.compose.service')
+        if (role not in supervisor.ROLES or role in roles or labels.get('com.docker.compose.project')!='servus' or
+            config.get('Image')!=image or config.get('User')!='node' or
+            config.get('Cmd')!=['node','dist/'+('server' if role=='api' else role)+'/index.js'] or
+            state.get('Running') is not True or state.get('Paused') is not False or state.get('Restarting') is not False or
+            not isinstance(mounts,list) or not any(isinstance(mount,dict) and mount.get('Type')=='bind' and
+            mount.get('Source')==source and mount.get('Destination')==source and mount.get('RW') is True for mount in mounts)):
+            raise ProvisionError('Legacy runtime differs')
+        roles.add(role);image_ids.add(item.get('Image'))
+    if roles!=set(supervisor.ROLES) or len(image_ids)!=1 or not all(isinstance(value,str) and supervisor.IMAGE_ID.fullmatch(value) for value in image_ids):
+        raise ProvisionError('Legacy image identity differs')
+    if runtime._read_private_file(config_dir+'/servus.env',65536)!=environment:raise ProvisionError('Legacy configuration changed')
+    return environment
+
+
+def prepare_runtime(config_dir, install_dir, supervisor, *, inherited_lock=None, legacy=False, runtime=None, docker_config='/var/lib/servus-updater/docker-config'):
     """Create the first lifecycle gate and component credentials under the install lock."""
     if os.geteuid() != 0: raise ProvisionError('Root is required')
+    if type(legacy) is not bool:raise ProvisionError('Invalid legacy mode')
     if (not all(isinstance(path, str) and path.startswith('/') and path != '/' and os.path.normpath(path) == path
                 for path in (config_dir, install_dir)) or config_dir == install_dir or
         config_dir.startswith(install_dir + '/') or install_dir.startswith(config_dir + '/')):
@@ -149,7 +188,10 @@ def prepare_runtime(config_dir, install_dir, supervisor, *, inherited_lock=None)
             if not all(present) or not marker: raise ProvisionError('Incomplete runtime preparation requires recovery')
         else:
             if exists(config, 'servus.env'):
-                raise ProvisionError('Existing installations require a verified migration')
+                if not legacy:raise ProvisionError('Existing installations require a verified migration')
+                legacy_env=validate_legacy_runtime(config_dir,install,supervisor,runtime,docker_config)
+            elif legacy:raise ProvisionError('Legacy configuration is unavailable')
+            else:legacy_env=None
             os.mkdir('lifecycle', 0o755, dir_fd=config)
             gate = os.open('lifecycle', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=config)
             try:
@@ -175,6 +217,8 @@ def prepare_runtime(config_dir, install_dir, supervisor, *, inherited_lock=None)
             try: os.fchown(control, 0, 1000); os.fchmod(control, 0o750); os.fsync(control)
             finally: os.close(control)
             os.fsync(config)
+            if legacy_env is not None and runtime._read_private_file(config_dir+'/servus.env',65536)!=legacy_env:
+                raise ProvisionError('Legacy configuration changed')
             create_file(install, '.lifecycle-enabled-v1', b'servus-lifecycle-v1\n', 0o600, 0)
             os.fsync(install)
             create_file(config, '.supervisor-enabled-v1', b'servus-supervisor-v1\n', 0o600, 0)
@@ -322,6 +366,7 @@ def main():
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument('--finalize', action='store_true')
     actions.add_argument('--runtime', action='store_true')
+    parser.add_argument('--legacy',action='store_true')
     parser.add_argument('--install-lock-fd', type=int)
     parser.add_argument('--config-dir')
     parser.add_argument('--install-dir')
@@ -330,12 +375,13 @@ def main():
         parser.error('Runtime options require --runtime')
     if args.install_lock_fd is not None and not (args.runtime or args.finalize):
         parser.error('--install-lock-fd requires --runtime or --finalize')
+    if args.legacy and not args.runtime:parser.error('--legacy requires --runtime')
     os.umask(0o077)
     try:
         if args.runtime:
-            supervisor, _, _, _ = trusted_modules()
+            supervisor, _, _, runtime = trusted_modules()
             prepare_runtime(args.config_dir or '/etc/servus', args.install_dir or '/opt/servus', supervisor,
-                            inherited_lock=args.install_lock_fd)
+                            inherited_lock=args.install_lock_fd,legacy=args.legacy,runtime=runtime)
         elif args.finalize:
             supervisor, daemon, backup, runtime = trusted_modules()
             finalize('/etc/servus', '/var/lib/servus-updater', '/opt/servus', '/usr/bin/node', supervisor, daemon, backup, runtime,

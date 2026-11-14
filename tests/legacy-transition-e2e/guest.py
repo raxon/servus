@@ -75,14 +75,15 @@ def after_reboot():
 
 
 def main():
-    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
+    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'],['--host-bootstrap'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
     if sys.argv[1:]==['--after-reboot']:return after_reboot()
     recover_check=sys.argv[1:]==['--recover-check']
     early_check=sys.argv[1:]==['--early-recover']
     orchestrated=sys.argv[1:]==['--orchestrated']
     bootstrap_fail=sys.argv[1:]==['--bootstrap-fail']
-    bootstrap_migrate=sys.argv[1:] in (['--bootstrap-migrate'],['--bootstrap-fail'])
-    full=sys.argv[1:] in (['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'])
+    host_bootstrap=sys.argv[1:]==['--host-bootstrap']
+    bootstrap_migrate=sys.argv[1:] in (['--bootstrap-migrate'],['--bootstrap-fail'],['--host-bootstrap'])
+    full=sys.argv[1:] in (['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'],['--host-bootstrap'])
     for path in ('/opt/servus','/etc/servus','/var/lib/servus','/var/lib/servus-updater'):
         if Path(path).exists():raise RuntimeError('Fixture requires an empty host')
     install=Path('/opt/servus');install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
@@ -141,6 +142,26 @@ def main():
     active='/active'
     if full:
         def run(*args,timeout=180):subprocess.run(args,check=True,timeout=timeout,stdin=subprocess.DEVNULL)
+        if host_bootstrap:
+            (install/'.servus-install').write_text('servus-installer-v1\n');(install/'.servus-install').chmod(0o600)
+            active=str(config/'servus.env');shutil.copyfile(old_env,active);os.chmod(active,0o600)
+            if Path('/usr/bin/node').exists():raise RuntimeError('Host fixture must begin without Node')
+            args=['/usr/bin/python3','-I',str(BASE/'apps/updater/legacy-host-bootstrap.py'),'--source',str(BASE),
+                  '--operation',op,'--commit','5c82968ef6ab05d416d95d301078d37c9d11cc36','--digest',root_digest,
+                  '--tag','v0.1.7','--old-compose',str(compose)]
+            invalid=args.copy();invalid[6]='invalid'
+            rejected=subprocess.run(invalid,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+            if rejected.returncode==0 or request('/health').get('version')!='0.1.5':raise RuntimeError('Invalid host bootstrap changed panel')
+            run(*args,timeout=2400)
+            if not Path('/usr/bin/node').is_file() or request('/health').get('version')!='0.1.7':raise RuntimeError('Host bootstrap did not finish')
+            cookie='';csrf='';request('/auth/login','POST',{'email':'fixture@example.test','password':'isolated-fixture-password'})
+            if not any(item.get('id')==project for item in request('/projects')):raise RuntimeError('Project was not retained')
+            if request('/updates').get('applyAvailable') is not True:raise RuntimeError('Updater is unavailable')
+            for name,digest in (('verification-executor.py','1b7cd6b9932008cf20ab57cee11a8b3bd8b79e58171308bcf8e180326415d71f'),
+                                ('verify-release.py','84c3c5f1b643aafad0e79cefe2678c871322c0fbe5532c8fb5f0efa934cf0c02')):
+                if hashlib.sha256((install/'legacy-verifier-v0.1.5'/name).read_bytes()).hexdigest()!=digest:raise RuntimeError('Legacy verifier backup differs')
+            print('PASS host dependencies and signed migration retained the legacy project',flush=True)
+            return
         host_args=['/usr/bin/python3','-I',str(BASE/'apps/updater/install-host.py'),'--source',str(BASE),'--install-dir',str(install)]
         if bootstrap_migrate:host_args.append('--adopt-legacy-verifier')
         run(*host_args)

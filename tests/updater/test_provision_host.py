@@ -58,6 +58,28 @@ class HostProvisioningTest(unittest.TestCase):
         with self.assertRaises(module.ProvisionError): module.prepare_runtime(str(self.config),str(install),supervisor)
         self.assertTrue((self.config/'lifecycle').is_dir())
 
+    def test_legacy_runtime_requires_matching_managed_running_containers(self):
+        install=self.runtime_fixture();(install/'.servus-install').write_text('servus-installer-v1\n');(install/'.servus-install').chmod(0o600)
+        data=self.root/'data';data.mkdir(mode=0o700);os.chown(data,1000,1000)
+        image='ghcr.io/raxon/servus@sha256:'+'a'*64
+        env=self.config/'servus.env';env.write_text('SERVUS_IMAGE='+image+'\nSERVUS_DATA_DIR='+str(data)+'\n');env.chmod(0o600)
+        ids=[letter*64 for letter in 'abc'];records=[]
+        for role,cid in zip(('api','agent','worker'),ids):
+            records.append({'Id':cid,'Image':'sha256:'+'b'*64,
+                'Config':{'Image':image,'User':'node','Cmd':['node','dist/'+('server' if role=='api' else role)+'/index.js'],
+                          'Labels':{'com.docker.compose.project':'servus','com.docker.compose.service':role}},
+                'State':{'Running':True,'Paused':False,'Restarting':False},
+                'Mounts':[{'Type':'bind','Source':str(data),'Destination':str(data),'RW':True}]})
+        runtime=SimpleNamespace(_read_private_file=runtime_policy._read_private_file,_env=runtime_policy._env,_json=runtime_policy._json,
+            _docker=lambda _config,*args: ('\n'.join(ids)+'\n').encode() if args[0]=='ps' else json.dumps(records).encode())
+        records[0]['Config']['Image']='unexpected'
+        with self.assertRaises(module.ProvisionError):module.prepare_runtime(str(self.config),str(install),supervisor,legacy=True,runtime=runtime)
+        self.assertFalse((self.config/'lifecycle').exists())
+        records[0]['Config']['Image']=image
+        module.prepare_runtime(str(self.config),str(install),supervisor,legacy=True,runtime=runtime)
+        self.assertEqual(env.read_text(),'SERVUS_IMAGE='+image+'\nSERVUS_DATA_DIR='+str(data)+'\n')
+        self.assertTrue((install/'.lifecycle-enabled-v1').is_file())
+
     def test_runtime_rejects_changed_state_credentials_and_install_lock(self):
         install=self.runtime_fixture()
         def run(): module.prepare_runtime(str(self.config),str(install),supervisor)
