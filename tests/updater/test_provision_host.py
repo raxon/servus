@@ -6,7 +6,9 @@ from types import SimpleNamespace
 from unittest import mock
 import os
 from pathlib import Path
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -67,6 +69,40 @@ class HostProvisioningTest(unittest.TestCase):
         state.write_text('servus-lifecycle-v1 normal\n');state.chmod(0o644)
         credential=self.config/'supervisor-secrets/api';credential.chmod(0o666)
         with self.assertRaises(supervisor.SupervisorError): run()
+
+    def test_runtime_accepts_only_the_inherited_install_lock_and_keeps_it_held(self):
+        install=self.runtime_fixture();lock=install/'install.lock'
+        held=os.open(lock,os.O_RDONLY); other=os.open(self.config,os.O_RDONLY)
+        try:
+            fcntl.flock(held,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(module.ProvisionError):
+                module.prepare_runtime(str(self.config),str(install),supervisor,inherited_lock=other)
+            self.assertFalse((self.config/'lifecycle').exists())
+            module.prepare_runtime(str(self.config),str(install),supervisor,inherited_lock=held)
+            contender=os.open(lock,os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError): fcntl.flock(contender,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally: os.close(contender)
+        finally: os.close(other);os.close(held)
+
+    def test_runtime_command_accepts_lock_from_installer_process(self):
+        install=self.runtime_fixture();modules=self.root/'modules';modules.mkdir(mode=0o700)
+        for name in ('provision-host.py','supervisor.py','supervisor-daemon.py','backup.py','runtime-policy.py'):
+            path=modules/name;shutil.copyfile(ROOT/'apps/updater'/name,path);path.chmod(0o644)
+        held=os.open(install/'install.lock',os.O_RDONLY)
+        try:
+            fcntl.flock(held,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            args=[sys.executable,'-I',str(modules/'provision-host.py'),'--runtime','--config-dir',str(self.config),
+                  '--install-dir',str(install),'--install-lock-fd',str(held)]
+            result=subprocess.run(args,pass_fds=(held,),capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            result=subprocess.run(args,pass_fds=(held,),capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            contender=os.open(install/'install.lock',os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError): fcntl.flock(contender,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally: os.close(contender)
+        finally: os.close(held)
 
     def test_creates_private_configuration_and_is_idempotent(self):
         self.prepare()

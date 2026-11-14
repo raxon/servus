@@ -111,7 +111,7 @@ def prepare(config_dir, state_dir):
         os.close(config)
 
 
-def prepare_runtime(config_dir, install_dir, supervisor):
+def prepare_runtime(config_dir, install_dir, supervisor, *, inherited_lock=None):
     """Create the first lifecycle gate and component credentials under the install lock."""
     if os.geteuid() != 0: raise ProvisionError('Root is required')
     if (not all(isinstance(path, str) and path.startswith('/') and path != '/' and os.path.normpath(path) == path
@@ -133,6 +133,14 @@ def prepare_runtime(config_dir, install_dir, supervisor):
     try:
         install = directory(install_dir, 0o700)
         lock = supervisor._open_root_file(install, 'install.lock', 0o600)
+        if inherited_lock is not None:
+            if type(inherited_lock) is not int or inherited_lock < 3:
+                raise ProvisionError('Invalid inherited installation lock')
+            inherited = os.fstat(inherited_lock); expected = os.fstat(lock)
+            if (inherited.st_dev, inherited.st_ino) != (expected.st_dev, expected.st_ino):
+                raise ProvisionError('Inherited installation lock does not match')
+            duplicate = os.dup(inherited_lock)
+            os.close(lock); lock = duplicate
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         present = [exists(config, name) for name in names]
         marker = exists(install, '.lifecycle-enabled-v1')
@@ -298,12 +306,18 @@ def main():
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument('--finalize', action='store_true')
     actions.add_argument('--runtime', action='store_true')
+    parser.add_argument('--install-lock-fd', type=int)
+    parser.add_argument('--config-dir')
+    parser.add_argument('--install-dir')
     args = parser.parse_args()
+    if (args.install_lock_fd is not None or args.config_dir is not None or args.install_dir is not None) and not args.runtime:
+        parser.error('Runtime options require --runtime')
     os.umask(0o077)
     try:
         if args.runtime:
             supervisor, _, _, _ = trusted_modules()
-            prepare_runtime('/etc/servus', '/opt/servus', supervisor)
+            prepare_runtime(args.config_dir or '/etc/servus', args.install_dir or '/opt/servus', supervisor,
+                            inherited_lock=args.install_lock_fd)
         elif args.finalize:
             supervisor, daemon, backup, runtime = trusted_modules()
             finalize('/etc/servus', '/var/lib/servus-updater', '/opt/servus', '/usr/bin/node', supervisor, daemon, backup, runtime)
