@@ -28,6 +28,7 @@ updater=load('initial_updater','servus-updater.py')
 policy=load('initial_policy','runtime-policy.py')
 backup=load('initial_backup','backup.py')
 adoption=load('initial_adoption','adoption-proof.py')
+fence_module=load('initial_migration_fence','migration-fence.py')
 
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
 class InitialGenerationTest(unittest.TestCase):
@@ -144,13 +145,20 @@ class InitialGenerationTest(unittest.TestCase):
         snapshot=str(self.root/'backup');digest='sha256:'+'d'*64
         identity=(os.stat(data).st_dev,os.stat(data).st_ino)
         restored=SimpleNamespace(verify_staged=mock.Mock(return_value=identity))
-        quiet=SimpleNamespace(ensure_host_namespaces=mock.Mock(),ensure_no_uid_writers=mock.Mock(),ensure_no_open_data=mock.Mock())
-        migration=SimpleNamespace(fence=SimpleNamespace(assert_locked=mock.Mock()),adoption=adoption,node_fd=-1,
-                                  coordinator=object(),restore=restored,quiescence=quiet)
-        with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace):
-            adoption.record(self.journal,self.op,self.env,snapshot,digest,str(parent),backup,-1,supervisor,self.daemon,policy,
-                            migration.coordinator,restored,quiet)
-        self.run_launch(migration=migration)
+        quiet=SimpleNamespace(ensure_host_namespaces=mock.Mock(),ensure_no_uid_writers=mock.Mock(),ensure_no_open_data=mock.Mock(),ensure_no_mount_aliases=mock.Mock())
+        source=self.root/'original';source.mkdir(mode=0o700)
+        docker=mock.Mock();docker.call.return_value=b''
+        old={role:letter*64 for role,letter in zip(('api','agent','worker'),'def')}
+        fence=fence_module.MigrationFence(self.journal,self.op,self.env,str(source),old,supervisor,self.daemon,adoption,quiet,docker)
+        migration=SimpleNamespace(fence=fence,adoption=adoption,node_fd=-1,coordinator=object(),restore=restored,quiescence=quiet)
+        lock=os.open(self.install/'install.lock',os.O_RDONLY);fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        try:
+            with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace):
+                fence.record(self.op,lock)
+                adoption.record(self.journal,self.op,self.env,snapshot,digest,str(parent),backup,-1,supervisor,self.daemon,policy,
+                                migration.coordinator,restored,quiet,inherited_lock=lock)
+            self.run_launch(migration=migration,inherited_lock=lock)
+        finally:os.close(lock)
         self.assertEqual(self.journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('consumed',))
         self.assertEqual(self.journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('started',))
         self.assertEqual(restored.verify_staged.call_count,2)
