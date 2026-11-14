@@ -239,15 +239,24 @@ def main():
             if not any(item.get('id')==project for item in request('/projects')):raise RuntimeError('Legacy project was not retained')
             print('PASS interrupted signed migration restored legacy login and project',flush=True)
             return
-        if full:result=execute()
+        if full:
+            os.close(lock);lock=None
+            invalid=subprocess.run(['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-migrate.py','--operation',str(uuid.uuid4()),
+                '--old-env',str(old_env),'--old-compose',str(compose),'--recovery-dir',str(recovery_dir),'--snapshot-dir',str(snapshot)],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+            if invalid.returncode==0 or journal.db.execute('SELECT phase FROM legacy_transitions').fetchone()!=('stopped',):
+                raise RuntimeError('Unknown migration was accepted')
+            run('/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-migrate.py','--operation',op,
+                '--old-env',str(old_env),'--old-compose',str(compose),'--recovery-dir',str(recovery_dir),
+                '--snapshot-dir',str(snapshot),timeout=600)
+            result='completed'
         else:
             with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace):result=execute()
-        if (not full and result!='simulated') or journal.db.execute('SELECT phase FROM legacy_transitions').fetchone()!=('started',):raise RuntimeError('Transition failed')
+        if (not full and result!='simulated') or journal.db.execute('SELECT phase FROM legacy_transitions').fetchone()!=('completed' if full else 'started',):raise RuntimeError('Transition failed')
         observed=set(command('ps','-aq','--no-trunc','--filter','label=com.docker.compose.project=servus').decode().splitlines())
         if observed.intersection(old_ids.values()) or (not full and observed):raise RuntimeError('Legacy containers remain')
         if os.stat(data).st_uid!=0:raise RuntimeError('Original data is not protected')
         if full:
-            os.close(lock);lock=None
             end=time.monotonic()+240
             while True:
                 try:
@@ -265,7 +274,6 @@ def main():
                 time.sleep(1)
             discovery=request('/updates/discovery')
             if not isinstance(discovery.get('discovery'),dict):raise RuntimeError('Updater discovery is unavailable')
-            transition.complete(journal,op,active,node_fd,supervisor,daemon,runtime,initial_module,backup,coordinator,service=handoff_module.systemctl)
             if (install/transition.MARKER).exists() or journal.db.execute('SELECT phase FROM legacy_transitions').fetchone()!=('completed',):
                 raise RuntimeError('Migration was not finalized')
             for unit in ('servus-supervisor.service','servus-updater.service','servus-updater-socket.service'):

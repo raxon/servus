@@ -12,6 +12,7 @@
 100644 apps/updater/initial-generation.py
 100644 apps/updater/install-gh.py
 100644 apps/updater/install-host.py
+100644 apps/updater/legacy-migrate.py
 100644 apps/updater/legacy-recovery.py
 100644 apps/updater/legacy-rollback.py
 100644 apps/updater/legacy-stop.py
