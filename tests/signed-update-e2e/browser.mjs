@@ -4,7 +4,8 @@ import { chromium } from '@playwright/test';
 
 const [origin, baseVersion, targetVersion, baseRevision] = process.argv.slice(2);
 const target = `v${targetVersion}`;
-assert.equal(origin, 'http://127.0.0.1:43899');
+assert.match(origin,/^http:\/\/127\.0\.0\.1:[1-9]\d{0,4}$/);
+assert.ok(Number(new URL(origin).port)<=65535);
 assert.match(baseVersion,/^\d+\.\d+\.\d+$/);
 assert.match(targetVersion,/^\d+\.\d+\.\d+$/);
 assert.match(baseRevision,/^[0-9a-f]{40}$/);
