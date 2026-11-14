@@ -40,10 +40,10 @@ jobs:
           docker run --rm --network none \
             --tmpfs /tmp:rw,nosuid,nodev,size=256m \
             --tmpfs /run:rw,nosuid,nodev,size=16m \
-            --mount "type=bind,source=$GITHUB_WORKSPACE/apps/updater,target=/work/apps/updater,readonly" \
-            --mount "type=bind,source=$GITHUB_WORKSPACE/tests/updater,target=/work/tests/updater,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/apps/updater,target=/source/apps/updater,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/tests/updater,target=/source/tests/updater,readonly" \
             --workdir /work python:3.12-slim \
-            python3 -I -B -m unittest discover -s tests/updater
+            sh -ec 'mkdir -p apps tests; cp -R /source/apps/updater apps/; cp -R /source/tests/updater tests/; exec python3 -I -B -m unittest discover -s tests/updater'
       - name: Test lifecycle gate
         env:
           SERVUS_LIFECYCLE_TEST_CONTEXT: default
