@@ -24,6 +24,37 @@ spec.loader.exec_module(daemon)
 
 @unittest.skipUnless(sys.platform == 'linux' and os.geteuid() == 0, 'Requires isolated Linux root')
 class DaemonTest(unittest.TestCase):
+    def test_binding_uses_approved_policy_matching_hub(self):
+        hub = SimpleNamespace(policy=object())
+        def read(path, maximum):
+            return b'policy' if path == '/root/policy' else b'environment'
+        with mock.patch.object(daemon, 'load_approved_policy', return_value=hub.policy), mock.patch.object(daemon, '_private_file', side_effect=read):
+            binding = daemon.approved_policy_binding(hub, '/root/policy', '/root/journal', '/root/environment')
+            self.assertEqual(binding[0], '/root/policy')
+            self.assertEqual(binding[1], 'sha256:' + daemon.hashlib.sha256(b'environment').hexdigest())
+            self.assertEqual(binding[2], 'sha256:' + daemon.hashlib.sha256(b'policy').hexdigest())
+            self.assertIs(binding[3], hub.policy)
+        with mock.patch.object(daemon, 'load_approved_policy', return_value=object()):
+            with self.assertRaises(supervisor.SupervisorError):
+                daemon.approved_policy_binding(hub, '/root/policy', '/root/journal', '/root/environment')
+
+    def test_ownership_rejects_lost_lock_and_closed_handle(self):
+        with tempfile.TemporaryDirectory(dir='/root') as temporary:
+            root = Path(temporary)
+            control, journal = root / 'control', root / 'journal'
+            control.mkdir(mode=0o750); journal.mkdir(mode=0o700)
+            os.chown(control, 0, 1000)
+            ownership = daemon.DaemonOwnership(str(control), str(journal), 1000)
+            try:
+                ownership.assert_held(str(control))
+                fcntl.flock(ownership.lock, fcntl.LOCK_UN)
+                with self.assertRaises(supervisor.SupervisorError):
+                    ownership.assert_held(str(control))
+            finally:
+                ownership.close()
+            with self.assertRaises(supervisor.SupervisorError):
+                ownership.assert_held(str(control))
+
     def test_status_rechecks_approval_with_lock_before_reporting_ready(self):
         for scenario in ('valid', 'changed_env', 'recovery_required'):
             with self.subTest(scenario=scenario):

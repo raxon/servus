@@ -118,6 +118,18 @@ def load_approved_policy(path, approval_journal, accepted_env, *, expected_opera
         raise supervisor.SupervisorError('Active policy approval is unavailable') from error
 
 
+def approved_policy_binding(hub, path, approval_journal, accepted_env):
+    """Capture the approved policy for the authenticated hub under install.lock."""
+    policy = load_approved_policy(path, approval_journal, accepted_env)
+    if policy != hub.policy:
+        raise supervisor.SupervisorError('Active policy changed')
+    env_digest = 'sha256:' + hashlib.sha256(_private_file(accepted_env, 65536)).hexdigest()
+    policy_digest = 'sha256:' + hashlib.sha256(_private_file(path, 1048576)).hexdigest()
+    if load_approved_policy(path, approval_journal, accepted_env) != policy:
+        raise supervisor.SupervisorError('Active policy changed')
+    return path, env_digest, policy_digest, policy
+
+
 def complete_healthy_preparation(hub, approval_journal, operation_id, policy_path, accepted_env):
     """Record completion only while all authenticated roles are healthy."""
     if supervisor.inspect_servus(hub.policy) != hub.identities:
@@ -216,6 +228,27 @@ class DaemonOwnership:
         if self.directory is not None:
             os.close(self.directory)
             self.directory = None
+
+    def assert_held(self, control_dir):
+        """Revalidate the daemon singleton lock and its protected directory."""
+        if self.directory is None or self.lock is None:
+            raise supervisor.SupervisorError('Daemon ownership is unavailable')
+        directory = supervisor._trusted_directory(control_dir, 0o750)
+        try:
+            expected, current = os.fstat(self.directory), os.fstat(directory)
+            if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+                raise supervisor.SupervisorError('Daemon control directory changed')
+            opened = os.fstat(self.lock)
+            named = os.stat('daemon.lock', dir_fd=directory, follow_symlinks=False)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0 or opened.st_gid != 0 or
+                opened.st_nlink != 1 or stat.S_IMODE(opened.st_mode) != 0o600 or
+                (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                raise supervisor.SupervisorError('Daemon lock changed')
+            supervisor._assert_exclusive_flock(self.lock)
+        except OSError as error:
+            raise supervisor.SupervisorError('Daemon ownership is unavailable') from error
+        finally:
+            os.close(directory)
 
 
 def command_listener(directory):

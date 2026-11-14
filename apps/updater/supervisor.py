@@ -24,10 +24,29 @@ import struct
 import subprocess
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
 
 ROLES = ('api', 'worker', 'agent')
+
+
+def _assert_exclusive_flock(fd):
+    """Require a live exclusive flock attached to this open description."""
+    info = os.fstat(fd)
+    try:
+        with open(f'/proc/self/fdinfo/{fd}', encoding='ascii') as stream:
+            lines = stream.read(16384).splitlines()
+        for line in lines:
+            match = re.fullmatch(r'lock:\s*\d+: FLOCK\s+ADVISORY\s+WRITE\s+(\d+)\s+([0-9a-f]+):([0-9a-f]+):(\d+)\s+0 EOF', line)
+            if (match and int(match[1]) == os.getpid() and int(match[2], 16) == os.major(info.st_dev) and
+                int(match[3], 16) == os.minor(info.st_dev) and int(match[4]) == info.st_ino):
+                return
+    except (OSError, ValueError) as error:
+        raise SupervisorError('Cannot verify exclusive lock') from error
+    raise SupervisorError('Exclusive lock was lost')
+
+
 MAX_LINE = 4096
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
 CONTAINER = re.compile(r'^[0-9a-f]{64}$')
@@ -672,7 +691,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
         self.close()
 
     def _record(self, request_id, state, request_ids, timeout_ms):
-        if not _uuid4(request_id) or state not in ('intent', 'maintenance', 'drained', 'stopping', 'stopped_unverified', 'recovery_required'):
+        if not _uuid4(request_id) or state not in ('intent', 'maintenance', 'drained', 'stopping', 'stopped_unverified', 'snapshotting', 'snapshot_verified', 'switching', 'starting', 'recovery_required'):
             raise SupervisorError('Invalid supervisor state')
         if (not isinstance(request_ids, dict) or set(request_ids) != set(ROLES) or
             not all(_uuid4(value) for value in request_ids.values()) or len(set(request_ids.values())) != len(ROLES) or
@@ -705,14 +724,29 @@ class MaintenanceSupervisor(ComponentEndpoint):
         finally:
             fcntl.flock(self.gate_lock, fcntl.LOCK_UN)
 
-    def stop_after_drain(self, hub, request_id, timeout_ms=60000):
-        """Stop the three authenticated containers; never starts or updates them."""
+    @contextmanager
+    def drained_window(self, hub, request_id, timeout_ms=60000, *, policy_binding=None):
+        """Hold the exclusive startup gate after stopping authenticated roles.
+
+        Callers must independently prove that every other writer and daemon-side
+        operation is quiescent. A held gate alone does not authorize a backup.
+        Any exception or uncommitted exit preserves a recovery-required marker.
+        """
         if not isinstance(hub, DrainHub) or not _uuid4(request_id) or type(timeout_ms) is not int or not 1 <= timeout_ms <= 60000:
             raise SupervisorError('Invalid maintenance request')
+        if policy_binding is not None:
+            if (not isinstance(policy_binding, tuple) or len(policy_binding) != 4 or
+                not isinstance(policy_binding[0], str) or not os.path.isabs(policy_binding[0]) or
+                any(not isinstance(value, str) or not re.fullmatch(r'sha256:[a-f0-9]{64}', value) for value in policy_binding[1:3]) or
+                policy_binding[3] != hub.policy):
+                raise SupervisorError('Active policy does not match the drained hub')
         self._verify_no_previous_operation()
         request_ids = {role: str(uuid.uuid4()) for role in ROLES}
         # Capture intent before either maintenance state or container changes.
         self._record(request_id, 'intent', request_ids, timeout_ms)
+        exclusive = False
+        completed = False
+        lease = None
         try:
             self._start_maintenance()
             self._record(request_id, 'maintenance', request_ids, timeout_ms)
@@ -729,20 +763,96 @@ class MaintenanceSupervisor(ComponentEndpoint):
                     result[0].get('State', {}).get('Running') is not False):
                     raise SupervisorError('A container could not be confirmed stopped')
             fcntl.flock(self.gate_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                by_name = os.stat('lock', dir_fd=self.gate, follow_symlinks=False)
-                by_fd = os.fstat(self.gate_lock)
-                if (by_name.st_dev, by_name.st_ino) != (by_fd.st_dev, by_fd.st_ino):
-                    raise SupervisorError('Lifecycle lock changed')
-                # Durable jobs, Docker-side processes and other writers are not
-                # yet verified. No snapshot or image update may follow from this.
-                self._record(request_id, 'stopped_unverified', request_ids, timeout_ms)
-            finally:
-                fcntl.flock(self.gate_lock, fcntl.LOCK_UN)
-            return 'stopped_unverified'
+            exclusive = True
+            by_name = os.stat('lock', dir_fd=self.gate, follow_symlinks=False)
+            by_fd = os.fstat(self.gate_lock)
+            if (by_name.st_dev, by_name.st_ino) != (by_fd.st_dev, by_fd.st_ino):
+                raise SupervisorError('Lifecycle lock changed')
+            self._record(request_id, 'stopped_unverified', request_ids, timeout_ms)
+            lease = DrainLease(self, request_id, request_ids, timeout_ms, policy_binding)
+            yield lease
+            completed = lease._settled
         except BaseException:
             try:
                 self._record(request_id, 'recovery_required', request_ids, timeout_ms)
             except BaseException:
                 pass
             raise
+        finally:
+            if lease is not None:
+                lease._active = False
+            if not completed:
+                try:
+                    self._record(request_id, 'recovery_required', request_ids, timeout_ms)
+                except BaseException:
+                    pass
+            if exclusive:
+                fcntl.flock(self.gate_lock, fcntl.LOCK_UN)
+
+    def stop_after_drain(self, hub, request_id, timeout_ms=60000):
+        """Stop the three authenticated containers; never starts or updates them."""
+        with self.drained_window(hub, request_id, timeout_ms) as lease:
+            lease.retain_maintenance()
+        return 'stopped_unverified'
+
+
+class DrainLease:
+    """An exclusive gate lease scoped to one durable maintenance intent."""
+
+    def __init__(self, owner, operation_id, request_ids, timeout_ms, policy_binding=None):
+        self._owner = owner
+        self._operation_id = operation_id
+        self._request_ids = request_ids
+        self._timeout_ms = timeout_ms
+        self._settled = False
+        self._state = 'stopped_unverified'
+        self._active = True
+        self._policy_binding = policy_binding[:3] if policy_binding is not None else None
+
+    def assert_locked(self, operation_id, state):
+        """Recheck the host lock identities and the still-closed startup gate."""
+        owner = self._owner
+        if not self._active or self._settled or operation_id != self._operation_id or state != self._state:
+            raise SupervisorError('Maintenance lease is not current')
+        try:
+            for directory, name, fd, mode in ((owner.install, 'install.lock', owner.install_lock, 0o600),
+                                               (owner.gate, 'lock', owner.gate_lock, 0o644)):
+                opened = os.fstat(fd)
+                named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0 or opened.st_nlink != 1 or
+                    stat.S_IMODE(opened.st_mode) != mode or
+                    (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                    raise SupervisorError('Maintenance lock changed')
+                _assert_exclusive_flock(fd)
+            state_fd = _open_root_file(owner.gate, 'state', 0o644)
+            try:
+                if os.read(state_fd, 64) != b'servus-lifecycle-v1 maintenance\n':
+                    raise SupervisorError('Lifecycle gate changed')
+            finally:
+                os.close(state_fd)
+        except (OSError, TypeError) as error:
+            raise SupervisorError('Maintenance lease is unavailable') from error
+
+    def assert_snapshot_verified(self, operation_id):
+        self.assert_locked(operation_id, 'snapshot_verified')
+
+    def assert_active_policy(self, policy_path, env_digest, policy_digest):
+        self.assert_snapshot_verified(self._operation_id)
+        if self._policy_binding is None or self._policy_binding != (policy_path, env_digest, policy_digest):
+            raise SupervisorError('Active policy is not bound to this drain')
+
+    def record(self, state):
+        transitions = {'stopped_unverified': 'snapshotting', 'snapshotting': 'snapshot_verified',
+                       'snapshot_verified': 'switching'}
+        if self._settled or transitions.get(self._state) != state:
+            raise SupervisorError('Invalid maintenance transition')
+        self.assert_locked(self._operation_id, self._state)
+        self._owner._record(self._operation_id, state, self._request_ids, self._timeout_ms)
+        self._state = state
+
+    def retain_maintenance(self):
+        """Leave the startup gate closed for later recovery or integration."""
+        if self._settled:
+            raise SupervisorError('Maintenance window is already settled')
+        self.assert_locked(self._operation_id, self._state)
+        self._settled = True

@@ -1,4 +1,5 @@
 import copy
+import fcntl
 import importlib.util
 import json
 import os
@@ -215,6 +216,43 @@ class SupervisorTest(unittest.TestCase):
         (self.gate / 'lock').symlink_to(self.install / 'install.lock')
         with self.assertRaises((OSError, supervisor.SupervisorError)):
             supervisor.MaintenanceSupervisor(self.install, self.gate, self.journal)
+
+    def test_drained_window_holds_gate_and_abandoned_window_requires_recovery(self):
+        ids = {role: {'id': char * 64, 'pid': 123, 'cgroup': '/docker/' + char * 64} for role, char in zip(supervisor.ROLES, 'abc')}
+        hub = mock.create_autospec(supervisor.DrainHub, instance=True)
+        hub.identities = ids
+        hub.policy = POLICY
+        operation = str(uuid.uuid4())
+        def docker(*args, **kwargs):
+            if args[0] == 'inspect':
+                return json.dumps([{'Id': args[1], 'State': {'Running': False}}]).encode()
+            return b''
+        with supervisor.MaintenanceSupervisor(self.install, self.gate, self.journal) as owner:
+            with mock.patch.object(supervisor, '_docker', side_effect=docker), mock.patch.object(supervisor, 'inspect_servus', return_value=ids):
+                binding = ('/root/policy.json', 'sha256:' + 'a' * 64, 'sha256:' + 'b' * 64, POLICY)
+                with owner.drained_window(hub, operation, policy_binding=binding) as lease:
+                    fd = os.open(self.gate / 'lock', os.O_RDONLY)
+                    try:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        os.close(fd)
+                    with self.assertRaises(supervisor.SupervisorError):
+                        lease.assert_snapshot_verified(operation)
+                    lease.record('snapshotting')
+                    lease.record('snapshot_verified')
+                    lease.assert_snapshot_verified(operation)
+                    lease.assert_active_policy(*binding[:3])
+                    with self.assertRaises(supervisor.SupervisorError):
+                        lease.assert_active_policy(binding[0], binding[1], 'sha256:' + 'c' * 64)
+                    with self.assertRaises(supervisor.SupervisorError):
+                        lease.assert_snapshot_verified(str(uuid.uuid4()))
+                    fcntl.flock(owner.gate_lock, fcntl.LOCK_UN)
+                    with self.assertRaises(supervisor.SupervisorError):
+                        lease.assert_snapshot_verified(operation)
+                with self.assertRaises(supervisor.SupervisorError):
+                    lease.assert_snapshot_verified(operation)
+        self.assertEqual(json.loads((self.journal / 'maintenance.json').read_bytes())['state'], 'recovery_required')
 
     def test_host_socket_and_credentials_are_root_owned_and_never_adopt_existing_socket(self):
         directory = self.root / 'control'

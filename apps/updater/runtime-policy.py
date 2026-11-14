@@ -590,3 +590,131 @@ def activate(journal, operation_id, accepted_env_path, candidate_path, policy_pa
     finally:
         for fd in (output_fd, daemon_lock, control_fd, lock_fd, install_fd):
             if fd is not None: os.close(fd)
+
+
+def activate_locked(journal, operation_id, accepted_env_path, candidate_path, policy_path,
+                    active_env_path, lease, daemon_ownership, extractor, supervisor,
+                    coordinator, backup_module, node_fd):
+    """Supersede an active policy only inside a verified maintenance window.
+
+    The caller owns the installation, gate and daemon locks and supplies only
+    modules loaded from trusted root-owned files. Proof is read from the same
+    journal as the candidate; no caller-provided assertion authorizes the swap.
+    A crash after durable intent blocks policy loading until reconciliation.
+    """
+    if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
+        raise PolicyError('An isolated Linux root coordinator is required')
+    if not isinstance(lease, supervisor.DrainLease) or not supervisor._uuid4(operation_id):
+        raise PolicyError('A current maintenance lease is required')
+    if not isinstance(policy_path, str) or not policy_path.startswith('/') or os.path.normpath(policy_path) != policy_path:
+        raise PolicyError('Invalid active policy path')
+    parent, name = os.path.split(policy_path)
+    if not name:
+        raise PolicyError('Invalid active policy path')
+    install_dir = os.readlink('/proc/self/fd/' + str(lease._owner.install))
+    control_dir = os.readlink('/proc/self/fd/' + str(daemon_ownership.directory))
+    lease.assert_snapshot_verified(operation_id)
+    daemon_ownership.assert_held(control_dir)
+    output_fd = extractor._trusted_parent(parent)
+    intent = False
+    db = journal.db
+    try:
+        candidate = _read_private_file(candidate_path, 1024 * 1024)
+        config = _read_private_file(accepted_env_path, 65536)
+        live_config = _read_private_file(active_env_path, 65536)
+        if config != live_config:
+            raise PolicyError('Active environment does not match the candidate')
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            if db.execute("SELECT 1 FROM policy_approvals WHERE state IN ('activating','recovery_required') LIMIT 1").fetchone():
+                raise PolicyError('A policy activation requires recovery')
+            row = db.execute("SELECT a.attempt_id,a.attempt_nonce,a.preparation_id,a.root_digest,a.image_config_digest,a.env_digest,a.candidate_digest,a.accepted_env_path "
+                "FROM policy_approvals a JOIN operations o ON o.id=a.operation_id JOIN preparations p ON p.operation_id=a.operation_id "
+                "WHERE a.operation_id=? AND a.state='candidate' AND a.source_env_path=? AND a.candidate_path=? "
+                "AND o.status='verified' AND o.attempt_id=a.attempt_id AND o.attempt_nonce=a.attempt_nonce "
+                "AND o.digest=a.root_digest AND o.config_digest=a.image_config_digest AND p.status='prepared' "
+                "AND p.attempt_id=a.attempt_id AND p.attempt_nonce=a.attempt_nonce AND p.preparation_id=a.preparation_id "
+                "AND NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') "
+                "AND EXISTS (SELECT 1 FROM policy_probes WHERE operation_id=a.operation_id AND preparation_id=a.preparation_id AND config_digest=a.env_digest AND state='removed')",
+                (operation_id, accepted_env_path, candidate_path)).fetchone()
+            if not row or row[5] != 'sha256:' + hashlib.sha256(config).hexdigest() or row[6] != 'sha256:' + hashlib.sha256(candidate).hexdigest():
+                raise PolicyError('Policy approval or configuration changed')
+            if row[5] != 'sha256:' + hashlib.sha256(_read_private_file(row[7], 65536)).hexdigest():
+                raise PolicyError('Approved environment snapshot changed')
+            previous = db.execute("SELECT a.operation_id,a.policy_path,a.accepted_env_path,a.env_digest,a.candidate_digest,a.source_env_path "
+                "FROM policy_approvals a JOIN preparations p ON p.operation_id=a.operation_id "
+                "WHERE a.state='active' AND p.status='completed'").fetchall()
+            if len(previous) != 1 or previous[0][0] == operation_id or previous[0][5] != active_env_path:
+                raise PolicyError('Previous active policy is unavailable')
+            old = previous[0]
+            if (old[3] != 'sha256:' + hashlib.sha256(_read_private_file(old[2], 65536)).hexdigest() or
+                    old[4] != 'sha256:' + hashlib.sha256(_read_private_file(old[1], 1024 * 1024)).hexdigest()):
+                raise PolicyError('Previous approved policy changed')
+            # A valid old approval is not sufficient unless it is the policy
+            # under which the currently held hub was authenticated and drained.
+            lease.assert_active_policy(old[1], old[3], old[4])
+            proof = db.execute("SELECT preparation_id,attempt_id,attempt_nonce,root_digest,backup_path,backup_manifest_digest "
+                "FROM update_transactions WHERE operation_id=? AND phase='snapshot_verified'", (operation_id,)).fetchone()
+            if (not proof or proof[:4] != (row[2], row[0], row[1], row[3]) or
+                not isinstance(proof[4], str) or not proof[4].startswith('/') or os.path.normpath(proof[4]) != proof[4] or
+                not isinstance(proof[5], str) or not DIGEST.fullmatch(proof[5])):
+                raise PolicyError('Verified snapshot proof is unavailable')
+            document = _json(candidate)
+            if not isinstance(document, dict) or set(document) != {'version', 'policy'} or type(document['version']) is not int or document['version'] != 1 or not isinstance(document['policy'], dict):
+                raise PolicyError('Invalid policy candidate')
+            policy = supervisor.RuntimePolicy(**document['policy'])
+            if (policy.image_reference != IMAGE + '@' + row[3] or policy.install_dir != install_dir or
+                policy.control_dir != control_dir or _env(config).get('SERVUS_IMAGE') != policy.image_reference):
+                raise PolicyError('Policy identity changed')
+            try:
+                os.stat(name, dir_fd=output_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise PolicyError('Active policy already exists')
+            # Recheck the entire inventory, encryption and database integrity.
+            coordinator.verify_snapshot(proof[4], proof[5], backup_module, node_fd, supervisor)
+            lease.assert_snapshot_verified(operation_id)
+            daemon_ownership.assert_held(control_dir)
+            lease.assert_active_policy(old[1], old[3], old[4])
+            if _read_private_file(active_env_path, 65536) != config:
+                raise PolicyError('Active environment changed')
+            cursor = db.execute("UPDATE policy_approvals SET state='activating',policy_path=?,source_env_path=? WHERE operation_id=? AND state='candidate'", (policy_path, active_env_path, operation_id))
+            if cursor.rowcount != 1:
+                raise PolicyError('Policy approval changed')
+            db.execute('COMMIT')
+            intent = True
+        except BaseException:
+            if db.in_transaction: db.execute('ROLLBACK')
+            raise
+        _publish_private(output_fd, name, candidate)
+        lease.assert_snapshot_verified(operation_id)
+        daemon_ownership.assert_held(control_dir)
+        lease.assert_active_policy(old[1], old[3], old[4])
+        if _read_private_file(active_env_path, 65536) != config:
+            raise PolicyError('Active environment changed')
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            prior = db.execute("UPDATE policy_approvals SET state='superseded' WHERE operation_id=? AND state='active'", (old[0],))
+            current = db.execute("UPDATE policy_approvals SET state='active' WHERE operation_id=? AND state='activating' AND policy_path=? AND env_digest=? AND candidate_digest=? AND source_env_path=? "
+                "AND EXISTS (SELECT 1 FROM update_transactions t WHERE t.operation_id=policy_approvals.operation_id AND t.phase='snapshot_verified' AND t.preparation_id=? AND t.attempt_id=? AND t.attempt_nonce=? AND t.root_digest=? AND t.backup_path=? AND t.backup_manifest_digest=?) "
+                "AND EXISTS (SELECT 1 FROM operations o JOIN preparations p ON p.operation_id=o.id WHERE o.id=policy_approvals.operation_id AND o.status='verified' AND o.attempt_id=? AND o.attempt_nonce=? AND o.digest=? AND o.config_digest=? AND p.status='prepared' AND p.preparation_id=? AND p.attempt_id=? AND p.attempt_nonce=?) "
+                "AND NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent')",
+                (operation_id, policy_path, row[5], row[6], active_env_path,
+                 row[2], row[0], row[1], row[3], proof[4], proof[5],
+                 row[0], row[1], row[3], row[4], row[2], row[0], row[1]))
+            if prior.rowcount != 1 or current.rowcount != 1:
+                raise PolicyError('Policy activation changed')
+            db.execute('COMMIT')
+        except BaseException:
+            if db.in_transaction: db.execute('ROLLBACK')
+            raise
+        intent = False
+        return policy_path
+    except BaseException:
+        if intent:
+            try: db.execute("UPDATE policy_approvals SET state='recovery_required' WHERE operation_id=? AND state='activating'", (operation_id,))
+            except BaseException: pass
+        raise
+    finally:
+        os.close(output_fd)
