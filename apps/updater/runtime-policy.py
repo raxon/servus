@@ -245,7 +245,29 @@ def _record_candidate(db, operation_id, attempt_id, nonce, preparation_id, proje
         raise
 
 
-def produce(journal, operation_id, staging_parent, accepted_env_path, install_dir, output_path, extractor, supervisor, *, resolve_child=None, lock_owner=None):
+def _installation_lock(install_fd, supervisor, inherited_lock=None):
+    expected = supervisor._open_root_file(install_fd, 'install.lock', 0o600)
+    try:
+        if inherited_lock is None:
+            result = os.dup(expected)
+        else:
+            if type(inherited_lock) is not int or inherited_lock < 3:
+                raise PolicyError('Invalid inherited installation lock')
+            held, named = os.fstat(inherited_lock), os.fstat(expected)
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                raise PolicyError('Inherited installation lock does not match')
+            result = os.dup(inherited_lock)
+    finally:
+        os.close(expected)
+    try:
+        fcntl.flock(result, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return result
+    except BaseException:
+        os.close(result)
+        raise
+
+
+def produce(journal, operation_id, staging_parent, accepted_env_path, install_dir, output_path, extractor, supervisor, *, resolve_child=None, lock_owner=None, inherited_lock=None):
     """Produce a policy only after durable intent, validation and probe cleanup.
 
     The caller must load these modules from trusted root-owned code. This
@@ -265,10 +287,9 @@ def produce(journal, operation_id, staging_parent, accepted_env_path, install_di
     try:
         if lock_owner is None:
             install_fd = supervisor._trusted_directory(install_dir)
-            lock_fd = supervisor._open_root_file(install_fd, 'install.lock', 0o600)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_fd = _installation_lock(install_fd, supervisor, inherited_lock)
         else:
-            if not isinstance(lock_owner, supervisor.MaintenanceSupervisor):
+            if inherited_lock is not None or not isinstance(lock_owner, supervisor.MaintenanceSupervisor):
                 raise PolicyError('A current installation lock is required')
             supervisor._assert_exclusive_flock(lock_owner.install_lock)
             install_fd = supervisor._trusted_directory(install_dir)
@@ -508,7 +529,7 @@ def produce(journal, operation_id, staging_parent, accepted_env_path, install_di
         os.close(install_fd)
 
 
-def activate(journal, operation_id, accepted_env_path, candidate_path, policy_path, install_dir, control_dir, extractor, supervisor):
+def activate(journal, operation_id, accepted_env_path, candidate_path, policy_path, install_dir, control_dir, extractor, supervisor, *, inherited_lock=None):
     """Activate exactly one approved candidate while both host locks are held.
 
     Policies have distinct immutable paths. A previous active policy can only be
@@ -526,8 +547,7 @@ def activate(journal, operation_id, accepted_env_path, candidate_path, policy_pa
     intent = False
     try:
         install_fd = supervisor._trusted_directory(install_dir)
-        lock_fd = supervisor._open_root_file(install_fd, 'install.lock', 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd = _installation_lock(install_fd, supervisor, inherited_lock)
         control_fd = supervisor._trusted_directory(control_dir, 0o750)
         try:
             daemon_lock = os.open('daemon.lock', os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=control_fd)

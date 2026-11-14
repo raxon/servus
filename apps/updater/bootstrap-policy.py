@@ -21,7 +21,20 @@ class BootstrapError(Exception):
 
 
 def bootstrap(journal, operation, accepted_env, install_dir, control_dir, policy_root,
-              extractor, supervisor, policy, *, resolve_child=None, verify_active=None):
+              extractor, supervisor, policy, *, resolve_child=None, verify_active=None, inherited_lock=None):
+    directory = supervisor._trusted_directory(install_dir)
+    try:
+        lock = policy._installation_lock(directory, supervisor, inherited_lock)
+        try:
+            return _bootstrap_locked(journal, operation, accepted_env, install_dir, control_dir, policy_root,
+                                     extractor, supervisor, policy, resolve_child=resolve_child,
+                                     verify_active=verify_active, inherited_lock=lock)
+        finally: os.close(lock)
+    finally: os.close(directory)
+
+
+def _bootstrap_locked(journal, operation, accepted_env, install_dir, control_dir, policy_root,
+                      extractor, supervisor, policy, *, resolve_child=None, verify_active=None, inherited_lock=None):
     if not supervisor._uuid4(operation): raise BootstrapError('Invalid operation identity')
     row = journal.db.execute("SELECT p.preparation_id,p.staging_path,o.digest FROM preparations p JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=? AND p.status='prepared' AND o.status='verified' AND p.attempt_id=o.attempt_id AND p.attempt_nonce=o.attempt_nonce", (operation,)).fetchone()
     if (not row or not supervisor._uuid4(row[0]) or not isinstance(row[1], str) or
@@ -51,9 +64,9 @@ def bootstrap(journal, operation, accepted_env, install_dir, control_dir, policy
             raise BootstrapError('An existing policy requires recovery')
     else:
         policy.produce(journal, operation, os.path.dirname(row[1]), accepted_env, install_dir,
-                       candidate, extractor, supervisor, resolve_child=resolve_child)
+                       candidate, extractor, supervisor, resolve_child=resolve_child, inherited_lock=inherited_lock)
     return policy.activate(journal, operation, accepted_env, candidate, active, install_dir,
-                           control_dir, extractor, supervisor)
+                           control_dir, extractor, supervisor, inherited_lock=inherited_lock)
 
 
 def _trusted_modules():
@@ -85,6 +98,7 @@ def main():
     parser = argparse.ArgumentParser()
     for name in ('operation', 'state-dir', 'accepted-env', 'install-dir', 'control-dir', 'policy-dir'):
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--install-lock-fd', type=int)
     args = parser.parse_args()
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
         print('Initial policy requires isolated Linux root.', file=sys.stderr); return 1
@@ -111,7 +125,7 @@ def main():
                                                expected_operation_id=operation)
         bootstrap(journal, args.operation, args.accepted_env, args.install_dir, args.control_dir,
                   args.policy_dir, extractor, supervisor, policy, resolve_child=resolve_child,
-                  verify_active=verify_active)
+                  verify_active=verify_active, inherited_lock=args.install_lock_fd)
         return 0
     except Exception:
         print('Initial policy could not be activated safely.', file=sys.stderr)

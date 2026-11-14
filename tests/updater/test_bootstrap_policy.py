@@ -70,6 +70,21 @@ class BootstrapPolicyTest(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT state FROM policy_approvals').fetchone(),('active',))
         self.assertEqual(self.active.read_bytes(),self.candidate.read_bytes())
 
+    def test_activation_holds_inherited_installer_lock_until_return(self):
+        held=os.open(self.install/'install.lock',os.O_RDONLY)
+        other=os.open(self.env,os.O_RDONLY)
+        try:
+            fcntl.flock(held,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(policy.PolicyError): self.invoke(inherited_lock=other)
+            self.assertEqual(self.db.execute('SELECT state FROM policy_approvals').fetchone(),('candidate',))
+            with mock.patch.object(supervisor,'RuntimePolicy',return_value=self.policy_value), mock.patch.object(supervisor,'_docker',return_value=b''):
+                self.assertEqual(self.invoke(inherited_lock=held),str(self.active))
+            contender=os.open(self.install/'install.lock',os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError): fcntl.flock(contender,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally: os.close(contender)
+        finally: os.close(other);os.close(held)
+
     def test_resuming_active_initial_policy_reverifies_exact_binding(self):
         snapshot = self.private/('env-'+self.prep+'.env')
         self.db.execute("UPDATE policy_approvals SET state='active',policy_path=?,accepted_env_path=?",(str(self.active),str(snapshot)))
@@ -106,6 +121,21 @@ class BootstrapPolicyTest(unittest.TestCase):
             self.assertEqual(self.invoke(),str(self.active))
         self.assertEqual(produce.call_args.args[0:6], (self.journal,self.op,str(self.staging),str(self.env),str(self.install),str(self.candidate)))
         self.assertEqual(activate.call_args.args[0:7], (self.journal,self.op,str(self.env),str(self.candidate),str(self.active),str(self.install),str(self.control)))
+
+    def test_installation_lock_is_continuous_between_generation_and_activation(self):
+        self.db.execute('DELETE FROM policy_approvals')
+        calls=[]
+        def check_lock(*_args, **kwargs):
+            inherited=kwargs['inherited_lock'];self.assertIsInstance(inherited,int)
+            contender=os.open(self.install/'install.lock',os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError): fcntl.flock(contender,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally: os.close(contender)
+            calls.append(inherited)
+            return str(self.active)
+        with mock.patch.object(policy,'produce',side_effect=check_lock), mock.patch.object(policy,'activate',side_effect=check_lock):
+            self.assertEqual(self.invoke(),str(self.active))
+        self.assertEqual(len(calls),2);self.assertEqual(calls[0],calls[1])
 
     def test_running_containers_and_changed_environment_are_refused(self):
         with mock.patch.object(supervisor,'RuntimePolicy',return_value=self.policy_value), mock.patch.object(supervisor,'_docker',return_value=b'running'):
