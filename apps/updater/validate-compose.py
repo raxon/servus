@@ -101,14 +101,14 @@ try:
         if name == "api" and updater_dir is not None: expected_targets.add("/run/servus-updater")
         if len(targets) != len(mounts) or set(targets) != expected_targets: raise ValueError()
         mount = targets["/run/servus-lifecycle"]
-        if mount.get("type") != "bind" or mount.get("source") != sys.argv[1] or mount.get("target") != "/run/servus-lifecycle" or mount.get("read_only") is not True or mount.get("bind", {}).get("create_host_path") is not False: raise ValueError()
+        if mount.get("type") != "bind" or mount.get("source") != sys.argv[1] or mount.get("target") != "/run/servus-lifecycle" or mount.get("read_only") is not True or mount.get("bind", {}).get("create_host_path", False) is not False: raise ValueError()
         control = targets["/run/servus-supervisor"]
         token = targets["/run/servus-control/token"]
-        if control.get("type") != "bind" or control.get("source") != sys.argv[6] or control.get("read_only") is not True or control.get("bind", {}).get("create_host_path") is not False: raise ValueError()
-        if token.get("type") != "bind" or token.get("source") != sys.argv[7] + "/" + name or token.get("read_only") is not True or token.get("bind", {}).get("create_host_path") is not False: raise ValueError()
+        if control.get("type") != "bind" or control.get("source") != sys.argv[6] or control.get("read_only") is not True or control.get("bind", {}).get("create_host_path", False) is not False: raise ValueError()
+        if token.get("type") != "bind" or token.get("source") != sys.argv[7] + "/" + name or token.get("read_only") is not True or token.get("bind", {}).get("create_host_path", False) is not False: raise ValueError()
         if name == "api" and updater_dir is not None:
             updater = targets["/run/servus-updater"]
-            if updater.get("type") != "bind" or updater.get("source") != updater_dir or updater.get("read_only") is not True or updater.get("bind", {}).get("create_host_path") is not False: raise ValueError()
+            if updater.get("type") != "bind" or updater.get("source") != updater_dir or updater.get("read_only") is not True or updater.get("bind", {}).get("create_host_path", False) is not False: raise ValueError()
         data = targets[sys.argv[3]]
         if data.get("type") != "bind" or data.get("source") != sys.argv[3] or data.get("read_only", False) is not False: raise ValueError()
         if name == "agent":

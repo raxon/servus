@@ -56,6 +56,14 @@ class UpdateSocketComposeTest(unittest.TestCase):
             with self.subTest(enabled=enabled):
                 self.assertEqual(self.check(*fixture(enabled)).returncode, 0)
 
+    def test_older_compose_omits_false_bind_option(self):
+        env, document = fixture(True)
+        for service in document['services'].values():
+            for mount in service['volumes']:
+                if mount.get('bind', {}).get('create_host_path') is False:
+                    mount['bind'] = {}
+        self.assertEqual(self.check(env, document).returncode, 0)
+
     def test_socket_mount_and_access_must_be_exact(self):
         env, document = fixture(True)
         variants = []
