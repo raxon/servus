@@ -14,6 +14,36 @@ class QuiescenceError(Exception):
     pass
 
 
+def ensure_restart_fenced(docker, expected):
+    """Check stopped legacy containers cannot restart through Docker policy.
+
+    This observation does not stop manual starts or external orchestrators.
+    The caller must maintain an independent durable startup fence.
+    """
+    if not isinstance(expected, set) or len(expected) != 3 or not all(isinstance(item, str) and re.fullmatch(r'[a-f0-9]{64}', item) for item in expected):
+        raise QuiescenceError('Invalid control-plane container inventory')
+    items = docker.inspect(*sorted(expected))
+    if (not isinstance(items, list) or len(items) != len(expected) or
+        any(not isinstance(item, dict) for item in items) or
+        {item.get('Id') for item in items} != expected):
+        raise QuiescenceError('Control-plane inspection is unavailable')
+    for item in items:
+        state = item.get('State')
+        host = item.get('HostConfig')
+        config = item.get('Config')
+        if not isinstance(state, dict) or not isinstance(host, dict) or not isinstance(config, dict):
+            raise QuiescenceError('Control-plane restart policy is unavailable')
+        labels = config.get('Labels')
+        if labels is not None and not isinstance(labels, dict):
+            raise QuiescenceError('Control-plane orchestration is unavailable')
+        if (state.get('Running') is not False or state.get('Paused') is not False or
+            state.get('Restarting') is not False or host.get('AutoRemove') is not False or
+            not isinstance(host.get('RestartPolicy'), dict) or
+            host['RestartPolicy'].get('Name') != 'no' or
+            any(key.startswith('com.docker.swarm.') for key in (labels or {}))):
+            raise QuiescenceError('Control-plane restart is not fenced')
+
+
 def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=None):
     """Inspect all containers; only a separately approved ingress may hold Docker's socket."""
     if not isinstance(expected, set) or len(expected) != 3 or not all(re.fullmatch(r'[a-f0-9]{64}', item) for item in expected):

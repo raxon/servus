@@ -119,6 +119,29 @@ class DockerInventoryTest(unittest.TestCase):
             with self.assertRaises(module.QuiescenceError):
                 module.ensure_no_mount_aliases(self.docker, '/var/lib/servus')
 
+    def test_restart_fence_requires_stopped_unmanaged_containers(self):
+        roles = self.items[:-1]
+        for item in roles:
+            item['HostConfig'] = {'AutoRemove': False, 'RestartPolicy': {'Name': 'no'}}
+            item['Config'] = {'Labels': {'com.docker.compose.project': 'servus'}}
+        self.docker.inspect.return_value = roles
+        module.ensure_restart_fenced(self.docker, self.ids)
+        for item, field, value in ((roles[0]['State'], 'Running', True),
+                                   (roles[0]['State'], 'Restarting', True),
+                                   (roles[0]['HostConfig']['RestartPolicy'], 'Name', 'unless-stopped'),
+                                   (roles[0]['HostConfig'], 'AutoRemove', True),
+                                   (roles[0]['Config']['Labels'], 'com.docker.swarm.service.name', 'servus')):
+            with self.subTest(field=field):
+                previous = item.get(field)
+                item[field] = value
+                with self.assertRaises(module.QuiescenceError):
+                    module.ensure_restart_fenced(self.docker, self.ids)
+                if previous is None: del item[field]
+                else: item[field] = previous
+        self.docker.inspect.return_value = roles[:-1]
+        with self.assertRaises(module.QuiescenceError):
+            module.ensure_restart_fenced(self.docker, self.ids)
+
 
 if __name__ == '__main__':
     unittest.main()
