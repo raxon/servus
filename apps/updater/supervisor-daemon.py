@@ -2,8 +2,8 @@
 """Serve authenticated component channels until a root operator requests a drain.
 
 The policy must be provisioned independently from trusted installation inputs.
-No production policy provisioner is implemented yet. This daemon never derives
-expected policy from the running containers or applies updates.
+No production policy provisioner is implemented yet. Optional host-side update
+application requires an approved policy and protected configuration.
 """
 import argparse
 from contextlib import closing
