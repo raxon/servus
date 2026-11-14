@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 umask 077
 servus_staging=
+servus_config_temp=
 
 fail() { printf 'Servus: %s\n' "$*" >&2; return 1; }
 log() { printf 'Servus: %s\n' "$*"; }
@@ -59,6 +60,7 @@ check_path_ancestors() {
 }
 cleanup_staging() {
   if [[ -n $servus_staging ]]; then rm -rf -- "$servus_staging"; servus_staging=; fi
+  if [[ -n $servus_config_temp ]]; then rm -f -- "$servus_config_temp"; servus_config_temp=; fi
 }
 validate_image() { [[ $1 =~ ^ghcr\.io/raxon/servus@sha256:[0-9a-f]{64}$ ]] || fail 'Image must be ghcr.io/raxon/servus with a lowercase sha256 digest.'; }
 validate_ref() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$ && $1 != *..* && $1 != */ && $1 != *//* ]] || fail 'Invalid source ref.'; }
@@ -96,6 +98,86 @@ detect_platform() {
   case "$(uname -m)" in x86_64|amd64) architecture=amd64;; aarch64|arm64) architecture=arm64;; *) fail 'Use an amd64 or arm64 VPS.';; esac
 }
 read_setting() { awk -F= -v key="$1" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$config_file"; }
+canonical_saved_origin() {
+  local value=${1,,} scheme host port octet a b c d
+  [[ $value =~ ^(https?)://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*)(:([0-9]{1,5}))?$ ]] || return 1
+  scheme=${BASH_REMATCH[1]}; host=${BASH_REMATCH[2]}; port=${BASH_REMATCH[7]:-}
+  [[ ${#host} -le 253 ]] || return 1
+  if [[ $host =~ ^[0-9.]+$ ]]; then
+    [[ $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r a b c d <<< "$host"
+    for octet in "$a" "$b" "$c" "$d"; do
+      [[ $octet =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( 10#$octet <= 255 )) || return 1
+    done
+  fi
+  if [[ -n $port ]]; then
+    (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+    port=$((10#$port))
+    [[ $scheme != http || $port != 80 ]] && [[ $scheme != https || $port != 443 ]] || port=
+  fi
+  printf '%s://%s%s' "$scheme" "$host" "${port:+:$port}"
+}
+append_origin() {
+  local item=$1
+  case ",$allowed_origins," in *",$item,"*) ;; *) allowed_origins+="${allowed_origins:+,}$item";; esac
+}
+read_saved_origins() {
+  local file=$1 line count=0 public_count=0 raw= item canonical stored_public= public_host
+  saved_origins=
+  [[ -f $file ]] || return 0
+  [[ ! -L $file ]] || fail 'Configuration must not be a symlink.'
+  while IFS= read -r line || [[ -n $line ]]; do
+    case "$line" in
+      SERVUS_PUBLIC_URL|SERVUS_PUBLIC_URL=*)
+        ((public_count+=1))
+        [[ $line == SERVUS_PUBLIC_URL=* ]] || fail 'Invalid saved origin configuration.'
+        stored_public=${line#*=}
+        ;;
+      SERVUS_ALLOWED_ORIGINS|SERVUS_ALLOWED_ORIGINS=*)
+        ((count+=1))
+        [[ $count == 1 && $line == SERVUS_ALLOWED_ORIGINS=* ]] || fail 'Invalid saved origin configuration.'
+        raw=${line#*=}
+        ;;
+    esac
+  done < "$file"
+  (( count )) || return 0
+  [[ $(stat -c '%u:%a' "$file") == 0:600 ]] || fail 'Saved origin configuration must be root-owned and mode 0600.'
+  [[ -n $raw && $raw != ,* && $raw != *, && $raw != *,,* ]] || fail 'Invalid saved origin configuration.'
+  [[ $public_count == 1 ]] || fail 'Invalid saved origin configuration.'
+  stored_public=$(canonical_saved_origin "$stored_public") || fail 'Invalid saved origin configuration.'
+  local allowed_origins=
+  while [[ -n $raw ]]; do
+    item=${raw%%,*}
+    if [[ $raw == *,* ]]; then raw=${raw#*,}; else raw=; fi
+    canonical=$(canonical_saved_origin "$item") || fail 'Invalid saved origin configuration.'
+    public_host=${canonical#http://}; public_host=${public_host%%:*}
+    [[ $canonical == https://* || $canonical == "$stored_public" || $public_host == localhost || $public_host == 127.0.0.1 ]] || fail 'Invalid saved origin configuration.'
+    append_origin "$canonical"
+  done
+  saved_origins=$allowed_origins
+}
+read_proxy_secret() {
+  local file=$1 line count=0
+  proxy_secret=
+  [[ -f $file ]] || return 0
+  [[ ! -L $file ]] || fail 'Configuration must not be a symlink.'
+  while IFS= read -r line || [[ -n $line ]]; do
+    case "$line" in
+      SERVUS_TRUSTED_PROXY_SECRET_FILE|SERVUS_TRUSTED_PROXY_SECRET_FILE=*)
+        fail 'File-based trusted proxy configuration is not supported by this installer.'
+        ;;
+      SERVUS_TRUSTED_PROXY_SECRET|SERVUS_TRUSTED_PROXY_SECRET=*)
+        ((count+=1))
+        [[ $count == 1 && $line == SERVUS_TRUSTED_PROXY_SECRET=* ]] || fail 'Invalid trusted proxy secret configuration.'
+        proxy_secret=${line#*=}
+        [[ $proxy_secret =~ ^[0-9a-f]{64}$ ]] || fail 'Invalid trusted proxy secret configuration.'
+        ;;
+    esac
+  done < "$file"
+  if (( count )); then
+    [[ $(stat -c '%u:%a' "$file") == 0:600 ]] || fail 'Trusted proxy configuration must be root-owned and mode 0600.'
+  fi
+}
 has_configured_admin() {
   local db=$1/panel.sqlite
   [[ -f $db && ! -L $db && ! -L $db-wal && ! -L $db-shm ]] || return 1
@@ -178,6 +260,8 @@ with tarfile.open(archive, 'r:*') as source:
 PY
 }
 main() {
+  unset SERVUS_TRUSTED_PROXY_SECRET PANEL_TRUSTED_PROXY_SECRET SERVUS_TRUSTED_PROXY_SECRET_FILE PANEL_TRUSTED_PROXY_SECRET_FILE SERVUS_ALLOWED_ORIGINS
+  local proxy_secret= saved_origins=
   local dry_run=0 source_dir= hostname= image_ref= swarm_advertise_addr= ref_explicit=0 ref=${SERVUS_REF:-main} port=4180 ingress_port=80
   local install_dir=${SERVUS_INSTALL_DIR:-/opt/servus} config_dir=${SERVUS_CONFIG_DIR:-/etc/servus} data_dir=${SERVUS_DATA_DIR:-/var/lib/servus}
   local public_url=${SERVUS_PUBLIC_URL:-} bind_address=${SERVUS_BIND_ADDRESS:-127.0.0.1}
@@ -249,17 +333,24 @@ main() {
   if [[ -d $install_dir && ! -f $install_dir/.servus-install ]] && [[ -n $(ls -A "$install_dir") ]]; then fail 'Installation directory is not an owned Servus installation.'; fi
   if [[ ! -f $install_dir/.servus-install && -d $config_dir && -n $(ls -A "$config_dir") ]]; then fail 'Configuration directory is not empty and has no Servus installation marker.'; fi
   if [[ ! -f $install_dir/.servus-install && -d $data_dir && -n $(ls -A "$data_dir") ]]; then fail 'Data directory is not empty and has no Servus installation marker.'; fi
+  install -d -m 0700 "$install_dir" "$install_dir/releases" "$config_dir"
+  command -v flock >/dev/null || fail 'Install util-linux (flock), then retry.'
+  exec 9> "$install_dir/install.lock"
+  flock -n 9 || fail 'Another Servus installation is running.'
+  [[ ! -e $config_dir/servus-origin-migration.pending && ! -L $config_dir/servus-origin-migration.pending ]] || fail 'An unfinished origin migration requires recovery before installation.'
+  [[ ! -L $config_dir/servus.env ]] || fail 'Configuration must not be a symlink.'
+  if [[ $bind_address == 0.0.0.0 && ! -f $config_dir/servus.env ]]; then
+    fail 'A new installation cannot bind publicly before an administrator exists. Use localhost for setup, then configure public access.'
+  fi
   if [[ -f $config_dir/servus.env ]]; then
     local preflight_bind
+    read_proxy_secret "$config_dir/servus.env"
+    read_saved_origins "$config_dir/servus.env"
     preflight_bind=$(awk -F= '$1 == "SERVUS_BIND_ADDRESS" {sub(/^[^=]*=/, ""); print; exit}' "$config_dir/servus.env")
     if [[ $preflight_bind == 0.0.0.0 ]] && ! has_configured_admin "$data_dir"; then
       fail 'Existing public installation has no verifiable administrator. Restrict network access and complete setup before updating. Existing data and bind address were not changed.'
     fi
   fi
-  install -d -m 0700 "$install_dir" "$install_dir/releases" "$config_dir"
-  command -v flock >/dev/null || fail 'Install util-linux (flock), then retry.'
-  exec 9> "$install_dir/install.lock"
-  flock -n 9 || fail 'Another Servus installation is running.'
   install_dependencies
   local existing_ingress
   existing_ingress=$(docker service inspect panel-ingress --format '{{index .Spec.Labels "panel.owner"}}' 2>/dev/null || true)
@@ -299,7 +390,10 @@ main() {
   public_url=$(normalize_origin "$public_url")
   local secure_cookies=false
   [[ $public_url != https://* ]] || secure_cookies=true
-  local allowed_origins="$public_url,http://localhost:$port,http://127.0.0.1:$port"
+  local allowed_origins=$saved_origins
+  append_origin "$public_url"
+  append_origin "http://localhost:$port"
+  append_origin "http://127.0.0.1:$port"
   local socket_gid release staging image old_env=
   socket_gid=$(stat -c '%g' /var/run/docker.sock)
   release=$(date -u +%Y%m%d%H%M%S)-$$
@@ -334,13 +428,16 @@ main() {
   [[ $(stat -c '%u' "$data_dir") == 1000 ]] || fail 'The data directory must belong to container UID 1000. Existing ownership was left unchanged.'
   local next_env=$staging/servus.env
   printf 'SERVUS_IMAGE=%s\nSERVUS_DATA_DIR=%s\nSERVUS_PORT=%s\nSERVUS_INGRESS_PORT=%s\nSERVUS_DOCKER_GID=%s\nSERVUS_BIND_ADDRESS=%s\nSERVUS_PUBLIC_URL=%s\nSERVUS_ALLOWED_ORIGINS=%s\nSERVUS_SECURE_COOKIES=%s\nSERVUS_SOURCE_REF=%s\n' "$image" "$data_dir" "$port" "$ingress_port" "$socket_gid" "$bind_address" "$public_url" "$allowed_origins" "$secure_cookies" "$ref" > "$next_env"
+  if [[ -n $proxy_secret ]]; then printf 'SERVUS_TRUSTED_PROXY_SECRET=%s\n' "$proxy_secret" >> "$next_env"; fi
   docker compose --env-file "$next_env" -f "$source/deployment/compose.yaml" -p servus config --quiet
   if [[ -f $config_file ]]; then
     old_env=$install_dir/releases/$release-previous.env
     (umask 077; cp "$config_file" "$old_env")
   fi
   local healthy=0
-  cp "$next_env" "$config_file"; chmod 0600 "$config_file"
+  servus_config_temp=$(mktemp "$config_dir/.servus.env.XXXXXXXX")
+  cp "$next_env" "$servus_config_temp"; chmod 0600 "$servus_config_temp"
+  mv -f "$servus_config_temp" "$config_file"; servus_config_temp=
   if docker compose --env-file "$config_file" -f "$source/deployment/compose.yaml" -p servus up -d --remove-orphans && wait_panel_ready "$port"; then healthy=1; fi
   if (( ! healthy )); then
     if [[ -n $old_env ]]; then

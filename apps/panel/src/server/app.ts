@@ -15,6 +15,7 @@ import { agentRequest as defaultAgentRequest, AgentRequestError } from '../agent
 import { registerConsole } from './console.js';
 import { registerCentralAuth } from './central-auth.js';
 import { BUILD_INFO } from './generated-build-info.js';
+import { clientAddress, normalizeClientAddress, trustedProxyRequest } from './proxy-address.js';
 
 const prefix = '/api/v1';
 const cookieName = 'panel_session';
@@ -25,12 +26,14 @@ export interface AppOptions {
   dataDir: string; webDir?: string; store?: Store; logger?: boolean;
   runtimeStatus?: () => Promise<RuntimeStatus>; allowedOrigins?: string[]; secureCookies?: boolean;
   agentRequest?:typeof defaultAgentRequest; agentConnection?:{socketPath:string;token:string};
+  trustedProxySecret?: string;
 }
 export async function createApp(options: AppOptions) {
+  if(options.trustedProxySecret!==undefined && !/^[a-f0-9]{64}$/.test(options.trustedProxySecret))throw new Error('Invalid trusted proxy secret configuration');
   const store = options.store ?? new Store(options.dataDir);
   const app = Fastify({ logger: options.logger ?? false, logController: new LogController({ disableRequestLogging: true }), bodyLimit: 256 * 1024, trustProxy: false });
   await app.register(cookie);
-  await app.register(rateLimit, { global: false });
+  await app.register(rateLimit, { global: false, keyGenerator: req => clientAddress(req,options.trustedProxySecret) });
   await app.register(websocket,{options:{maxPayload:65536}});
   const runtimeRequest=options.agentRequest??defaultAgentRequest;
   const allowedOrigins = new Set(options.allowedOrigins ?? ['http://localhost:4180','http://127.0.0.1:4180','http://localhost:4181','http://127.0.0.1:4181']);
@@ -39,6 +42,10 @@ export async function createApp(options: AppOptions) {
     reply.header('Referrer-Policy','same-origin');
     reply.header('X-Frame-Options','DENY');
     reply.header('Cache-Control','no-store');
+    if(trustedProxyRequest(req,options.trustedProxySecret)) {
+      const forwarded=req.headers['x-servus-client-ip'];
+      if(typeof forwarded!=='string'||!normalizeClientAddress(forwarded))throw new AppError('INVALID_PROXY_ADDRESS','Invalid proxy client address',400);
+    }
     if (!['GET','HEAD','OPTIONS'].includes(req.method) && req.headers.origin && !allowedOrigins.has(req.headers.origin)) throw new AppError('ORIGIN_DENIED','This request origin is not allowed',403);
   });
   app.setErrorHandler((error, req, reply) => {

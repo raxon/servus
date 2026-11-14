@@ -178,7 +178,9 @@ All endpoints use `/api/v1`. Authentication uses a session cookie. Read the `csr
 
 Configuration updates require `expectedRevision`. A stale revision returns HTTP 409. Arrays supplied in a patch replace the corresponding desired collection. The typed request shapes are defined in `apps/panel/src/shared/types.ts`, and validation rules in `apps/panel/src/server/configuration.ts`.
 
-The console connects to `/api/v1/services/:id/console?ticket=...` by WebSocket. Input packets use `{type:"input",data}`, resize packets use `{type:"resize",cols,rows}`, and output is raw terminal data. Reloading or leaving the console closes its connection. Errors use `{error:{code,message}}`.
+Open a WebSocket to `/api/v1/services/:id/console` with the session cookie and an allowed Origin. Send `{type:"authenticate",ticket}` as the first text message, then wait for `{type:"ready"}` before sending input or resize messages. Tickets in the URL are rejected, so clients using the old `?ticket=...` format must be updated.
+
+After the ready message, input packets use `{type:"input",data}`, resize packets use `{type:"resize",cols,rows}`, and output is raw terminal data. Reloading or leaving the console closes its connection. HTTP API errors use `{error:{code,message}}`.
 
 ## Docker Compose packaging
 

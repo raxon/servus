@@ -211,10 +211,12 @@ c.commit();c.close()`,db,state],{encoding:'utf8'});assert.equal(created.status,0
     } else if(state==='unreadable')writeFileSync(db,'invalid-database');
     else if(state==='symlink') {const target=join(f.root,'external');writeFileSync(target,'external-data');symlinkSync(target,db);}
     const original=existsSync(db)?readFileSync(db):null;
-    const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; main "$@"');
+    f.env.SERVUS_TEST_DEPENDENCIES=join(f.root,'dependencies-called');
+    const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { touch "$SERVUS_TEST_DEPENDENCIES"; }; main "$@"');
     fails(result,state==='admin'?/intentional build failure/:/no verifiable administrator/);
     assert.equal(readFileSync(config,'utf8'),env);
-    if(state!=='admin')assert.equal(existsSync(join(f.env.SERVUS_INSTALL_DIR,'install.lock')),false);
+    assert.equal(existsSync(join(f.env.SERVUS_INSTALL_DIR,'install.lock')),true);
+    assert.equal(existsSync(f.env.SERVUS_TEST_DEPENDENCIES),state==='admin');
     if(original)assert.deepEqual(readFileSync(db),original);
     else assert.equal(existsSync(db),false);
   }
@@ -297,5 +299,117 @@ test('safe source extraction strips one root and preserves file bytes', () => {
 test('source extraction rejects traversal, absolute names, links and multiple roots', () => {
   for(const entries of [[{name:'source/../../escape'}],[{name:'/etc/escape'}],[{name:'source/alias',link:'/etc'}],[{name:'one/file'},{name:'two/file'}]]) {
     const f=fixture(),tar=archive(f,entries);fails(run(f,['extract_source',tar,join(f.root,'unpacked')]),/Unsafe|link or special|one root/);assert.equal(existsSync(join(f.root,'escape')),false);
+  }
+});
+
+test('trusted proxy secret is validated without exposing it', () => {
+  const f=fixture(), path=join(f.root,'config.env'), secret='a'.repeat(64);
+  f.command('stat','echo 0:600');
+  const inspect='source "$1"; shift; read_proxy_secret "$1"; [[ $proxy_secret == "$2" ]]';
+  for(const content of ['', `SERVUS_TRUSTED_PROXY_SECRET=${secret}\n`]) {
+    writeFileSync(path,content,{mode:0o600});
+    const result=run(f,[path,content?secret:''],inspect);succeeds(result);
+    assert.equal((result.stdout+result.stderr).includes(secret),false);
+  }
+  for(const content of ['SERVUS_TRUSTED_PROXY_SECRET=\n','SERVUS_TRUSTED_PROXY_SECRET=Z\n',`SERVUS_TRUSTED_PROXY_SECRET=${secret}\nSERVUS_TRUSTED_PROXY_SECRET=${secret}\n`,'SERVUS_TRUSTED_PROXY_SECRET\n']) {
+    writeFileSync(path,content);const result=run(f,[path,secret],inspect);
+    fails(result,/Invalid trusted proxy secret configuration/);
+    assert.equal((result.stdout+result.stderr).includes(secret),false);
+  }
+  writeFileSync(path,`SERVUS_TRUSTED_PROXY_SECRET=${secret}\n`);
+  f.command('stat','echo 0:644');fails(run(f,[path,secret],inspect),/root-owned and mode 0600/);
+  writeFileSync(path,'SERVUS_TRUSTED_PROXY_SECRET_FILE=/secure/secret\n');
+  fails(run(f,[path,secret],inspect),/File-based trusted proxy configuration is not supported/);
+});
+
+test('rerun retains only a valid stored proxy secret and does not log it', () => {
+  for(const withSecret of [false,true]) {
+    const f=fixture(), secret='b'.repeat(64);
+    for(const path of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(path);
+    writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+    const config=join(f.env.SERVUS_CONFIG_DIR,'servus.env');
+    const previous=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://localhost:4180\nSERVUS_ALLOWED_ORIGINS=http://localhost:4180,http://localhost:14480,https://panel.example.test:443,https://PANEL.EXAMPLE.TEST\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_IMAGE=previous-image\n${withSecret?`SERVUS_TRUSTED_PROXY_SECRET=${secret}\n`:''}`;
+    writeFileSync(config,previous,{mode:0o600});
+    f.env.SERVUS_TRUSTED_PROXY_SECRET='c'.repeat(64);
+    f.env.SERVUS_ALLOWED_ORIGINS='https://untrusted.example';
+    f.command('stat','if [[ $2 == %u:%a ]]; then echo 0:600; elif [[ $2 == %u ]]; then echo 1000; else echo 0; fi');
+    f.command('mv','if [[ $1 == -Tf ]]; then shift; /bin/mv -f "$@"; else /bin/mv "$@"; fi');
+    f.command('docker','case "$1" in service) exit 1;; ps) exit 0;; info) echo inactive;; *) exit 0;; esac');
+    const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; wait_panel_ready() { :; }; main "$@"');
+    succeeds(result);
+    const updated=readFileSync(config,'utf8');
+    assert.equal(updated.includes(`SERVUS_TRUSTED_PROXY_SECRET=${secret}\n`),withSecret);
+    assert.equal(updated.includes('c'.repeat(64)),false);
+    const origins=updated.match(/^SERVUS_ALLOWED_ORIGINS=(.*)$/m)[1].split(',');
+    assert.deepEqual(origins,['http://localhost:4180','http://localhost:14480','https://panel.example.test','http://127.0.0.1:4180']);
+    assert.equal(updated.includes('untrusted.example'),false);
+    assert.equal((result.stdout+result.stderr).includes(secret),false);
+    assert.equal((result.stdout+result.stderr).includes('c'.repeat(64)),false);
+  }
+});
+
+test('saved origins reject malformed, unsafe and duplicate configuration without leaking values', () => {
+  const f=fixture(), path=join(f.root,'config.env');
+  f.command('stat','echo 0:600');
+  const inspect='source "$1"; shift; read_saved_origins "$1"';
+  for(const invalid of ['','*','https://*.example.test','https://safe.test/path','https://safe.test:99999','https://safe.test,,http://localhost:4180','https://safe.test,','http://evil.test','https://safe.test;echo']) {
+    writeFileSync(path,`SERVUS_PUBLIC_URL=https://panel.example.test\nSERVUS_ALLOWED_ORIGINS=${invalid}\n`,{mode:0o600});
+    const result=run(f,[path],inspect);fails(result,/Invalid saved origin configuration/);
+    if(invalid)assert.equal((result.stdout+result.stderr).includes(invalid),false);
+  }
+  writeFileSync(path,'SERVUS_PUBLIC_URL=https://panel.example.test\nSERVUS_ALLOWED_ORIGINS=https://panel.example.test\nSERVUS_ALLOWED_ORIGINS=https://panel.example.test\n');
+  fails(run(f,[path],inspect),/Invalid saved origin configuration/);
+  writeFileSync(path,'SERVUS_PUBLIC_URL=https://panel.example.test\nSERVUS_PUBLIC_URL=https://other.example.test\nSERVUS_ALLOWED_ORIGINS=https://panel.example.test\n');
+  fails(run(f,[path],inspect),/Invalid saved origin configuration/);
+  f.command('stat','echo 0:644');
+  writeFileSync(path,'SERVUS_PUBLIC_URL=https://panel.example.test\nSERVUS_ALLOWED_ORIGINS=https://panel.example.test\n');
+  fails(run(f,[path],inspect),/root-owned and mode 0600/);
+});
+
+test('rerun rejects an invalid stored proxy secret before changing configuration', () => {
+  const f=fixture(), invalid='bad-proxy-secret';
+  for(const path of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(path);
+  writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+  const config=join(f.env.SERVUS_CONFIG_DIR,'servus.env');
+  const previous=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://localhost:4180\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_TRUSTED_PROXY_SECRET=${invalid}\n`;
+  writeFileSync(config,previous,{mode:0o600});
+  const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; main "$@"');
+  fails(result,/Invalid trusted proxy secret configuration/);
+  assert.equal(readFileSync(config,'utf8'),previous);
+  assert.equal((result.stdout+result.stderr).includes(invalid),false);
+});
+
+test('rerun reads updated origins and secret after obtaining the installer lock', () => {
+  const f=fixture(), oldSecret='d'.repeat(64), newSecret='e'.repeat(64);
+  for(const path of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(path);
+  writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+  const config=join(f.env.SERVUS_CONFIG_DIR,'servus.env'), replacement=join(f.root,'replacement.env');
+  const contents=(secret,origin)=>`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://localhost:4180\nSERVUS_ALLOWED_ORIGINS=${origin}\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_IMAGE=previous-image\nSERVUS_TRUSTED_PROXY_SECRET=${secret}\n`;
+  writeFileSync(config,contents(oldSecret,'https://old.example.test'),{mode:0o600});
+  writeFileSync(replacement,contents(newSecret,'https://new.example.test'),{mode:0o600});
+  f.env.SERVUS_TEST_REPLACEMENT=replacement;
+  f.command('flock','cp "$SERVUS_TEST_REPLACEMENT" "$SERVUS_CONFIG_DIR/servus.env"');
+  f.command('stat','if [[ $2 == %u:%a ]]; then echo 0:600; elif [[ $2 == %u ]]; then echo 1000; else echo 0; fi');
+  f.command('mv','if [[ $1 == -Tf ]]; then shift; /bin/mv -f "$@"; else /bin/mv "$@"; fi');
+  f.command('docker','case "$1" in service) exit 1;; ps) exit 0;; info) echo inactive;; *) exit 0;; esac');
+  const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; wait_panel_ready() { :; }; main "$@"');
+  succeeds(result);
+  const updated=readFileSync(config,'utf8');
+  assert.equal(updated.includes(`SERVUS_TRUSTED_PROXY_SECRET=${newSecret}\n`),true);
+  assert.equal(updated.includes(oldSecret),false);
+  assert.equal(updated.includes('https://new.example.test'),true);
+  assert.equal(updated.includes('https://old.example.test'),false);
+  assert.equal((result.stdout+result.stderr).includes(newSecret),false);
+});
+
+test('unfinished origin migration blocks installation, including a dangling symlink', () => {
+  for(const symlink of [false,true]) {
+    const f=fixture();for(const path of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(path);
+    writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+    const pending=join(f.env.SERVUS_CONFIG_DIR,'servus-origin-migration.pending');
+    if(symlink)symlinkSync(join(f.root,'absent'),pending);else writeFileSync(pending,'pending');
+    const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { touch "$SERVUS_DATA_DIR/dependencies"; }; main "$@"');
+    fails(result,/unfinished origin migration requires recovery/);
+    assert.equal(existsSync(join(f.env.SERVUS_DATA_DIR,'dependencies')),false);
   }
 });

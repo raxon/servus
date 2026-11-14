@@ -6,7 +6,7 @@ import { WebSocket } from 'ws';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 
-const usage = 'Usage: node scripts/test-vps.mjs --confirm-vps-test --url URL --credentials FILE --ingress-url URL [--phases nginx,redis] [--timeout-seconds 60..900] [--memory-mb 64..256]';
+const usage = 'Usage: node scripts/test-vps.mjs --confirm-vps-test --url URL --credentials FILE --ingress-url URL [--phases nginx,redis,postgres,mariadb] [--timeout-seconds 60..900] [--memory-mb 64..256]';
 const idPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function requireId(value) { if (typeof value !== 'string' || !idPattern.test(value)) throw new Error('Unexpected resource identifier'); return value; }
 function normalizeUrl(value, ingress = false) {
@@ -32,10 +32,12 @@ export function parseArgs(argv) {
     if (arg==='--memory-mb') out.memoryMb=Number(value);
   }
   if (!out.confirmed || !out.url || !out.credentials) throw new Error('Explicit confirmation, API URL and credentials file are required');
-  if (!out.phases.length || new Set(out.phases).size !== out.phases.length || out.phases.some(p=>!['nginx','redis'].includes(p))) throw new Error('Phases must be nginx, redis or nginx,redis');
+  if (!out.phases.length || new Set(out.phases).size !== out.phases.length || out.phases.some(p=>!['nginx','redis','postgres','mariadb'].includes(p))) throw new Error('Phases must contain only nginx, redis, postgres or mariadb');
   if (out.phases.includes('nginx') && !out.ingressUrl) throw new Error('Nginx phase requires a loopback ingress URL');
   if (!Number.isInteger(out.timeoutSeconds) || out.timeoutSeconds<60 || out.timeoutSeconds>900) throw new Error('Timeout must be 60 to 900 seconds');
   if (!Number.isInteger(out.memoryMb) || out.memoryMb<64 || out.memoryMb>256) throw new Error('Memory limit must be 64 to 256 MB per service');
+  if (out.phases.includes('postgres') && out.memoryMb<128) throw new Error('PostgreSQL phase requires at least 128 MB');
+  if (out.phases.includes('mariadb') && out.memoryMb<192) throw new Error('MariaDB phase requires at least 192 MB');
   return out;
 }
 export function readCredentials(path) {
@@ -129,7 +131,8 @@ export async function runHarness(options, credentials, overrides = {}) {
     if(!container || !/^[a-f0-9]{12,64}$/.test(container.id))throw new Error('Fixture container is unavailable');
     const grant=await api(`/services/${id}/console-ticket`,{method:'POST',body:{containerId:container.id,shell:'/bin/sh'}});
     if(typeof grant.ticket!=='string'||!/^[a-f0-9]{64}$/.test(grant.ticket))throw new Error('Invalid terminal grant');
-    await consoleCheck({base:options.url,serviceId:id,ticket:grant.ticket,cookie,command:cmd,marker,timeoutMs:Math.min(remaining(),15000)});
+    try { await consoleCheck({base:options.url,serviceId:id,ticket:grant.ticket,cookie,command:cmd,marker,timeoutMs:Math.min(remaining(),15000)}); }
+    catch (error) { const phase=marker.replace(/_[a-f0-9]{16}$/, ''); throw new Error(`${phase}: ${error instanceof Error ? error.message : 'Terminal check failed'}`); }
   }
   try {
     const login=await api('/auth/login',{method:'POST',body:credentials});csrf=login.csrfToken;
@@ -188,6 +191,35 @@ export async function runHarness(options, credentials, overrides = {}) {
       await serviceCommand(redisId,`[ "$(${cli} GET ${key})" = '${value}' ] && printf '\\n${marker}\\n'`,marker);
       await action(redisId,'stop');log('PASS Redis rejects missing and invalid credentials, accepts valid credentials and retains data after restart');
       log('Redis API exposes no HTTP domains; host-port isolation requires independent Docker inspection.');
+    }
+    for(const kind of ['postgres','mariadb']) {
+      if(!options.phases.includes(kind))continue;
+      const password=randomBytes(24).toString('base64url');
+      const id=await createService(`${prefix}-${kind}`,{kind,replicas:1,database:{database:'app',user:'app',password},resources:{cpu:0.2,memoryMb:options.memoryMb}});
+      const details=await api(`/services/${id}`);
+      if(details.kind!==kind||(details.domains?.length??0)!==0)throw new Error(`${kind} fixture has unexpected routing`);
+      const value=`value_${runId}`,label=kind.toUpperCase(),noAuth=`SERVUS_${label}_NOAUTH_${runId}`,wrongAuth=`SERVUS_${label}_WRONGAUTH_${runId}`,marker=`SERVUS_${label}_OK_${runId}`;
+      const insert=`CREATE TABLE servus_marker (value TEXT NOT NULL); INSERT INTO servus_marker (value) VALUES ('${value}');`;
+      const select='SELECT value FROM servus_marker;';
+      if(kind==='postgres') {
+        const plain='PGPASSFILE=/dev/null psql -X -w -h 127.0.0.1 -U app -d app -v ON_ERROR_STOP=1 -tA';
+        const valid=`PGPASSWORD="$(cat /run/secrets/panel-db-password)" ${plain}`;
+        await serviceCommand(id,`result=$(PGPASSWORD='' ${plain} -c 'SELECT 1' 2>&1); case "$result" in *'no password supplied'*) printf '\\n${noAuth}\\n';; esac`,noAuth);
+        await serviceCommand(id,`result=$(PGPASSWORD='wrong-${runId}' ${plain} -c 'SELECT 1' 2>&1); case "$result" in *'password authentication failed'*) printf '\\n${wrongAuth}\\n';; esac`,wrongAuth);
+        await serviceCommand(id,`${valid} -c "${insert}" >/dev/null && printf '\\n${marker}\\n'`,marker);
+        await action(id,'restart');
+        await serviceCommand(id,`result=$(${valid} -c '${select}') && [ "$result" = '${value}' ] && printf '\\n${marker}\\n'`,marker);
+      } else {
+        const plain='mariadb --no-defaults --protocol=tcp --host=127.0.0.1 --port=3306 --user=app --database=app --batch --skip-column-names --connect-timeout=3';
+        const valid=`MYSQL_PWD="$(cat /run/secrets/panel-db-password)" ${plain}`;
+        await serviceCommand(id,`result=$(MYSQL_PWD='' ${plain} -e 'SELECT 1' 2>&1); case "$result" in *'Access denied'*) printf '\\n${noAuth}\\n';; esac`,noAuth);
+        await serviceCommand(id,`result=$(MYSQL_PWD='wrong-${runId}' ${plain} -e 'SELECT 1' 2>&1); case "$result" in *'Access denied'*) printf '\\n${wrongAuth}\\n';; esac`,wrongAuth);
+        await serviceCommand(id,`${valid} -e "${insert}" >/dev/null && printf '\\n${marker}\\n'`,marker);
+        await action(id,'restart');
+        await serviceCommand(id,`result=$(${valid} -e '${select}') && [ "$result" = '${value}' ] && printf '\\n${marker}\\n'`,marker);
+      }
+      await action(id,'stop');log(`PASS ${kind} rejects missing and invalid credentials, accepts valid credentials and retains data after restart`);
+      log(`${kind} API exposes no HTTP domains; host-port isolation requires independent Docker inspection.`);
     }
   } finally {
     if(projectId) {
