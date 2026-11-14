@@ -107,6 +107,17 @@ class DockerInventoryTest(unittest.TestCase):
         self.docker.inspect.return_value = self.items[:-1]
         with self.assertRaises(module.QuiescenceError): self.check()
 
+    def test_early_recovery_can_inspect_running_roles_but_not_extra_access(self):
+        self.items[0]['State']['Running'] = True
+        def inspect():
+            module.ensure_no_other_data_mounts(self.docker,self.ids,'/var/lib/servus',trusted_ingress=self.trusted,allow_running_expected=True)
+        inspect()
+        self.items[0]['State']['Paused'] = True
+        with self.assertRaises(module.QuiescenceError):inspect()
+        self.items[0]['State']['Paused'] = False
+        self.ingress['Mounts'].append({'Source':'/var/lib/servus/secrets','RW':False})
+        with self.assertRaises(module.QuiescenceError):inspect()
+
     def test_rejects_another_container_with_the_same_image_and_labels(self):
         self.ingress['Id'] = 'f' * 64
         self.docker.call.return_value = ('\n'.join(item['Id'] for item in self.items) + '\n').encode()

@@ -69,8 +69,9 @@ def ensure_restart_fenced(docker, expected):
             raise QuiescenceError('Control-plane restart is not fenced')
 
 
-def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=None):
-    """Inspect all containers; only a separately approved ingress may hold Docker's socket."""
+def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=None, allow_running_expected=False):
+    """Inspect container access; an early recovery may inspect running legacy roles."""
+    if type(allow_running_expected) is not bool:raise QuiescenceError('Invalid inventory mode')
     if not isinstance(expected, set) or len(expected) != 3 or not all(re.fullmatch(r'[a-f0-9]{64}', item) for item in expected):
         raise QuiescenceError('Invalid control-plane container inventory')
     if trusted_ingress is not None and (not isinstance(trusted_ingress, tuple) or len(trusted_ingress) != 4 or
@@ -94,7 +95,8 @@ def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=N
             raise QuiescenceError('Container mounts are unavailable')
         if item['Id'] in expected:
             state = item.get('State')
-            if (not isinstance(state, dict) or state.get('Running') is not False or
+            if (not isinstance(state, dict) or type(state.get('Running')) is not bool or
+                (not allow_running_expected and state['Running'] is not False) or
                 state.get('Paused') is not False or state.get('Restarting') is not False or
                 sum(os.path.realpath(mount['Source']) == data and mount.get('RW') is True for mount in mounts) != 1):
                 raise QuiescenceError('Control-plane container is not stopped or changed')

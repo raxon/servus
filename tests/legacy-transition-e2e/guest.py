@@ -34,6 +34,7 @@ coordinator=load('fixture_coordinator','update-coordinator.py');restore=load('fi
 adoption=load('fixture_adoption','adoption-proof.py');updater=load('fixture_updater','servus-updater.py')
 legacy=load('fixture_legacy','legacy-stop.py');recovery=load('fixture_recovery','legacy-recovery.py')
 transition=load('fixture_transition','legacy-transition.py');fence_module=load('fixture_fence','migration-fence.py')
+early=load('fixture_early','legacy-early-recovery.py')
 quiet=load('fixture_quiet','quiescence.py')
 initial_module=load('fixture_initial','initial-generation.py');extractor=load('fixture_extractor','extract-install.py')
 daemon_module=load('fixture_daemon','supervisor-daemon.py')
@@ -73,10 +74,11 @@ def after_reboot():
 
 
 def main():
-    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
+    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--early-recover'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
     if sys.argv[1:]==['--after-reboot']:return after_reboot()
     recover_check=sys.argv[1:]==['--recover-check']
-    full=sys.argv[1:] in (['--full'],['--recover-check'])
+    early_check=sys.argv[1:]==['--early-recover']
+    full=sys.argv[1:] in (['--full'],['--recover-check'],['--early-recover'])
     for path in ('/opt/servus','/etc/servus','/var/lib/servus','/var/lib/servus-updater'):
         if Path(path).exists():raise RuntimeError('Fixture requires an empty host')
     install=Path('/opt/servus');install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
@@ -155,6 +157,54 @@ def main():
             '/usr/local/libexec/servus/bootstrap-release.py','--operation',op,'--commit','5c82968ef6ab05d416d95d301078d37c9d11cc36',
             '--digest',root_digest,'--tag','v0.1.7',timeout=960)
         run('/usr/bin/systemctl','stop','servus-updater-bootstrap.service')
+        if early_check:
+            run('/usr/bin/systemctl','stop','servus-updater-socket.service')
+            service_lock=os.open(state/'service.lock',os.O_RDONLY|os.O_NOFOLLOW);fcntl.flock(service_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            policy_journal=updater.Journal(state)
+            transition_lock=os.open(install/'install.lock',os.O_RDONLY);fcntl.flock(transition_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            try:
+                def resolve_child(root_digest,expected_config):
+                    registry=verifier.Registry(time.monotonic()+verifier.TOTAL_SECONDS);registry.authenticate()
+                    return verifier.revalidate_amd64_identity(registry,root_digest,expected_config)
+                row=policy_journal.db.execute("SELECT preparation_id,staging_path FROM preparations WHERE operation_id=? AND status='prepared'",(op,)).fetchone()
+                candidate=state/'policies'/('candidate-'+row[0]+'.json')
+                runtime.produce(policy_journal,op,str(Path(row[1]).parent),active,str(install),str(candidate),extractor,supervisor,
+                                resolve_child=resolve_child,inherited_lock=transition_lock)
+                class InterruptDocker(Docker):
+                    stops=0
+                    def call(self,*args,**kwargs):
+                        if args[0]=='stop':
+                            self.stops+=1
+                            if self.stops==2:raise RuntimeError('fixture stop interruption')
+                        return super().call(*args,**kwargs)
+                try:
+                    transition.prepare_stop(policy_journal,op,active,str(state/'policies'),str(data),OLD,old_image_id,old_ids,
+                        supervisor,daemon_module,adoption,runtime,quiet,InterruptDocker(),legacy,install_lock=transition_lock,trusted_ingress=trusted)
+                except RuntimeError as error:
+                    if str(error)!='fixture stop interruption':raise
+                else:raise RuntimeError('Stop interruption was not injected')
+                os.close(transition_lock);transition_lock=None;os.close(service_lock);service_lock=None
+                policy_journal.db.execute("CREATE TABLE IF NOT EXISTS initial_generations(operation_id TEXT PRIMARY KEY,phase TEXT NOT NULL)")
+                policy_journal.db.execute("INSERT INTO initial_generations VALUES(?,'starting')",(op,))
+                args=['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-rollback-early.py','--operation',op,
+                      '--old-env',str(old_env),'--old-compose',str(compose)]
+                denied=subprocess.run(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+                if denied.returncode==0 or docker.inspect(old_ids['api'])[0]['State']['Running'] is not False:
+                    raise RuntimeError('Started generation did not block early recovery')
+                policy_journal.db.execute('DELETE FROM initial_generations')
+                run(*args,timeout=300)
+                if policy_journal.db.execute('SELECT phase FROM legacy_early_rollbacks').fetchone()!=('healthy',):raise RuntimeError('Early recovery failed')
+                repeated=subprocess.run(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+                if repeated.returncode==0:raise RuntimeError('Early recovery was replayed')
+                if request('/health').get('version')!='0.1.5':raise RuntimeError('Legacy API was not recovered')
+                cookie='';csrf='';request('/auth/login','POST',{'email':'fixture@example.test','password':'isolated-fixture-password'})
+                if not any(item.get('id')==project for item in request('/projects')):raise RuntimeError('Legacy project was not retained')
+                print('PASS partial legacy stop restored original containers, login and project',flush=True)
+                return
+            finally:
+                policy_journal.close()
+                if transition_lock is not None:os.close(transition_lock)
+                if service_lock is not None:os.close(service_lock)
         invalid=subprocess.run(['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-prepare.py','--operation',str(uuid.uuid4()),'--old-env',str(old_env)],
             stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
         if invalid.returncode==0 or request('/health').get('version')!='0.1.5':raise RuntimeError('Unknown preparation stopped the legacy panel')
