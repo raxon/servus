@@ -22,6 +22,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -493,10 +494,17 @@ class DrainHub:
         for role in ROLES:
             request_id = request_ids[role]
             deadline = time.monotonic() + timeout_ms / 1000
-            _send_message(self.connections[role], {'version': 1, 'type': 'drain', 'requestId': request_id, 'timeoutMs': timeout_ms}, deadline)
-            result = _read_message(self.connections[role], deadline)
+            try:
+                _send_message(self.connections[role], {'version': 1, 'type': 'drain', 'requestId': request_id, 'timeoutMs': timeout_ms}, deadline)
+                result = _read_message(self.connections[role], deadline)
+            except (OSError, SupervisorError):
+                print('servus drain failure role=' + role + ' outcome=channel_error', file=sys.stderr, flush=True)
+                raise
             if (set(result) != {'version', 'type', 'requestId', 'status'} or type(result.get('version')) is not int or result['version'] != 1 or
                 result.get('type') != 'drain_result' or result.get('requestId') != request_id or result.get('status') != 'drained'):
+                status = result.get('status')
+                outcome = status if status in ('uncertain', 'timeout', 'stopped') else 'invalid_response'
+                print('servus drain failure role=' + role + ' outcome=' + outcome, file=sys.stderr, flush=True)
                 raise SupervisorError('A component could not be drained')
         return None
 
@@ -775,14 +783,18 @@ class MaintenanceSupervisor(ComponentEndpoint):
         exclusive = False
         completed = False
         lease = None
+        phase = 'maintenance_gate'
         try:
             self._start_maintenance()
             self._record(request_id, 'maintenance', request_ids, timeout_ms)
+            phase = 'drain'
             hub.drain(timeout_ms, request_ids)
             self._record(request_id, 'drained', request_ids, timeout_ms)
+            phase = 'identity'
             if inspect_servus(hub.policy) != hub.identities:
                 raise SupervisorError('Container identity changed')
             self._record(request_id, 'stopping', request_ids, timeout_ms)
+            phase = 'stop'
             for role in ROLES:
                 _docker('stop', '--time', '30', hub.identities[role]['id'], timeout=45)
             for role in ROLES:
@@ -790,6 +802,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
                 if (not isinstance(result, list) or len(result) != 1 or result[0].get('Id') != hub.identities[role]['id'] or
                     result[0].get('State', {}).get('Running') is not False):
                     raise SupervisorError('A container could not be confirmed stopped')
+            phase = 'exclusive_gate'
             fcntl.flock(self.gate_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             exclusive = True
             by_name = os.stat('lock', dir_fd=self.gate, follow_symlinks=False)
@@ -798,9 +811,11 @@ class MaintenanceSupervisor(ComponentEndpoint):
                 raise SupervisorError('Lifecycle lock changed')
             self._record(request_id, 'stopped_unverified', request_ids, timeout_ms)
             lease = DrainLease(self, request_id, request_ids, timeout_ms, policy_binding, hub=hub)
+            phase = 'update'
             yield lease
             completed = lease._settled
         except BaseException:
+            print('servus maintenance failure phase=' + phase, file=sys.stderr, flush=True)
             try:
                 self._record(request_id, 'recovery_required', request_ids, timeout_ms)
             except BaseException:

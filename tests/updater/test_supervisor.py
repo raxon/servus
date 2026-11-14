@@ -1,6 +1,7 @@
 import copy
 import fcntl
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -207,14 +208,28 @@ class SupervisorTest(unittest.TestCase):
         hub.drain.side_effect = supervisor.SupervisorError('Unavailable')
         operation = str(uuid.uuid4())
         with supervisor.MaintenanceSupervisor(self.install, self.gate, self.journal) as coordinator:
-            with mock.patch.object(supervisor, '_docker') as docker:
+            diagnostics = io.StringIO()
+            with mock.patch.object(supervisor, '_docker') as docker, mock.patch.object(supervisor.sys, 'stderr', diagnostics):
                 with self.assertRaises(supervisor.SupervisorError):
                     coordinator.stop_after_drain(hub, operation)
                 docker.assert_not_called()
+            self.assertIn('servus maintenance failure phase=drain', diagnostics.getvalue())
             self.assertEqual((self.gate / 'state').read_bytes(), b'servus-lifecycle-v1 maintenance\n')
             self.assertEqual(json.loads((self.journal / 'maintenance.json').read_bytes())['state'], 'recovery_required')
             with self.assertRaises(supervisor.SupervisorError):
                 coordinator.stop_after_drain(hub, str(uuid.uuid4()))
+
+    def test_drain_diagnostic_never_logs_untrusted_response(self):
+        hub = supervisor.DrainHub(mock.Mock(), TOKENS, 1000, POLICY, IDENTITIES)
+        hub.connections = {role: mock.Mock() for role in supervisor.ROLES}
+        ids = {role: str(uuid.uuid4()) for role in supervisor.ROLES}
+        response = {'version': 1, 'type': 'drain_result', 'requestId': ids['api'], 'status': 'secret-untrusted-input'}
+        diagnostics = io.StringIO()
+        with mock.patch.object(supervisor, 'inspect_servus', return_value=IDENTITIES), \
+             mock.patch.object(supervisor, '_send_message'), mock.patch.object(supervisor, '_read_message', return_value=response), \
+             mock.patch.object(supervisor.sys, 'stderr', diagnostics):
+            with self.assertRaises(supervisor.SupervisorError): hub.drain(5000, ids)
+        self.assertEqual(diagnostics.getvalue(), 'servus drain failure role=api outcome=invalid_response\n')
 
     def test_stops_only_authenticated_ids_and_never_reports_snapshot(self):
         ids = {role: {'id': char * 64, 'pid': 123, 'cgroup': '/docker/' + char * 64} for role, char in zip(supervisor.ROLES, 'abc')}
