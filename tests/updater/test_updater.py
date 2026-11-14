@@ -34,6 +34,30 @@ class JournalContractTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_update_intent_is_migrated_durable_and_recovered_fail_closed(self):
+        journal = self.module.Journal(self.state)
+        journal.db.execute("INSERT INTO operations(id,commit_sha,digest,tag,status,attempt_id,attempt_nonce,config_digest) VALUES(?,?,?,?,?,?,?,?)", (UUID, REQUEST['commit'], REQUEST['digest'], REQUEST['tag'], 'verified', OTHER_UUID, 'a' * 64, REQUEST['digest']))
+        journal.db.execute("INSERT INTO preparations(operation_id,attempt_id,attempt_nonce,preparation_id,status) VALUES(?,?,?,?,?)", (UUID, OTHER_UUID, 'a' * 64, UUID, 'prepared'))
+        journal.db.execute('DROP TABLE update_transactions')
+        journal.db.execute('PRAGMA user_version=6')
+        journal.close()
+        journal = self.module.Journal(self.state)
+        try:
+            self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 7)
+            journal.claim_update(UUID)
+            row = journal.db.execute('SELECT operation_id,preparation_id,attempt_id,attempt_nonce,root_digest,backup_path,backup_manifest_digest,phase FROM update_transactions').fetchone()
+            self.assertEqual(row, (UUID, UUID, OTHER_UUID, 'a' * 64, REQUEST['digest'], None, None, 'intent'))
+        finally:
+            journal.close()
+        journal = self.module.Journal(self.state)
+        try:
+            journal.recover()
+            self.assertEqual(journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('recovery_required',))
+            with self.assertRaises(self.module.ProtocolError):
+                journal.claim_update(UUID)
+        finally:
+            journal.close()
+
     def test_tag_is_durable_and_all_release_fields_are_idempotent(self):
         journal = self.module.Journal(self.state)
         result = self.module.process(journal, REQUEST)

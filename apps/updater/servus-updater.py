@@ -110,7 +110,7 @@ class Journal:
                     raise RuntimeError('Existing journal has unknown operations')
                 self.db.execute('DROP INDEX IF EXISTS one_active_operation')
                 self.db.execute('ALTER TABLE operations RENAME TO operations_old')
-            elif table and version not in (2, 3, 4, 5, 6):
+            elif table and version not in (2, 3, 4, 5, 6, 7):
                 raise RuntimeError('Unsupported updater journal version')
             elif not table and version != 0:
                 raise RuntimeError('Invalid updater journal')
@@ -136,7 +136,9 @@ class Journal:
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_preparation ON preparations ((1)) WHERE status IN ('preparing','prepared','recovery_required')")
             self.db.execute("CREATE TABLE IF NOT EXISTS extraction_probes (name TEXT PRIMARY KEY, operation_id TEXT NOT NULL REFERENCES operations(id), attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, preparation_id TEXT NOT NULL, purpose TEXT NOT NULL CHECK(purpose IN ('prepare','policy')), status TEXT NOT NULL CHECK(status IN ('intent','removed')))")
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_extraction_probe ON extraction_probes ((1)) WHERE status='intent'")
-            self.db.execute('PRAGMA user_version=6')
+            self.db.execute("CREATE TABLE IF NOT EXISTS update_transactions (operation_id TEXT PRIMARY KEY REFERENCES operations(id), preparation_id TEXT NOT NULL, attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, root_digest TEXT NOT NULL, backup_path TEXT, backup_manifest_digest TEXT, phase TEXT NOT NULL CHECK(phase IN ('intent','snapshotting','snapshot_verified','switching','starting','completed','recovery_required')))")
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_update ON update_transactions ((1)) WHERE phase != 'completed'")
+            self.db.execute('PRAGMA user_version=7')
             self.db.execute('COMMIT')
         except BaseException:
             self.db.execute('ROLLBACK')
@@ -156,6 +158,25 @@ class Journal:
         self.db.execute("UPDATE operations SET status='recovery_required' WHERE status='verifying'")
         # An interrupted Docker operation cannot be proven stopped by this journal.
         self.db.execute("UPDATE preparations SET status='recovery_required' WHERE status='preparing'")
+        self.db.execute("UPDATE update_transactions SET phase='recovery_required' WHERE phase NOT IN ('completed','recovery_required')")
+
+    def claim_update(self, operation_id):
+        """Persist update intent for one verified, prepared release."""
+        if not valid_uuid(operation_id): raise ProtocolError('invalid_request')
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            row = self.db.execute("SELECT p.preparation_id,p.attempt_id,p.attempt_nonce,o.digest FROM preparations p JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=? AND p.status='prepared' AND o.status='verified' AND o.attempt_id=p.attempt_id AND o.attempt_nonce=p.attempt_nonce", (operation_id,)).fetchone()
+            if not row or not valid_uuid(row[0]) or not valid_uuid(row[1]) or not re.fullmatch(r'[a-f0-9]{64}', row[2] or '') or not DIGEST_PATTERN.fullmatch(row[3] or ''):
+                raise ProtocolError('not_found')
+            if self.db.execute("SELECT 1 FROM update_transactions WHERE phase != 'completed' LIMIT 1").fetchone():
+                raise ProtocolError('recovery_required')
+            if self.db.execute('SELECT 1 FROM update_transactions WHERE operation_id=?', (operation_id,)).fetchone():
+                raise ProtocolError('idempotency_conflict')
+            self.db.execute("INSERT INTO update_transactions(operation_id,preparation_id,attempt_id,attempt_nonce,root_digest,phase) VALUES(?,?,?,?,?,'intent')", (operation_id,*row))
+            self.db.execute('COMMIT')
+        except BaseException:
+            if self.db.in_transaction: self.db.execute('ROLLBACK')
+            raise
 
     def claim_preparation(self, operation_id):
         """Record intent before any Docker call, bound to the verified attempt."""

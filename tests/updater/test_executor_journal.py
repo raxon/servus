@@ -169,7 +169,7 @@ class ExecutorJournalTest(unittest.TestCase):
                 journal = self.mod.Journal(pathlib.Path(tmp))
                 try:
                     self.assertEqual(journal.status(ID)['status'], 'verification_failed')
-                    self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 6)
+                    self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 7)
                     with self.assertRaises(self.mod.ProtocolError): journal.verified_config_digest(ID)
                     self.assertEqual(journal.retry(ID)['status'], 'accepted')
                 finally: journal.close()
@@ -186,7 +186,7 @@ class ExecutorJournalTest(unittest.TestCase):
             os.chmod(path, 0o600)
             journal = self.mod.Journal(pathlib.Path(tmp))
             try:
-                self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 6)
+                self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 7)
                 self.assertEqual(journal.db.execute('SELECT status,staging_path FROM preparations').fetchone(), ('prepared','/srv/stage'))
                 with self.assertRaises(self.mod.ProtocolError): journal.submit(OTHER, COMMIT, DIGEST, TAG)
                 journal.db.execute("UPDATE preparations SET status='completed' WHERE operation_id=?", (ID,))
