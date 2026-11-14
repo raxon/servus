@@ -66,6 +66,9 @@ export function CreateService({
   const [hostname, setHostname] = useState("");
   const [port, setPort] = useState(80);
   const [repository, setRepository] = useState("");
+  const [privateGit, setPrivateGit] = useState(false);
+  const [gitUsername, setGitUsername] = useState("");
+  const [gitToken, setGitToken] = useState("");
   const [branch, setBranch] = useState("main");
   const [context, setContext] = useState(".");
   const [dockerfile, setDockerfile] = useState("Dockerfile");
@@ -76,7 +79,7 @@ export function CreateService({
     mutationFn: () => {
       const source: SourceConfig =
         kind === "app" && sourceType === "git"
-          ? { type: "git", repository, branch, context, dockerfile }
+          ? { type: "git", repository, branch, context, dockerfile, ...(privateGit ? { credential: { username: gitUsername, token: gitToken } } : {}) }
           : { type: "image" };
       const body: ServiceInput = {
         name,
@@ -182,7 +185,7 @@ export function CreateService({
                 }
               >
                 <option value="image">Docker image</option>
-                <option value="git">Public Git repository</option>
+                <option value="git">Git repository</option>
               </select>
             </label>
           ) : null}
@@ -214,6 +217,14 @@ export function CreateService({
                   placeholder="https://github.com/organization/application.git"
                 />
               </label>
+              <label className="checkbox-label">
+                <input type="checkbox" checked={privateGit} onChange={(event) => setPrivateGit(event.target.checked)} />
+                Private repository
+              </label>
+              {privateGit ? <>
+                <label>Git username<input value={gitUsername} onChange={(event) => setGitUsername(event.target.value)} autoComplete="off" required /></label>
+                <label>Access token<input type="password" value={gitToken} onChange={(event) => setGitToken(event.target.value)} autoComplete="new-password" required /><small>The token is encrypted on this installation.</small></label>
+              </> : null}
               <label>
                 Branch or ref
                 <input

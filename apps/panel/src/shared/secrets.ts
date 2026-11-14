@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import Database from 'better-sqlite3';
 
 const referencePattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const pause = new Int32Array(new SharedArrayBuffer(4));
@@ -9,9 +10,11 @@ const pause = new Int32Array(new SharedArrayBuffer(4));
 export class SecretVault {
   private readonly key: Buffer;
   private readonly directory: string;
+  private readonly database: string;
   constructor(dataDir: string) {
     const root = resolve(dataDir);
     this.directory = join(root, 'secrets');
+    this.database = join(root, 'panel.sqlite');
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     chmodSync(this.directory, 0o700);
     const keyPath = join(root, 'secret-key');
@@ -61,10 +64,39 @@ export class SecretVault {
     return this.open(readFileSync(join(this.directory, reference), 'utf8'));
   }
 
+  /** Read only references authorized for this service and use. */
+  getServiceSecret(reference: string, serviceId: string, purpose: 'environment' | 'database' | 'git'): string {
+    if (!referencePattern.test(reference) || !referencePattern.test(serviceId)) throw new Error('Invalid secret identity.');
+    const db = new Database(this.database, { readonly: true, fileMustExist: true });
+    try {
+      if (db.pragma('user_version', { simple: true }) !== 5) throw new Error('Secret purpose metadata is unavailable.');
+      const row = db.prepare('SELECT purpose FROM service_secret_refs WHERE reference=? AND service_id=?').get(reference, serviceId) as { purpose: string } | undefined;
+      if (!row || !(row.purpose === purpose || (row.purpose === 'legacy_shared' && purpose !== 'git'))) throw new Error('Secret reference is not valid for this purpose.');
+      return this.get(reference);
+    } finally { db.close(); }
+  }
+
+  /** Database root passwords are agent-generated and never service references. */
+  getDatabaseRootSecret(reference: string): string {
+    if (!referencePattern.test(reference)) throw new Error('Invalid secret identity.');
+    const db = new Database(this.database, { readonly: true, fileMustExist: true });
+    try {
+      if (db.pragma('user_version', { simple: true }) !== 5 || db.prepare('SELECT 1 FROM service_secret_refs WHERE reference=?').get(reference)) throw new Error('Database root secret is invalid.');
+      return this.get(reference);
+    } finally { db.close(); }
+  }
+
   redact(value: string): string {
     let result = value;
     const secrets = readdirSync(this.directory).filter(reference => referencePattern.test(reference))
-      .map(reference => this.get(reference)).filter(Boolean).sort((left, right) => right.length - left.length);
+      .flatMap(reference => {
+        const value = this.get(reference);
+        try {
+          const record: unknown = JSON.parse(value);
+          if (record && typeof record === 'object' && 'kind' in record && record.kind === 'git-credential-v1' && 'token' in record && typeof record.token === 'string' && 'username' in record && typeof record.username === 'string') return [value, record.token, Buffer.from(record.token).toString('base64'), Buffer.from(`${record.username}:${record.token}`).toString('base64')];
+        } catch { /* Ordinary secrets need not contain JSON. */ }
+        return [value];
+      }).filter(Boolean).sort((left, right) => right.length - left.length);
     for (const secret of secrets) {
       result = result.replaceAll(secret, '[REDACTED]');
       const encoded = encodeURIComponent(secret);

@@ -7,7 +7,9 @@ quiescence. A dedicated unprivileged child reads the application-owned source;
 the privileged process never follows source file paths. The caller controls
 staging, cleanup and publication, including partial staging after failures or
 SIGKILL. Cgroup namespaces can hide tighter ancestor limits; the coordinator
-must verify those limits and provision memory. Anonymous memory and memfd
+must provision memory. Capture requires the initial cgroup namespace and a
+cgroup v2 mount exposing its root; a private cgroup namespace or a subtree-only
+mount is rejected because it can hide ancestor limits. Anonymous memory and memfd
 can be swapped; the coordinator must
 require encrypted swap or disable it if plaintext swap is unacceptable.
 There is deliberately no CLI.
@@ -36,7 +38,7 @@ MEMORY_RESERVE = 512 * 1024 ** 2
 MAX_SECRETS = 4096
 MAX_TOTAL = 32 * 1024 * 1024
 NODE_VERIFY = r'''const {createDecipheriv}=require('node:crypto');
-let text='';process.stdin.setEncoding('utf8');process.stdin.on('data',v=>text+=v);process.stdin.on('end',()=>{try{const x=JSON.parse(text);const k=Buffer.from(x.key,'hex');for(const s of x.sealed){const b=Buffer.from(s.value,'base64');const d=createDecipheriv('aes-256-gcm',k,b.subarray(0,12));d.setAAD(Buffer.from('panel-secret-v1'));d.setAuthTag(b.subarray(12,28));const p=Buffer.concat([d.update(b.subarray(28)),d.final()]);if(s.json){const j=JSON.parse(p.toString('utf8'));if(!j||typeof j!=='object'||Array.isArray(j))throw Error();}}process.stdout.write('ok');}catch{process.exitCode=1;}});'''
+let text='';process.stdin.setEncoding('utf8');process.stdin.on('data',v=>text+=v);process.stdin.on('end',()=>{try{const x=JSON.parse(text);const k=Buffer.from(x.key,'hex');for(const s of x.sealed){const b=Buffer.from(s.value,'base64');const d=createDecipheriv('aes-256-gcm',k,b.subarray(0,12));d.setAAD(Buffer.from('panel-secret-v1'));d.setAuthTag(b.subarray(12,28));const p=Buffer.concat([d.update(b.subarray(28)),d.final()]);if(s.json||s.git){const j=JSON.parse(p.toString('utf8'));if(!j||typeof j!=='object'||Array.isArray(j))throw Error();if(s.git){if(Object.keys(j).sort().join(',')!=='kind,repository,serviceId,token,username'||j.kind!=='git-credential-v1'||typeof j.token!=='string'||!j.token||j.token.length>4096||/[\x00-\x20\x7f]/.test(j.token)||!Array.isArray(s.git)||!s.git.length)throw Error();for(const e of s.git){const u=new URL(e.repository);if(u.protocol!=='https:'||u.username||u.password||u.search||u.hash||u.href!==e.repository||j.serviceId!==e.serviceId||j.repository!==e.repository||j.username!==e.username)throw Error();}}}}process.stdout.write('ok');}catch{process.exitCode=1;}});'''
 
 PANEL_SCHEMA = {
  'users': {'id','email','password_hash','role','created_at'},
@@ -107,15 +109,22 @@ def _child_dir(parent, name, owner, dev):
         return fd
     except BaseException: os.close(fd); raise
 
-def _cgroup_v2_headroom(mountpoint, relative):
+def _cgroup_v2_headroom(mountpoint, relative, *, actual_root=False):
     # Read all visible ancestors: each one's current value includes siblings.
     parts=relative.split('/') if relative else []
     if any(not part or part in ('.','..') for part in parts): raise CaptureError('Invalid cgroup path')
     remaining=None
     for depth in range(len(parts),-1,-1):
         directory=os.path.join(mountpoint,*parts[:depth])
-        with open(os.path.join(directory,'memory.max'),encoding='ascii') as f: limit=f.read().strip()
-        with open(os.path.join(directory,'memory.current'),encoding='ascii') as f: usage=int(f.read().strip())
+        limit=usage=None
+        try:
+            with open(os.path.join(directory,'memory.max'),encoding='ascii') as f: limit=f.read().strip()
+        except FileNotFoundError: pass
+        try:
+            with open(os.path.join(directory,'memory.current'),encoding='ascii') as f: usage=int(f.read().strip())
+        except FileNotFoundError: pass
+        if limit is None and usage is None and depth==0 and actual_root and os.path.isdir(directory): continue
+        if limit is None or usage is None: raise CaptureError('Cannot check cgroup memory limits')
         if usage<0: raise CaptureError('Invalid cgroup memory usage')
         if limit!='max':
             value=int(limit)
@@ -143,21 +152,26 @@ def _visible_cgroup_v2():
             elif path==root: relative=''
             elif path.startswith(root.rstrip('/')+'/'): relative=path[len(root.rstrip('/'))+1:]
             else: continue
-            candidates.append((len(root),mount,relative))
+            # Linux reserves this inode for the initial cgroup namespace.
+            # A namespace-relative '/' can hide host ancestors, so it is not
+            # sufficient evidence of the actual root cgroup by itself.
+            initial_namespace=os.stat('/proc/self/ns/cgroup').st_ino==0xEFFFFFFB
+            candidates.append((len(root),mount,relative,root=='/' and initial_namespace))
     if not candidates: raise CaptureError('Cannot locate cgroup v2 mount')
     # The broadest mount exposes the greatest number of ancestors.
-    _,mount,relative=min(candidates,key=lambda item:item[0])
-    return mount,relative
+    _,mount,relative,actual_root=min(candidates,key=lambda item:item[0])
+    return mount,relative,actual_root
 
 def _memory_headroom(size):
-    # Availability can change concurrently and ancestors outside a cgroup
-    # namespace are not visible. The coordinator must account for both.
+    # Availability can change concurrently. The coordinator must provision
+    # enough memory and prevent concurrent workloads from exhausting it.
     needed = MEMORY_RESERVE + 4 * size
     try:
         with open('/proc/meminfo', encoding='ascii') as info:
             available = next(int(line.split()[1]) * 1024 for line in info if line.startswith('MemAvailable:'))
-        mount,relative=_visible_cgroup_v2()
-        cgroup_available=_cgroup_v2_headroom(mount,relative)
+        mount,relative,actual_root=_visible_cgroup_v2()
+        if not actual_root: raise CaptureError('Cannot verify complete cgroup ancestry')
+        cgroup_available=_cgroup_v2_headroom(mount,relative,actual_root=actual_root)
         if cgroup_available is not None: available=min(available,cgroup_available)
     except (OSError, ValueError, StopIteration, IndexError): raise CaptureError('Cannot check available memory') from None
     if available < needed: raise CaptureError('Insufficient memory for SQLite capture')
@@ -341,7 +355,7 @@ def _schema(db,expected,version):
     for table,cols in expected.items():
         if {r[1] for r in db.execute(f'PRAGMA table_info({table})')}!=cols: raise CaptureError('Unsupported database schema')
 
-def _config_references(config, refs, service_id, owners):
+def _config_references(config, refs, service_id, owners, purposes=None, git_requirements=None):
     if not isinstance(config,dict): raise CaptureError('Service configuration is invalid')
     environment=config.get('environment',[])
     if not isinstance(environment,list): raise CaptureError('Service configuration is invalid')
@@ -351,6 +365,7 @@ def _config_references(config, refs, service_id, owners):
             if not item.get('secret') or not isinstance(item['secretRef'],str): raise CaptureError('Secret reference is invalid')
             reference=item['secretRef']
             if owners.get(reference)!=service_id: raise CaptureError('Secret reference belongs to another service')
+            if purposes is not None and purposes.get(reference) not in ('environment','legacy_shared'): raise CaptureError('Secret reference has an invalid purpose')
             refs.add(reference)
     database=config.get('database')
     if database is not None:
@@ -359,6 +374,20 @@ def _config_references(config, refs, service_id, owners):
             if not isinstance(database['passwordSecretRef'],str): raise CaptureError('Secret reference is invalid')
             reference=database['passwordSecretRef']
             if owners.get(reference)!=service_id: raise CaptureError('Secret reference belongs to another service')
+            if purposes is not None and purposes.get(reference) not in ('database','legacy_shared'): raise CaptureError('Secret reference has an invalid purpose')
+            refs.add(reference)
+    source=config.get('source')
+    if source is not None:
+        if not isinstance(source,dict): raise CaptureError('Service configuration is invalid')
+        credential=source.get('credential')
+        if credential is not None:
+            if source.get('type')!='git' or not isinstance(credential,dict) or set(credential)!={'username','secretRef'} or not isinstance(credential['username'],str) or not isinstance(credential['secretRef'],str): raise CaptureError('Git credential reference is invalid')
+            reference=credential['secretRef']
+            if owners.get(reference)!=service_id or purposes is None or purposes.get(reference)!='git': raise CaptureError('Git credential reference has an invalid purpose')
+            repository=source.get('repository')
+            if not isinstance(repository,str) or not repository or len(repository)>1000 or not credential['username'] or len(credential['username'])>256 or re.search(r'[\x00-\x20\x7f:=]',credential['username']): raise CaptureError('Git credential reference is invalid')
+            if git_requirements is None: raise CaptureError('Git credential validation is unavailable')
+            git_requirements.setdefault(reference,set()).add((service_id,repository,credential['username']))
             refs.add(reference)
 
 def _validate_staging(dest_fd,node_fd):
@@ -368,22 +397,27 @@ def _validate_staging(dest_fd,node_fd):
         try: data[name]=_read(fd).decode('ascii')
         finally: os.close(fd)
         if not re.fullmatch(r'[a-f0-9]{64}',data[name]): raise CaptureError('Installation key or token is invalid')
-    encrypted=[]; refs=set(); mariadb=set(); dev=os.fstat(dest_fd).st_dev
+    encrypted=[]; refs=set(); mariadb=set(); git_requirements={}; dev=os.fstat(dest_fd).st_dev
     with sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/panel.sqlite?mode=ro',uri=True) as db:
-        _schema(db,PANEL_SCHEMA,4)
+        version=db.execute('PRAGMA user_version').fetchone()[0]
+        if version==4: _schema(db,PANEL_SCHEMA,4)
+        elif version==5: _schema(db,{**PANEL_SCHEMA,'service_secret_refs':PANEL_SCHEMA['service_secret_refs']|{'purpose'}},5)
+        else: raise CaptureError('Unsupported database schema')
         if db.execute("SELECT 1 FROM jobs WHERE status != 'succeeded' OR status IS NULL LIMIT 1").fetchone(): raise CaptureError('Unresolved panel jobs require recovery')
         if db.execute("SELECT 1 FROM actions WHERE status != 'succeeded' OR status IS NULL LIMIT 1").fetchone(): raise CaptureError('Unresolved panel actions require recovery')
         owners=dict(db.execute('SELECT reference,service_id FROM service_secret_refs'))
+        purposes=dict(db.execute('SELECT reference,purpose FROM service_secret_refs')) if version==5 else None
+        if purposes is not None and any(value not in ('unclassified','environment','database','git','legacy_shared') for value in purposes.values()): raise CaptureError('Secret purpose metadata is invalid')
         refs.update(owners)
         for ident,raw,deployed in db.execute('SELECT id,config,deployed_revision FROM services'):
             try: config=json.loads(raw)
             except (TypeError,ValueError): raise CaptureError('Service configuration is invalid') from None
-            _config_references(config,refs,ident,owners)
+            _config_references(config,refs,ident,owners,purposes,git_requirements)
             if config.get('kind')=='mariadb' and deployed is not None: mariadb.add(ident)
         for ident,raw in db.execute('SELECT service_id,snapshot FROM jobs'):
             try: snapshot=json.loads(raw)
             except (TypeError,ValueError): raise CaptureError('Job snapshot is invalid') from None
-            _config_references(snapshot,refs,ident,owners)
+            _config_references(snapshot,refs,ident,owners,purposes,git_requirements)
         checks={'central_config':['client_secret','revoke_token'],'central_pending_revocations':['revoke_token'],'central_pairings':['secret','redeemed_credentials'],'central_transactions':['verifier']}
         for table,cols in checks.items():
             for col in cols:
@@ -414,7 +448,10 @@ def _validate_staging(dest_fd,node_fd):
                 fd,_=_file(directory,name,0,dev)
                 try: text=_read(fd).decode('ascii')
                 finally: os.close(fd)
-                if directory==secret_dir: encrypted.append(_sealed(text))
+                if directory==secret_dir:
+                    entry=_sealed(text)
+                    if name in git_requirements: entry['git']=[{'serviceId':service_id,'repository':repository,'username':username} for service_id,repository,username in sorted(git_requirements[name])]
+                    encrypted.append(entry)
                 else:
                     if not UUID.fullmatch(text): raise CaptureError('Secret reference is invalid')
                     refs.add(text)
@@ -435,6 +472,10 @@ def _capture_quiescent(source_fd,destination_fd,node_fd,*,source_uid,reader_gid,
     if group_name not in ('nobody','nogroup'): raise CaptureError('Reader group is not trusted')
     source=_dir(source_fd,source_uid,0o700); dest=_dir(destination_fd,0,0o700)
     if (source.st_dev,source.st_ino)==(dest.st_dev,dest.st_ino) or os.listdir(destination_fd): raise CaptureError('Staging directory must be empty and separate')
+    # Reject hidden cgroup ancestors before creating the reader or copying data.
+    # The reader checks again with the actual database size before each copy.
+    try: _memory_headroom(0)
+    except MemoryError: raise CaptureError('Cannot check available memory') from None
     deadline=time.monotonic()+deadline_seconds; parent,child=socket.socketpair(); parent_pid=os.getpid(); pid=os.fork()
     if pid==0:
         parent.close()

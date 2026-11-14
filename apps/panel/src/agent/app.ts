@@ -24,7 +24,7 @@ const input = z.object({
     state: z.enum(['pending', 'running', 'stopped', 'deploying', 'failed', 'unknown']),
     createdAt: z.string(), updatedAt: z.string(), lastError: z.string().nullable(),
     kind: z.enum(['app','postgres','redis','mariadb']).optional(),
-    source: z.discriminatedUnion('type', [z.object({type:z.literal('image')}), z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256)})]).optional(),
+    source: z.discriminatedUnion('type', [z.object({type:z.literal('image')}), z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256),credential:z.object({username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().optional()})]).optional(),
     environment: z.array(z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32768).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).refine(value=>!value.secret||Boolean(value.secretRef)&&value.value===undefined)).max(100).optional(),
     domains: z.array(z.object({hostname,port:z.number().int().min(1).max(65535),primary:z.boolean().optional()})).max(20).optional(),
     mounts: z.array(z.object({type:z.enum(['volume','file','bind']),name:z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/),target:z.string().startsWith('/').max(256),readOnly:z.boolean().optional(),content:z.string().max(32768).optional(),source:z.string().max(512).optional()})).max(20).optional(),

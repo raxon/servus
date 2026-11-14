@@ -18,7 +18,7 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
 }> {
   if (stateful(service) && service.replicas !== 1) throw new Error('Writable storage and databases require a single replica.');
   const mounts: Docker.MountSettings[] = [];
-  const environment = (service.environment || []).map(item => `${item.name}=${item.secretRef ? vault.get(item.secretRef) : item.value || ''}`);
+  const environment = (service.environment || []).map(item => `${item.name}=${item.secretRef ? vault.getServiceSecret(item.secretRef,service.id,'environment') : item.value || ''}`);
   const secrets: NonNullable<Docker.ContainerSpec['Secrets']> = [];
   const configured = service.mounts || [];
   if(options.freshPostgres && (!options.postgresScram || service.kind!=='postgres' || configured.length || service.environment?.some(item=>item.name==='PGDATA')))throw new Error('A new protected PostgreSQL service requires its default data volume and data path.');
@@ -46,7 +46,7 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
   if (databaseKind(service)) {
     const kind = service.kind as keyof typeof databasePaths;
     if (!service.database?.passwordSecretRef) throw new Error('The database password secret is missing.');
-    const password = vault.get(service.database.passwordSecretRef);
+    const password = vault.getServiceSecret(service.database.passwordSecretRef,service.id,'database');
     const passwordName = secretName('db', service.id, service.database.passwordSecretRef);
     const passwordId = await swarmSecret(docker, passwordName, password, service.id);
     secrets.push({ SecretID: passwordId, SecretName: passwordName, File: { Name: 'panel-db-password', UID: '0', GID: '0', Mode: 0o444 } });
@@ -79,7 +79,7 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
       }
       const rootReference = readFileSync(path, 'utf8');
       const rootName = secretName('root', service.id, rootReference);
-      secrets.push({ SecretID: await swarmSecret(docker, rootName, vault.get(rootReference), service.id), SecretName: rootName, File: { Name: 'panel-db-root-password', UID: '0', GID: '0', Mode: 0o444 } });
+      secrets.push({ SecretID: await swarmSecret(docker, rootName, vault.getDatabaseRootSecret(rootReference), service.id), SecretName: rootName, File: { Name: 'panel-db-root-password', UID: '0', GID: '0', Mode: 0o444 } });
       environment.push(`MARIADB_DATABASE=${database}`, `MARIADB_USER=${user}`, 'MARIADB_PASSWORD_FILE=/run/secrets/panel-db-password', 'MARIADB_ROOT_PASSWORD_FILE=/run/secrets/panel-db-root-password');
     }
     if (kind === 'redis') { command = ['/bin/sh']; args = ['-c', 'exec docker-entrypoint.sh redis-server --appendonly yes --requirepass "$(cat /run/secrets/panel-db-password)"']; }

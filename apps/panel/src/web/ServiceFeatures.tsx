@@ -110,6 +110,10 @@ function SourcePanel({ service }: { service: Service }) {
   const [repository, setRepository] = useState(
     current.type === "git" ? current.repository : "",
   );
+  const existingCredential = current.type === "git" ? current.credential : undefined;
+  const [privateGit, setPrivateGit] = useState(Boolean(existingCredential));
+  const [gitUsername, setGitUsername] = useState(existingCredential?.username ?? "");
+  const [gitToken, setGitToken] = useState("");
   const [branch, setBranch] = useState(
     current.type === "git" ? current.branch : "main",
   );
@@ -132,8 +136,8 @@ function SourcePanel({ service }: { service: Service }) {
           source:
             type === "image"
               ? { type }
-              : { type, repository, branch, context, dockerfile },
-        });
+              : { type, repository, branch, context, dockerfile, ...(privateGit ? { credential: gitToken ? {username:gitUsername,token:gitToken} : {username:gitUsername,secretRef:existingCredential?.secretRef} } : {}) },
+        }, { onSuccess: () => setGitToken("") });
       }}
     >
       <div className="configuration-intro">
@@ -142,7 +146,7 @@ function SourcePanel({ service }: { service: Service }) {
           <h2>Application source</h2>
         </div>
         <p>
-          Choose an image or build a Dockerfile from a public Git repository.
+          Choose an image or build a Dockerfile from a Git repository.
         </p>
       </div>
       <fieldset className="configuration-fields" disabled={save.isPending}>
@@ -186,10 +190,17 @@ function SourcePanel({ service }: { service: Service }) {
                 required
               />
               <small>
-                Public HTTPS repositories are supported. Do not put credentials
-                in the URL.
+                Use an HTTPS URL without credentials.
               </small>
             </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={privateGit} onChange={(event) => setPrivateGit(event.target.checked)} />
+              Private repository
+            </label>
+            {privateGit ? <>
+              <label>Git username<input value={gitUsername} onChange={(event) => setGitUsername(event.target.value)} autoComplete="off" required /></label>
+              <label>Access token<input type="password" value={gitToken} onChange={(event) => setGitToken(event.target.value)} autoComplete="new-password" required={!existingCredential?.secretRef || (current.type === "git" && (repository !== current.repository || gitUsername !== existingCredential.username))} /><small>{existingCredential?.secretRef ? "Leave empty to keep the saved token." : "The token is encrypted on this installation."}</small></label>
+            </> : null}
             <label>
               Branch or ref
               <input

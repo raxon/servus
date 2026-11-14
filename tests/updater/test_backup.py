@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -10,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('servus_backup_capture', ROOT / 'apps/updater/backup.py')
@@ -35,6 +37,56 @@ class CgroupHeadroomTest(unittest.TestCase):
             self.assertIsNone(backup._cgroup_v2_headroom(directory,'team/reader'))
             with self.assertRaises(backup.CaptureError): backup._cgroup_v2_headroom(directory,'team/../reader')
 
+    def test_only_actual_root_may_lack_both_memory_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory);child=root/'service';child.mkdir()
+            (child/'memory.max').write_text('2000');(child/'memory.current').write_text('1000')
+            self.assertEqual(backup._cgroup_v2_headroom(directory,'service',actual_root=True),1000)
+            with self.assertRaises(backup.CaptureError): backup._cgroup_v2_headroom(directory,'service',actual_root=False)
+            (root/'memory.max').write_text('max')
+            with self.assertRaises(backup.CaptureError): backup._cgroup_v2_headroom(directory,'service',actual_root=True)
+            (root/'memory.max').unlink();(child/'memory.max').unlink();(child/'memory.current').unlink()
+            with self.assertRaises(backup.CaptureError): backup._cgroup_v2_headroom(directory,'service',actual_root=True)
+
+    def test_missing_root_still_requires_memavailable_and_other_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory);child=root/'service';child.mkdir()
+            (child/'memory.max').write_text('1000');(child/'memory.current').write_text('900')
+            with mock.patch.object(backup,'_visible_cgroup_v2',return_value=(directory,'service',True)):
+                with self.assertRaisesRegex(backup.CaptureError,'Insufficient memory'): backup._memory_headroom(1)
+            real_open=open
+            def missing_meminfo(path,*args,**kwargs):
+                if path=='/proc/meminfo': raise FileNotFoundError(path)
+                return real_open(path,*args,**kwargs)
+            with mock.patch.object(backup,'_visible_cgroup_v2',return_value=(directory,'service',True)),mock.patch('builtins.open',side_effect=missing_meminfo):
+                with self.assertRaisesRegex(backup.CaptureError,'Cannot check available memory'): backup._memory_headroom(1)
+
+    def test_denied_memory_file_is_not_treated_as_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            real_open=open
+            def denied(path,*args,**kwargs):
+                if str(path).endswith('memory.max'): raise PermissionError(path)
+                return real_open(path,*args,**kwargs)
+            with mock.patch.object(backup,'_visible_cgroup_v2',return_value=(directory,'',True)),mock.patch('builtins.open',side_effect=denied):
+                with self.assertRaisesRegex(backup.CaptureError,'Cannot check available memory'): backup._memory_headroom(1)
+
+    def test_namespace_relative_root_is_not_assumed_to_be_actual_root(self):
+        real_open=open;real_stat=os.stat
+        def fixtures(path,*args,**kwargs):
+            if path=='/proc/self/cgroup': return io.StringIO('0::/service\n')
+            if path=='/proc/self/mountinfo': return io.StringIO('40 30 0:31 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n')
+            return real_open(path,*args,**kwargs)
+        class Stat: st_ino=42
+        def namespace(path,*args,**kwargs):
+            return Stat() if path=='/proc/self/ns/cgroup' else real_stat(path,*args,**kwargs)
+        with mock.patch('builtins.open',side_effect=fixtures),mock.patch.object(backup.os,'stat',side_effect=namespace):
+            self.assertEqual(backup._visible_cgroup_v2(),('/sys/fs/cgroup','service',False))
+
+    def test_capture_refuses_hidden_cgroup_ancestors(self):
+        with mock.patch.object(backup,'_visible_cgroup_v2',return_value=('/sys/fs/cgroup','service',False)),mock.patch.object(backup,'_cgroup_v2_headroom') as headroom:
+            with self.assertRaisesRegex(backup.CaptureError,'Cannot verify complete cgroup ancestry'): backup._memory_headroom(1)
+            headroom.assert_not_called()
+
 @unittest.skipUnless(os.name == 'posix' and os.geteuid() == 0 and pathlib.Path('/proc/self/fd').exists() and pathlib.Path(NODE).is_file() and pathlib.Path(APP, 'dist/server/store.js').is_file(), 'Requires isolated Linux, root and a built Servus image')
 class CaptureTest(unittest.TestCase):
     def setUp(self):
@@ -50,8 +102,8 @@ import {createAgent} from '/app/dist/agent/app.js';import {writeFileSync,mkdirSy
 const d=process.argv[1], id=process.argv[2];const s=new Store(d);const ref=s.vault.put('synthetic-secret');const user=s.createUser('fixture@example.test',await hashPassword('fixture-password'),'admin');
 s.db.prepare('INSERT INTO projects(id,name,description,created_at) VALUES(?,?,?,?)').run(id,'fixture','before','2020-01-01');
 s.db.prepare('INSERT INTO services(id,project_id,name,image,port,hostname,replicas,revision,state,created_at,updated_at,config,deployed_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,id,'fixture','mariadb:11.4',3306,'fixture.internal',1,1,'running','2020-01-01','2020-01-01',JSON.stringify({kind:'mariadb'}),1);
-s.db.prepare('INSERT INTO service_secret_refs(reference,service_id) VALUES (?,?)').run(ref,id);
-mkdirSync(d+'/database-roots',{mode:0o700});writeFileSync(d+'/database-roots/'+id,ref,{mode:0o600});
+s.db.prepare('INSERT INTO service_secret_refs(reference,service_id,purpose) VALUES (?,?,?)').run(ref,id,'database');
+const rootRef=s.vault.put('synthetic-root-secret');mkdirSync(d+'/database-roots',{mode:0o700});writeFileSync(d+'/database-roots/'+id,rootRef,{mode:0o600});
 writeFileSync(d+'/agent-token','42'.repeat(32),{mode:0o600});s.close();
 const cfg={dataDir:d,token:'42'.repeat(32),socketPath:d+'/agent.sock',dockerSocket:'/none',ingressPort:18080,ingressImage:'unused'};
 const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout.write(JSON.stringify({ref,actor:user.id}));'''
@@ -82,6 +134,24 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
 
     def capture(self,reader_gid=65534): return backup._capture_quiescent(self.source_fd,self.destination_fd,self.node_fd,source_uid=1000,reader_gid=reader_gid)
 
+    def test_capture_rejects_private_cgroup_before_fork_or_copy(self):
+        with mock.patch.object(backup,'_visible_cgroup_v2',return_value=('/sys/fs/cgroup','',False)),mock.patch.object(backup.os,'fork') as fork:
+            with self.assertRaisesRegex(backup.CaptureError,'Cannot verify complete cgroup ancestry'): self.capture()
+            fork.assert_not_called()
+        self.assertEqual(list(self.dst.iterdir()),[])
+
+    def test_real_cgroup_namespace_policy(self):
+        expected=os.environ.get('SERVUS_CGROUP_EXPECT','host')
+        if expected=='private':
+            self.assertFalse(backup._visible_cgroup_v2()[2])
+            with self.assertRaisesRegex(backup.CaptureError,'Cannot verify complete cgroup ancestry'): self.capture()
+            self.assertEqual(list(self.dst.iterdir()),[])
+        elif expected=='host':
+            self.assertTrue(backup._visible_cgroup_v2()[2])
+            self.capture()
+            self.assertIn('manifest.json',os.listdir(self.dst))
+        else: self.fail('Invalid cgroup fixture mode')
+
     def test_real_store_agent_committed_wal_and_isolated_restore(self):
         manifest = self.capture()
         self.assertIn('secrets/'+self.ref, manifest['files'])
@@ -97,6 +167,15 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         subprocess.run([NODE,'--input-type=module','-e',script,str(restored_dir),self.ref],check=True,timeout=20)
         raw=(self.dst/'manifest.json').read_text();self.assertNotIn('synthetic-secret',raw)
         with self.assertRaises(backup.CaptureError): self.capture()
+
+    def test_v4_snapshot_restores_and_migrates_without_changing_source(self):
+        self.panel.execute('ALTER TABLE service_secret_refs DROP COLUMN purpose')
+        self.panel.execute('PRAGMA user_version=4');self.panel.commit();self.fix_permissions()
+        self.capture()
+        restored_dir=self.root/'restored-v4';shutil.copytree(self.dst,restored_dir)
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==5)process.exit(2);s.close()"
+        subprocess.run([NODE,'--input-type=module','-e',script,str(restored_dir)],check=True,timeout=20)
+        self.assertEqual(self.panel.execute('PRAGMA user_version').fetchone(),(4,))
 
     def test_wrong_key_or_corrupted_ciphertext_is_rejected(self):
         (self.src/'secret-key').write_text('43'*32); self.fix_permissions()
@@ -130,6 +209,51 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         self.panel.execute("INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)",(UUID,UUID,UUID,json.dumps(snapshot),'succeeded',1,'2020-01-01'))
         self.panel.commit();self.fix_permissions()
         with self.assertRaisesRegex(backup.CaptureError,'belongs to another service'): self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
+
+    def test_git_credential_reference_cannot_be_used_as_environment(self):
+        self.panel.execute("UPDATE service_secret_refs SET purpose='git' WHERE reference=?",(self.ref,))
+        config={'kind':'app','environment':[{'name':'TOKEN','secret':True,'secretRef':self.ref}]}
+        self.panel.execute('UPDATE services SET config=? WHERE id=?',(json.dumps(config),UUID));self.panel.commit();self.fix_permissions()
+        with self.assertRaisesRegex(backup.CaptureError,'invalid purpose'): self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
+
+    def add_git_credential(self, *, service_id=UUID, repository='https://github.com/example/private.git', username='git-user'):
+        script=r'''import {Store} from '/app/dist/server/store.js';const [dir,service,repository,username]=process.argv.slice(1);const s=new Store(dir);const ref=s.vault.put(JSON.stringify({kind:'git-credential-v1',serviceId:service,repository,username,token:'fixture-git-token'}));s.db.prepare('INSERT INTO service_secret_refs(reference,service_id,purpose) VALUES (?,?,?)').run(ref,'12345678-1234-4123-8123-123456789abc','git');s.close();process.stdout.write(ref);'''
+        reference=subprocess.check_output([NODE,'--input-type=module','-e',script,str(self.src),service_id,repository,username],text=True,timeout=20)
+        config={'kind':'app','source':{'type':'git','repository':'https://github.com/example/private.git','branch':'main','context':'.','dockerfile':'Dockerfile','credential':{'username':'git-user','secretRef':reference}}}
+        self.panel.execute('UPDATE services SET config=? WHERE id=?',(json.dumps(config),UUID));self.panel.commit();self.fix_permissions()
+        return reference,config
+
+    def test_git_metadata_is_checked_for_matching_configuration_and_snapshot(self):
+        reference,config=self.add_git_credential()
+        self.panel.execute("INSERT INTO actions(id,project_id,service_id,actor_id,type,status,phase,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(UUID,UUID,UUID,self.actor,'deploy','succeeded','finished','2020-01-01','2020-01-01'))
+        self.panel.execute("INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)",(UUID,UUID,UUID,json.dumps(config),'succeeded',1,'2020-01-01'))
+        self.panel.commit();self.fix_permissions();manifest=self.capture()
+        self.assertIn('secrets/'+reference,manifest['files']);self.assertNotIn('fixture-git-token',json.dumps(manifest))
+
+    def test_git_metadata_rejects_mismatched_repository(self):
+        self.add_git_credential(repository='https://github.com/other/repo.git')
+        with self.assertRaisesRegex(backup.CaptureError,'Encryption verification failed'): self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
+
+    def test_git_metadata_rejects_mismatched_username(self):
+        self.add_git_credential(username='other-user')
+        with self.assertRaisesRegex(backup.CaptureError,'Encryption verification failed'): self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
+
+    def test_git_metadata_rejects_mismatched_service(self):
+        self.add_git_credential(service_id='22345678-1234-4123-8123-123456789abc')
+        with self.assertRaisesRegex(backup.CaptureError,'Encryption verification failed'): self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
+
+    def test_git_metadata_checks_every_historical_job_snapshot(self):
+        _reference,config=self.add_git_credential()
+        config['source']['repository']='https://github.com/other/repo.git'
+        self.panel.execute("INSERT INTO actions(id,project_id,service_id,actor_id,type,status,phase,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(UUID,UUID,UUID,self.actor,'deploy','succeeded','finished','2020-01-01','2020-01-01'))
+        self.panel.execute("INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)",(UUID,UUID,UUID,json.dumps(config),'succeeded',1,'2020-01-01'))
+        self.panel.commit();self.fix_permissions()
+        with self.assertRaisesRegex(backup.CaptureError,'Encryption verification failed'): self.capture()
         self.assertFalse((self.dst/'manifest.json').exists())
 
     def test_docker_group_is_rejected(self):

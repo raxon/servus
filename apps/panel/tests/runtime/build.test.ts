@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { buildSource, buildLogPath } from '../../src/agent/build.js';
 import { SecretVault } from '../../src/shared/secrets.js';
 import type { Service } from '../../src/shared/types.js';
+import Database from 'better-sqlite3';
 
 const cleanup:(()=>unknown|Promise<unknown>)[]=[];
 afterEach(async()=>{for(const fn of cleanup.splice(0).reverse())await fn();vi.unstubAllEnvs();});
@@ -32,6 +33,7 @@ it('pins Git source across retries, passes commit metadata and never persists st
   const vault=new SecretVault(dataDir),secret='sensitive-build-token',reference=vault.put(secret),operationId=randomUUID();
   const service:Service={id:randomUUID(),projectId:randomUUID(),name:'git',image:'unused',hostname:'git.localhost',port:80,replicas:1,revision:1,deployedRevision:null,state:'pending',createdAt:'now',updatedAt:'now',lastError:null,
     source:{type:'git',repository:`http://127.0.0.1:${port}/control.git`,branch:'main',context:'.',dockerfile:'Dockerfile'},environment:[{name:'BUILD_SECRET',secret:true,secretRef:reference}]};
+  const metadata=new Database(join(dataDir,'panel.sqlite'));metadata.exec('CREATE TABLE service_secret_refs(reference TEXT PRIMARY KEY,service_id TEXT NOT NULL,purpose TEXT NOT NULL); PRAGMA user_version=5');metadata.prepare('INSERT INTO service_secret_refs VALUES (?,?,?)').run(reference,service.id,'environment');cleanup.push(()=>metadata.close());
   const built=await buildSource(service,operationId,dataDir,'/unused',vault);expect(built.sourceCommit).toBe(first);
   const logs=readFileSync(buildLogPath(dataDir,service.id,operationId),'utf8');expect(logs).toContain('[REDACTED]');expect(logs).not.toContain(secret);
   writeFileSync(join(source,'new-file'),'second');git(['add','.']);git(['-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-m','second']);git(['--git-dir',bare,'fetch',source,'main:main'],root);git(['--git-dir',bare,'update-server-info'],root);

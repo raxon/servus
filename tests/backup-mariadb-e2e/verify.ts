@@ -90,7 +90,7 @@ try {
   const rootSecret=before.find((item:any)=>item.File?.Name==='panel-db-root-password')?.SecretID;assert(rootSecret);
   stopFixture();assert.equal(cli('ps','-q','--filter',`volume=${source}`),'','Control-plane source still has a running writer');
   console.log('PASS isolated MariaDB deployment and synthetic data');
-  cli('run','--rm','--user','0','--network','none','--memory','1200m','--mount',`type=volume,source=${source},target=/fixture-source`,'--mount',`type=volume,source=${staging},target=/fixture-staging`,'--entrypoint','/usr/local/bin/python3.12',utility,'-I','/fixture/capture.py');
+  cli('run','--rm','--user','0','--network','none','--cgroupns=host','--memory','1200m','--mount',`type=volume,source=${source},target=/fixture-source`,'--mount',`type=volume,source=${staging},target=/fixture-staging`,'--entrypoint','/usr/local/bin/python3.12',utility,'-I','/fixture/capture.py');
   cli('run','--rm','--user','0','--network','none','--mount',`type=volume,source=${staging},target=/from,readonly`,'--mount',`type=volume,source=${restored},target=/to`,'--entrypoint','sh',image,'-c','cp -a /from/. /to/ && chown -R 1000:1000 /to && chmod 700 /to');
   start('agent',restored,port,group);start('api',restored,port,group);start('worker',restored,port,group);cookie='';csrf='';await ready();
   const restoredLogin=await api('/auth/login','POST',{email,password});csrf=restoredLogin.csrfToken;assert(cookie&&csrf);

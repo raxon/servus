@@ -6,7 +6,8 @@ export interface User { id: string; email: string; role: 'admin' | 'member'; cre
 export interface SessionResponse { user: User; csrfToken: string }
 export interface Project { id: string; name: string; description: string; createdAt: string; serviceCount: number }
 export type ServiceKind = 'app' | 'postgres' | 'redis' | 'mariadb';
-export type SourceConfig = { type: 'image' } | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string };
+export interface GitCredential { username: string; token?: string; secretRef?: string }
+export type SourceConfig = { type: 'image' } | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string; credential?: GitCredential };
 export interface EnvironmentVariable { name: string; value?: string; secret?: boolean; secretRef?: string }
 export interface DomainConfig { hostname: string; port: number; primary?: boolean }
 export interface MountConfig { type: 'volume' | 'file' | 'bind'; name: string; target: string; readOnly?: boolean; content?: string; source?: string }

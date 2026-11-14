@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
@@ -33,6 +33,34 @@ const appInput={name:'web',image:'nginx:alpine',port:80,hostname:'advanced.local
 function finishFirst(store:Store) {const job=store.claimNextJob('test-worker',60000)!;store.completeAction(job.actionId,'test-worker',{state:'running',deployedRevision:job.snapshot.revision});}
 
 describe('versioned configuration and secret ownership',()=>{
+  it('encrypts and binds Git tokens to the service and repository, retaining queued revisions across rotation',async()=>{
+    const {dir,store,app,headers,create}=await fixture();
+    const token='git-token-example-4938',replacement='git-token-rotated-2098';
+    const source={type:'git',repository:'https://github.com/example/private.git',branch:'main',context:'.',dockerfile:'Dockerfile',credential:{username:'git-user',token}};
+    const response=await create({...appInput,source});expect(response.statusCode).toBe(202);expect(response.body).not.toContain(token);
+    const {service,action}=response.json(),ref=service.source.credential.secretRef;
+    expect(service.source.credential.token).toBeUndefined();
+    const snapshot=(store.db.prepare('SELECT snapshot FROM jobs WHERE action_id=?').get(action.id) as {snapshot:string}).snapshot;
+    expect(snapshot).not.toContain(token);expect(snapshot).toContain(ref);
+    const record=JSON.parse(store.vault.get(ref));expect(record).toMatchObject({serviceId:service.id,repository:source.repository,username:'git-user',token});
+    const rotated=await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:1,source:{...source,credential:{username:'git-user',token:replacement}}}});
+    expect(rotated.statusCode).toBe(200);expect(rotated.body).not.toContain(replacement);expect(rotated.json().source.credential.secretRef).not.toBe(ref);expect(JSON.parse(store.vault.get(ref)).token).toBe(token);
+    const stolen=await create({...appInput,name:'second',hostname:'second.localhost',source:{...source,credential:{username:'git-user',secretRef:ref}}},'git-second');expect(stolen.statusCode).toBe(403);
+    const changed=await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:2,source:{...source,repository:'https://github.com/other/repo.git',credential:{username:'git-user',secretRef:ref}}}});expect(changed.statusCode).toBe(403);
+    const asEnv=await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:2,environment:[{name:'GIT_TOKEN',secret:true,secretRef:ref}]}});expect(asEnv.statusCode).toBe(403);
+    const noCsrf=await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers:{cookie:headers.cookie},payload:{expectedRevision:2,source}});expect(noCsrf.statusCode).toBe(403);
+    const viewer=store.createUser('git-viewer@example.test',await hashPassword('viewer-testing-password'));store.addMember(service.projectId,viewer.id,'viewer');const session=store.createSession(viewer.id);
+    const viewerResult=await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers:{cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken},payload:{expectedRevision:2,source}});expect(viewerResult.statusCode).toBe(404);
+    const envSaved=await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:2,environment:[{name:'ENV_TOKEN',secret:true,value:'environment-secret'}]}});expect(envSaved.statusCode).toBe(200);
+    const envRef=envSaved.json().environment[0].secretRef;
+    const asGit=await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:3,source:{...source,credential:{username:'git-user',secretRef:envRef}}}});expect(asGit.statusCode).toBe(403);
+    const db=(await create({name:'db-purpose',kind:'mariadb'},'purpose-db')).json().service;
+    const databaseAsEnv=await app.inject({method:'PATCH',url:`/api/v1/services/${db.id}`,headers,payload:{expectedRevision:1,environment:[{name:'LEAK',secret:true,secretRef:db.database.passwordSecretRef}]}});expect(databaseAsEnv.statusCode).toBe(403);
+    const plain=JSON.stringify(store.db.prepare('SELECT config FROM services').all())+JSON.stringify(store.db.prepare('SELECT snapshot FROM jobs').all());expect(plain).not.toContain(token);expect(plain).not.toContain(replacement);
+    for(const name of ['panel.sqlite','panel.sqlite-wal'])if(existsSync(join(dir,name))){const data=readFileSync(join(dir,name));expect(data.includes(Buffer.from(token))).toBe(false);expect(data.includes(Buffer.from(replacement))).toBe(false);}
+    expect(readFileSync(join(dir,'secrets',ref)).includes(Buffer.from(token))).toBe(false);
+    expect(store.vault.redact(`failure ${token}`)).not.toContain(token);
+  });
   it('encrypts environment secrets, keeps snapshots immutable and redacts event output',async()=>{
     const {store,app,headers,create}=await fixture();const secret='original-secret-2468',replacement='replacement-secret-1357';
     const response=await create({...appInput,environment:[{name:'API_KEY',value:secret,secret:true},{name:'MODE',value:'production'}]});
@@ -355,7 +383,7 @@ describe('v1 to v2 migration',()=>{
     db.prepare('INSERT INTO actions VALUES (?,?,?,?,?,?,?,?,?,?,?)').run('legacy-action','legacy','service','admin','deploy','queued','queued',null,'2026-01-01','2026-01-01',null);
     db.prepare('INSERT INTO jobs(id,action_id,service_id,snapshot,status,created_at) VALUES (?,?,?,?,?,?)').run('legacy-job','legacy-action','service',JSON.stringify(legacySnapshot),'queued','2026-01-01');
     db.close();const store=new Store(dir);cleanup.push(async()=>store.close());
-    expect(store.db.pragma('user_version',{simple:true})).toBe(4);expect(store.getProject('legacy')!.description).toBe('existing data');expect(store.getService('service')!.kind).toBe('app');
+    expect(store.db.pragma('user_version',{simple:true})).toBe(5);expect(store.getProject('legacy')!.description).toBe('existing data');expect(store.getService('service')!.kind).toBe('app');
     const recovered=store.claimNextJob('migration-worker',60000)!;expect(recovered.actionId).toBe('legacy-action');expect(recovered.snapshot).toEqual(legacySnapshot);
     expect(store.updateService('service',{expectedRevision:1,environment:[{name:'TOKEN',secret:true,value:'migration-secret-123'}]}).environment![0]!.secretRef).toBeTruthy();
   });

@@ -42,7 +42,7 @@ export class Store {
     retryStartupLock(()=>this.db.pragma('journal_mode = WAL'));
     this.db.pragma('foreign_keys = ON');
     const version = this.db.pragma('user_version', { simple: true }) as number;
-    if (version > 4) throw new Error('This database requires a newer panel release');
+    if (version > 5) throw new Error('This database requires a newer panel release');
     if (version === 0) this.db.transaction(() => {
       const currentVersion = this.db.pragma('user_version', { simple: true }) as number;
       if(currentVersion>=1)return;
@@ -103,6 +103,36 @@ export class Store {
         CREATE TABLE central_link_proofs (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, session_hash TEXT NOT NULL, issuer TEXT NOT NULL, subject TEXT NOT NULL, expires_at TEXT NOT NULL);
         PRAGMA user_version = 4;
       `);
+    }).immediate();
+    this.db.transaction(()=>{
+      if(Number(this.db.pragma('user_version',{simple:true}))>=5)return;
+      this.db.exec("ALTER TABLE service_secret_refs ADD COLUMN purpose TEXT NOT NULL DEFAULT 'unclassified' CHECK(purpose IN ('unclassified','environment','database','git','legacy_shared'))");
+      const known=new Map<string,{serviceId:string;purposes:Set<string>}>();
+      for(const row of this.db.prepare('SELECT reference,service_id FROM service_secret_refs').all() as {reference:string;service_id:string}[])known.set(row.reference,{serviceId:row.service_id,purposes:new Set()});
+      const add=(serviceId:string,ref:unknown,purpose:string)=>{
+        if(ref===undefined||ref===null)return;
+        const item=typeof ref==='string'?known.get(ref):undefined;
+        if(!item||item.serviceId!==serviceId)throw new Error('Legacy secret reference ownership is invalid');
+        item.purposes.add(purpose);
+      };
+      const classify=(serviceId:string,value:string)=>{
+        const config=JSON.parse(value) as import('../shared/types.js').ServiceConfiguration;
+        if(!config||typeof config!=='object'||Array.isArray(config))throw new Error('Legacy configuration is invalid');
+        if(config.environment!==undefined&&!Array.isArray(config.environment))throw new Error('Legacy environment is invalid');
+        for(const item of config.environment??[])add(serviceId,item.secretRef,'environment');
+        if(config.database)add(serviceId,config.database.passwordSecretRef,'database');
+        if(config.source?.type==='git'&&config.source.credential)add(serviceId,config.source.credential.secretRef,'git');
+      };
+      for(const row of this.db.prepare('SELECT id,config FROM services').all() as {id:string;config:string}[])classify(row.id,row.config);
+      for(const row of this.db.prepare('SELECT service_id,snapshot FROM jobs').all() as {service_id:string;snapshot:string}[])classify(row.service_id,row.snapshot);
+      const update=this.db.prepare('UPDATE service_secret_refs SET purpose=? WHERE reference=?');
+      for(const [reference,item] of known){
+        const values=[...item.purposes];
+        if(values.includes('git')&&values.length>1)throw new Error('Git credential has conflicting legacy purposes');
+        const purpose=values.length===0?'unclassified':values.length===1?values[0]:'legacy_shared';
+        update.run(purpose,reference);
+      }
+      this.db.pragma('user_version = 5');
     }).immediate();
     this.orm = drizzle(this.db, { schema });
     this.vault = new SecretVault(dataDir);
@@ -368,27 +398,42 @@ export class Store {
       return true;
     }).immediate();
   }
-  private requireOwnedSecret(serviceId:string,reference:string) {
-    if(!this.db.prepare('SELECT 1 FROM service_secret_refs WHERE reference=? AND service_id=?').get(reference,serviceId))throw new AppError('SECRET_REFERENCE','This secret reference does not belong to this service',403);
+  private requireOwnedSecret(serviceId:string,reference:string,purpose:'environment'|'database'|'git') {
+    const row=this.db.prepare('SELECT purpose FROM service_secret_refs WHERE reference=? AND service_id=?').get(reference,serviceId) as {purpose:string}|undefined;
+    if(!row||!(row.purpose===purpose||(row.purpose==='legacy_shared'&&purpose!=='git')))throw new AppError('SECRET_REFERENCE','This secret reference is not valid for this purpose',403);
     try{this.vault.get(reference);}catch{throw new AppError('SECRET_REFERENCE','This secret is unavailable',400);}
     return reference;
   }
-  private putServiceSecret(serviceId:string,value:string) {
+  private putServiceSecret(serviceId:string,value:string,purpose:'environment'|'database'|'git') {
     const reference=this.vault.put(value);
-    this.db.prepare('INSERT INTO service_secret_refs(reference,service_id) VALUES (?,?)').run(reference,serviceId);
+    this.db.prepare('INSERT INTO service_secret_refs(reference,service_id,purpose) VALUES (?,?,?)').run(reference,serviceId,purpose);
     return reference;
   }
   private protectConfiguration(serviceId:string,input:Service):import('../shared/types.js').ServiceConfiguration {
     const config=configurationOf(input);
+    if(config.source?.type==='git'&&config.source.credential) {
+      const source=config.source, credential=source.credential!, repository=new URL(source.repository).href;
+      if(credential.token!==undefined) {
+        const record=JSON.stringify({kind:'git-credential-v1',serviceId,repository,username:credential.username,token:credential.token});
+        config.source={...source,repository,credential:{username:credential.username,secretRef:this.putServiceSecret(serviceId,record,'git')}};
+      } else {
+        if(!credential.secretRef)throw new AppError('SECRET_REQUIRED','Enter a Git token');
+        const reference=this.requireOwnedSecret(serviceId,credential.secretRef,'git');
+        let record:unknown;
+        try{record=JSON.parse(this.vault.get(reference));}catch{throw new AppError('SECRET_REFERENCE','Git credential is invalid',400);}
+        if(!record||typeof record!=='object'||!('kind' in record)||record.kind!=='git-credential-v1'||!('serviceId' in record)||record.serviceId!==serviceId||!('repository' in record)||record.repository!==repository||!('username' in record)||record.username!==credential.username||!('token' in record)||typeof record.token!=='string')throw new AppError('SECRET_REFERENCE','Git credential does not match this repository',403);
+        config.source={...source,repository,credential:{username:credential.username,secretRef:reference}};
+      }
+    }
     config.environment=(config.environment??[]).map(env=>{
       if(!env.secret)return {name:env.name,value:env.value??'',secret:false};
-      const reference=env.value!==undefined?this.putServiceSecret(serviceId,env.value):env.secretRef?this.requireOwnedSecret(serviceId,env.secretRef):null;
+      const reference=env.value!==undefined?this.putServiceSecret(serviceId,env.value,'environment'):env.secretRef?this.requireOwnedSecret(serviceId,env.secretRef,'environment'):null;
       if(!reference)throw new AppError('SECRET_REQUIRED','Enter a secret value or retain its existing reference');
       return {name:env.name,secret:true,secretRef:reference};
     });
     if((config.kind??'app')!=='app') {
       const database=config.database??{database:'app',user:'app'};
-      const reference=database.password!==undefined?this.putServiceSecret(serviceId,database.password):database.passwordSecretRef?this.requireOwnedSecret(serviceId,database.passwordSecretRef):this.putServiceSecret(serviceId,randomBytes(24).toString('base64url'));
+      const reference=database.password!==undefined?this.putServiceSecret(serviceId,database.password,'database'):database.passwordSecretRef?this.requireOwnedSecret(serviceId,database.passwordSecretRef,'database'):this.putServiceSecret(serviceId,randomBytes(24).toString('base64url'),'database');
       config.database={database:database.database,user:database.user,passwordSecretRef:reference};
     } else if(config.database)throw new AppError('DATABASE_CONFIG','Database settings belong to managed database services');
     return config;
@@ -419,7 +464,7 @@ export class Store {
     if(!deployed||service.deployedRevision===null)throw new AppError('DATABASE_NOT_DEPLOYED','Database connection is available after its first confirmed deployment',409);
     const database=(JSON.parse(deployed.snapshot) as Service).database??{database:'app',user:'app'};
     const result:import('../shared/types.js').ConnectionInfo={host:`panel-app-${service.id}`,port:service.kind==='postgres'?5432:service.kind==='mariadb'?3306:6379,database:service.kind==='redis'?'0':database.database,user:service.kind==='redis'?'default':database.user};
-    if(reveal&&database.passwordSecretRef){this.requireOwnedSecret(serviceId,database.passwordSecretRef);result.password=this.vault.get(database.passwordSecretRef);}
+    if(reveal&&database.passwordSecretRef){this.requireOwnedSecret(serviceId,database.passwordSecretRef,'database');result.password=this.vault.get(database.passwordSecretRef);}
     return result;
   }
   recordAudit(actorId:string,operation:string,resourceId:string) {this.db.prepare('INSERT INTO audit_events(id,actor_id,operation,resource_id,created_at) VALUES (?,?,?,?,?)').run(randomUUID(),actorId,operation,resourceId,now());}
