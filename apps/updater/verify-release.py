@@ -114,6 +114,61 @@ def verify_bytes(data, digest, size=None):
     if hashlib.sha256(data).hexdigest() != digest[7:]:
         raise VerificationError('OCI content digest mismatch')
 
+def resolve_amd64_config_digest(registry, image):
+    """Resolve an authenticated image manifest to its Docker config digest."""
+    if image.get('mediaType') in (OCI_INDEX, DOCKER_INDEX):
+        manifests = image.get('manifests')
+        if not isinstance(manifests, list) or len(manifests) > 64:
+            raise VerificationError('Invalid image index')
+        matches = [item for item in manifests if isinstance(item, dict)
+                   and isinstance(item.get('platform'), dict)
+                   and item['platform'].get('os') == 'linux'
+                   and item['platform'].get('architecture') == 'amd64'
+                   and item['platform'].get('variant') in (None, '')]
+        if len(matches) != 1:
+            raise VerificationError('Expected exactly one linux/amd64 image')
+        descriptor = matches[0]
+        if descriptor.get('mediaType') not in (OCI_MANIFEST, DOCKER_MANIFEST):
+            raise VerificationError('Invalid image descriptor')
+        ref, size = descriptor.get('digest'), descriptor.get('size')
+        if type(size) is not int or size < 0 or size > MAX_MANIFEST or not isinstance(ref, str) or not DIGEST_PATTERN.fullmatch(ref):
+            raise VerificationError('Invalid image descriptor')
+        data = registry.manifest(ref)
+        verify_bytes(data, ref, size)
+        image = decode_oci_json(data)
+        if not isinstance(image, dict) or image.get('mediaType') != descriptor['mediaType']:
+            raise VerificationError('Image descriptor media type mismatch')
+    if (not isinstance(image, dict) or image.get('schemaVersion') != 2 or
+            image.get('mediaType') not in (OCI_MANIFEST, DOCKER_MANIFEST)):
+        raise VerificationError('Invalid image manifest')
+    config = image.get('config')
+    if not isinstance(config, dict) or config.get('mediaType') not in (
+            'application/vnd.oci.image.config.v1+json', 'application/vnd.docker.container.image.v1+json'):
+        raise VerificationError('Invalid image config descriptor')
+    ref, size = config.get('digest'), config.get('size')
+    if type(size) is not int or size < 0 or size > MAX_BUNDLE or not isinstance(ref, str) or not DIGEST_PATTERN.fullmatch(ref):
+        raise VerificationError('Invalid image config descriptor')
+    data = registry.blob(ref)
+    verify_bytes(data, ref, size)
+    parsed = decode_oci_json(data)
+    if not isinstance(parsed, dict) or parsed.get('os') != 'linux' or parsed.get('architecture') != 'amd64':
+        raise VerificationError('Image config platform mismatch')
+    return ref
+
+def decode_oci_json(data):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise VerificationError('Duplicate OCI JSON key')
+            result[key] = value
+        return result
+    try:
+        return json.loads(data, object_pairs_hook=unique,
+                          parse_constant=lambda _: (_ for _ in ()).throw(VerificationError('Invalid OCI JSON value')))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise VerificationError('Invalid OCI JSON') from exc
+
 def allowed_blob_redirect(location):
     if not isinstance(location, str) or len(location) > 8192:
         return False
@@ -322,14 +377,14 @@ def write_private(path, data):
     with os.fdopen(fd, 'wb') as out:
         out.write(data)
 
-def _verify_release(digest, commit, tag, registry=None, verify=run_gh):
+def _verify_release(digest, commit, tag, registry=None, verify=run_gh, *, include_config_digest=False):
     require_inputs(digest, commit, tag)
     deadline = time.monotonic() + TOTAL_SECONDS
     registry = registry or Registry(deadline)
     registry.authenticate()
     manifest = registry.manifest(digest)
     verify_bytes(manifest, digest)
-    image = decode_json(manifest)
+    image = decode_oci_json(manifest)
     if not isinstance(image, dict) or image.get('schemaVersion') != 2 or image.get('mediaType') not in (OCI_INDEX, OCI_MANIFEST, DOCKER_MANIFEST, DOCKER_INDEX):
         raise VerificationError('Unsupported image manifest')
     index = decode_json(registry.manifest('sha256-' + digest[7:], MAX_INDEX))
@@ -370,7 +425,10 @@ def _verify_release(digest, commit, tag, registry=None, verify=run_gh):
             except VerificationError:
                 continue
             if cert_and_subject_match(result, digest, commit, tag):
-                return {'image': IMAGE, 'digest': digest, 'commit': commit, 'tag': tag, 'verified': True}
+                verified = {'image': IMAGE, 'digest': digest, 'commit': commit, 'tag': tag, 'verified': True}
+                if include_config_digest:
+                    verified['configDigest'] = resolve_amd64_config_digest(registry, image)
+                return verified
     raise VerificationError('No attestation matched the release identity')
 
 def require_exclusive_child_wait():
@@ -498,7 +556,7 @@ def bounded_verification(callback, timeout):
         if cleanup_failed:
             raise VerificationError('Verification process group could not be stopped')
 
-def verify_release(digest, commit, tag, registry=None, verify=run_gh):
+def verify_release(digest, commit, tag, registry=None, verify=run_gh, *, include_config_digest=False):
     if os.geteuid() == 0:
         raise VerificationError('Release verification requires a configured cgroup supervisor')
     if __name__ != '__main__' or not sys.flags.isolated:
@@ -506,14 +564,15 @@ def verify_release(digest, commit, tag, registry=None, verify=run_gh):
     require_inputs(digest, commit, tag)
     if registry is not None:
         # Injected registries are limited to local unit tests.
-        return _verify_release(digest, commit, tag, registry, verify)
-    return bounded_verification(lambda: _verify_release(digest, commit, tag, None, verify), TOTAL_SECONDS)
+        return _verify_release(digest, commit, tag, registry, verify, include_config_digest=include_config_digest)
+    return bounded_verification(lambda: _verify_release(digest, commit, tag, None, verify, include_config_digest=include_config_digest), TOTAL_SECONDS)
 
 def main():
     parser = argparse.ArgumentParser(description='Verify a public Servus GHCR image attestation')
     parser.add_argument('--digest', required=True)
     parser.add_argument('--commit', required=True)
     parser.add_argument('--tag', required=True)
+    parser.add_argument('--include-config-digest', action='store_true')
     args, unknown = parser.parse_known_args()
     if unknown:
         print('Release verification failed', file=sys.stderr)
@@ -524,7 +583,7 @@ def main():
         print('Release verification requires a configured cgroup supervisor', file=sys.stderr)
         return 1
     try:
-        print(json.dumps(verify_release(args.digest, args.commit, args.tag), separators=(',', ':')))
+        print(json.dumps(verify_release(args.digest, args.commit, args.tag, include_config_digest=args.include_config_digest), separators=(',', ':')))
     except (VerificationError, OSError, ValueError):
         print('Release verification failed', file=sys.stderr)
         return 1
