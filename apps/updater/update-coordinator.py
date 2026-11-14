@@ -243,3 +243,87 @@ def capture_stopped_snapshot(journal, operation_id, lease, destination, node_fd,
             os.close(source_fd)
         if destination_fd is not None:
             os.close(destination_fd)
+
+
+def create_generation(journal, operation_id, lease, daemon_ownership, approval_journal,
+                      active_env, docker_config, supervisor, daemon, extractor,
+                      runtime_policy, backup_module, node_fd):
+    """Create and inspect a candidate generation while the startup gate is closed.
+
+    This trusted host operation does not start the containers. Any uncertain
+    Docker result leaves both the gate and the transaction in recovery state.
+    """
+    if not isinstance(lease, supervisor.DrainLease) or not supervisor._uuid4(operation_id):
+        raise UpdateError('A current maintenance lease is required')
+    lease.assert_snapshot_verified(operation_id)
+    control_dir = os.readlink('/proc/self/fd/' + str(daemon_ownership.directory))
+    daemon_ownership.assert_held(control_dir)
+    database = journal.db.execute('PRAGMA database_list').fetchone()
+    if not database or os.path.realpath(database[2]) != os.path.realpath(approval_journal):
+        raise UpdateError('Approval journal does not match update journal')
+    config_fd = supervisor._trusted_directory(docker_config, 0o700)
+    try:
+        if os.listdir(config_fd):
+            raise UpdateError('Docker configuration must be empty')
+    finally:
+        os.close(config_fd)
+    policy_path, accepted_env, policy = daemon.resolve_active_policy(approval_journal, active_env)
+    if not isinstance(policy, supervisor.RuntimePolicy) or policy.control_dir != control_dir:
+        raise UpdateError('Active policy identity changed')
+    row = journal.db.execute("SELECT p.staging_path,t.backup_path,t.backup_manifest_digest,t.root_digest "
+        "FROM update_transactions t JOIN operations o ON o.id=t.operation_id "
+        "JOIN preparations p ON p.operation_id=t.operation_id JOIN policy_approvals a ON a.operation_id=t.operation_id "
+        "WHERE t.operation_id=? AND t.phase='snapshot_verified' AND o.status='verified' AND p.status='prepared' "
+        "AND a.state='active' AND a.policy_path=? AND a.accepted_env_path=? AND a.source_env_path=? "
+        "AND t.preparation_id=p.preparation_id AND t.attempt_id=p.attempt_id AND t.attempt_nonce=p.attempt_nonce "
+        "AND t.attempt_id=o.attempt_id AND t.attempt_nonce=o.attempt_nonce AND t.root_digest=o.digest "
+        "AND a.attempt_id=t.attempt_id AND a.attempt_nonce=t.attempt_nonce AND a.preparation_id=t.preparation_id "
+        "AND a.root_digest=t.root_digest AND a.image_config_digest=o.config_digest",
+        (operation_id, policy_path, accepted_env, active_env)).fetchone()
+    if (not row or not isinstance(row[0], str) or not os.path.isabs(row[0]) or os.path.normpath(row[0]) != row[0] or
+        not re.fullmatch(r'servus-install-[a-f0-9]{32}', os.path.basename(row[0])) or
+        policy.image_reference != 'ghcr.io/raxon/servus@' + row[3]):
+        raise UpdateError('Active generation does not match the verified update')
+    stage = row[0]
+    stage_fd = supervisor._trusted_directory(stage, 0o700)
+    deployment_fd = None
+    try:
+        manifest_fd = supervisor._open_root_file(stage_fd, 'manifest.json', 0o644)
+        try:
+            manifest = extractor._manifest_files(backup_module._read(manifest_fd, extractor.MANIFEST_LIMIT))
+        finally:
+            os.close(manifest_fd)
+        deployment_fd = supervisor._trusted_directory(os.path.join(stage, 'deployment'))
+        compose_fd = supervisor._open_root_file(deployment_fd, 'compose.yaml', 0o644)
+        try:
+            content = backup_module._read(compose_fd, extractor.MAX_FILE)
+        finally:
+            os.close(compose_fd)
+        expected = manifest.get('deployment/compose.yaml')
+        if expected != (0o644, len(content), hashlib.sha256(content).hexdigest()):
+            raise UpdateError('Prepared Compose file changed')
+        compose = os.path.join(stage, 'deployment', 'compose.yaml')
+        verify_snapshot(row[1], row[2], backup_module, node_fd, supervisor)
+        lease.assert_snapshot_verified(operation_id)
+        daemon_ownership.assert_held(control_dir)
+        result = journal.db.execute("UPDATE update_transactions SET phase='switching' WHERE operation_id=? AND phase='snapshot_verified' AND backup_path=? AND backup_manifest_digest=? AND root_digest=?",
+                                    (operation_id, row[1], row[2], row[3]))
+        if result.rowcount != 1:
+            raise UpdateError('Update transaction changed')
+        try:
+            lease.record('switching')
+            runtime_policy._docker(docker_config, 'compose', '--env-file', active_env, '-f', compose,
+                                   '-p', 'servus', 'create', '--no-build', '--pull', 'never', '--force-recreate', timeout=180)
+            lease.assert_locked(operation_id, 'switching')
+            daemon_ownership.assert_held(control_dir)
+            path, accepted, current = daemon.resolve_active_policy(approval_journal, active_env)
+            if (path, accepted, current) != (policy_path, accepted_env, policy):
+                raise UpdateError('Active policy changed during creation')
+            return supervisor.inspect_servus(policy, created=True)
+        except BaseException:
+            journal.db.execute("UPDATE update_transactions SET phase='recovery_required' WHERE operation_id=? AND phase='switching'", (operation_id,))
+            raise
+    finally:
+        if deployment_fd is not None:
+            os.close(deployment_fd)
+        os.close(stage_fd)
