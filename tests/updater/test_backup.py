@@ -95,14 +95,14 @@ class OperationHistoryTest(unittest.TestCase):
         self.agent = sqlite3.connect(':memory:')
         self.panel.executescript("""
             CREATE TABLE actions(id TEXT PRIMARY KEY,service_id TEXT,type TEXT,status TEXT,phase TEXT,created_at TEXT,finished_at TEXT);
-            CREATE TABLE jobs(action_id TEXT UNIQUE,service_id TEXT,status TEXT,lease_until TEXT);
+            CREATE TABLE jobs(action_id TEXT UNIQUE,service_id TEXT,status TEXT,lease_until TEXT,snapshot TEXT);
         """)
         self.agent.execute('CREATE TABLE operations(id TEXT PRIMARY KEY,service_id TEXT,state TEXT,response TEXT)')
         self.panel.execute("INSERT INTO actions VALUES('old','service','deploy','failed','failed','2026-01-01T00:00:00.000Z','2026-01-01T00:01:00.000Z')")
-        self.panel.execute("INSERT INTO jobs VALUES('old','service','failed',NULL)")
+        self.panel.execute("INSERT INTO jobs VALUES('old','service','failed',NULL,?)", (json.dumps({'id':'service','kind':'app','mounts':[]}),))
         self.agent.execute("INSERT INTO operations VALUES('old','service','failed','{}')")
         self.panel.execute("INSERT INTO actions VALUES('new','service','deploy','succeeded','complete','2026-01-01T00:02:00.000Z','2026-01-01T00:03:00.000Z')")
-        self.panel.execute("INSERT INTO jobs VALUES('new','service','succeeded',NULL)")
+        self.panel.execute("INSERT INTO jobs VALUES('new','service','succeeded',NULL,?)", (json.dumps({'id':'service','kind':'app','mounts':[]}),))
         self.agent.execute("INSERT INTO operations VALUES('new','service','succeeded',?)", (json.dumps({'state':'running'}),))
 
     def tearDown(self):
@@ -120,6 +120,9 @@ class OperationHistoryTest(unittest.TestCase):
             (self.panel, "UPDATE jobs SET service_id='other' WHERE action_id='new'"),
             (self.panel, "UPDATE jobs SET lease_until='held' WHERE action_id='old'"),
             (self.panel, "DELETE FROM jobs WHERE action_id='old'"),
+            (self.panel, """UPDATE jobs SET snapshot='{"id":"service","kind":"postgres"}' WHERE action_id='old'"""),
+            (self.panel, """UPDATE jobs SET snapshot='{"id":"service","kind":"app","mounts":[{}]}' WHERE action_id='new'"""),
+            (self.panel, "UPDATE jobs SET snapshot='{}' WHERE action_id='old'"),
             (self.agent, "UPDATE operations SET service_id='other' WHERE id='new'"),
             (self.agent, "UPDATE operations SET state='failed' WHERE id='new'"),
             (self.agent, "UPDATE operations SET response='{}' WHERE id='new'"),
@@ -399,7 +402,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
             self.panel.execute('INSERT INTO actions(id,project_id,service_id,actor_id,type,status,phase,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
                                (ident,UUID,UUID,self.actor,'deploy',status,phase,created,finished,finished))
             self.panel.execute('INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)',
-                               (ident,ident,UUID,'{}',status,1,created))
+                               (ident,ident,UUID,json.dumps({'id':UUID,'kind':'app','mounts':[]}),status,1,created))
             response=json.dumps({'state':'running'}) if status=='succeeded' else json.dumps({'error':{'code':'RUNTIME_FAILED'}})
             self.agent.execute('INSERT INTO operations(id,request_hash,state,response,updated_at,service_id,operation_stage) VALUES(?,?,?,?,?,?,?)',
                                (ident,'a'*64,status,response,finished,UUID,'applying' if status=='succeeded' else 'rolling_back'))

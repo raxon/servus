@@ -402,25 +402,34 @@ def _validate_operation_history(panel, agent):
         raise CaptureError('Unresolved agent operations require recovery')
 
     failures = panel.execute("SELECT id,service_id,type,phase,finished_at FROM actions WHERE status='failed'").fetchall()
-    failed_jobs = panel.execute("SELECT action_id,service_id,lease_until FROM jobs WHERE status='failed'").fetchall()
+    failed_jobs = panel.execute("SELECT action_id,service_id,lease_until,snapshot FROM jobs WHERE status='failed'").fetchall()
     failed_agent = agent.execute("SELECT id,service_id FROM operations WHERE state='failed'").fetchall()
     # Unmatched or inconsistent terminal records do not establish a safe state.
     if len(failures) != len(failed_jobs) or len(failures) != len(failed_agent):
         raise CaptureError('Unresolved failed operations require recovery')
-    jobs = {action: (service, lease) for action, service, lease in failed_jobs}
+    jobs = {action: (service, lease, snapshot) for action, service, lease, snapshot in failed_jobs}
     agents = {action: service for action, service in failed_agent}
     if len(jobs) != len(failures) or len(agents) != len(failures):
         raise CaptureError('Unresolved failed operations require recovery')
+    def stateless_snapshot(raw, service):
+        try: value = json.loads(raw)
+        except (TypeError, ValueError): return False
+        return (isinstance(value, dict) and value.get('id') == service and value.get('kind', 'app') == 'app'
+                and value.get('mounts', []) == [] and value.get('database') is None)
+
     for action, service, kind, phase, finished in failures:
-        if not service or kind != 'deploy' or phase != 'failed' or not finished or jobs.get(action) != (service, None) or agents.get(action) != service:
+        job = jobs.get(action)
+        if (not service or kind != 'deploy' or phase != 'failed' or not finished or not job or
+                job[:2] != (service, None) or not stateless_snapshot(job[2], service) or agents.get(action) != service):
             raise CaptureError('Unresolved failed operations require recovery')
-        candidates = panel.execute("""SELECT a.id FROM actions a JOIN jobs j ON j.action_id=a.id
+        candidates = panel.execute("""SELECT a.id,j.snapshot FROM actions a JOIN jobs j ON j.action_id=a.id
             WHERE a.service_id=? AND j.service_id=a.service_id AND a.type='deploy'
               AND a.status='succeeded' AND a.phase='complete' AND j.status='succeeded'
               AND j.lease_until IS NULL AND a.created_at>? AND a.finished_at IS NOT NULL
               AND a.finished_at>=a.created_at""", (service, finished)).fetchall()
         recovered = False
-        for (candidate,) in candidates:
+        for candidate, snapshot in candidates:
+            if not stateless_snapshot(snapshot, service): continue
             row = agent.execute("SELECT state,service_id,response FROM operations WHERE id=?", (candidate,)).fetchone()
             if not row or row[0] != 'succeeded' or row[1] != service: continue
             try: response = json.loads(row[2])
