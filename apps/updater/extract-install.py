@@ -7,6 +7,7 @@ independently verify those steps and provide the exact local image ID. Docker,
 root and the private staging directory are part of the trust boundary.
 """
 import io
+import hashlib
 import json
 import os
 import re
@@ -49,10 +50,44 @@ FILES = {
     'deployment/systemd/servus-supervisor.service': 0o644,
     'scripts/install.sh': 0o755,
 }
+# The published v0.1.5 image predates manifest-v1. This set is frozen and is
+# accepted only when the trusted caller explicitly selects the legacy format.
+LEGACY_V015_FILES = {
+    'Dockerfile': 0o644,
+    'apps/panel/package.json': 0o644,
+    'apps/updater/backup.py': 0o644,
+    'apps/updater/discover-release.py': 0o644,
+    'apps/updater/extract-install.py': 0o644,
+    'apps/updater/guarded-verifier.py': 0o644,
+    'apps/updater/preflight.py': 0o644,
+    'apps/updater/prepare-verified.py': 0o644,
+    'apps/updater/preparation-fence.py': 0o644,
+    'apps/updater/provision-verifier-group.py': 0o644,
+    'apps/updater/servus-updater.py': 0o755,
+    'apps/updater/supervisor-daemon.py': 0o644,
+    'apps/updater/supervisor.py': 0o644,
+    'apps/updater/verification-executor.py': 0o644,
+    'apps/updater/verification-fence.py': 0o644,
+    'apps/updater/verify-release.py': 0o644,
+    'deployment/compose.yaml': 0o644,
+    'deployment/lifecycle-gate.sh': 0o644,
+    'deployment/systemd/servus-supervisor.service': 0o644,
+    'scripts/install.sh': 0o755,
+}
+UPDATER_ABI = 1
+MANIFEST_LIMIT = 256 * 1024
+LEGACY_V015_DIGEST = 'sha256:32f7cccf97841716ffae6bbff4f4234d5c3575e3b3ad9daa61dcf5afba72a13c'
 
 
 class ExtractionError(Exception):
     """Do not expose archive contents or Docker output in errors."""
+
+
+def format_for_verified_digest(digest):
+    """Select legacy only for the exact previously authenticated image digest."""
+    if not isinstance(digest, str) or not IMAGE_ID.fullmatch(digest):
+        raise ExtractionError('A verified image digest is required')
+    return 'legacy-v0.1.5' if digest == LEGACY_V015_DIGEST else 'manifest-v1'
 
 
 def _docker(*args, limit=1024 * 1024, timeout=30):
@@ -117,16 +152,66 @@ def _trusted_parent(path):
         raise
 
 
-def _read_archive(payload):
+def _allowed_addition(name):
+    return bool(re.fullmatch(r'apps/updater/[a-z0-9][a-z0-9-]{0,63}\.py', name) or
+                re.fullmatch(r'deployment/systemd/servus-[a-z0-9][a-z0-9-]{0,63}\.(?:service|socket|timer)', name) or
+                re.fullmatch(r'scripts/[a-z0-9][a-z0-9-]{0,63}\.(?:sh|py)', name))
+
+
+def _unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ExtractionError('Duplicate installation manifest field')
+        result[key] = value
+    return result
+
+
+def _manifest_files(data):
+    if len(data) > MANIFEST_LIMIT:
+        raise ExtractionError('Invalid installation manifest')
+    try:
+        document = json.loads(data, object_pairs_hook=_unique_pairs,
+                              parse_constant=lambda _: (_ for _ in ()).throw(ExtractionError('Invalid installation manifest')))
+    except (UnicodeError, ValueError, RecursionError) as error:
+        raise ExtractionError('Invalid installation manifest') from error
+    if (not isinstance(document, dict) or set(document) != {'schema', 'minimumUpdaterAbi', 'files'} or
+        type(document['schema']) is not int or document['schema'] != 1 or
+        type(document['minimumUpdaterAbi']) is not int or not 1 <= document['minimumUpdaterAbi'] <= UPDATER_ABI or
+        not isinstance(document['files'], list) or not 1 <= len(document['files']) <= 256):
+        raise ExtractionError('Unsupported installation manifest')
+    result = {}
+    for item in document['files']:
+        if not isinstance(item, dict) or set(item) != {'path', 'type', 'mode', 'size', 'sha256'}:
+            raise ExtractionError('Invalid installation manifest')
+        name, mode, size, digest = item['path'], item['mode'], item['size'], item['sha256']
+        if (not isinstance(name, str) or name in result or name == 'manifest.json' or
+            not (name in FILES or _allowed_addition(name)) or item['type'] != 'file' or
+            type(mode) is not int or mode not in (0o644, 0o755) or
+            (name in FILES and mode != FILES[name]) or type(size) is not int or not 0 <= size <= MAX_FILE or
+            not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest)):
+            raise ExtractionError('Invalid installation manifest')
+        result[name] = (mode, size, digest)
+    if not set(FILES).issubset(result):
+        raise ExtractionError('Incomplete installation manifest')
+    return result
+
+
+class InstallationFiles(dict):
+    def __init__(self, files, modes):
+        super().__init__(files)
+        self.modes = modes
+
+
+def _read_archive(payload, *, artifact_format='manifest-v1'):
     if not isinstance(payload, bytes) or len(payload) > MAX_ARCHIVE:
         raise ExtractionError('Invalid installation archive')
-    directories = {''}
-    for path in FILES:
-        parts = path.split('/')[:-1]
-        for end in range(1, len(parts) + 1):
-            directories.add('/'.join(parts[:end]))
+    if artifact_format not in ('manifest-v1', 'legacy-v0.1.5'):
+        raise ExtractionError('Unsupported installation format')
     seen = set()
     files = {}
+    modes = {}
+    directories = set()
     total = 0
     try:
         with tarfile.open(fileobj=io.BytesIO(payload), mode='r:') as archive:
@@ -141,10 +226,12 @@ def _read_archive(payload):
                     raise ExtractionError('Invalid installation archive')
                 seen.add(name)
                 if item.isdir():
-                    if name not in directories or item.mode & 0o7777 != 0o755:
+                    if item.mode & 0o7777 != 0o755:
                         raise ExtractionError('Invalid installation archive')
+                    directories.add(name)
                     continue
-                if not item.isfile() or name not in FILES or item.mode & 0o7777 != FILES[name] or item.size < 0 or item.size > MAX_FILE:
+                if (not item.isfile() or not name or item.mode & 0o7777 not in (0o644, 0o755) or
+                    item.size < 0 or item.size > MAX_FILE):
                     raise ExtractionError('Invalid installation archive')
                 total += item.size
                 if total > MAX_ARCHIVE:
@@ -154,6 +241,7 @@ def _read_archive(payload):
                 if data is None or len(data) != item.size:
                     raise ExtractionError('Invalid installation archive')
                 files[name] = data
+                modes[name] = item.mode & 0o7777
             # A single tar stream ends with zero blocks. Do not accept an
             # appended second stream or other content ignored by tarfile.
             trailer = payload[archive.offset:]
@@ -161,12 +249,33 @@ def _read_archive(payload):
                 raise ExtractionError('Invalid installation archive')
     except (tarfile.TarError, OSError, ValueError, OverflowError) as error:
         raise ExtractionError('Invalid installation archive') from error
-    if set(files) != set(FILES):
+    if artifact_format == 'legacy-v0.1.5':
+        expected = {name: (mode, len(files.get(name, b'')), None) for name, mode in LEGACY_V015_FILES.items()}
+    else:
+        data = files.pop('manifest.json', None)
+        manifest_mode = modes.pop('manifest.json', None)
+        if data is None or manifest_mode != 0o644:
+            raise ExtractionError('Installation manifest is required')
+        expected = _manifest_files(data)
+    if set(files) != set(expected):
         raise ExtractionError('Incomplete installation archive')
-    return files
+    for name, (mode, size, digest) in expected.items():
+        if (modes[name] != mode or len(files[name]) != size or
+            (digest is not None and hashlib.sha256(files[name]).hexdigest() != digest)):
+            raise ExtractionError('Installation file differs from manifest')
+    required_dirs = {''}
+    for name in files:
+        parts = name.split('/')[:-1]
+        required_dirs.update('/'.join(parts[:end]) for end in range(1, len(parts) + 1))
+    if directories != required_dirs:
+        raise ExtractionError('Invalid installation directories')
+    if artifact_format == 'manifest-v1':
+        files['manifest.json'] = data
+        modes['manifest.json'] = 0o644
+    return InstallationFiles(files, modes)
 
 
-def extract(image_id, parent, *, verified_platform_ids=(), probe_name=None):
+def extract(image_id, parent, *, verified_platform_ids=(), probe_name=None, artifact_format='manifest-v1'):
     """Create a private installation tree from a caller-verified image ID.
 
     Returns an absolute path. A failed cleanup or extraction publishes no tree.
@@ -212,7 +321,7 @@ def extract(image_id, parent, *, verified_platform_ids=(), probe_name=None):
                 identity['Config']['Labels'].get('io.servus.updater.extraction') != probe_name):
                 raise ExtractionError('Probe container identity rejected')
         archive = _docker('cp', container + ':/opt/servus/install/.', '-', limit=MAX_ARCHIVE)
-        files = _read_archive(archive)
+        files = _read_archive(archive, artifact_format=artifact_format)
         # The full set is validated before any extracted content reaches disk.
         nonce = secrets.token_hex(16)
         stage = '.servus-install-' + nonce
@@ -221,7 +330,7 @@ def extract(image_id, parent, *, verified_platform_ids=(), probe_name=None):
         for name, data in files.items():
             target = os.path.join(stage_path, name)
             os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILES[name])
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, files.modes[name])
             try:
                 view = memoryview(data)
                 while view:
@@ -229,7 +338,7 @@ def extract(image_id, parent, *, verified_platform_ids=(), probe_name=None):
                     if written <= 0:
                         raise ExtractionError('Installation staging failed')
                     view = view[written:]
-                os.fchmod(fd, FILES[name])
+                os.fchmod(fd, files.modes[name])
                 os.fsync(fd)
             finally:
                 os.close(fd)

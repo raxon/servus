@@ -2,6 +2,10 @@
 """Compare a built image's install files with the exact release commit."""
 
 import argparse
+import hashlib
+import importlib.util
+import io
+import json
 from pathlib import PurePosixPath
 import re
 import subprocess
@@ -18,7 +22,7 @@ def expected_files(commit):
     for line in manifest.splitlines():
         mode, name = line.split(' ', 1)
         path = PurePosixPath(name)
-        if mode not in ('100644', '100755') or path.is_absolute() or str(path) != name or '..' in path.parts or name in expected:
+        if mode not in ('100644', '100755') or name == 'manifest.json' or path.is_absolute() or str(path) != name or '..' in path.parts or name in expected:
             raise ValueError('Invalid install manifest')
         entry = subprocess.check_output(['git', 'ls-tree', commit, '--', name], text=True).strip()
         if not entry.startswith(mode + ' blob ') or entry.split('\t', 1)[-1] != name:
@@ -29,6 +33,11 @@ def expected_files(commit):
         expected[name] = (int(mode[-3:], 8), content)
     if not expected or sum(len(value[1]) for value in expected.values()) > MAX_TOTAL:
         raise ValueError('Invalid install file total')
+    records = [{'path': name, 'type': 'file', 'mode': mode, 'size': len(content),
+                'sha256': hashlib.sha256(content).hexdigest()}
+               for name, (mode, content) in sorted(expected.items())]
+    document = {'schema': 1, 'minimumUpdaterAbi': 1, 'files': records}
+    expected['manifest.json'] = (0o644, (json.dumps(document, separators=(',', ':'), sort_keys=True) + '\n').encode())
     return expected
 
 
@@ -71,6 +80,7 @@ def run():
     parser = argparse.ArgumentParser()
     parser.add_argument('--revision', required=True)
     parser.add_argument('--image-id', required=True)
+    parser.add_argument('--updater', help='Check compatibility with a manifest-v1 updater')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9a-f]{40}', args.revision) or not re.fullmatch(r'sha256:[0-9a-f]{64}', args.image_id):
         raise ValueError('Full commit and image IDs are required')
@@ -82,7 +92,17 @@ def run():
     try:
         process = subprocess.Popen(['docker', 'cp', cid + ':/opt/servus/install/.', '-'], stdout=subprocess.PIPE)
         assert process.stdout is not None
-        verify_stream(process.stdout, expected)
+        payload = process.stdout.read(MAX_TOTAL + 1)
+        if len(payload) > MAX_TOTAL:
+            raise ValueError('Installation archive exceeds size limit')
+        verify_stream(io.BytesIO(payload), expected)
+        if args.updater:
+            spec = importlib.util.spec_from_file_location('servus_release_compatibility', args.updater)
+            if spec is None or spec.loader is None:
+                raise ValueError('Updater compatibility check is unavailable')
+            updater = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(updater)
+            updater._read_archive(payload, artifact_format='manifest-v1')
         process.stdout.close()
         if process.wait() != 0:
             raise ValueError('Cannot read image installation files')

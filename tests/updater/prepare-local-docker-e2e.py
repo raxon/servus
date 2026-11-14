@@ -6,6 +6,7 @@ creation, extraction and cleanup use the real Docker daemon. This test is not
 an attestation or real registry integration test.
 """
 import importlib.util
+import hashlib
 import json
 import os
 import pathlib
@@ -41,6 +42,11 @@ def main():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('fixture:' + name)
             path.chmod(mode)
+        records = []
+        for name, mode in sorted(extractor.FILES.items()):
+            data = (inputs / name).read_bytes()
+            records.append({'path': name, 'type': 'file', 'mode': mode, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        (inputs / 'manifest.json').write_text(json.dumps({'schema': 1, 'minimumUpdaterAbi': 1, 'files': records}, sort_keys=True, separators=(',', ':')) + '\n')
         (context / 'Dockerfile').write_text('FROM scratch\nCOPY inputs/ /opt/servus/install/\n')
         docker_env = {**extractor.ENV, 'DOCKER_BUILDKIT': '0'}
         def docker(*args):
@@ -84,7 +90,7 @@ def main():
                 selected_id = json.loads(original('image', 'inspect', '--platform=linux/amd64', '--format', '{{json .}}', image_id))['Id']
                 stage = pathlib.Path(prepare.prepare_verified(journal, operation_id, str(staging), extractor, resolve_child=lambda _root, _config: selected_id))
                 assert journal.db.execute('SELECT status,staging_path FROM preparations').fetchone() == ('prepared', str(stage))
-                assert set(str(p.relative_to(stage)) for p in stage.rglob('*') if p.is_file()) == set(extractor.FILES)
+                assert set(str(p.relative_to(stage)) for p in stage.rglob('*') if p.is_file()) == set(extractor.FILES) | {'manifest.json'}
                 for name in extractor.FILES:
                     assert (stage / name).read_text() == 'fixture:' + name
                 assert calls.count('create') == calls.count('cp') == calls.count('rm') == 1

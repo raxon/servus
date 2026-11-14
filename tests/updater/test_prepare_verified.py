@@ -20,6 +20,7 @@ class FakeExtractor:
     def __init__(self, image_id=DIGEST):
         self.image = {'Id': image_id, 'RepoDigests': [preparer.IMAGE + '@' + DIGEST], 'Os': 'linux', 'Architecture': 'amd64'}
         self.calls = []
+        self.artifact_format = None
         self.fail = False
     def _trusted_parent(self, path): return os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     def _docker(self, *args, **kwargs):
@@ -30,6 +31,7 @@ class FakeExtractor:
         return json.dumps(self.image).encode()
     def extract(self, image_id, parent, **kwargs):
         self.calls.append(('extract', image_id))
+        self.artifact_format = kwargs.get('artifact_format')
         if self.fail: raise self.ExtractionError('extract failed')
         return os.path.join(parent, 'servus-install-' + 'f' * 32)
 
@@ -58,11 +60,20 @@ class PreparationTests(unittest.TestCase):
                 stage = self.run_prepare(extractor)
                 self.assertEqual(extractor.calls[0][0], ('pull', '--platform=linux/amd64', preparer.IMAGE + '@' + DIGEST))
                 self.assertEqual(extractor.calls[-1], ('extract', image_id))
+                self.assertEqual(extractor.artifact_format, 'manifest-v1')
                 row = self.journal.db.execute('SELECT attempt_id,attempt_nonce,status,staging_path FROM preparations WHERE operation_id=?', (ID,)).fetchone()
                 self.assertEqual(row, (attempt['attemptId'], attempt['attemptNonce'], 'prepared', stage))
                 with self.assertRaises(self.mod.ProtocolError): self.journal.submit(OTHER, COMMIT, DIGEST, TAG)
                 self.journal.db.execute('DELETE FROM preparations')
                 self.journal.db.execute('DELETE FROM operations')
+    def test_legacy_format_is_bound_to_exact_verified_release(self):
+        tag, commit, digest = preparer.LEGACY_V015
+        self.journal.submit(ID, commit, digest, tag)
+        attempt = self.journal.claim(); self.journal.finish(attempt, 'verified', CONFIG)
+        extractor = FakeExtractor(digest)
+        extractor.image['RepoDigests'] = [preparer.IMAGE + '@' + digest]
+        self.run_prepare(extractor)
+        self.assertEqual(extractor.artifact_format, 'legacy-v0.1.5')
     def test_unverified_operation_does_not_contact_docker(self):
         self.journal.submit(ID, COMMIT, DIGEST, TAG)
         extractor = FakeExtractor()

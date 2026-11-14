@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -I
 """Exercise policy generation on an isolated Docker host and private registry."""
 import importlib.util
+import hashlib
 import json
 import os
 import pathlib
@@ -194,6 +195,11 @@ def main():
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, destination)
             destination.chmod(mode)
+        records = []
+        for name, mode in sorted(extractor.FILES.items()):
+            contents = (context / name).read_bytes()
+            records.append({'path': name, 'type': 'file', 'mode': mode, 'size': len(contents), 'sha256': hashlib.sha256(contents).hexdigest()})
+        (context / 'manifest.json').write_text(json.dumps({'schema': 1, 'minimumUpdaterAbi': 1, 'files': records}, sort_keys=True, separators=(',', ':')) + '\n')
         app = source / 'app'; (app / 'dist/shared').mkdir(parents=True)
         shutil.copyfile(ROOT / 'deployment/lifecycle-gate.sh', app / 'lifecycle-gate.sh')
         for name in ('supervisor-control.js', 'supervisor-entrypoint.js'):

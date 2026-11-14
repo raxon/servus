@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -I
 """Exercise OCI index preparation against a private registry without an attestation."""
 import importlib.util
+import hashlib
 import json
 import os
 import pathlib
@@ -56,6 +57,11 @@ def main():
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, destination)
             destination.chmod(mode)
+        records = []
+        for name, mode in sorted(extractor.FILES.items()):
+            contents = (context / name).read_bytes()
+            records.append({'path': name, 'type': 'file', 'mode': mode, 'size': len(contents), 'sha256': hashlib.sha256(contents).hexdigest()})
+        (context / 'manifest.json').write_text(json.dumps({'schema': 1, 'minimumUpdaterAbi': 1, 'files': records}, sort_keys=True, separators=(',', ':')) + '\n')
         (source / 'Dockerfile').write_text('FROM node:24-bookworm-slim\nWORKDIR /app\nENV NODE_ENV=production PANEL_DATA_DIR=/var/lib/panel PANEL_HOST=0.0.0.0 PANEL_PORT=4180\nCOPY inputs/ /opt/servus/install/\nUSER node\n')
         try:
             container_id = docker('run', '-d', '--name', registry_name, '-p', '127.0.0.1::5000', 'registry:2')
@@ -102,7 +108,7 @@ def main():
                 row = journal.db.execute('SELECT status,staging_path FROM preparations').fetchone()
                 assert row[0] == 'prepared'
                 extracted = pathlib.Path(row[1])
-                assert set(str(path.relative_to(extracted)) for path in extracted.rglob('*') if path.is_file()) == set(extractor.FILES)
+                assert set(str(path.relative_to(extracted)) for path in extracted.rglob('*') if path.is_file()) == set(extractor.FILES) | {'manifest.json'}
                 print('Prepared an OCI index from a real local registry; attestation was simulated')
             finally:
                 journal.close()

@@ -12,6 +12,8 @@ import sys
 
 DIGEST = re.compile(r'^sha256:[a-f0-9]{64}$')
 IMAGE = 'ghcr.io/raxon/servus'
+LEGACY_V015 = ('v0.1.5', '7c2013b081b4c26244a52c75b51e6ca2226c8a5a',
+               'sha256:32f7cccf97841716ffae6bbff4f4234d5c3575e3b3ad9daa61dcf5afba72a13c')
 
 
 class PreparationError(Exception):
@@ -79,7 +81,10 @@ def prepare_claimed(journal, operation, staging_parent, extractor, *, resolve_ch
                 raise PreparationError('Platform image identity rejected')
             verified_ids.add(child)
         probe_name = journal.record_extraction_probe(operation, 'prepare')
-        stage = extractor.extract(image_id, staging_parent, verified_platform_ids=tuple(sorted(verified_ids - {image_id})), probe_name=probe_name)
+        artifact_format = ('legacy-v0.1.5' if (operation['tag'], operation['commit'], root_digest) == LEGACY_V015
+                           else 'manifest-v1')
+        stage = extractor.extract(image_id, staging_parent, verified_platform_ids=tuple(sorted(verified_ids - {image_id})),
+                                  probe_name=probe_name, artifact_format=artifact_format)
         journal.complete_extraction_probe(operation, probe_name)
         if defer_commit:
             journal.stage_preparation(operation, stage)

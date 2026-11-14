@@ -299,7 +299,8 @@ def produce(journal, operation_id, staging_parent, accepted_env_path, install_di
         extraction_operation = {'operationId': operation_id, 'attemptId': attempt_id, 'attemptNonce': nonce,
                                 'preparationId': preparation_id, 'configDigest': config_digest}
         extraction_probe = journal.record_extraction_probe(extraction_operation, 'policy')
-        stage = extractor.extract(image_id, staging_parent, verified_platform_ids=tuple(sorted(verified_ids - {image_id})), probe_name=extraction_probe)
+        stage = extractor.extract(image_id, staging_parent, verified_platform_ids=tuple(sorted(verified_ids - {image_id})),
+                                  probe_name=extraction_probe, artifact_format=extractor.format_for_verified_digest(root_digest))
         journal.complete_extraction_probe(extraction_operation, extraction_probe)
         env_file = os.path.join(work, 'servus.env')
         image_env_file = os.path.join(work, 'image-env.json')

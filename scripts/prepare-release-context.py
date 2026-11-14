@@ -2,6 +2,8 @@
 """Build a release context exclusively from a committed Git tree."""
 
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -32,10 +34,11 @@ def run():
         raise ValueError('Release Dockerfile path is reserved')
     manifest = output / 'scripts/release-install-files.txt'
     seen = set()
+    records = []
     for line in manifest.read_text(encoding='utf-8').splitlines():
         mode, path = line.split(' ', 1)
         p = PurePosixPath(path)
-        if mode not in ('100644', '100755') or p.is_absolute() or str(p) != path or '..' in p.parts or path in seen:
+        if mode not in ('100644', '100755') or path == 'manifest.json' or p.is_absolute() or str(p) != path or '..' in p.parts or path in seen:
             raise ValueError('Invalid install manifest')
         seen.add(path)
         entry = subprocess.check_output(['git', 'ls-tree', commit, '--', path], text=True).strip()
@@ -48,8 +51,18 @@ def run():
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, dest)
         os.chmod(dest, int(mode[-3:], 8))
+        data = dest.read_bytes()
+        if len(data) > 2 * 1024 * 1024:
+            raise ValueError('Install file is too large')
+        records.append({'path': path, 'type': 'file', 'mode': int(mode[-3:], 8),
+                        'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
     if not seen:
         raise ValueError('Install manifest is empty')
+    if sum(item['size'] for item in records) > 16 * 1024 * 1024:
+        raise ValueError('Install files exceed size limit')
+    document = {'schema': 1, 'minimumUpdaterAbi': 1, 'files': sorted(records, key=lambda item: item['path'])}
+    (assets / 'manifest.json').write_text(json.dumps(document, separators=(',', ':'), sort_keys=True) + '\n', encoding='utf-8')
+    os.chmod(assets / 'manifest.json', 0o644)
     dockerfile = (output / 'Dockerfile').read_bytes()
     if not dockerfile.endswith(b'\n'):
         dockerfile += b'\n'

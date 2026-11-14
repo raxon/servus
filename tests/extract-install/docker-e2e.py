@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 """Exercise extraction against a disposable local Docker image; requires Linux root."""
 import importlib.util
+import hashlib
+import json
 import os
 import pathlib
 import secrets
@@ -40,6 +42,11 @@ def main():
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(('fixture:' + name).encode())
             target.chmod(mode)
+        records = []
+        for name, mode in sorted(extractor.FILES.items()):
+            data = (root / name).read_bytes()
+            records.append({'path': name, 'type': 'file', 'mode': mode, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        (root / 'manifest.json').write_text(json.dumps({'schema': 1, 'minimumUpdaterAbi': 1, 'files': records}, sort_keys=True, separators=(',', ':')) + '\n')
         (context / 'Dockerfile').write_text('FROM scratch\nCOPY inputs/ /opt/servus/install/\n')
         docker('build', '--platform=linux/amd64', '--network=none', '--pull=false', '--tag', image, str(context))
         image_id = docker('image', 'inspect', '--format', '{{.Id}}', image)
@@ -69,7 +76,7 @@ def main():
         assert subprocess.run(['/usr/bin/docker', 'inspect', observed[0]], stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, env=extractor.ENV).returncode != 0
         actual = {str(path.relative_to(result)) for path in result.rglob('*') if path.is_file()}
-        assert actual == set(extractor.FILES)
+        assert actual == set(extractor.FILES) | {'manifest.json'}
         for name, mode in extractor.FILES.items():
             file = result / name
             assert file.read_bytes() == ('fixture:' + name).encode()

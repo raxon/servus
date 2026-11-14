@@ -13,6 +13,9 @@ VERIFY = ROOT / 'scripts/verify-release-install.py'
 spec = importlib.util.spec_from_file_location('verify_release_install', VERIFY)
 verify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify)
+extract_spec = importlib.util.spec_from_file_location('release_extract', ROOT / 'apps/updater/extract-install.py')
+extract = importlib.util.module_from_spec(extract_spec)
+extract_spec.loader.exec_module(extract)
 
 
 def archive(items):
@@ -100,6 +103,44 @@ class ReleaseArtifactTest(unittest.TestCase):
                 subprocess.run(['python3', str(VERIFY), '--revision', commit, '--image-id', image], cwd=repo, check=True)
             finally:
                 subprocess.run(['docker', 'image', 'rm', image], check=True, stdout=subprocess.DEVNULL)
+
+    @unittest.skipUnless(os.environ.get('SERVUS_RELEASE_DOCKER_TEST') == '1', 'Docker integration is opt-in')
+    def test_same_updater_accepts_two_successive_images_with_new_allowed_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / 'repo'; repo.mkdir()
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            for name, mode in extract.FILES.items():
+                target = repo / name; target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('FROM scratch\n' if name == 'Dockerfile' else 'fixture:' + name)
+                target.chmod(mode)
+            manifest = repo / 'scripts/release-install-files.txt'
+            manifest.write_text(''.join(f'{mode | 0o100000:06o} {name}\n' for name, mode in sorted(extract.FILES.items())))
+            images = []
+            try:
+                for number in (1, 2):
+                    if number == 2:
+                        future = repo / 'apps/updater/future-helper.py'; future.write_text('fixture:future')
+                        with manifest.open('a') as stream: stream.write('100644 apps/updater/future-helper.py\n')
+                    subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+                    subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', f'fixture-{number}'], cwd=repo, check=True)
+                    commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+                    context = Path(directory) / f'context-{number}'
+                    subprocess.run(['python3', str(PREPARE), '--revision', commit, '--output', str(context)], cwd=repo, check=True)
+                    iid = Path(directory) / f'image-{number}'
+                    subprocess.run(['docker', 'build', '--quiet', '--iidfile', str(iid), '-f', str(context / 'Dockerfile.release'), str(context)], check=True, stdout=subprocess.DEVNULL)
+                    image = iid.read_text().strip(); images.append(image)
+                    cid = subprocess.check_output(['docker', 'create', '--pull=never', '--network=none', '--entrypoint', '/bin/false', image], text=True).strip()
+                    try:
+                        payload = subprocess.check_output(['docker', 'cp', cid + ':/opt/servus/install/.', '-'])
+                        files = extract._read_archive(payload)
+                        self.assertEqual('apps/updater/future-helper.py' in files, number == 2)
+                        subprocess.run(['python3', str(VERIFY), '--revision', commit, '--image-id', image,
+                                        '--updater', str(ROOT / 'apps/updater/extract-install.py')], cwd=repo, check=True)
+                    finally:
+                        subprocess.run(['docker', 'rm', '-v', cid], check=True, stdout=subprocess.DEVNULL)
+            finally:
+                for image in images:
+                    subprocess.run(['docker', 'image', 'rm', image], check=True, stdout=subprocess.DEVNULL)
 
 
 if __name__ == '__main__':
