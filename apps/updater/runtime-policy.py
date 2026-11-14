@@ -337,7 +337,7 @@ def produce(journal, operation_id, staging_parent, accepted_env_path, install_di
         if not isinstance(image_config, dict) or not isinstance(image_config.get('Env'), list):
             raise PolicyError('Image configuration is unavailable')
         _write(image_env_file, json.dumps(image_config['Env'], separators=(',', ':')).encode())
-        compose_file = os.path.join(stage, 'deployment/compose.yaml')
+        compose_file = os.path.join(stage, 'deployment/compose-supervised.yaml')
         common = ('compose', '--env-file', env_file, '-f', compose_file, '-p', 'servus')
         effective = docker(*common, 'config', '--format', 'json', limit=2 * 1024 * 1024)
         # The validator itself is part of trusted, installed updater code.

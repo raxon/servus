@@ -1,0 +1,135 @@
+name: servus
+x-runtime: &runtime
+  image: ${SERVUS_IMAGE:?Run scripts/install.sh to prepare the image}
+  environment: &runtime-env
+    PANEL_DATA_DIR: ${SERVUS_DATA_DIR:-/var/lib/servus}
+    PANEL_INGRESS_PORT: ${SERVUS_INGRESS_PORT:-80}
+    PANEL_SUPERVISOR_SOCKET: /run/servus-supervisor/socket
+    PANEL_SUPERVISOR_SECRET_FILE: /run/servus-control/token
+  volumes:
+    - ${SERVUS_DATA_DIR:-/var/lib/servus}:${SERVUS_DATA_DIR:-/var/lib/servus}
+    - type: bind
+      source: ${SERVUS_LIFECYCLE_DIR:?Missing lifecycle gate}
+      target: /run/servus-lifecycle
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SERVUS_SUPERVISOR_CONTROL_DIR:?Missing supervisor control directory}
+      target: /run/servus-supervisor
+      read_only: true
+      bind:
+        create_host_path: false
+  entrypoint: [/bin/sh, /app/lifecycle-gate.sh]
+  restart: unless-stopped
+  init: true
+services:
+  api:
+    <<: *runtime
+    command: [dist/server/index.js]
+    volumes:
+      - ${SERVUS_DATA_DIR:-/var/lib/servus}:${SERVUS_DATA_DIR:-/var/lib/servus}
+      - type: bind
+        source: ${SERVUS_LIFECYCLE_DIR:?Missing lifecycle gate}
+        target: /run/servus-lifecycle
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SERVUS_SUPERVISOR_CONTROL_DIR:?Missing supervisor control directory}
+        target: /run/servus-supervisor
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SERVUS_SUPERVISOR_SECRET_DIR:?Missing supervisor secret directory}/api
+        target: /run/servus-control/token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SERVUS_UPDATER_SOCKET_DIR:?Missing updater socket directory}
+        target: /run/servus-updater
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      <<: *runtime-env
+      PANEL_UPDATER_SOCKET: /run/servus-updater/updater.sock
+      PANEL_UPDATER_APPLY_ENABLED: "true"
+      PANEL_HOST: 0.0.0.0
+      PANEL_PORT: 4180
+      PANEL_ALLOWED_ORIGINS: ${SERVUS_ALLOWED_ORIGINS:?Missing allowed origins}
+      PANEL_SECURE_COOKIES: ${SERVUS_SECURE_COOKIES:-false}
+      PANEL_TRUSTED_PROXY_SECRET: ${SERVUS_TRUSTED_PROXY_SECRET:-}
+    ports:
+      - ${SERVUS_BIND_ADDRESS:-0.0.0.0}:${SERVUS_PORT:-4180}:4180
+    depends_on:
+      agent:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:4180/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 12
+  worker:
+    <<: *runtime
+    command: [dist/worker/index.js]
+    volumes:
+      - ${SERVUS_DATA_DIR:-/var/lib/servus}:${SERVUS_DATA_DIR:-/var/lib/servus}
+      - type: bind
+        source: ${SERVUS_LIFECYCLE_DIR:?Missing lifecycle gate}
+        target: /run/servus-lifecycle
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SERVUS_SUPERVISOR_CONTROL_DIR:?Missing supervisor control directory}
+        target: /run/servus-supervisor
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SERVUS_SUPERVISOR_SECRET_DIR:?Missing supervisor secret directory}/worker
+        target: /run/servus-control/token
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      agent:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+  agent:
+    <<: *runtime
+    command: [dist/agent/index.js]
+    group_add:
+      - ${SERVUS_DOCKER_GID:?Missing Docker socket group}
+    volumes:
+      - ${SERVUS_DATA_DIR:-/var/lib/servus}:${SERVUS_DATA_DIR:-/var/lib/servus}
+      - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ${SERVUS_LIFECYCLE_DIR:?Missing lifecycle gate}
+        target: /run/servus-lifecycle
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SERVUS_SUPERVISOR_CONTROL_DIR:?Missing supervisor control directory}
+        target: /run/servus-supervisor
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SERVUS_SUPERVISOR_SECRET_DIR:?Missing supervisor secret directory}/agent
+        target: /run/servus-control/token
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: [CMD, node, --input-type=module, -e, "import {runtimeStatus} from './dist/agent/client.js'; runtimeStatus().then(s=>process.exit(s.online?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 10s
+      start_period: 10s
+      retries: 24

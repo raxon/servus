@@ -57,6 +57,8 @@ jobs:
         env:
           SERVUS_SOCKET_TEST_CONTEXT: default
         run: node tests/integration/updater-socket.mjs
+      - name: Validate supervised Compose template
+        run: node tests/integration/supervised-compose.mjs
       - name: Test installation file extraction with Docker
         run: |
           set -euo pipefail

@@ -153,7 +153,8 @@ def _trusted_parent(path):
 
 
 def _allowed_addition(name):
-    return bool(re.fullmatch(r'apps/updater/[a-z0-9][a-z0-9-]{0,63}\.py', name) or
+    return bool(name == 'deployment/compose-supervised.yaml' or
+                re.fullmatch(r'apps/updater/[a-z0-9][a-z0-9-]{0,63}\.py', name) or
                 re.fullmatch(r'deployment/systemd/servus-[a-z0-9][a-z0-9-]{0,63}\.(?:service|socket|timer)', name) or
                 re.fullmatch(r'scripts/[a-z0-9][a-z0-9-]{0,63}\.(?:sh|py)', name))
 

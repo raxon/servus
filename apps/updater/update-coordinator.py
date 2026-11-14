@@ -297,15 +297,15 @@ def create_generation(journal, operation_id, lease, daemon_ownership, approval_j
         finally:
             os.close(manifest_fd)
         deployment_fd = supervisor._trusted_directory(os.path.join(stage, 'deployment'))
-        compose_fd = supervisor._open_root_file(deployment_fd, 'compose.yaml', 0o644)
+        compose_fd = supervisor._open_root_file(deployment_fd, 'compose-supervised.yaml', 0o644)
         try:
             content = backup_module._read(compose_fd, extractor.MAX_FILE)
         finally:
             os.close(compose_fd)
-        expected = manifest.get('deployment/compose.yaml')
+        expected = manifest.get('deployment/compose-supervised.yaml')
         if expected != (0o644, len(content), hashlib.sha256(content).hexdigest()):
             raise UpdateError('Prepared Compose file changed')
-        compose = os.path.join(stage, 'deployment', 'compose.yaml')
+        compose = os.path.join(stage, 'deployment', 'compose-supervised.yaml')
         verify_snapshot(row[1], row[2], backup_module, node_fd, supervisor)
         lease.assert_snapshot_verified(operation_id)
         daemon_ownership.assert_held(control_dir)

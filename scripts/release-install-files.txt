@@ -21,6 +21,7 @@
 100644 apps/updater/verification-fence.py
 100644 apps/updater/verify-release.py
 100644 deployment/compose.yaml
+100644 deployment/compose-supervised.yaml
 100644 deployment/lifecycle-gate.sh
 100644 deployment/systemd/servus-supervisor.service
 100644 deployment/systemd/servus-updater.service

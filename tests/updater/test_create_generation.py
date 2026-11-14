@@ -39,10 +39,9 @@ class CreateGenerationTest(unittest.TestCase):
         self.config = self.root / 'docker-config'; self.config.mkdir(mode=0o700)
         self.stage = self.root / ('servus-install-' + 'a' * 32); self.stage.mkdir(mode=0o700)
         deployment = self.stage / 'deployment'; deployment.mkdir(mode=0o755)
-        self.compose = deployment / 'compose.yaml'; self.compose.write_bytes(b'services: {}\n'); self.compose.chmod(0o644)
+        self.compose = deployment / 'compose-supervised.yaml'; self.compose.write_bytes(b'services: {}\n'); self.compose.chmod(0o644)
         entries = [{'path': name, 'type': 'file', 'mode': mode, 'size': 0, 'sha256': hashlib.sha256(b'').hexdigest()} for name, mode in extractor.FILES.items()]
-        entry = next(item for item in entries if item['path'] == 'deployment/compose.yaml')
-        entry.update(size=self.compose.stat().st_size, sha256=hashlib.sha256(self.compose.read_bytes()).hexdigest())
+        entries.append({'path': 'deployment/compose-supervised.yaml', 'type': 'file', 'mode': 0o644, 'size': self.compose.stat().st_size, 'sha256': hashlib.sha256(self.compose.read_bytes()).hexdigest()})
         self.manifest = self.stage / 'manifest.json'
         self.manifest.write_text(json.dumps({'schema': 1, 'minimumUpdaterAbi': 1, 'files': entries})); self.manifest.chmod(0o644)
         self.journal = updater.Journal(self.state)
