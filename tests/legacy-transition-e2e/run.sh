@@ -1,0 +1,32 @@
+#!/bin/bash
+# Run the legacy migration fixture only on a new disposable Colima VM.
+set -euo pipefail
+umask 077
+cd "$(dirname "$0")/../.."
+for tool in colima docker openssl git; do command -v "$tool" >/dev/null; done
+profile="servus-legacy-e2e-$(openssl rand -hex 8)"
+context="colima-$profile"
+created=0
+cleanup() {
+  result=$?
+  trap - EXIT
+  if [ "$created" = 1 ]; then colima delete "$profile" --force --data >/dev/null || result=1; fi
+  exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if docker context inspect "$context" >/dev/null 2>&1 || [ -e "$HOME/.colima/$profile" ]; then exit 1; fi
+created=1
+colima start "$profile" --activate=false --ssh-config=false --cpus 2 --memory 3 --disk 20 --mount none
+guest() { colima -p "$profile" ssh -- "$@"; }
+guest sudo install -d -m 700 /run/servus-legacy-fixture
+git archive HEAD apps/updater | guest sudo tar -x -C /run/servus-legacy-fixture
+git show v0.1.4:deployment/compose.yaml | guest sudo tee /run/servus-legacy-fixture/compose.yaml >/dev/null
+guest sudo tee /run/servus-legacy-fixture/guest.py < tests/legacy-transition-e2e/guest.py >/dev/null
+guest sudo docker swarm init >/dev/null
+guest sudo docker pull --platform linux/amd64 ghcr.io/raxon/servus@sha256:32f7cccf97841716ffae6bbff4f4234d5c3575e3b3ad9daa61dcf5afba72a13c >/dev/null
+guest sudo docker pull --platform linux/amd64 ghcr.io/raxon/servus@sha256:68e56744e3a81249154e90012a7440041f87b965686f1c52e5e31bf3be0113c4 >/dev/null
+guest sudo docker pull node:24-bookworm-slim >/dev/null
+guest sudo sh -c 'set -e; id=$(docker create --pull=never --entrypoint=/bin/false node:24-bookworm-slim); trap "docker rm $id >/dev/null" EXIT; docker cp "$id:/usr/local/bin/node" /run/servus-legacy-fixture/node; chmod 755 /run/servus-legacy-fixture/node'
+guest sudo systemd-run --quiet --scope --property=MemoryAccounting=yes /usr/bin/python3 -I -B /run/servus-legacy-fixture/guest.py
