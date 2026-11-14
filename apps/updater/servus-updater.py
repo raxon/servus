@@ -109,7 +109,7 @@ class Journal:
                     raise RuntimeError('Existing journal has unknown operations')
                 self.db.execute('DROP INDEX IF EXISTS one_active_operation')
                 self.db.execute('ALTER TABLE operations RENAME TO operations_old')
-            elif table and version not in (2, 3, 4):
+            elif table and version not in (2, 3, 4, 5):
                 raise RuntimeError('Unsupported updater journal version')
             elif not table and version != 0:
                 raise RuntimeError('Invalid updater journal')
@@ -125,7 +125,9 @@ class Journal:
                 self.db.execute("INSERT INTO operations(id,commit_sha,digest,tag,status,created_at) SELECT id,commit_sha,digest,tag,'accepted',created_at FROM operations_old")
                 self.db.execute('DROP TABLE operations_old')
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON operations ((1)) WHERE status IN ('accepted','verifying','recovery_required')")
-            self.db.execute('PRAGMA user_version=4')
+            self.db.execute("CREATE TABLE IF NOT EXISTS preparations (operation_id TEXT PRIMARY KEY REFERENCES operations(id), attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, preparation_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('preparing','prepared','recovery_required')), staging_path TEXT)")
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_preparation ON preparations ((1)) WHERE status IN ('preparing','prepared','recovery_required')")
+            self.db.execute('PRAGMA user_version=5')
             self.db.execute('COMMIT')
         except BaseException:
             self.db.execute('ROLLBACK')
@@ -143,6 +145,37 @@ class Journal:
     def recover(self):
         # Verification is read-only, but a prior executor may still be alive.
         self.db.execute("UPDATE operations SET status='recovery_required' WHERE status='verifying'")
+        # An interrupted Docker operation cannot be proven stopped by this journal.
+        self.db.execute("UPDATE preparations SET status='recovery_required' WHERE status='preparing'")
+
+    def claim_preparation(self, operation_id):
+        """Record intent before any Docker call, bound to the verified attempt."""
+        if not valid_uuid(operation_id): raise ProtocolError('invalid_request')
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            row = self.db.execute("SELECT commit_sha,digest,tag,attempt_id,attempt_nonce,config_digest FROM operations WHERE id=? AND status='verified'", (operation_id,)).fetchone()
+            if not row or not valid_uuid(row[3]) or not isinstance(row[4], str) or not re.fullmatch(r'[a-f0-9]{64}', row[4]) or not isinstance(row[5], str) or not DIGEST_PATTERN.fullmatch(row[5]):
+                raise ProtocolError('not_found')
+            if self.db.execute("SELECT 1 FROM operations WHERE status IN ('accepted','verifying','recovery_required') LIMIT 1").fetchone():
+                raise ProtocolError('operation_in_progress')
+            if self.db.execute("SELECT 1 FROM preparations WHERE status IN ('preparing','prepared','recovery_required') LIMIT 1").fetchone():
+                raise ProtocolError('recovery_required')
+            if self.db.execute('SELECT 1 FROM preparations WHERE operation_id=?', (operation_id,)).fetchone():
+                raise ProtocolError('idempotency_conflict')
+            preparation_id = str(uuid.uuid4())
+            self.db.execute("INSERT INTO preparations(operation_id,attempt_id,attempt_nonce,preparation_id,status) VALUES(?,?,?,?,'preparing')", (operation_id, row[3], row[4], preparation_id))
+            self.db.execute('COMMIT')
+            return {'operationId':operation_id, 'commit':row[0], 'digest':row[1], 'tag':row[2], 'attemptId':row[3], 'attemptNonce':row[4], 'configDigest':row[5], 'preparationId':preparation_id}
+        except BaseException:
+            if self.db.in_transaction: self.db.execute('ROLLBACK')
+            raise
+
+    def finish_preparation(self, operation, staging_path=None):
+        if staging_path is not None and (not isinstance(staging_path, str) or not staging_path.startswith('/') or os.path.normpath(staging_path) != staging_path or not re.fullmatch(r'servus-install-[a-f0-9]{32}', os.path.basename(staging_path))):
+            raise ValueError('Invalid installation staging path')
+        status = 'prepared' if staging_path is not None else 'recovery_required'
+        cursor = self.db.execute("UPDATE preparations SET status=?,staging_path=? WHERE operation_id=? AND status='preparing' AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND EXISTS (SELECT 1 FROM operations WHERE id=? AND status='verified' AND attempt_id=? AND attempt_nonce=? AND config_digest=?)", (status, staging_path, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['configDigest']))
+        if cursor.rowcount != 1: raise RuntimeError('Unexpected preparation state')
 
     def pending_recoveries(self):
         rows = self.db.execute("SELECT id,attempt_id,attempt_nonce FROM operations WHERE status='recovery_required' AND attempt_id IS NOT NULL AND attempt_nonce IS NOT NULL").fetchall()
@@ -156,7 +189,7 @@ class Journal:
                 if row[1] != commit or row[2] != digest or row[3] != tag:
                     raise ProtocolError('idempotency_conflict')
             else:
-                if self.db.execute("SELECT 1 FROM operations WHERE status IN ('accepted','verifying','recovery_required')").fetchone():
+                if self.db.execute("SELECT 1 FROM operations WHERE status IN ('accepted','verifying','recovery_required')").fetchone() or self.db.execute("SELECT 1 FROM preparations WHERE status IN ('preparing','prepared','recovery_required')").fetchone():
                     raise ProtocolError('operation_in_progress')
                 self.db.execute("INSERT INTO operations(id,commit_sha,digest,tag,status) VALUES(?,?,?,?,'accepted')", (operation_id, commit, digest, tag))
             self.db.execute('COMMIT')
@@ -173,7 +206,7 @@ class Journal:
             if row[0] == 'recovery_required':
                 raise ProtocolError('recovery_required')
             if row[0] == 'verification_failed':
-                if self.db.execute("SELECT 1 FROM operations WHERE id != ? AND status IN ('accepted','verifying','recovery_required')", (operation_id,)).fetchone():
+                if self.db.execute("SELECT 1 FROM operations WHERE id != ? AND status IN ('accepted','verifying','recovery_required')", (operation_id,)).fetchone() or self.db.execute("SELECT 1 FROM preparations WHERE status IN ('preparing','prepared','recovery_required')").fetchone():
                     raise ProtocolError('operation_in_progress')
                 self.db.execute("UPDATE operations SET status='accepted' WHERE id=?", (operation_id,))
             self.db.execute('COMMIT')

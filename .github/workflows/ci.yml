@@ -90,6 +90,7 @@ jobs:
               docker exec "$name" python3 -I -B /workspace/tests/extract-install/docker-e2e.py "$mode"
             else
               docker exec "$name" python3 -I -B /workspace/tests/extract-install/docker-e2e.py
+              docker exec "$name" python3 -I -B /workspace/tests/updater/prepare-local-docker-e2e.py
             fi
             cleanup
           done

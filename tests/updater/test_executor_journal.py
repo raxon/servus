@@ -169,7 +169,7 @@ class ExecutorJournalTest(unittest.TestCase):
                 journal = self.mod.Journal(pathlib.Path(tmp))
                 try:
                     self.assertEqual(journal.status(ID)['status'], 'verification_failed')
-                    self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 4)
+                    self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 5)
                     with self.assertRaises(self.mod.ProtocolError): journal.verified_config_digest(ID)
                     self.assertEqual(journal.retry(ID)['status'], 'accepted')
                 finally: journal.close()

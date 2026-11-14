@@ -32,6 +32,7 @@ FILES = {
     'apps/updater/extract-install.py': 0o644,
     'apps/updater/guarded-verifier.py': 0o644,
     'apps/updater/preflight.py': 0o644,
+    'apps/updater/prepare-verified.py': 0o644,
     'apps/updater/provision-verifier-group.py': 0o644,
     'apps/updater/servus-updater.py': 0o755,
     'apps/updater/supervisor-daemon.py': 0o644,
