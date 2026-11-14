@@ -8,10 +8,12 @@ import { agentConfig } from '../agent/config.js';
 import type { agentRequest } from '../agent/client.js';
 import { AppError } from './errors.js';
 import { hashToken, type Store } from './store.js';
+import type { MaintenanceGate } from './maintenance.js';
 
 interface ConsoleOptions {
   store:Store;allowedOrigins:Set<string>;agentConnection?:{socketPath:string;token:string};runtimeRequest:typeof agentRequest;
   serviceAccess:(req:FastifyRequest,id:string,write?:boolean,includeDeleted?:boolean)=>{auth:{user:User;csrfToken:string};service:Service};
+  maintenance?:MaintenanceGate;onUpgrade?:(req:FastifyRequest)=>void;
 }
 interface Ticket {serviceId:string;containerId:string;shell:string;sessionToken:string;expiresAt:number}
 const consoleInput=z.object({containerId:z.string().regex(/^[a-f0-9]{12,64}$/),shell:z.enum(['/bin/sh','/bin/bash']).default('/bin/sh')}).strict();
@@ -23,6 +25,8 @@ const terminalInput=z.discriminatedUnion('type',[
 
 export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
   const {store,serviceAccess}=options,tickets=new Map<string,Ticket>(),cleanup=new Set<()=>void>();
+  const stopStreams=()=>{for(const close of [...cleanup])close();tickets.clear();};
+  const unregisterDrain=options.maintenance?.registerCloser(stopStreams);
   let pendingConnections=0;
   const prefix='/api/v1/services/:id';
   app.post<{Params:{id:string}}>(`${prefix}/console-ticket`,async req=>{
@@ -45,6 +49,8 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
       if(!req.cookies.panel_session||!store.getSession(req.cookies.panel_session))throw new AppError('UNAUTHORIZED','Sign in to continue',401);
     },
   },(socket,req)=>{
+    options.onUpgrade?.(req);
+    if(options.maintenance?.isDraining){socket.close(1012,'Service is temporarily unavailable');return;}
     if(pendingConnections>=100){socket.close(1013,'Too many pending console connections');return;}
     pendingConnections++;
     let phase:'authentication'|'connecting'|'ready'='authentication',pendingSlot=true,closed=false,ticket:Ticket|undefined,upstream:WebSocket|undefined;
@@ -89,6 +95,7 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
         const activeTicket=ticket;
         checkSession=setInterval(()=>{
           try {
+            if(closed)return;
             const current=store.getSession(activeTicket.sessionToken);
             if(!current||!store.canAccess(current.user,store.getService(activeTicket.serviceId)?.projectId??'',true))close();
           } catch {if(socket.readyState===WebSocket.OPEN)socket.close(1011,'Console is unavailable');close();}
@@ -97,6 +104,7 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
         upstream.on('error',upstreamFailed);upstream.on('close',code=>{if(phase==='ready'&&code===1000)close();else upstreamFailed();});
         upstream.on('open',()=>{
           try {
+            if(closed)return;
             const current=store.getSession(activeTicket.sessionToken),service=store.getService(activeTicket.serviceId);
             if(!current||!service||!store.canAccess(current.user,service.projectId,true)){socket.close(1008,'Console grant is unavailable');close();return;}
             if(closed||socket.readyState!==WebSocket.OPEN){close();return;}
@@ -115,6 +123,7 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
   });
 
   app.get<{Params:{id:string};Querystring:{since?:string}}>(`${prefix}/logs/stream`,async(req,reply)=>{
+    if(options.maintenance?.isDraining)throw new AppError('MAINTENANCE','Service is temporarily unavailable',503);
     serviceAccess(req,req.params.id);
     let cursor=req.query.since??(typeof req.headers['last-event-id']==='string'?req.headers['last-event-id']:undefined);
     if(cursor)z.string().max(50).regex(/^[0-9TZ:.+\-]+$/).parse(cursor);
@@ -123,6 +132,8 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
     const close=()=>{if(ended)return;ended=true;clearInterval(interval);cleanup.delete(close);reply.raw.end();};
     const poll=async()=>{
       if(ended||busy)return;
+      const finish=options.maintenance?.beginWork();
+      try {
       const auth=store.getSession(req.cookies.panel_session!);
       const service=store.getService(req.params.id);
       if(!auth||!service||!store.canAccess(auth.user,service.projectId)){close();return;}
@@ -138,8 +149,9 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
         else reply.raw.write(': heartbeat\n\n');
       }catch{if(!ended)reply.raw.write(`event: unavailable\ndata: ${JSON.stringify({message:'Runtime logs are temporarily unavailable'})}\n\n`);}
       finally{busy=false;}
+      } finally {finish?.();}
     };
     const interval=setInterval(()=>void poll(),1000);cleanup.add(close);reply.raw.on('close',close);void poll();
   });
-  app.addHook('preClose',async()=>{for(const close of [...cleanup])close();tickets.clear();});
+  app.addHook('preClose',async()=>{stopStreams();unregisterDrain?.();});
 }

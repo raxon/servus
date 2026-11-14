@@ -16,6 +16,8 @@ import { registerConsole } from './console.js';
 import { registerCentralAuth } from './central-auth.js';
 import { BUILD_INFO } from './generated-build-info.js';
 import { clientAddress, normalizeClientAddress, trustedProxyRequest } from './proxy-address.js';
+import { MaintenanceGate } from './maintenance.js';
+import { registerUpdates } from './updates.js';
 
 const prefix = '/api/v1';
 const cookieName = 'panel_session';
@@ -27,6 +29,8 @@ export interface AppOptions {
   runtimeStatus?: () => Promise<RuntimeStatus>; allowedOrigins?: string[]; secureCookies?: boolean;
   agentRequest?:typeof defaultAgentRequest; agentConnection?:{socketPath:string;token:string};
   trustedProxySecret?: string;
+  maintenance?: MaintenanceGate;
+  updaterSocketPath?: string;
 }
 export async function createApp(options: AppOptions) {
   if(options.trustedProxySecret!==undefined && !/^[a-f0-9]{64}$/.test(options.trustedProxySecret))throw new Error('Invalid trusted proxy secret configuration');
@@ -36,6 +40,38 @@ export async function createApp(options: AppOptions) {
   await app.register(rateLimit, { global: false, keyGenerator: req => clientAddress(req,options.trustedProxySecret) });
   await app.register(websocket,{options:{maxPayload:65536}});
   const runtimeRequest=options.agentRequest??defaultAgentRequest;
+  const maintenance=options.maintenance;
+  const requestReleases = new WeakMap<FastifyRequest, () => void>();
+  const upgrades = new WeakSet<FastifyRequest>();
+  if (maintenance) {
+    app.addHook('onRoute', route => {
+      if (!route.url.startsWith('/api/') || route.url === '/api/v1/health' || route.url.endsWith('/console')) return;
+      const original=route.handler;
+      route.handler=async function(req,reply) {
+        const done=maintenance.beginWork();
+        try {
+          const result=original.call(this,req,reply);
+          if (!result || typeof (result as Promise<unknown>).then !== 'function') maintenance.markUncertain();
+          return await result;
+        } finally { done(); }
+      };
+    });
+    app.addHook('onRequest', async (req,reply) => {
+      const path=req.raw.url?.split('?',1)[0];
+      if ((path === '/health' || path === '/api/v1/health') && (req.method === 'GET' || req.method === 'HEAD')) return;
+      const done=maintenance.admit();
+      if (!done) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Service is temporarily unavailable'}});
+      requestReleases.set(req,done);
+      let finished=false;
+      reply.raw.once('finish',()=>{finished=true;});
+      req.raw.once('aborted',()=>{maintenance.markUncertain();done();});
+      reply.raw.once('close',()=>{
+        if (!upgrades.has(req) && !finished) maintenance.markUncertain();
+        done();
+      });
+    });
+    app.addHook('onResponse',async req=>{requestReleases.get(req)?.();});
+  }
   const allowedOrigins = new Set(options.allowedOrigins ?? ['http://localhost:4180','http://127.0.0.1:4180','http://localhost:4181','http://127.0.0.1:4181']);
   app.addHook('onRequest', async (req, reply) => {
     reply.header('X-Content-Type-Options','nosniff');
@@ -106,6 +142,7 @@ export async function createApp(options: AppOptions) {
     if(auth.user.role!=='admin')throw new AppError('FORBIDDEN','Administrator access required',403);
     return auth.user;
   }
+  registerUpdates(app,{administrator,socketPath:options.updaterSocketPath});
   app.get(`${prefix}/users`,async req=>{
     administrator(req);
     return {users:store.db.prepare('SELECT id,email,role,created_at AS createdAt FROM users ORDER BY email').all()};
@@ -190,7 +227,8 @@ export async function createApp(options: AppOptions) {
   });
   app.get<{Params:{id:string}}>(`${prefix}/services/:id/containers`,async req=>{serviceAccess(req,req.params.id);return runtimeRequest<import('../shared/types.js').ContainerInfo[]>(`/services/${req.params.id}/containers`);});
   app.get<{Params:{id:string}}>(`${prefix}/services/:id/metrics`,async req=>{serviceAccess(req,req.params.id);return runtimeRequest<import('../shared/types.js').ServiceMetrics>(`/services/${req.params.id}/metrics`);});
-  registerConsole(app,{store,allowedOrigins,serviceAccess,agentConnection:options.agentConnection,runtimeRequest});
+  registerConsole(app,{store,allowedOrigins,serviceAccess,agentConnection:options.agentConnection,runtimeRequest,maintenance,
+    onUpgrade:req=>{upgrades.add(req);requestReleases.get(req)?.();}});
 
   const webDir=resolve(options.webDir ?? 'dist/web');
   if(existsSync(webDir)) {

@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { agentConfig } from './config.js';
 import { DockerRuntime, message, isUncertainRuntimeError, type RecoveryContext } from './runtime.js';
 import type { Service } from '../shared/types.js';
+import type { AgentMaintenanceGate } from './maintenance.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -40,7 +41,7 @@ type JournalRow = {
 };
 type AgentRuntime = Pick<DockerRuntime, 'status' | 'inspectService' | 'apply'> & Partial<Pick<DockerRuntime, 'containers' | 'metrics' | 'logs' | 'consoleContainer'>>;
 
-export async function createAgent(config = agentConfig(), runtime: AgentRuntime = new DockerRuntime(config.dockerSocket, config.ingressPort, config.ingressImage, config.dataDir)) {
+export async function createAgent(config = agentConfig(), runtime: AgentRuntime = new DockerRuntime(config.dockerSocket, config.ingressPort, config.ingressImage, config.dataDir), maintenance?: AgentMaintenanceGate) {
   const app = Fastify({ logger: false, bodyLimit: 512 * 1024 });
   const vault = new SecretVault(config.dataDir);
   await app.register(websocket, { options: { maxPayload: 65536 } });
@@ -61,6 +62,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       if (row[column] && !row[column].startsWith('enc:v1:')) journal.prepare(`UPDATE operations SET ${column}=? WHERE id=?`).run(sealSpec(JSON.parse(row[column])),row.id);
     }
   }
+  maintenance?.bindJournal(() => Boolean(journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get()));
   const active = new Map<string, Promise<unknown>>();
   const locks = new Set<string>();
   app.addHook('onRequest', async (req, reply) => {
@@ -82,12 +84,23 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
   });
   app.get<{Params:{id:string};Querystring:{containerId?:string;shell?:string}}>('/services/:id/console', {websocket:true,preValidation:async(req,reply)=>{
     if(!z.string().uuid().safeParse(req.params.id).success||!['/bin/sh','/bin/bash'].includes(req.query.shell||'/bin/sh')||(req.query.containerId&&!/^[a-f0-9]{12,64}$/.test(req.query.containerId)))return reply.code(400).send({error:{code:'INVALID_CONSOLE',message:'Invalid console target.'}});
+    const release=maintenance?.admit();
+    if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     try { await runtime.consoleContainer!(req.params.id,req.query.containerId); }
     catch { return reply.code(404).send({error:{code:'CONTAINER_NOT_FOUND',message:'No permitted running container is available.'}}); }
+    finally { release?.(); }
   }}, (socket,req)=>{
+    const release=maintenance?.admit();
+    if(maintenance&&!release){socket.close(1012,'Agent is draining');return;}
     let closed=false, exec: Docker.Exec|undefined, stream:Duplex|undefined;
+    let endSession: () => void = () => {};
+    const sessionEnd = new Promise<void>(resolve => { endSession = resolve; });
+    const unregister = maintenance?.registerCloser(()=>socket.close(1012,'Agent is draining'));
     const idle=setTimeout(()=>socket.close(1000,'Console expired'),15*60000);idle.unref();
     const ready=runtime.consoleContainer!(req.params.id,req.query.containerId).then(async container=>{
+      if(closed)return;
+      // Docker stream closure does not establish that its exec process has exited.
+      maintenance?.markUncertain();
       exec=await container.exec({Cmd:[req.query.shell||'/bin/sh'],Tty:true,AttachStdin:true,AttachStdout:true,AttachStderr:true});
       stream=await exec.start({hijack:true,stdin:true,Tty:true});
       if(closed){stream.destroy();return;}
@@ -104,8 +117,9 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       idle.refresh();
       void ready.then(async()=>{if(closed||!stream)return;if(packet.type==='input')stream.write(packet.data);if(packet.type==='resize'&&exec)await exec.resize({w:packet.cols!,h:packet.rows!});}).catch(()=>socket.close(1011,'Shell disconnected'));
     });
-    socket.on('close',()=>{closed=true;clearTimeout(idle);if(stream&&!stream.destroyed){stream.write('\u0003exit\n');stream.end();setTimeout(()=>stream?.destroy(),250).unref();}});
-    socket.on('error',()=>{closed=true;clearTimeout(idle);stream?.destroy();});
+    socket.on('close',()=>{closed=true;clearTimeout(idle);if(stream&&!stream.destroyed){stream.write('\u0003exit\n');stream.end();setTimeout(()=>stream?.destroy(),250).unref();}endSession();});
+    socket.on('error',()=>{closed=true;clearTimeout(idle);stream?.destroy();endSession();});
+    void Promise.allSettled([ready,sessionEnd]).then(()=>{unregister?.();release?.();});
   });
   app.get<{Params:{id:string}}>('/operations/:id', (req, reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success) return reply.code(400).send({ error: { code: 'INVALID_ID', message: 'Invalid operation identity.' } });
@@ -115,6 +129,9 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     return { state: row.state, ...(row.state === 'succeeded' ? { result: response } : row.state === 'failed' ? { error: response.error } : {}) };
   });
   app.post('/services/apply', async (req, reply) => {
+    const release=maintenance?.admit();
+    if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    try {
     const parsed = input.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: { code: 'INVALID_SPEC', message: 'Invalid service operation.' } });
     const body = parsed.data;
@@ -157,7 +174,8 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       throw error;
     }).finally(() => { active.delete(body.operationId); locks.delete(body.service.id); });
     active.set(body.operationId, operation);
-    return operation;
+    return await operation;
+    } finally { release?.(); }
   });
   app.setErrorHandler((error, _request, reply) => {
     if (isUncertainRuntimeError(error)) return reply.code(503).send({ error: { code: 'OPERATION_UNCERTAIN', message: 'Docker connection interrupted. Reconcile the same operation before making another change.' } });
