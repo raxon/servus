@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket } from 'ws';
@@ -64,6 +64,29 @@ describe('maintenance barrier',()=>{
     await entered.promise;controller.abort();await request;await new Promise(resolve=>setTimeout(resolve,30));
     expect(await gate.drain(10)).toEqual({status:'timeout'});
     const finish=gate.drain(1000);pending.resolve({online:true});expect(await finish).toEqual({status:'uncertain'});
+  });
+  it('does not poison a later drain when a static asset download is cancelled',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-maintenance-')), webDir=join(dir,'web'), gate=new MaintenanceGate();
+    mkdirSync(join(webDir,'assets'),{recursive:true});writeFileSync(join(webDir,'assets','large.bin'),Buffer.alloc(32*1024*1024));
+    const store=new Store(dir),app=await createApp({dataDir:dir,store,maintenance:gate,webDir});
+    cleanup.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
+    let route='';app.addHook('onRequest',async req=>{route=req.routeOptions.url;});
+    const address=await app.listen({host:'127.0.0.1',port:0});
+    const response=await fetch(`${address}/assets/large.bin`);expect(response.status).toBe(200);
+    expect(route).toBe('/*');
+    await response.body!.cancel();await new Promise(resolve=>setTimeout(resolve,100));
+    expect(await gate.drain(1000)).toEqual({status:'drained'});
+  });
+  it('still treats a disconnected dynamic asset route as uncertain',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-maintenance-')),store=new Store(dir),gate=new MaintenanceGate();
+    const app=await createApp({dataDir:dir,store,maintenance:gate});
+    cleanup.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
+    const entered=deferred<void>(),pending=deferred<void>();
+    app.get('/assets/dynamic',async()=>{entered.resolve();await pending.promise;return {ok:true};});
+    const address=await app.listen({host:'127.0.0.1',port:0});const controller=new AbortController();
+    const request=fetch(`${address}/assets/dynamic`,{signal:controller.signal}).catch(()=>undefined);
+    await entered.promise;controller.abort();await request;await new Promise(resolve=>setTimeout(resolve,30));
+    pending.resolve();expect(await gate.drain(1000)).toEqual({status:'uncertain'});
   });
   it('closes SSE and waits for an in-flight log poll before claiming drain',async()=>{
     const poll=deferred<{lines:string[]}>(),entered=deferred<void>();

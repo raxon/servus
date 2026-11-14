@@ -64,11 +64,12 @@ export async function createApp(options: AppOptions) {
       const done=maintenance.admit();
       if (!done) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Service is temporarily unavailable'}});
       requestReleases.set(req,done);
+      const staticAsset=(req.method==='GET'||req.method==='HEAD')&&req.routeOptions.url==='/*'&&path?.startsWith('/assets/')===true;
       let finished=false;
       reply.raw.once('finish',()=>{finished=true;});
-      req.raw.once('aborted',()=>{maintenance.markUncertain();done();});
+      req.raw.once('aborted',()=>{if(!staticAsset)maintenance.markUncertain();done();});
       reply.raw.once('close',()=>{
-        if (!upgrades.has(req) && !finished) maintenance.markUncertain();
+        if (!staticAsset && !upgrades.has(req) && !finished) maintenance.markUncertain();
         done();
       });
     });
