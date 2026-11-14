@@ -43,7 +43,7 @@ git archive HEAD | tar -xf - -C "$temp_dir/head"
 release_mode=head
 if [ "${SERVUS_TEST_WORKTREE:-0}" = 1 ]; then
   release_mode=worktree
-  for component in extract-install.py prepare-verified.py provision-host.py bootstrap-handoff.py provision-verifier-group.py; do
+  for component in extract-install.py prepare-verified.py provision-host.py bootstrap-handoff.py provision-verifier-group.py install-host.py; do
     cp "apps/updater/$component" "$temp_dir/head/apps/updater/$component"
   done
 fi
@@ -110,6 +110,10 @@ guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/provision-host.py --run
 guest sudo test -f /etc/servus/.supervisor-enabled-v1
 guest sudo test -f /opt/servus/.lifecycle-enabled-v1
 printf 'PASS first runtime provisioning and safe rerun on Linux\n'
+guest sudo install -d -m 700 /run/servus-release-fixture/source
+COPYFILE_DISABLE=1 tar -cf - -C "$temp_dir/head" apps/updater deployment/systemd | guest sudo tar --no-same-owner -xf - -C /run/servus-release-fixture/source
+guest sudo tee /run/servus-release-fixture/install-host-unit.py < tests/release-preparation-e2e/install-host-unit.py > /dev/null
+guest sudo /usr/bin/python3 -I /run/servus-release-fixture/install-host-unit.py
 guest sudo tee /usr/local/libexec/servus/bootstrap-handoff.py < "$temp_dir/head/apps/updater/bootstrap-handoff.py" > /dev/null
 guest sudo chmod 644 /usr/local/libexec/servus/bootstrap-handoff.py
 guest sudo tee /run/servus-release-fixture/handoff-unit.py < tests/release-preparation-e2e/handoff-unit.py > /dev/null
