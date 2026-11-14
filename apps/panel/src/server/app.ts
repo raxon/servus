@@ -45,6 +45,7 @@ export async function createApp(options: AppOptions) {
   const maintenance=options.maintenance;
   const requestReleases = new WeakMap<FastifyRequest, () => void>();
   const upgrades = new WeakSet<FastifyRequest>();
+  const readOnlyStreams = new WeakSet<FastifyRequest>();
   if (maintenance) {
     app.addHook('onRoute', route => {
       if (!route.url.startsWith('/api/') || route.url === '/api/v1/health' || route.url.endsWith('/console')) return;
@@ -67,9 +68,9 @@ export async function createApp(options: AppOptions) {
       const staticAsset=(req.method==='GET'||req.method==='HEAD')&&req.routeOptions.url==='/*'&&path?.startsWith('/assets/')===true;
       let finished=false;
       reply.raw.once('finish',()=>{finished=true;});
-      req.raw.once('aborted',()=>{if(!staticAsset)maintenance.markUncertain();done();});
+      req.raw.once('aborted',()=>{if(!staticAsset&&!readOnlyStreams.has(req))maintenance.markUncertain();done();});
       reply.raw.once('close',()=>{
-        if (!staticAsset && !upgrades.has(req) && !finished) maintenance.markUncertain();
+        if (!staticAsset && !readOnlyStreams.has(req) && !upgrades.has(req) && !finished) maintenance.markUncertain();
         done();
       });
     });
@@ -247,7 +248,7 @@ export async function createApp(options: AppOptions) {
   app.get<{Params:{id:string}}>(`${prefix}/services/:id/containers`,async req=>{serviceAccess(req,req.params.id);return runtimeRequest<import('../shared/types.js').ContainerInfo[]>(`/services/${req.params.id}/containers`);});
   app.get<{Params:{id:string}}>(`${prefix}/services/:id/metrics`,async req=>{serviceAccess(req,req.params.id);return runtimeRequest<import('../shared/types.js').ServiceMetrics>(`/services/${req.params.id}/metrics`);});
   registerConsole(app,{store,allowedOrigins,serviceAccess,agentConnection:options.agentConnection,runtimeRequest,maintenance,
-    onUpgrade:req=>{upgrades.add(req);requestReleases.get(req)?.();}});
+    onUpgrade:req=>{upgrades.add(req);requestReleases.get(req)?.();},onReadOnlyStream:req=>{readOnlyStreams.add(req);}});
 
   const webDir=resolve(options.webDir ?? 'dist/web');
   if(existsSync(webDir)) {

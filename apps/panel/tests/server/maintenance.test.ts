@@ -101,6 +101,19 @@ describe('maintenance barrier',()=>{
     expect(await finish).toEqual({status:'drained'});
     await response.body?.cancel();
   });
+  it('waits for an in-flight log poll after the browser closes its stream',async()=>{
+    const poll=deferred<{lines:string[]}>(),entered=deferred<void>();
+    const agent:typeof agentRequest=async<T>(path:string)=>{if(path.includes('/logs')){entered.resolve();return await poll.promise as T;}throw new Error('unexpected');};
+    const {app,gate,store,headers}=await fixture(agent);const project=store.createProject('stream-disconnect');
+    const created=await app.inject({method:'POST',url:`/api/v1/projects/${project.id}/services`,headers:{...headers,'idempotency-key':'stream-disconnect'},payload:{name:'web',image:'nginx:alpine',port:80,hostname:'stream.localhost'}});
+    const address=await app.listen({host:'127.0.0.1',port:0});
+    const response=await fetch(`${address}/api/v1/services/${created.json().service.id}/logs/stream`,{headers:{cookie:headers.cookie}});
+    expect(response.status).toBe(200);await entered.promise;await response.body!.cancel();
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect(await gate.drain(20)).toEqual({status:'timeout'});
+    const finish=gate.drain(1000);poll.resolve({lines:['log']});
+    expect(await finish).toEqual({status:'drained'});
+  });
   it('closes an authenticated websocket awaiting its grant when draining',async()=>{
     const {app,gate,store,headers}=await fixture();const project=store.createProject('maintenance');
     const created=await app.inject({method:'POST',url:`/api/v1/projects/${project.id}/services`,headers:{...headers,'idempotency-key':'maint-ws'},payload:{name:'web',image:'nginx:alpine',port:80,hostname:'maintenance.localhost'}});

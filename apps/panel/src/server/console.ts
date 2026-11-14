@@ -13,7 +13,7 @@ import type { MaintenanceGate } from './maintenance.js';
 interface ConsoleOptions {
   store:Store;allowedOrigins:Set<string>;agentConnection?:{socketPath:string;token:string};runtimeRequest:typeof agentRequest;
   serviceAccess:(req:FastifyRequest,id:string,write?:boolean,includeDeleted?:boolean)=>{auth:{user:User;csrfToken:string};service:Service};
-  maintenance?:MaintenanceGate;onUpgrade?:(req:FastifyRequest)=>void;
+  maintenance?:MaintenanceGate;onUpgrade?:(req:FastifyRequest)=>void;onReadOnlyStream?:(req:FastifyRequest)=>void;
 }
 interface Ticket {serviceId:string;containerId:string;shell:string;sessionToken:string;expiresAt:number}
 const consoleInput=z.object({containerId:z.string().regex(/^[a-f0-9]{12,64}$/),shell:z.enum(['/bin/sh','/bin/bash']).default('/bin/sh')}).strict();
@@ -127,6 +127,7 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
     serviceAccess(req,req.params.id);
     let cursor=req.query.since??(typeof req.headers['last-event-id']==='string'?req.headers['last-event-id']:undefined);
     if(cursor)z.string().max(50).regex(/^[0-9TZ:.+\-]+$/).parse(cursor);
+    options.onReadOnlyStream?.(req);
     reply.hijack();reply.raw.setHeader('Content-Type','text/event-stream');reply.raw.setHeader('Cache-Control','no-cache');reply.raw.setHeader('Connection','keep-alive');reply.raw.flushHeaders();
     let ended=false,busy=false;const seen=new Set<string>();
     const close=()=>{if(ended)return;ended=true;clearInterval(interval);cleanup.delete(close);reply.raw.end();};
