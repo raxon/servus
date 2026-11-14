@@ -130,6 +130,26 @@ def approved_policy_binding(hub, path, approval_journal, accepted_env):
     return path, env_digest, policy_digest, policy
 
 
+def resolve_active_policy(approval_journal, active_env):
+    """Resolve the approved generation while the caller holds install.lock."""
+    _private_file(approval_journal, 64 * 1024 * 1024)
+    try:
+        uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=ro'
+        with sqlite3.connect(uri, uri=True, timeout=2) as db:
+            rows = db.execute("SELECT policy_path,accepted_env_path,source_env_path FROM policy_approvals WHERE state='active'").fetchall()
+        if len(rows) != 1 or rows[0][2] != active_env or not all(isinstance(item, str) and item for item in rows[0]):
+            raise supervisor.SupervisorError('Active policy generation is unavailable')
+        path, accepted_env, _ = rows[0]
+        policy = load_approved_policy(path, approval_journal, accepted_env)
+        with sqlite3.connect(uri, uri=True, timeout=2) as db:
+            current = db.execute("SELECT policy_path,accepted_env_path,source_env_path FROM policy_approvals WHERE state='active'").fetchall()
+        if current != rows:
+            raise supervisor.SupervisorError('Active policy generation changed')
+        return path, accepted_env, policy
+    except (sqlite3.Error, ValueError, OSError) as error:
+        raise supervisor.SupervisorError('Active policy generation is unavailable') from error
+
+
 def complete_healthy_preparation(hub, approval_journal, operation_id, policy_path, accepted_env):
     """Record completion only while all authenticated roles are healthy."""
     if supervisor.inspect_servus(hub.policy) != hub.identities:
@@ -347,8 +367,13 @@ def run(args):
     signal.signal(signal.SIGINT, stop)
     try:
         ownership = DaemonOwnership(args.socket_dir, args.journal_dir, args.gid)
+        active_env = getattr(args, 'active_env', None)
         with supervisor.MaintenanceSupervisor(args.install_dir, args.gate_dir, args.journal_dir):
-            policy = load_approved_policy(args.policy, args.approval_journal, args.accepted_env)
+            if active_env:
+                policy_path, accepted_env, policy = resolve_active_policy(args.approval_journal, active_env)
+            else:
+                policy_path, accepted_env = args.policy, args.accepted_env
+                policy = load_approved_policy(policy_path, args.approval_journal, accepted_env)
         if policy.install_dir != args.install_dir or policy.gate_dir != args.gate_dir or policy.control_dir != args.socket_dir:
             raise supervisor.SupervisorError('Policy paths do not match daemon configuration')
         tokens = endpoint.read_component_tokens(args.secret_dir, args.gid)
@@ -357,6 +382,11 @@ def run(args):
         while not stopping:
             if hub is None:
                 try:
+                    if active_env:
+                        with supervisor.MaintenanceSupervisor(args.install_dir, args.gate_dir, args.journal_dir):
+                            policy_path, accepted_env, policy = resolve_active_policy(args.approval_journal, active_env)
+                            if policy.install_dir != args.install_dir or policy.gate_dir != args.gate_dir or policy.control_dir != args.socket_dir:
+                                raise supervisor.SupervisorError('Policy paths do not match daemon configuration')
                     hub = supervisor.DrainHub(listener, tokens, args.uid, policy)
                 except (supervisor.SupervisorError, OSError):
                     pass
@@ -371,7 +401,7 @@ def run(args):
                 continue
             if control in ready:
                 handle_command(control, hub, args.install_dir, args.gate_dir, args.journal_dir,
-                               args.policy, args.approval_journal, args.accepted_env)
+                               policy_path, args.approval_journal, accepted_env)
                 if hub and hub.used:
                     hub.close()
                     hub = None
@@ -408,6 +438,7 @@ def main():
     parser = argparse.ArgumentParser()
     for name in ('policy', 'install-dir', 'gate-dir', 'journal-dir', 'secret-dir', 'socket-dir', 'approval-journal', 'accepted-env'):
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--active-env')
     parser.add_argument('--uid', type=int, required=True)
     parser.add_argument('--gid', type=int, required=True)
     try:

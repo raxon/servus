@@ -9,6 +9,7 @@ import importlib.util
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -24,6 +25,27 @@ spec.loader.exec_module(daemon)
 
 @unittest.skipUnless(sys.platform == 'linux' and os.geteuid() == 0, 'Requires isolated Linux root')
 class DaemonTest(unittest.TestCase):
+    def test_resolves_current_policy_generation_and_rejects_drift(self):
+        with tempfile.TemporaryDirectory(dir='/root') as temporary:
+            path = Path(temporary) / 'journal.sqlite'
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE policy_approvals(policy_path TEXT,accepted_env_path TEXT,source_env_path TEXT,state TEXT)')
+                db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?)', ('/root/new-policy', '/root/new-env', '/root/active-env', 'active'))
+            os.chmod(path, 0o600)
+            policy = object()
+            with mock.patch.object(daemon, 'load_approved_policy', return_value=policy) as load:
+                self.assertEqual(daemon.resolve_active_policy(str(path), '/root/active-env'), ('/root/new-policy', '/root/new-env', policy))
+                load.assert_called_once_with('/root/new-policy', str(path), '/root/new-env')
+                with self.assertRaises(supervisor.SupervisorError):
+                    daemon.resolve_active_policy(str(path), '/root/other-env')
+            def change(*_):
+                with sqlite3.connect(path) as db:
+                    db.execute("UPDATE policy_approvals SET policy_path='/root/different-policy'")
+                return policy
+            with mock.patch.object(daemon, 'load_approved_policy', side_effect=change):
+                with self.assertRaises(supervisor.SupervisorError):
+                    daemon.resolve_active_policy(str(path), '/root/active-env')
+
     def test_binding_uses_approved_policy_matching_hub(self):
         hub = SimpleNamespace(policy=object())
         def read(path, maximum):
