@@ -22,12 +22,23 @@ class SocketProvisioningTest(unittest.TestCase):
 
     def test_create_and_repeat_keep_the_same_directory_inodes(self):
         module.prepare(str(self.root), 1000)
-        parent, control = self.root / 'servus-updater', self.root / 'servus-updater/control'
-        before = (parent.stat().st_ino, control.stat().st_ino)
+        parent, control, fences = self.root / 'servus-updater', self.root / 'servus-updater/control', self.root / 'servus-updater/fences'
+        before = (parent.stat().st_ino, control.stat().st_ino, fences.stat().st_ino)
         self.assertEqual((parent.stat().st_uid, parent.stat().st_gid, stat.S_IMODE(parent.stat().st_mode)), (0, 0, 0o755))
         self.assertEqual((control.stat().st_uid, control.stat().st_gid, stat.S_IMODE(control.stat().st_mode)), (0, 1000, 0o710))
+        self.assertEqual((fences.stat().st_uid, fences.stat().st_gid, stat.S_IMODE(fences.stat().st_mode)), (0, 0, 0o755))
         module.prepare(str(self.root), 1000)
-        self.assertEqual((parent.stat().st_ino, control.stat().st_ino), before)
+        self.assertEqual((parent.stat().st_ino, control.stat().st_ino, fences.stat().st_ino), before)
+
+    def test_unsafe_fence_directory_is_rejected_without_replacement(self):
+        module.prepare(str(self.root),1000)
+        fences=self.root/'servus-updater/fences';inode=fences.stat().st_ino
+        fences.chmod(0o777)
+        with self.assertRaises(module.ProvisionError):module.prepare(str(self.root),1000)
+        self.assertEqual((fences.stat().st_ino,stat.S_IMODE(fences.stat().st_mode)),(inode,0o777))
+        fences.rmdir();target=self.root/'target';target.mkdir(mode=0o700);fences.symlink_to(target)
+        with self.assertRaises(OSError):module.prepare(str(self.root),1000)
+        self.assertEqual(list(target.iterdir()),[])
 
     def test_unsafe_existing_directory_is_not_changed(self):
         module.prepare(str(self.root), 1000)

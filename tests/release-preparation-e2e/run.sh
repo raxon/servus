@@ -43,7 +43,7 @@ git archive HEAD | tar -xf - -C "$temp_dir/head"
 release_mode=head
 if [ "${SERVUS_TEST_WORKTREE:-0}" = 1 ]; then
   release_mode=worktree
-  for component in extract-install.py prepare-verified.py provision-host.py bootstrap-handoff.py provision-verifier-group.py install-host.py; do
+  for component in extract-install.py prepare-verified.py provision-host.py bootstrap-handoff.py provision-verifier-group.py provision-socket.py install-host.py; do
     cp "apps/updater/$component" "$temp_dir/head/apps/updater/$component"
   done
 fi
@@ -87,9 +87,13 @@ install_modules() {
 }
 install_modules tag
 guest sudo /usr/bin/python3 -I -B /run/servus-release-fixture/flow.py tag
-install_modules head
-guest sudo tee /usr/local/libexec/servus/bootstrap-release.py < "$temp_dir/head/apps/updater/bootstrap-release.py" > /dev/null
-guest sudo chmod 644 /usr/local/libexec/servus/bootstrap-release.py
+guest sh -c 'test ! -e /usr/local/libexec/servus-legacy-fixture'
+guest sudo mv /usr/local/libexec/servus /usr/local/libexec/servus-legacy-fixture
+guest sudo chmod 700 /opt/servus
+guest sudo install -d -m 700 /run/servus-release-fixture/source
+COPYFILE_DISABLE=1 tar -cf - -C "$temp_dir/head" apps/updater deployment/systemd | guest sudo tar --warning=no-unknown-keyword --no-same-owner -xf - -C /run/servus-release-fixture/source
+guest sudo tee /run/servus-release-fixture/install-real-host.py < tests/release-preparation-e2e/install-real-host.py > /dev/null
+guest sudo /usr/bin/python3 -I /run/servus-release-fixture/install-real-host.py
 guest sudo /usr/bin/python3 -I -B /run/servus-release-fixture/flow.py "$release_mode"
 guest sudo tee /usr/local/libexec/servus/provision-socket.py < "$temp_dir/head/apps/updater/provision-socket.py" > /dev/null
 guest sudo chmod 644 /usr/local/libexec/servus/provision-socket.py
@@ -110,8 +114,6 @@ guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/provision-host.py --run
 guest sudo test -f /etc/servus/.supervisor-enabled-v1
 guest sudo test -f /opt/servus/.lifecycle-enabled-v1
 printf 'PASS first runtime provisioning and safe rerun on Linux\n'
-guest sudo install -d -m 700 /run/servus-release-fixture/source
-COPYFILE_DISABLE=1 tar -cf - -C "$temp_dir/head" apps/updater deployment/systemd | guest sudo tar --no-same-owner -xf - -C /run/servus-release-fixture/source
 guest sudo tee /run/servus-release-fixture/install-host-unit.py < tests/release-preparation-e2e/install-host-unit.py > /dev/null
 guest sudo /usr/bin/python3 -I /run/servus-release-fixture/install-host-unit.py
 guest sudo tee /usr/local/libexec/servus/bootstrap-handoff.py < "$temp_dir/head/apps/updater/bootstrap-handoff.py" > /dev/null

@@ -43,7 +43,12 @@ print('PASS verifier provisioning accepts private install and inherited lock',fl
 units=Path('/etc/systemd/system')
 for name in ('servus-supervisor.service','servus-updater.service'):
     path=units/name
-    if path.exists() or path.is_symlink():raise SystemExit('Fixture service already exists')
+    saved=units/(name+'.fixture-original')
+    if saved.exists() or saved.is_symlink() or path.is_symlink() or not path.is_file():
+        raise SystemExit('Unexpected fixture service')
+    if path.read_bytes() != (root/'source/deployment/systemd'/name).read_bytes():
+        raise SystemExit('Fixture service does not match installed source')
+    path.rename(saved)
     path.write_text('[Unit]\nDescription=Isolated Servus handoff test\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/bin/flock -n /opt/servus/install.lock /bin/true\n[Install]\nWantedBy=multi-user.target\n')
     path.chmod(0o644)
 subprocess.run(['/usr/bin/systemctl','daemon-reload'],check=True,timeout=30)

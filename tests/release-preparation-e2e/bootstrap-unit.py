@@ -16,6 +16,11 @@ info = control.lstat()
 if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != 65534 or stat.S_IMODE(info.st_mode) != 0o710:
     raise SystemExit('Unexpected old fixture socket directory')
 control.rmdir()
+fences=Path('/run/servus-updater/fences');previous=Path('/run/servus-release-fixture/previous-fences')
+info=fences.lstat()
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o755 or previous.exists():
+    raise SystemExit('Unexpected old fixture fence directory')
+fences.rename(previous)
 
 def command(*arguments, timeout=30):
     return subprocess.run(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -25,6 +30,9 @@ client = '''import json,socket,sys\ns=socket.socket(socket.AF_UNIX);s.settimeout
 try:
     command('/usr/bin/systemctl','daemon-reload')
     command('/usr/bin/systemctl','start','servus-updater-socket.service')
+    info=fences.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o755:
+        raise RuntimeError('Updater fence directory was not prepared safely')
     command('/usr/bin/systemctl','start','servus-updater-bootstrap.service')
     path = control/'updater.sock'
     for _ in range(100):
@@ -39,7 +47,7 @@ try:
     if request('status') != {'ok':False,'error':'not_found'}: raise RuntimeError('Unexpected updater status')
     if request('apply') != {'ok':False,'error':'unavailable'}: raise RuntimeError('Bootstrap updater allowed apply')
     command('/usr/bin/systemctl','is-active','--quiet','servus-updater-bootstrap.service')
-    print('PASS real systemd bootstrap unit, socket identity, and disabled apply',flush=True)
+    print('PASS real systemd bootstrap unit, socket and fence directories, and disabled apply',flush=True)
 finally:
     subprocess.run(['/usr/bin/systemctl','stop','servus-updater-bootstrap.service'],stdin=subprocess.DEVNULL,
                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30,check=False)

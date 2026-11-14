@@ -24,25 +24,30 @@ def prepare(run_dir, group):
             info = os.fstat(parent)
             if info.st_uid != 0 or info.st_mode & 0o022:
                 raise ProvisionError('Untrusted runtime ancestor')
-        for name, mode, gid in (('servus-updater', 0o755, 0), ('control', 0o710, group)):
+        def child_directory(parent_fd, name, mode, gid):
             try:
-                os.mkdir(name, mode, dir_fd=parent)
+                os.mkdir(name, mode, dir_fd=parent_fd)
             except FileExistsError:
                 created = False
             else:
                 created = True
-            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
             try:
                 if created:
-                    os.fchown(child, 0, gid); os.fchmod(child, mode); os.fsync(child); os.fsync(parent)
+                    os.fchown(child, 0, gid); os.fchmod(child, mode); os.fsync(child); os.fsync(parent_fd)
                 info = os.fstat(child)
-                named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != gid or
                     stat.S_IMODE(info.st_mode) != mode or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
                     raise ProvisionError('Unsafe updater socket directory')
             except BaseException:
                 os.close(child); raise
-            os.close(parent); parent = child
+            return child
+        updater = child_directory(parent, 'servus-updater', 0o755, 0)
+        try:
+            for name,mode,gid in (('control',0o710,group),('fences',0o755,0)):
+                fd=child_directory(updater,name,mode,gid);os.close(fd)
+        finally: os.close(updater)
     finally:
         os.close(parent)
 
