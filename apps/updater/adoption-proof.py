@@ -1,0 +1,112 @@
+#!/usr/bin/python3 -I
+"""Bind staged migration data to one verified, approved initial release.
+
+The caller must establish and maintain a durable writer and startup fence for
+both the old and restored data. This module records evidence only; it does not
+stop services, authorize container startup or perform recovery.
+"""
+import os
+import re
+import sys
+
+
+class AdoptionError(Exception):
+    pass
+
+
+def _binding(journal, operation, active_env, supervisor, daemon):
+    if not supervisor._uuid4(operation): raise AdoptionError('Invalid operation')
+    database=journal.db.execute('PRAGMA database_list').fetchone()
+    if not database or not database[2] or not os.path.isabs(database[2]): raise AdoptionError('Persistent journal is required')
+    policy_path,snapshot,approved=daemon.resolve_active_policy(database[2],active_env)
+    if not isinstance(approved,supervisor.RuntimePolicy): raise AdoptionError('Invalid active policy')
+    row=journal.db.execute("""SELECT p.preparation_id,p.attempt_id,p.attempt_nonce,o.digest,o.config_digest
+        FROM preparations p JOIN operations o ON o.id=p.operation_id JOIN policy_approvals a ON a.operation_id=o.id
+        WHERE o.id=? AND o.status='verified' AND p.status='prepared' AND a.state='active'
+          AND a.policy_path=? AND a.accepted_env_path=? AND a.source_env_path=?
+          AND p.attempt_id=o.attempt_id AND p.attempt_nonce=o.attempt_nonce
+          AND a.attempt_id=o.attempt_id AND a.attempt_nonce=o.attempt_nonce
+          AND a.preparation_id=p.preparation_id AND a.root_digest=o.digest
+          AND a.image_config_digest=o.config_digest AND NOT EXISTS(SELECT 1 FROM update_transactions)
+          AND NOT EXISTS(SELECT 1 FROM extraction_probes WHERE status='intent')""",
+        (operation,policy_path,snapshot,active_env)).fetchone()
+    if (not row or not supervisor._uuid4(row[0]) or not supervisor._uuid4(row[1]) or
+        not isinstance(row[2],str) or not re.fullmatch(r'[0-9a-f]{64}',row[2]) or
+        any(not isinstance(value,str) or not re.fullmatch(r'sha256:[0-9a-f]{64}',value) for value in row[3:]) or
+        approved.image_reference!='ghcr.io/raxon/servus@'+row[3]):
+        raise AdoptionError('Verified release is not prepared')
+    return policy_path,snapshot,approved,row
+
+
+def _check_paths(snapshot, digest, parent, operation, approved):
+    if (not isinstance(snapshot,str) or not os.path.isabs(snapshot) or os.path.normpath(snapshot)!=snapshot or
+        not isinstance(parent,str) or not os.path.isabs(parent) or os.path.normpath(parent)!=parent or
+        not isinstance(digest,str) or not re.fullmatch(r'sha256:[0-9a-f]{64}',digest) or
+        approved.data_dir!=os.path.join(parent,'restore-'+operation) or
+        snapshot==parent or snapshot.startswith(parent+'/') or parent.startswith(snapshot+'/')):
+        raise AdoptionError('Migration paths do not match the approved policy')
+
+
+def _quiet(quiescence, target):
+    # These observations are necessary, but cannot prevent a new writer. The
+    # caller must maintain the independent startup and writer fence.
+    quiescence.ensure_host_namespaces()
+    quiescence.ensure_no_uid_writers(1000)
+    quiescence.ensure_no_open_data(target)
+
+
+def record(journal, operation, active_env, snapshot_path, digest, parent, backup, node_fd, supervisor, daemon, policy, coordinator, restore, quiescence, *, inherited_lock=None):
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated: raise AdoptionError('Isolated Linux root is required')
+    policy_path,accepted,approved,binding=_binding(journal,operation,active_env,supervisor,daemon)
+    _check_paths(snapshot_path,digest,parent,operation,approved)
+    directory=supervisor._trusted_directory(approved.install_dir,0o700);lock=None
+    try:
+        lock=policy._installation_lock(directory,supervisor,inherited_lock)
+        if _binding(journal,operation,active_env,supervisor,daemon)!=(policy_path,accepted,approved,binding): raise AdoptionError('Approved policy changed')
+        _quiet(quiescence,approved.data_dir)
+        identity=restore.verify_staged(snapshot_path,digest,parent,operation,backup,node_fd,supervisor,coordinator)
+        _quiet(quiescence,approved.data_dir)
+        db=journal.db;db.execute('BEGIN IMMEDIATE')
+        try:
+            if _binding(journal,operation,active_env,supervisor,daemon)!=(policy_path,accepted,approved,binding): raise AdoptionError('Approved policy changed')
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='initial_generations'").fetchone() and db.execute('SELECT 1 FROM initial_generations LIMIT 1').fetchone():
+                raise AdoptionError('Initial generation already started')
+            db.execute("CREATE TABLE IF NOT EXISTS initial_adoptions (operation_id TEXT PRIMARY KEY, preparation_id TEXT NOT NULL, attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, root_digest TEXT NOT NULL, config_digest TEXT NOT NULL, policy_path TEXT NOT NULL, accepted_env TEXT NOT NULL, active_env TEXT NOT NULL, snapshot_path TEXT NOT NULL, snapshot_digest TEXT NOT NULL, data_parent TEXT NOT NULL, data_dev INTEGER NOT NULL, data_ino INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('ready','consumed','recovery_required')))")
+            if db.execute('SELECT 1 FROM initial_adoptions LIMIT 1').fetchone(): raise AdoptionError('Existing adoption requires recovery')
+            db.execute("INSERT INTO initial_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'ready')",(operation,*binding,policy_path,accepted,active_env,snapshot_path,digest,parent,*identity))
+            db.execute('COMMIT')
+        except BaseException:
+            if db.in_transaction:db.execute('ROLLBACK')
+            raise
+        return identity
+    finally:
+        if lock is not None:os.close(lock)
+        os.close(directory)
+
+
+def verify(journal, operation, active_env, backup, node_fd, supervisor, daemon, coordinator, restore, quiescence, *, install_lock):
+    """Recheck an existing proof while the caller holds its installation fence."""
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated:raise AdoptionError('Isolated Linux root is required')
+    policy_path,accepted,approved,binding=_binding(journal,operation,active_env,supervisor,daemon)
+    directory=supervisor._trusted_directory(approved.install_dir,0o700)
+    try:
+        expected=supervisor._open_root_file(directory,'install.lock',0o600)
+        try:
+            held=os.fstat(install_lock);named=os.fstat(expected)
+            if (held.st_dev,held.st_ino)!=(named.st_dev,named.st_ino):raise AdoptionError('Installation lock does not match')
+            supervisor._assert_exclusive_flock(install_lock)
+        finally:os.close(expected)
+    finally:os.close(directory)
+    try:
+        row=journal.db.execute("SELECT preparation_id,attempt_id,attempt_nonce,root_digest,config_digest,policy_path,accepted_env,active_env,snapshot_path,snapshot_digest,data_parent,data_dev,data_ino,state FROM initial_adoptions WHERE operation_id=?",(operation,)).fetchone()
+    except Exception as error:raise AdoptionError('Adoption evidence is unavailable') from error
+    if not row or row[:8] != (*binding,policy_path,accepted,active_env) or row[-1]!='ready':raise AdoptionError('Adoption evidence does not match')
+    snapshot_path,digest,parent,dev,ino=row[8:13]
+    _check_paths(snapshot_path,digest,parent,operation,approved)
+    _quiet(quiescence,approved.data_dir)
+    identity=restore.verify_staged(snapshot_path,digest,parent,operation,backup,node_fd,supervisor,coordinator)
+    if identity!=(dev,ino) or _binding(journal,operation,active_env,supervisor,daemon)!=(policy_path,accepted,approved,binding):raise AdoptionError('Migration evidence changed')
+    _quiet(quiescence,approved.data_dir)
+    current=journal.db.execute("SELECT preparation_id,attempt_id,attempt_nonce,root_digest,config_digest,policy_path,accepted_env,active_env,snapshot_path,snapshot_digest,data_parent,data_dev,data_ino,state FROM initial_adoptions WHERE operation_id=?",(operation,)).fetchone()
+    if current!=row:raise AdoptionError('Migration evidence changed')
+    return identity

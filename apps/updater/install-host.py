@@ -13,7 +13,7 @@ import stat
 import sys
 
 MODULES = (
-    'backup.py','bootstrap-handoff.py','bootstrap-initial.py','bootstrap-policy.py','bootstrap-release.py',
+    'adoption-proof.py','backup.py','bootstrap-handoff.py','bootstrap-initial.py','bootstrap-policy.py','bootstrap-release.py',
     'discover-release.py','extract-install.py','guarded-verifier.py','initial-generation.py',
     'install-gh.py','install-host.py','preflight.py','prepare-verified.py','preparation-fence.py',
     'provision-verifier-group.py','provision-socket.py','provision-host.py','quiescence.py',

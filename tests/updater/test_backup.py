@@ -1,6 +1,7 @@
 import importlib.util
 import errno
 import hashlib
+import fcntl
 from contextlib import closing
 import io
 import json
@@ -14,6 +15,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -278,12 +280,34 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         supervisor=load('restore_real_supervisor','supervisor.py')
         coordinator=load('restore_real_coordinator','update-coordinator.py')
         restore=load('restore_real_snapshot','restore-snapshot.py')
+        adoption=load('restore_real_adoption','adoption-proof.py')
+        runtime=load('restore_real_runtime','runtime-policy.py')
+        updater=load('restore_real_updater','servus-updater.py')
         with tempfile.TemporaryDirectory(dir='/root') as protected:
             parent=pathlib.Path(protected)/'migration';parent.mkdir(mode=0o711)
             snapshot=pathlib.Path(protected)/'snapshot';shutil.copytree(self.dst,snapshot)
             manifest=(snapshot/'manifest.json').read_bytes()
-            destination=restore.stage(str(snapshot),'sha256:'+hashlib.sha256(manifest).hexdigest(),str(parent),UUID,
+            digest='sha256:'+hashlib.sha256(manifest).hexdigest()
+            destination=restore.stage(str(snapshot),digest,str(parent),UUID,
                                       backup,self.node_fd,supervisor,coordinator)
+            install=pathlib.Path(protected)/'install';install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
+            state=pathlib.Path(protected)/'state';state.mkdir(mode=0o700);journal=updater.Journal(state)
+            attempt='12345678-1234-4123-8123-123456789abd';prep='12345678-1234-4123-8123-123456789abe'
+            image='sha256:'+'a'*64;config='sha256:'+'b'*64;nonce='c'*64
+            active=str(pathlib.Path(protected)/'active.env');policy_path=str(pathlib.Path(protected)/'policy');accepted=str(pathlib.Path(protected)/'accepted.env')
+            journal.db.execute('CREATE TABLE policy_approvals(operation_id TEXT,attempt_id TEXT,attempt_nonce TEXT,preparation_id TEXT,root_digest TEXT,image_config_digest TEXT,policy_path TEXT,accepted_env_path TEXT,source_env_path TEXT,state TEXT)')
+            journal.db.execute('INSERT INTO operations(id,commit_sha,digest,tag,status,attempt_id,attempt_nonce,config_digest) VALUES(?,?,?,?,?,?,?,?)',(UUID,'d'*40,image,'v1.0.0','verified',attempt,nonce,config))
+            journal.db.execute('INSERT INTO preparations(operation_id,attempt_id,attempt_nonce,preparation_id,status) VALUES(?,?,?,?,?)',(UUID,attempt,nonce,prep,'prepared'))
+            journal.db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?,?,?,?,?,?,?)',(UUID,attempt,nonce,prep,image,config,policy_path,accepted,active,'active'))
+            approved=SimpleNamespace(install_dir=str(install),data_dir=destination,image_reference='ghcr.io/raxon/servus@'+image)
+            daemon=SimpleNamespace(resolve_active_policy=lambda *_:(policy_path,accepted,approved))
+            quiet=SimpleNamespace(ensure_host_namespaces=lambda:None,ensure_no_uid_writers=lambda _:None,ensure_no_open_data=lambda _:None)
+            lock=os.open(install/'install.lock',os.O_RDONLY);fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            try:
+                with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace):
+                    identity=adoption.record(journal,UUID,active,str(snapshot),digest,str(parent),backup,self.node_fd,supervisor,daemon,runtime,coordinator,restore,quiet,inherited_lock=lock)
+                    self.assertEqual(adoption.verify(journal,UUID,active,backup,self.node_fd,supervisor,daemon,coordinator,restore,quiet,install_lock=lock),identity)
+            finally:os.close(lock);journal.close()
             script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==5||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
             subprocess.run([NODE,'--input-type=module','-e',script,destination,self.ref],check=True,timeout=20)
             self.assertEqual(self.panel.execute('PRAGMA user_version').fetchone(),(4,))
