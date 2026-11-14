@@ -10,6 +10,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('reconcile_policy', ROOT / 'apps/updater/reconcile-policy-journal.py')
 recovery = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(recovery)
+fence_spec = importlib.util.spec_from_file_location('policy_fence', ROOT / 'apps/updater/reconcile-policy-fence.py')
+fence = importlib.util.module_from_spec(fence_spec)
+fence_spec.loader.exec_module(fence)
 OP = '12345678-1234-4123-8123-123456789abc'
 PREP = '12345678-1234-4123-8123-123456789abd'
 ATTEMPT = '12345678-1234-4123-8123-123456789abe'
@@ -141,6 +144,29 @@ class ReconciliationTest(unittest.TestCase):
                 os.close(policy_fd); os.close(recovery_fd)
             self.assertEqual(list(recovery_dir.iterdir()), [])
             self.assertEqual(self.db.execute('SELECT status FROM preparations').fetchone(), ('recovery_required',))
+
+    @unittest.skipUnless(os.geteuid() == 0 and pathlib.Path('/proc/self/fd').exists(), 'Requires a Linux root fixture')
+    def test_fenced_recovery_archives_and_requeues(self):
+        self.db.execute('ALTER TABLE extraction_probes ADD COLUMN name TEXT')
+        self.db.execute('UPDATE extraction_probes SET name=?', ('servus-extract-' + 'e' * 32,))
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name in ('state', 'install', 'policy', 'recovery'):
+                (root / name).mkdir(mode=0o700)
+            (root / 'state' / 'maintenance').mkdir(mode=0o700)
+            for path in (root / 'state' / 'service.lock', root / 'install' / 'install.lock'):
+                path.touch(mode=0o600)
+            for name in ('candidate-env-' + PREP + '.env', 'env-' + PREP + '.env', 'candidate-' + PREP + '.json'):
+                path = root / 'policy' / name; path.write_text('private'); path.chmod(0o600)
+            fds = [os.open(root / name, os.O_RDONLY | os.O_DIRECTORY) for name in ('state', 'install', 'policy', 'recovery')]
+            try:
+                inactive = 'LoadState=loaded\nActiveState=inactive\nControlGroup=\n'
+                fence.fenced_reconcile(self.db, OP, *fds, recovery,
+                                       execute=lambda command: inactive if command[0].endswith('systemctl') else '')
+            finally:
+                for fd in fds: os.close(fd)
+            self.assertEqual(self.db.execute('SELECT state FROM apply_requests').fetchone(), ('requested',))
+            self.assertTrue((root / 'recovery' / ('policy-recovery-' + PREP) / 'journal.sqlite').exists())
 
 
 if __name__ == '__main__':
