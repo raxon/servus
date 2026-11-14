@@ -50,3 +50,27 @@ jobs:
         run: node --test tests/lifecycle-gate/gate.test.mjs
       - name: Build workspace
         run: npm run build
+      - name: Test control-plane capture and restore
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d)
+          image="servus-backup-ci:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 8)"
+          cleanup() {
+            docker image rm "$image" >/dev/null 2>&1 || true
+            rm -rf -- "$scratch"
+          }
+          trap cleanup EXIT
+          mkdir -p "$scratch/apps/panel" "$scratch/apps/website" "$scratch/apps/updater" "$scratch/tests/updater"
+          cp package.json package-lock.json "$scratch/"
+          cp apps/panel/package.json "$scratch/apps/panel/"
+          cp apps/website/package.json "$scratch/apps/website/"
+          cp -R apps/panel/dist "$scratch/panel-dist"
+          cp apps/updater/backup.py "$scratch/apps/updater/"
+          cp tests/updater/test_backup.py "$scratch/tests/updater/"
+          docker build --file tests/backup-ci/Dockerfile --tag "$image" "$scratch"
+          docker run --rm --user 0:0 --network none --read-only --memory 1200m --pids-limit 256 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --tmpfs /run:rw,nosuid,nodev,size=16m \
+            --tmpfs /root:rw,nosuid,nodev,size=16m \
+            --entrypoint python3 "$image" -I -B -c \
+            'import sys,unittest; suite=unittest.defaultTestLoader.discover("tests/updater",pattern="test_backup.py"); result=unittest.TextTestRunner(verbosity=2).run(suite); sys.exit(0 if result.wasSuccessful() and result.testsRun > 1 and not result.skipped else 1)'
