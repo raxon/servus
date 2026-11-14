@@ -225,10 +225,15 @@ def main():
                 quiet,docker,backup,coordinator,restore,recovery,fence,install_lock=lock)
             if journal.db.execute('SELECT phase FROM legacy_transitions').fetchone()!=('recovery_required',):
                 raise RuntimeError('Interrupted migration was not preserved')
-            work=state/'rollback-work';work.mkdir(mode=0o700)
-            transition.rollback_before_start(journal,op,active,str(parent),str(work),node_fd,supervisor,daemon,adoption,runtime,
-                quiet,docker,backup,coordinator,restore,recovery,fence,install_lock=lock,service=handoff_module.systemctl)
+            os.close(lock);lock=None
+            rejected=subprocess.run(['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-rollback.py','--operation',str(uuid.uuid4())],
+                                    stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+            if rejected.returncode==0 or list(state.glob('legacy-rollback-*')):raise RuntimeError('Unknown recovery operation was accepted')
+            run('/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-rollback.py','--operation',op,timeout=300)
             if journal.db.execute('SELECT phase FROM legacy_rollbacks').fetchone()!=('healthy',):raise RuntimeError('Rollback did not finish')
+            repeated=subprocess.run(['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-rollback.py','--operation',op],
+                                    stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+            if repeated.returncode==0:raise RuntimeError('Completed recovery was replayed')
             if request('/health').get('version')!='0.1.5':raise RuntimeError('Legacy API was not restored')
             cookie='';csrf='';request('/auth/login','POST',{'email':'fixture@example.test','password':'isolated-fixture-password'})
             if not any(item.get('id')==project for item in request('/projects')):raise RuntimeError('Legacy project was not retained')
