@@ -35,3 +35,4 @@
 100644 deployment/systemd/servus-updater-bootstrap.service
 100644 deployment/systemd/servus-updater-socket.service
 100755 scripts/install.sh
+100644 scripts/signed-bootstrap.sh
