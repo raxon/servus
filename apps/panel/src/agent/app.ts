@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { agentConfig } from './config.js';
 import { DockerRuntime, message, isUncertainRuntimeError, type RecoveryContext } from './runtime.js';
 import type { Service } from '../shared/types.js';
-import type { AgentMaintenanceGate } from './maintenance.js';
+import { consoleExecStopped, type AgentMaintenanceGate } from './maintenance.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -92,21 +92,23 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
   }}, (socket,req)=>{
     const release=maintenance?.admit();
     if(maintenance&&!release){socket.close(1012,'Agent is draining');return;}
-    let closed=false, exec: Docker.Exec|undefined, stream:Duplex|undefined;
+    let closed=false, started=false, startUncertain=false, containerId='', exec: Docker.Exec|undefined, stream:Duplex|undefined;
     let endSession: () => void = () => {};
     const sessionEnd = new Promise<void>(resolve => { endSession = resolve; });
     const unregister = maintenance?.registerCloser(()=>socket.close(1012,'Agent is draining'));
     const idle=setTimeout(()=>socket.close(1000,'Console expired'),15*60000);idle.unref();
     const ready=runtime.consoleContainer!(req.params.id,req.query.containerId).then(async container=>{
       if(closed)return;
-      // Docker stream closure does not establish that its exec process has exited.
-      maintenance?.markUncertain();
+      containerId=container.id;
       exec=await container.exec({Cmd:[req.query.shell||'/bin/sh'],Tty:true,AttachStdin:true,AttachStdout:true,AttachStderr:true});
+      if(closed)return;
+      startUncertain=true;
       stream=await exec.start({hijack:true,stdin:true,Tty:true});
+      started=true;startUncertain=false;
       if(closed){stream.destroy();return;}
       stream.on('data',chunk=>{if(socket.readyState===1)socket.send(chunk,{binary:true});});
       stream.on('end',()=>socket.close(1000,'Shell exited'));stream.on('error',()=>socket.close(1011,'Shell disconnected'));
-    }).catch(()=>socket.close(1011,'Unable to start shell'));
+    }).catch(()=>{if(startUncertain)maintenance?.markUncertain();socket.close(1011,'Unable to start shell');});
     socket.on('message',(data,isBinary)=>{
       if(isBinary||data.toString().length>65536){socket.close(1008,'Invalid console packet');return;}
       let packet:{type?:string;data?:string;cols?:number;rows?:number};
@@ -119,7 +121,9 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     });
     socket.on('close',()=>{closed=true;clearTimeout(idle);if(stream&&!stream.destroyed){stream.write('\u0003exit\n');stream.end();setTimeout(()=>stream?.destroy(),250).unref();}endSession();});
     socket.on('error',()=>{closed=true;clearTimeout(idle);stream?.destroy();endSession();});
-    void Promise.allSettled([ready,sessionEnd]).then(()=>{unregister?.();release?.();});
+    void Promise.allSettled([ready,sessionEnd]).then(async()=>{
+      if(maintenance&&started&&(!exec||!await consoleExecStopped(exec,containerId)))maintenance.markUncertain();
+    }).catch(()=>maintenance?.markUncertain()).finally(()=>{unregister?.();release?.();});
   });
   app.get<{Params:{id:string}}>('/operations/:id', (req, reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success) return reply.code(400).send({ error: { code: 'INVALID_ID', message: 'Invalid operation identity.' } });

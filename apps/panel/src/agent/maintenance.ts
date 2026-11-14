@@ -1,4 +1,27 @@
+import type Docker from 'dockerode';
+
 export type AgentDrainResult = { status: 'drained' | 'uncertain' | 'timeout' };
+
+/** Confirm a successfully started exec has exited; a failed inspection remains uncertain. */
+export async function consoleExecStopped(exec: Docker.Exec, containerId: string, timeoutMs = 3000): Promise<boolean> {
+  if (!/^[a-f0-9]{64}$/.test(exec.id) || !/^[a-f0-9]{12,64}$/.test(containerId)) return false;
+  const deadline=performance.now()+timeoutMs;
+  while(performance.now()<deadline) {
+    const controller=new AbortController();
+    const remaining=Math.max(1,Math.min(1000,deadline-performance.now()));
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    try {
+      const timeout=new Promise<never>((_,reject)=>{timer=setTimeout(()=>{controller.abort();reject(new Error('Inspection timed out'));},remaining);});
+      const info=await Promise.race([exec.inspect({abortSignal:controller.signal}),timeout]);
+      if(info.ID!==exec.id || !/^[a-f0-9]{64}$/.test(info.ContainerID) || !info.ContainerID.startsWith(containerId) || typeof info.Running!=='boolean') return false;
+      if(!info.Running) return Number.isSafeInteger(info.Pid) && info.Pid>0 && Number.isInteger(info.ExitCode);
+    } catch {return false;}
+    finally {if(timer)clearTimeout(timer);controller.abort();}
+    const wait=Math.min(100,Math.max(0,deadline-performance.now()));
+    if(wait)await new Promise(resolve=>setTimeout(resolve,wait));
+  }
+  return false;
+}
 
 // This barrier covers one agent process only. A coordinator must exclude other writers.
 export class AgentMaintenanceGate {

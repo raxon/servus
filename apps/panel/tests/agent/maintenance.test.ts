@@ -7,7 +7,7 @@ import { PassThrough } from 'node:stream';
 import Database from 'better-sqlite3';
 import WebSocket from 'ws';
 import { createAgent } from '../../src/agent/app.js';
-import { AgentMaintenanceGate } from '../../src/agent/maintenance.js';
+import { AgentMaintenanceGate, consoleExecStopped } from '../../src/agent/maintenance.js';
 
 const cleanup: (() => Promise<void> | void)[] = [];
 afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn(); });
@@ -82,6 +82,54 @@ describe('agent maintenance barrier', () => {
     const socket=new WebSocket(`${address.replace('http:','ws:')}/services/${randomUUID()}/console`,{headers});
     cleanup.push(()=>socket.terminate());
     await started.promise;
+    expect(await gate.drain(1000)).toEqual({status:'uncertain'});
+  });
+  it('permits maintenance after Docker confirms the closed console process exited', async () => {
+    const config=fixture(),gate=new AgentMaintenanceGate(),started=deferred<void>();
+    const stream=new PassThrough(),id='a'.repeat(64),containerId='b'.repeat(64),inspect=vi.fn(async()=>({ID:id,ContainerID:containerId,Running:false,Pid:123,ExitCode:0}));
+    const consoleContainer=vi.fn(async()=>({id:containerId,exec:async()=>({id,inspect,start:async()=>{started.resolve();return stream;}})}));
+    const app=await createAgent(config,{...runtime(async()=>outcome),consoleContainer} as any,gate);cleanup.push(()=>app.close());
+    const address=await app.listen({host:'127.0.0.1',port:0});
+    const socket=new WebSocket(`${address.replace('http:','ws:')}/services/${randomUUID()}/console`,{headers});
+    socket.on('error',()=>{});cleanup.push(()=>socket.terminate());
+    await started.promise;const closed=new Promise<void>(resolve=>socket.once('close',()=>resolve()));socket.close();await closed;
+    expect(await gate.drain(1000)).toEqual({status:'drained'});expect(inspect).toHaveBeenCalled();
+  });
+  it('keeps ambiguous Docker exec states uncertain',async()=>{
+    const id='a'.repeat(64),containerId='b'.repeat(64),base={ID:id,ContainerID:containerId,Running:false,Pid:123,ExitCode:0};
+    for(const state of [{...base,ID:'c'.repeat(64)},{...base,ContainerID:'c'.repeat(64)},{...base,Pid:0},{...base,ExitCode:null},{...base,Running:true}]) {
+      const exec={id,inspect:vi.fn(async()=>state)};
+      expect(await consoleExecStopped(exec as any,containerId,25)).toBe(false);
+    }
+    expect(await consoleExecStopped({id,inspect:async()=>{throw new Error('Docker unavailable');}} as any,containerId,25)).toBe(false);
+    expect(await consoleExecStopped({id,inspect:()=>new Promise(()=>{})} as any,containerId,25)).toBe(false);
+  });
+  it('waits for the exact Docker exec to finish before allowing maintenance',async()=>{
+    const id='a'.repeat(64),containerId='b'.repeat(64);let calls=0;
+    const exec={id,inspect:vi.fn(async()=>({ID:id,ContainerID:containerId,Running:++calls===1,Pid:123,ExitCode:calls===1?null:0}))};
+    expect(await consoleExecStopped(exec as any,containerId,1000)).toBe(true);
+    expect(calls).toBe(2);
+  });
+  it('does not start an exec after its console has already closed',async()=>{
+    const config=fixture(),gate=new AgentMaintenanceGate(),entered=deferred<void>(),created=deferred<any>();
+    const start=vi.fn(),consoleContainer=vi.fn(async()=>({id:'b'.repeat(64),exec:async()=>{entered.resolve();return created.promise;}}));
+    const app=await createAgent(config,{...runtime(async()=>outcome),consoleContainer} as any,gate);cleanup.push(()=>app.close());
+    const address=await app.listen({host:'127.0.0.1',port:0});
+    const socket=new WebSocket(`${address.replace('http:','ws:')}/services/${randomUUID()}/console`,{headers});
+    socket.on('error',()=>{});cleanup.push(()=>socket.terminate());await entered.promise;
+    const closed=new Promise<void>(resolve=>socket.once('close',()=>resolve()));socket.close();await closed;
+    await new Promise(resolve=>setTimeout(resolve,30));
+    created.resolve({id:'a'.repeat(64),start});
+    expect(await gate.drain(1000)).toEqual({status:'drained'});expect(start).not.toHaveBeenCalled();
+  });
+  it('keeps an uncertain Docker start failure blocked',async()=>{
+    const config=fixture(),gate=new AgentMaintenanceGate();
+    const consoleContainer=vi.fn(async()=>({id:'b'.repeat(64),exec:async()=>({id:'a'.repeat(64),start:async()=>{throw new Error('Docker connection lost');}})}));
+    const app=await createAgent(config,{...runtime(async()=>outcome),consoleContainer} as any,gate);cleanup.push(()=>app.close());
+    const address=await app.listen({host:'127.0.0.1',port:0});
+    const socket=new WebSocket(`${address.replace('http:','ws:')}/services/${randomUUID()}/console`,{headers});
+    socket.on('error',()=>{});cleanup.push(()=>socket.terminate());
+    await new Promise<void>(resolve=>socket.once('close',()=>resolve()));
     expect(await gate.drain(1000)).toEqual({status:'uncertain'});
   });
   it('rejects a console whose asynchronous validation races with drain', async () => {

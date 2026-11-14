@@ -29,6 +29,8 @@ jobs:
         run: npm run typecheck
       - name: Test panel
         run: npm run test:panel
+      - name: Test console drain with Docker
+        run: node --import tsx tests/integration/console-exec.mjs
       - name: Test installer
         run: npm run test:installer
       - name: Test signed installer handoff
