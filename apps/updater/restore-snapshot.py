@@ -17,6 +17,69 @@ class RestoreError(Exception):
     pass
 
 
+def verify_staged(snapshot, digest, parent_path, operation, backup, node_fd, supervisor, coordinator):
+    """Check staged data against its verified snapshot without authorizing a start.
+
+    The caller must maintain writer exclusion throughout this check and the
+    later handoff. A successful comparison cannot establish writer exclusion.
+    """
+    if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or not supervisor._uuid4(operation):
+        raise RestoreError('An isolated Linux root coordinator is required')
+    coordinator.verify_snapshot(snapshot, digest, backup, node_fd, supervisor)
+    source = supervisor._trusted_directory(snapshot, 0o700)
+    parent = target = None
+    try:
+        src_info = os.fstat(source)
+        manifest_fd, _ = backup._file(source, 'manifest.json', 0, src_info.st_dev)
+        try: raw = backup._read(manifest_fd)
+        finally: os.close(manifest_fd)
+        if 'sha256:' + hashlib.sha256(raw).hexdigest() != digest: raise RestoreError('Snapshot manifest changed')
+        try: files = json.loads(raw, object_pairs_hook=coordinator._pairs)['files']
+        except (ValueError, KeyError, TypeError) as error: raise RestoreError('Invalid snapshot manifest') from error
+        parent = supervisor._trusted_directory(parent_path, 0o711)
+        if os.fstat(parent).st_gid != 0: raise RestoreError('Unsafe migration parent')
+        name = 'restore-' + operation
+        target = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        info = os.fstat(target); named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if ((info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode)) != (1000,1000,0o700) or
+            (info.st_dev,info.st_ino) != (named.st_dev,named.st_ino)):
+            raise RestoreError('Unsafe staged data')
+        expected = {'panel.sqlite','agent.sqlite','secret-key','agent-token','secrets','database-roots'}
+        if set(os.listdir(target)) != expected: raise RestoreError('Unexpected staged data')
+        for folder in ('secrets','database-roots'):
+            child = backup._child_dir(target,folder,1000,info.st_dev)
+            try:
+                if os.fstat(child).st_gid != 1000 or set(os.listdir(child)) != {key.split('/')[1] for key in files if key.startswith(folder+'/')}:
+                    raise RestoreError('Staged inventory differs')
+            finally: os.close(child)
+        for relative, expected_hash in files.items():
+            parts=relative.split('/'); child=None
+            try:
+                if len(parts)==2: child=backup._child_dir(target,parts[0],1000,info.st_dev)
+                fd,before=backup._file(child if child is not None else target,parts[-1],1000,info.st_dev,
+                                       backup.MAX_DATABASE if relative.endswith('.sqlite') else backup.MAX_FILE)
+                try:
+                    if before.st_gid != 1000: raise RestoreError('Unsafe staged file')
+                    hasher=hashlib.sha256()
+                    while chunk:=os.read(fd,65536): hasher.update(chunk)
+                    after=os.fstat(fd)
+                    named_file=os.stat(parts[-1],dir_fd=child if child is not None else target,follow_symlinks=False)
+                    if ((before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) !=
+                        (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns) or
+                        (before.st_dev,before.st_ino)!=(named_file.st_dev,named_file.st_ino) or
+                        hasher.hexdigest()!=expected_hash): raise RestoreError('Staged file changed')
+                finally: os.close(fd)
+            finally:
+                if child is not None: os.close(child)
+        current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+        if (info.st_dev,info.st_ino)!=(current.st_dev,current.st_ino): raise RestoreError('Staged directory changed')
+        coordinator.verify_snapshot(snapshot,digest,backup,node_fd,supervisor)
+        return (info.st_dev,info.st_ino)
+    finally:
+        for fd in (target,parent,source):
+            if fd is not None: os.close(fd)
+
+
 def stage(snapshot, digest, parent_path, operation, backup, node_fd, supervisor, coordinator):
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
         raise RestoreError('An isolated Linux root coordinator is required')
@@ -105,6 +168,7 @@ def stage(snapshot, digest, parent_path, operation, backup, node_fd, supervisor,
             finally: os.close(fd)
         os.unlink('manifest.json', dir_fd=target)
         os.fchown(target, 1000, 1000); os.fsync(target); os.fsync(parent)
+        verify_staged(snapshot,digest,parent_path,operation,backup,node_fd,supervisor,coordinator)
         return destination
     finally:
         for fd in (target, parent, source):

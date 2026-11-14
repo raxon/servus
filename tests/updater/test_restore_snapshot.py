@@ -66,6 +66,11 @@ class RestoreSnapshotTest(unittest.TestCase):
             return Path(restore.stage(str(self.source), self.digest, str(self.parent), self.operation,
                                       backup, -1, supervisor, coordinator))
 
+    def verify_stage(self):
+        with mock.patch.object(backup, '_validate_staging'):
+            return restore.verify_staged(str(self.source), self.digest, str(self.parent), self.operation,
+                                         backup, -1, supervisor, coordinator)
+
     def test_restores_exact_inventory_under_root_owned_traversable_parent(self):
         target = self.run_stage()
         self.assertEqual(stat.S_IMODE(self.parent.stat().st_mode), 0o711)
@@ -78,6 +83,25 @@ class RestoreSnapshotTest(unittest.TestCase):
             self.assertEqual((path.stat().st_uid, path.stat().st_gid, stat.S_IMODE(path.stat().st_mode)), (1000, 1000, 0o600))
         supervisor._verify_data_directory(str(target))
         self.assertEqual((self.source / 'secrets' / self.secret).read_bytes(), b'encrypted fixture')
+        self.assertEqual(self.verify_stage(),(target.stat().st_dev,target.stat().st_ino))
+
+    def test_changed_staged_file_and_unexpected_inventory_are_rejected(self):
+        target=self.run_stage()
+        (target/'agent-token').write_bytes(b'changed')
+        with self.assertRaises(restore.RestoreError): self.verify_stage()
+        (target/'agent-token').write_bytes(b'a'*64)
+        (target/'extra').touch()
+        with self.assertRaises(restore.RestoreError): self.verify_stage()
+        (target/'extra').unlink()
+        secret=target/'secrets'/self.secret;secret.unlink();secret.symlink_to('/etc/passwd')
+        with self.assertRaises(OSError): self.verify_stage()
+
+    def test_changed_ownership_or_mode_is_rejected(self):
+        target=self.run_stage();token=target/'agent-token'
+        token.chmod(0o644)
+        with self.assertRaises(backup.CaptureError): self.verify_stage()
+        token.chmod(0o600);os.chown(token,1000,0)
+        with self.assertRaises(restore.RestoreError): self.verify_stage()
 
     def test_corrupted_snapshot_is_rejected_before_destination_exists(self):
         (self.source / 'agent-token').write_bytes(b'changed')
