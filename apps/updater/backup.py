@@ -18,6 +18,7 @@ import base64
 import binascii
 import ctypes
 import hashlib
+from contextlib import closing
 import grp
 import json
 import os
@@ -391,6 +392,13 @@ def _config_references(config, refs, service_id, owners, purposes=None, git_requ
             refs.add(reference)
 
 def _validate_staging(dest_fd,node_fd):
+    # Captures are serialized standalone databases, never live WAL databases.
+    # A sidecar must not be silently ignored by immutable SQLite reads.
+    for name in ('panel.sqlite', 'agent.sqlite'):
+        for suffix in ('-wal', '-shm', '-journal'):
+            try: os.stat(name+suffix,dir_fd=dest_fd,follow_symlinks=False)
+            except FileNotFoundError: continue
+            raise CaptureError('Unexpected snapshot database sidecar')
     data={}
     for name in ('secret-key','agent-token'):
         fd,_=_file(dest_fd,name,0,os.fstat(dest_fd).st_dev)
@@ -398,7 +406,7 @@ def _validate_staging(dest_fd,node_fd):
         finally: os.close(fd)
         if not re.fullmatch(r'[a-f0-9]{64}',data[name]): raise CaptureError('Installation key or token is invalid')
     encrypted=[]; refs=set(); mariadb=set(); git_requirements={}; dev=os.fstat(dest_fd).st_dev
-    with sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/panel.sqlite?mode=ro',uri=True) as db:
+    with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/panel.sqlite?mode=ro&immutable=1',uri=True)) as db:
         version=db.execute('PRAGMA user_version').fetchone()[0]
         if version==4: _schema(db,PANEL_SCHEMA,4)
         elif version==5: _schema(db,{**PANEL_SCHEMA,'service_secret_refs':PANEL_SCHEMA['service_secret_refs']|{'purpose'}},5)
@@ -423,7 +431,7 @@ def _validate_staging(dest_fd,node_fd):
             for col in cols:
                 for (value,) in db.execute(f'SELECT {col} FROM {table} WHERE {col} IS NOT NULL'):
                     encrypted.append(_sealed(value,table=='central_pairings' and col=='redeemed_credentials'))
-    with sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/agent.sqlite?mode=ro',uri=True) as db:
+    with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/agent.sqlite?mode=ro&immutable=1',uri=True)) as db:
         _schema(db,AGENT_SCHEMA,0)
         if db.execute("SELECT 1 FROM operations WHERE state != 'succeeded' OR state IS NULL LIMIT 1").fetchone(): raise CaptureError('Unresolved agent operations require recovery')
         for (response,) in db.execute('SELECT response FROM operations'):

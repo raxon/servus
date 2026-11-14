@@ -1,4 +1,6 @@
 import importlib.util
+import errno
+from contextlib import closing
 import io
 import json
 import os
@@ -134,6 +136,38 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
 
     def capture(self,reader_gid=65534): return backup._capture_quiescent(self.source_fd,self.destination_fd,self.node_fd,source_uid=1000,reader_gid=reader_gid)
 
+    def test_standalone_v5_capture_has_no_sidecars_and_restores(self):
+        self.panel.close(); self.agent.close()
+        self.capture()
+        self.assertFalse(any(p.name.endswith(('-wal', '-shm', '-journal')) for p in self.dst.iterdir()))
+        backup._validate_staging(self.destination_fd, self.node_fd)
+        with closing(sqlite3.connect(f'file:{self.dst}/panel.sqlite?mode=ro&immutable=1',uri=True)) as db:
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],5)
+            self.assertEqual(db.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
+            self.assertEqual(db.execute('SELECT description FROM projects WHERE id=?',(UUID,)).fetchone(),('committed-wal',))
+        restored=self.root/'restored-v5'; shutil.copytree(self.dst,restored)
+        script="import {Store} from '/app/dist/server/store.js';import {createAgent} from '/app/dist/agent/app.js';const d=process.argv[1],s=new Store(d);if(s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close();const a=await createAgent({dataDir:d,token:'42'.repeat(32),socketPath:d+'/agent.sock',dockerSocket:'/none',ingressPort:18080,ingressImage:'unused'},{});await a.ready();await a.close();"
+        subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
+        (self.dst/'panel.sqlite-wal').touch(mode=0o600)
+        with self.assertRaisesRegex(backup.CaptureError,'sidecar'):
+            backup._validate_staging(self.destination_fd,self.node_fd)
+
+    def test_standalone_v4_capture_has_no_sidecars_and_restores(self):
+        self.panel.execute('ALTER TABLE service_secret_refs DROP COLUMN purpose')
+        self.panel.execute('PRAGMA user_version=4'); self.panel.commit()
+        self.panel.close(); self.agent.close()
+        self.fix_permissions()
+        self.capture()
+        self.assertFalse(any(p.name.endswith(('-wal', '-shm', '-journal')) for p in self.dst.iterdir()))
+        backup._validate_staging(self.destination_fd, self.node_fd)
+        with closing(sqlite3.connect(f'file:{self.dst}/panel.sqlite?mode=ro&immutable=1',uri=True)) as db:
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],4)
+            self.assertEqual(db.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
+            self.assertEqual(db.execute('SELECT description FROM projects WHERE id=?',(UUID,)).fetchone(),('committed-wal',))
+        restored=self.root/'restored-v4-standalone'; shutil.copytree(self.dst,restored)
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==5||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+        subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
+
     def test_capture_rejects_private_cgroup_before_fork_or_copy(self):
         with mock.patch.object(backup,'_visible_cgroup_v2',return_value=('/sys/fs/cgroup','',False)),mock.patch.object(backup.os,'fork') as fork:
             with self.assertRaisesRegex(backup.CaptureError,'Cannot verify complete cgroup ancestry'): self.capture()
@@ -267,6 +301,12 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
 
     def test_symlink_is_refused(self):
         p=self.src/'secrets'/self.ref;p.unlink();p.symlink_to(self.src/'secret-key')
+        secret_dir=os.open(self.src/'secrets',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:
+            with self.assertRaises(OSError) as rejected:
+                backup._file(secret_dir,self.ref,1000,os.fstat(secret_dir).st_dev)
+            self.assertEqual(rejected.exception.errno,errno.ELOOP)
+        finally: os.close(secret_dir)
         with self.assertRaises(backup.CaptureError): self.capture()
         self.assertFalse((self.dst/'manifest.json').exists())
 
