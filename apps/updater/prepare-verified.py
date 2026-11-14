@@ -65,7 +65,9 @@ def prepare_verified(journal, operation_id, staging_parent, extractor, *, resolv
             if not isinstance(child, str) or not DIGEST.fullmatch(child) or child != selected_id:
                 raise PreparationError('Platform image identity rejected')
             verified_ids.add(child)
-        stage = extractor.extract(image_id, staging_parent, verified_platform_ids=tuple(sorted(verified_ids - {image_id})))
+        probe_name = journal.record_extraction_probe(operation, 'prepare')
+        stage = extractor.extract(image_id, staging_parent, verified_platform_ids=tuple(sorted(verified_ids - {image_id})), probe_name=probe_name)
+        journal.complete_extraction_probe(operation, probe_name)
         journal.finish_preparation(operation, stage)
         return stage
     except BaseException:

@@ -187,6 +187,20 @@ class ExtractTest(unittest.TestCase):
         os.chmod(self.parent, 0o777)
         with self.assertRaises(extractor.ExtractionError): extractor.extract(self.image, self.parent)
 
+    def test_named_probe_is_labeled_and_verified_before_copy(self):
+        name = 'servus-extract-' + 'e'*32
+        def named(*args, **kwargs):
+            if args[0] == 'inspect' and '{{json .}}' in args:
+                return json.dumps({'Name':'/' + name,'Config':{'Labels':{'io.servus.updater.extraction':name}}}).encode()
+            return self.docker(*args, **kwargs)
+        with mock.patch.object(extractor, '_docker', side_effect=named):
+            result = extractor.extract(self.image, self.parent, probe_name=name)
+        created = next(item for item in self.commands if item[0] == 'create')
+        self.assertIn(name, created)
+        self.assertIn('io.servus.updater.extraction=' + name, created)
+        shutil.rmtree(result)
+        with self.assertRaises(extractor.ExtractionError): extractor.extract(self.image, self.parent, probe_name='not-a-probe')
+
     def test_rejects_untrusted_root_before_traversing_parent(self):
         actual_fstat = os.fstat
         for owner, mode in ((1000, 0o755), (0, 0o775), (0, 0o757)):

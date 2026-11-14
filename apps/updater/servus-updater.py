@@ -127,6 +127,8 @@ class Journal:
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON operations ((1)) WHERE status IN ('accepted','verifying','recovery_required')")
             self.db.execute("CREATE TABLE IF NOT EXISTS preparations (operation_id TEXT PRIMARY KEY REFERENCES operations(id), attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, preparation_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('preparing','prepared','recovery_required')), staging_path TEXT)")
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_preparation ON preparations ((1)) WHERE status IN ('preparing','prepared','recovery_required')")
+            self.db.execute("CREATE TABLE IF NOT EXISTS extraction_probes (name TEXT PRIMARY KEY, operation_id TEXT NOT NULL REFERENCES operations(id), attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, preparation_id TEXT NOT NULL, purpose TEXT NOT NULL CHECK(purpose IN ('prepare','policy')), status TEXT NOT NULL CHECK(status IN ('intent','removed')))")
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_extraction_probe ON extraction_probes ((1)) WHERE status='intent'")
             self.db.execute('PRAGMA user_version=5')
             self.db.execute('COMMIT')
         except BaseException:
@@ -174,8 +176,27 @@ class Journal:
         if staging_path is not None and (not isinstance(staging_path, str) or not staging_path.startswith('/') or os.path.normpath(staging_path) != staging_path or not re.fullmatch(r'servus-install-[a-f0-9]{32}', os.path.basename(staging_path))):
             raise ValueError('Invalid installation staging path')
         status = 'prepared' if staging_path is not None else 'recovery_required'
-        cursor = self.db.execute("UPDATE preparations SET status=?,staging_path=? WHERE operation_id=? AND status='preparing' AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND EXISTS (SELECT 1 FROM operations WHERE id=? AND status='verified' AND attempt_id=? AND attempt_nonce=? AND config_digest=?)", (status, staging_path, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['configDigest']))
+        cursor = self.db.execute("UPDATE preparations SET status=?,staging_path=? WHERE operation_id=? AND status='preparing' AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND EXISTS (SELECT 1 FROM operations WHERE id=? AND status='verified' AND attempt_id=? AND attempt_nonce=? AND config_digest=?) AND (? != 'prepared' OR (NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM extraction_probes WHERE operation_id=? AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND purpose='prepare' AND status='removed')))", (status, staging_path, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['configDigest'], status, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId']))
         if cursor.rowcount != 1: raise RuntimeError('Unexpected preparation state')
+
+    def record_extraction_probe(self, operation, purpose):
+        if purpose not in ('prepare', 'policy'):
+            raise ValueError('Invalid extraction purpose')
+        name = 'servus-extract-' + secrets.token_hex(16)
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            row = self.db.execute("SELECT 1 FROM preparations p JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=? AND p.attempt_id=? AND p.attempt_nonce=? AND p.preparation_id=? AND p.status='preparing' AND o.status='verified' AND o.attempt_id=p.attempt_id AND o.attempt_nonce=p.attempt_nonce AND o.config_digest=?", (operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], operation['configDigest'])).fetchone()
+            if row is None: raise RuntimeError('Unexpected extraction state')
+            self.db.execute("INSERT INTO extraction_probes VALUES (?,?,?,?,?,?,'intent')", (name, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], purpose))
+            self.db.execute('COMMIT')
+            return name
+        except BaseException:
+            if self.db.in_transaction: self.db.execute('ROLLBACK')
+            raise
+
+    def complete_extraction_probe(self, operation, name):
+        cursor = self.db.execute("UPDATE extraction_probes SET status='removed' WHERE name=? AND operation_id=? AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND status='intent' AND EXISTS (SELECT 1 FROM preparations WHERE operation_id=? AND status='preparing' AND preparation_id=?)", (name, operation['operationId'], operation['attemptId'], operation['attemptNonce'], operation['preparationId'], operation['operationId'], operation['preparationId']))
+        if cursor.rowcount != 1: raise RuntimeError('Unexpected extraction state')
 
     def pending_recoveries(self):
         rows = self.db.execute("SELECT id,attempt_id,attempt_nonce FROM operations WHERE status='recovery_required' AND attempt_id IS NOT NULL AND attempt_nonce IS NOT NULL").fetchall()

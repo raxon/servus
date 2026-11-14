@@ -22,6 +22,7 @@ DOCKER = '/usr/bin/docker'
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'DOCKER_HOST': 'unix:///var/run/docker.sock', 'LANG': 'C', 'DOCKER_CONFIG': '/dev/null'}
 IMAGE_ID = re.compile(r'^sha256:[0-9a-f]{64}$')
 CONTAINER_ID = re.compile(r'^[0-9a-f]{64}$')
+PROBE_NAME = re.compile(r'^servus-extract-[a-f0-9]{32}$')
 MAX_ARCHIVE = 16 * 1024 * 1024
 MAX_FILE = 4 * 1024 * 1024
 FILES = {
@@ -162,7 +163,7 @@ def _read_archive(payload):
     return files
 
 
-def extract(image_id, parent, *, verified_platform_ids=()):
+def extract(image_id, parent, *, verified_platform_ids=(), probe_name=None):
     """Create a private installation tree from a caller-verified image ID.
 
     Returns an absolute path. A failed cleanup or extraction publishes no tree.
@@ -175,6 +176,8 @@ def extract(image_id, parent, *, verified_platform_ids=()):
     if (not isinstance(verified_platform_ids, (tuple, list)) or len(verified_platform_ids) > 2 or
         any(not isinstance(item, str) or not IMAGE_ID.fullmatch(item) for item in verified_platform_ids)):
         raise ExtractionError('Verified platform identity is invalid')
+    if probe_name is not None and (not isinstance(probe_name, str) or not PROBE_NAME.fullmatch(probe_name)):
+        raise ExtractionError('Extraction probe identity is invalid')
     try:
         parent_fd = _trusted_parent(parent)
     except OSError as error:
@@ -190,7 +193,8 @@ def extract(image_id, parent, *, verified_platform_ids=()):
             selected.get('Os') != 'linux' or selected.get('Architecture') != 'amd64' or
             not isinstance(config, dict) or config.get('Volumes') not in (None, {})):
             raise ExtractionError('Image identity or configuration rejected')
-        created = _docker('create', '--pull=never', '--platform=linux/amd64', '--network=none', '--read-only', '--entrypoint=/bin/false', image_id)
+        name_options = ('--name', probe_name, '--label', 'io.servus.updater.extraction=' + probe_name) if probe_name else ()
+        created = _docker('create', '--pull=never', '--platform=linux/amd64', '--network=none', '--read-only', '--entrypoint=/bin/false', *name_options, image_id)
         container = created.decode('ascii').strip()
         if not CONTAINER_ID.fullmatch(container):
             container = None
@@ -198,6 +202,12 @@ def extract(image_id, parent, *, verified_platform_ids=()):
         state = _docker('inspect', '--format', '{{.Image}} {{.State.Status}}', container).decode('ascii').strip()
         if state not in (image_id + ' created', selected_id + ' created'):
             raise ExtractionError('Probe container identity rejected')
+        if probe_name:
+            identity = json.loads(_docker('inspect', '--format', '{{json .}}', container))
+            if (not isinstance(identity, dict) or identity.get('Name') != '/' + probe_name or
+                not isinstance(identity.get('Config'), dict) or not isinstance(identity['Config'].get('Labels'), dict) or
+                identity['Config']['Labels'].get('io.servus.updater.extraction') != probe_name):
+                raise ExtractionError('Probe container identity rejected')
         archive = _docker('cp', container + ':/opt/servus/install/.', '-', limit=MAX_ARCHIVE)
         files = _read_archive(archive)
         # The full set is validated before any extracted content reaches disk.

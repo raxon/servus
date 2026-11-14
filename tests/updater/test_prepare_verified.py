@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -139,6 +140,29 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaises(FakeExtractor.ExtractionError): self.run_prepare(extractor)
         with self.assertRaises(self.mod.ProtocolError): self.run_prepare(extractor)
         self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone()[0], 'recovery_required')
+    def test_extraction_probe_intent_is_recorded_before_create_and_removed_after(self):
+        self.verified()
+        extractor = FakeExtractor()
+        original = extractor.extract
+        def inspect(image_id, parent, **kwargs):
+            row = self.journal.db.execute('SELECT name,purpose,status FROM extraction_probes').fetchone()
+            self.assertEqual(row, (kwargs['probe_name'], 'prepare', 'intent'))
+            return original(image_id, parent, **kwargs)
+        extractor.extract = inspect
+        self.run_prepare(extractor)
+        self.assertEqual(self.journal.db.execute('SELECT status FROM extraction_probes').fetchone()[0], 'removed')
+
+    def test_interrupted_extraction_keeps_identity_and_blocks_retry(self):
+        self.verified()
+        extractor = FakeExtractor()
+        def interrupted(image_id, parent, **kwargs):
+            self.assertEqual(self.journal.db.execute('SELECT name FROM extraction_probes').fetchone()[0], kwargs['probe_name'])
+            raise extractor.ExtractionError('interrupted')
+        extractor.extract = interrupted
+        with self.assertRaises(extractor.ExtractionError): self.run_prepare(extractor)
+        self.assertEqual(self.journal.db.execute('SELECT status FROM extraction_probes').fetchone()[0], 'intent')
+        self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone()[0], 'recovery_required')
+        with self.assertRaises(self.mod.ProtocolError): self.run_prepare(extractor)
     def test_restart_during_preparation_remains_blocked(self):
         self.verified()
         operation = self.journal.claim_preparation(ID)
@@ -156,6 +180,52 @@ class PreparationTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 self.journal.finish_preparation({**operation, key:'wrong'}, stage)
         self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone()[0], 'preparing')
+
+    def test_orphaned_extraction_prevents_prepared_status(self):
+        self.verified()
+        operation = self.journal.claim_preparation(ID)
+        probe = self.journal.record_extraction_probe(operation, 'prepare')
+        stage = os.path.join(self.tmp.name, 'servus-install-' + 'f' * 32)
+        with self.assertRaises(RuntimeError): self.journal.finish_preparation(operation, stage)
+        self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone()[0], 'preparing')
+        self.journal.complete_extraction_probe(operation, probe)
+        self.journal.finish_preparation(operation, stage)
+        self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone()[0], 'prepared')
+
+    def test_prepared_requires_completed_prepare_probe_for_same_attempt(self):
+        self.verified()
+        operation = self.journal.claim_preparation(ID)
+        stage = os.path.join(self.tmp.name, 'servus-install-' + 'f' * 32)
+        with self.assertRaises(RuntimeError): self.journal.finish_preparation(operation, stage)
+        other = self.journal.record_extraction_probe(operation, 'policy')
+        self.journal.complete_extraction_probe(operation, other)
+        with self.assertRaises(RuntimeError): self.journal.finish_preparation(operation, stage)
+        probe = self.journal.record_extraction_probe(operation, 'prepare')
+        self.journal.complete_extraction_probe(operation, probe)
+        self.journal.finish_preparation(operation, stage)
+        self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone()[0], 'prepared')
+
+    def test_concurrent_extraction_intents_allow_only_one(self):
+        self.verified()
+        operation = self.journal.claim_preparation(ID)
+        barrier = threading.Barrier(2)
+        outcomes = []
+        def run():
+            journal = self.mod.Journal(pathlib.Path(self.tmp.name))
+            try:
+                barrier.wait(timeout=5)
+                journal.record_extraction_probe(operation, 'prepare')
+                outcomes.append('success')
+            except sqlite3.IntegrityError:
+                outcomes.append('blocked')
+            finally:
+                journal.close()
+        workers = [threading.Thread(target=run) for _ in range(2)]
+        for worker in workers: worker.start()
+        for worker in workers: worker.join(10)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(sorted(outcomes), ['blocked', 'success'])
+        self.assertEqual(self.journal.db.execute("SELECT COUNT(*) FROM extraction_probes WHERE status='intent'").fetchone()[0], 1)
 
     def test_simultaneous_preparation_and_submission_are_serialized(self):
         self.verified()
