@@ -21,7 +21,7 @@ class BootstrapError(Exception):
 
 
 def bootstrap(journal, operation, accepted_env, install_dir, control_dir, policy_root,
-              extractor, supervisor, policy, *, resolve_child=None):
+              extractor, supervisor, policy, *, resolve_child=None, verify_active=None):
     if not supervisor._uuid4(operation): raise BootstrapError('Invalid operation identity')
     row = journal.db.execute("SELECT p.preparation_id,p.staging_path,o.digest FROM preparations p JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=? AND p.status='prepared' AND o.status='verified' AND p.attempt_id=o.attempt_id AND p.attempt_nonce=o.attempt_nonce", (operation,)).fetchone()
     if (not row or not supervisor._uuid4(row[0]) or not isinstance(row[1], str) or
@@ -34,9 +34,20 @@ def bootstrap(journal, operation, accepted_env, install_dir, control_dir, policy
     candidate = os.path.join(policy_root, 'candidate-' + row[0] + '.json')
     active = os.path.join(policy_root, 'policy-' + operation + '.json')
     table = journal.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_approvals'").fetchone()
-    approvals = journal.db.execute('SELECT operation_id,state,candidate_path,source_env_path FROM policy_approvals').fetchall() if table else []
+    approvals = journal.db.execute('SELECT operation_id,state,candidate_path,source_env_path,policy_path,accepted_env_path FROM policy_approvals').fetchall() if table else []
     if approvals:
-        if len(approvals) != 1 or approvals[0] != (operation, 'candidate', candidate, accepted_env):
+        if len(approvals) != 1:
+            raise BootstrapError('An existing policy requires recovery')
+        approval = approvals[0]
+        if approval[:4] == (operation, 'active', candidate, accepted_env):
+            snapshot = os.path.join(policy_root, 'env-' + row[0] + '.env')
+            if approval[4:] != (active, snapshot) or verify_active is None:
+                raise BootstrapError('An existing policy requires recovery')
+            verified = verify_active(active, snapshot, operation)
+            if verified.install_dir != install_dir or verified.control_dir != control_dir:
+                raise BootstrapError('The active policy does not match this installation')
+            return active
+        if approval[:4] != (operation, 'candidate', candidate, accepted_env) or approval[4] is not None:
             raise BootstrapError('An existing policy requires recovery')
     else:
         policy.produce(journal, operation, os.path.dirname(row[1]), accepted_env, install_dir,
@@ -67,7 +78,7 @@ def _trusted_modules():
         spec.loader.exec_module(module)
         return module
     supervisor = load('supervisor', 'supervisor.py', 0o644)
-    return supervisor, load('servus_bootstrap_journal', 'servus-updater.py', 0o755), load('servus_bootstrap_policy', 'runtime-policy.py', 0o644), load('servus_bootstrap_extract', 'extract-install.py', 0o644), load('servus_bootstrap_verify', 'verify-release.py', 0o644)
+    return supervisor, load('servus_bootstrap_journal', 'servus-updater.py', 0o755), load('servus_bootstrap_policy', 'runtime-policy.py', 0o644), load('servus_bootstrap_extract', 'extract-install.py', 0o644), load('servus_bootstrap_verify', 'verify-release.py', 0o644), load('servus_bootstrap_daemon', 'supervisor-daemon.py', 0o644)
 
 
 def main():
@@ -80,7 +91,7 @@ def main():
     os.umask(0o077)
     lock = None; journal = None
     try:
-        supervisor, updater, policy, extractor, verifier = _trusted_modules()
+        supervisor, updater, policy, extractor, verifier, daemon = _trusted_modules()
         state = updater.trusted_directory(args.state_dir, 0o700)
         directory = supervisor._trusted_directory(str(state), 0o700)
         try:
@@ -95,8 +106,12 @@ def main():
             registry = verifier.Registry(time.monotonic() + verifier.TOTAL_SECONDS)
             registry.authenticate()
             return verifier.revalidate_amd64_identity(registry, root, config)
+        def verify_active(path, snapshot, operation):
+            return daemon.load_approved_policy(path, str(state / 'journal.sqlite'), snapshot,
+                                               expected_operation_id=operation)
         bootstrap(journal, args.operation, args.accepted_env, args.install_dir, args.control_dir,
-                  args.policy_dir, extractor, supervisor, policy, resolve_child=resolve_child)
+                  args.policy_dir, extractor, supervisor, policy, resolve_child=resolve_child,
+                  verify_active=verify_active)
         return 0
     except Exception:
         print('Initial policy could not be activated safely.', file=sys.stderr)

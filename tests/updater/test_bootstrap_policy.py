@@ -24,6 +24,7 @@ def load(name, path):
 bootstrap = load('bootstrap_policy', 'apps/updater/bootstrap-policy.py')
 policy = load('bootstrap_runtime_policy', 'apps/updater/runtime-policy.py')
 extractor = load('bootstrap_extract', 'apps/updater/extract-install.py')
+daemon = load('bootstrap_supervisor_daemon', 'apps/updater/supervisor-daemon.py')
 
 
 @unittest.skipUnless(sys.platform == 'linux' and os.geteuid() == 0 and sys.flags.isolated, 'Requires isolated Linux root')
@@ -60,14 +61,44 @@ class BootstrapPolicyTest(unittest.TestCase):
 
     def tearDown(self): self.db.close();self.temp.cleanup()
 
-    def invoke(self):
-        return bootstrap.bootstrap(self.journal,self.op,str(self.env),str(self.install),str(self.control),str(self.private),extractor,supervisor,policy)
+    def invoke(self, **kwargs):
+        return bootstrap.bootstrap(self.journal,self.op,str(self.env),str(self.install),str(self.control),str(self.private),extractor,supervisor,policy,**kwargs)
 
     def test_existing_candidate_activates_without_repeating_probe(self):
         with mock.patch.object(supervisor,'RuntimePolicy',return_value=self.policy_value), mock.patch.object(supervisor,'_docker',return_value=b''), mock.patch.object(policy,'produce') as produce:
             self.assertEqual(self.invoke(),str(self.active));produce.assert_not_called()
         self.assertEqual(self.db.execute('SELECT state FROM policy_approvals').fetchone(),('active',))
         self.assertEqual(self.active.read_bytes(),self.candidate.read_bytes())
+
+    def test_resuming_active_initial_policy_reverifies_exact_binding(self):
+        snapshot = self.private/('env-'+self.prep+'.env')
+        self.db.execute("UPDATE policy_approvals SET state='active',policy_path=?,accepted_env_path=?",(str(self.active),str(snapshot)))
+        verify = mock.Mock(return_value=self.policy_value)
+        with mock.patch.object(policy,'produce') as produce, mock.patch.object(policy,'activate') as activate:
+            self.assertEqual(self.invoke(verify_active=verify),str(self.active))
+            verify.assert_called_once_with(str(self.active),str(snapshot),self.op)
+            produce.assert_not_called();activate.assert_not_called()
+        with self.assertRaises(bootstrap.BootstrapError): self.invoke()
+        verify.return_value=SimpleNamespace(install_dir='/unexpected',control_dir=str(self.control))
+        with self.assertRaises(bootstrap.BootstrapError): self.invoke(verify_active=verify)
+        self.db.execute("UPDATE policy_approvals SET policy_path=?",(str(self.private/'forged'),))
+        verify.reset_mock()
+        with self.assertRaises(bootstrap.BootstrapError): self.invoke(verify_active=verify)
+        verify.assert_not_called()
+
+    def test_resume_checks_real_approval_and_refuses_modified_environment(self):
+        snapshot = self.private/('env-'+self.prep+'.env')
+        snapshot.write_bytes(self.env.read_bytes());snapshot.chmod(0o600)
+        self.active.write_bytes(self.candidate.read_bytes());self.active.chmod(0o600)
+        self.db.execute("UPDATE policy_approvals SET state='active',policy_path=?,accepted_env_path=?",(str(self.active),str(snapshot)))
+        journal_file=self.private/'journal.sqlite'
+        disk=sqlite3.connect(journal_file);self.db.backup(disk);disk.close();journal_file.chmod(0o600)
+        def verify(path, accepted, operation):
+            return daemon.load_approved_policy(path,str(journal_file),accepted,expected_operation_id=operation)
+        with mock.patch.object(daemon,'load_policy',return_value=self.policy_value):
+            self.assertEqual(self.invoke(verify_active=verify),str(self.active))
+            self.env.write_text('SERVUS_IMAGE=changed\n');self.env.chmod(0o600)
+            with self.assertRaises(supervisor.SupervisorError): self.invoke(verify_active=verify)
 
     def test_new_candidate_is_generated_before_activation(self):
         self.db.execute('DELETE FROM policy_approvals')
@@ -93,7 +124,7 @@ class BootstrapPolicyTest(unittest.TestCase):
 
     def test_command_refuses_active_updater_lock(self):
         source=ROOT/'apps/updater'; module_dir=self.root/'modules'; module_dir.mkdir(mode=0o700)
-        for name in ('bootstrap-policy.py','supervisor.py','servus-updater.py','runtime-policy.py','extract-install.py','verify-release.py'):
+        for name in ('bootstrap-policy.py','supervisor.py','servus-updater.py','runtime-policy.py','extract-install.py','verify-release.py','supervisor-daemon.py'):
             path=module_dir/name; shutil.copyfile(source/name,path); path.chmod(0o755 if name=='servus-updater.py' else 0o644)
         state=self.root/'state';state.mkdir(mode=0o700)
         lock=state/'service.lock';lock.touch(mode=0o600)
