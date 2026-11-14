@@ -5,6 +5,7 @@ Existing files and directories are verified, never silently replaced. Service
 installation, policy activation, and live panel changes are separate steps.
 """
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import importlib.util
@@ -236,14 +237,29 @@ def trusted_ingress(docker_config, runtime):
     return [ids[0], 'panel-ingress', config['Image'], image]
 
 
-def finalize(config_dir, state_dir, install_dir, node_path, supervisor, daemon, backup, runtime):
+@contextlib.contextmanager
+def locked_install(install_dir, gate_dir, journal_dir, supervisor, runtime, inherited_lock):
+    install = supervisor._trusted_directory(install_dir)
+    gate = journal = lock = gate_lock = None
+    try:
+        gate = supervisor._trusted_directory(gate_dir, 0o755)
+        journal = supervisor._trusted_directory(journal_dir, 0o700)
+        lock = runtime._installation_lock(install, supervisor, inherited_lock)
+        gate_lock = supervisor._open_root_file(gate, 'lock', 0o644)
+        yield
+    finally:
+        for fd in (gate_lock, lock, journal, gate, install):
+            if fd is not None: os.close(fd)
+
+
+def finalize(config_dir, state_dir, install_dir, node_path, supervisor, daemon, backup, runtime, *, inherited_lock=None):
     """Bind host service configuration to an already approved generation."""
     if os.geteuid() != 0: raise ProvisionError('Root is required')
     prepare(config_dir, state_dir)
     gate = config_dir + '/lifecycle'; control = config_dir + '/supervisor-control'; secret_dir = config_dir + '/supervisor-secrets'
     journal = state_dir + '/journal.sqlite'; active_env = config_dir + '/servus.env'; policy_root = state_dir + '/policies'
     backup_root = state_dir + '/backups'; docker_config = state_dir + '/docker-config'; maintenance = state_dir + '/maintenance'
-    with supervisor.MaintenanceSupervisor(install_dir, gate, maintenance):
+    with locked_install(install_dir, gate, maintenance, supervisor, runtime, inherited_lock):
         policy_path, accepted_env, approved = daemon.resolve_active_policy(journal, active_env)
         expected_secrets = {role: secret_dir + '/' + role for role in supervisor.ROLES}
         if (approved.install_dir != install_dir or approved.gate_dir != gate or approved.control_dir != control or
@@ -310,8 +326,10 @@ def main():
     parser.add_argument('--config-dir')
     parser.add_argument('--install-dir')
     args = parser.parse_args()
-    if (args.install_lock_fd is not None or args.config_dir is not None or args.install_dir is not None) and not args.runtime:
+    if (args.config_dir is not None or args.install_dir is not None) and not args.runtime:
         parser.error('Runtime options require --runtime')
+    if args.install_lock_fd is not None and not (args.runtime or args.finalize):
+        parser.error('--install-lock-fd requires --runtime or --finalize')
     os.umask(0o077)
     try:
         if args.runtime:
@@ -320,7 +338,8 @@ def main():
                             inherited_lock=args.install_lock_fd)
         elif args.finalize:
             supervisor, daemon, backup, runtime = trusted_modules()
-            finalize('/etc/servus', '/var/lib/servus-updater', '/opt/servus', '/usr/bin/node', supervisor, daemon, backup, runtime)
+            finalize('/etc/servus', '/var/lib/servus-updater', '/opt/servus', '/usr/bin/node', supervisor, daemon, backup, runtime,
+                     inherited_lock=args.install_lock_fd)
         else:
             prepare('/etc/servus', '/var/lib/servus-updater')
         return 0

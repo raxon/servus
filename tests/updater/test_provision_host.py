@@ -18,6 +18,8 @@ spec = importlib.util.spec_from_file_location('provision_host', ROOT / 'apps/upd
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 sys.path.insert(0, str(ROOT / 'apps/updater'))
 import supervisor
+policy_spec = importlib.util.spec_from_file_location('provision_runtime_policy', ROOT / 'apps/updater/runtime-policy.py')
+runtime_policy = importlib.util.module_from_spec(policy_spec);policy_spec.loader.exec_module(runtime_policy)
 
 
 @unittest.skipUnless(sys.platform == 'linux' and os.geteuid() == 0, 'Requires isolated Linux root')
@@ -149,7 +151,8 @@ class HostProvisioningTest(unittest.TestCase):
                                  secret_sources={role:str(secrets/role) for role in supervisor.ROLES},updater_dir='/run/servus-updater/control')
         daemon=SimpleNamespace(resolve_active_policy=mock.Mock(return_value=(policy,snapshot,approved)))
         backup=SimpleNamespace(_verify_node=mock.Mock())
-        runtime=SimpleNamespace(_docker=mock.Mock(return_value=b''),_json=json.loads)
+        runtime=SimpleNamespace(_docker=mock.Mock(return_value=b''),_json=json.loads,
+                                _installation_lock=runtime_policy._installation_lock)
         return install,node,approved,daemon,backup,runtime
 
     def test_finalization_binds_supervisor_configuration_and_trusted_node(self):
@@ -178,6 +181,21 @@ class HostProvisioningTest(unittest.TestCase):
         approved.updater_dir='/run/servus-updater/control';backup._verify_node.side_effect=RuntimeError('unusable node')
         with self.assertRaises(RuntimeError): module.finalize(*arguments)
         self.assertFalse((self.config/'supervisor.env').exists());self.assertFalse((self.config/'update-apply.json').exists())
+
+    def test_finalization_accepts_installer_lock_and_rejects_another_file(self):
+        install,node,approved,daemon,backup,runtime=self.finalization_fixture()
+        arguments=(str(self.config),str(self.state),str(install),str(node),supervisor,daemon,backup,runtime)
+        held=os.open(install/'install.lock',os.O_RDONLY);wrong=os.open(node,os.O_RDONLY)
+        try:
+            fcntl.flock(held,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(runtime_policy.PolicyError): module.finalize(*arguments,inherited_lock=wrong)
+            self.assertFalse((self.config/'supervisor.env').exists())
+            module.finalize(*arguments,inherited_lock=held)
+            contender=os.open(install/'install.lock',os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError): fcntl.flock(contender,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally: os.close(contender)
+        finally: os.close(wrong);os.close(held)
 
     def test_unsafe_control_or_node_and_changed_configuration_are_rejected(self):
         install,node,approved,daemon,backup,runtime=self.finalization_fixture()
