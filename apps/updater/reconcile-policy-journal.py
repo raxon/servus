@@ -17,6 +17,33 @@ class ReconciliationError(RuntimeError):
     pass
 
 
+def requeue_unstarted(db, operation_id):
+    """Retry a failed dispatch only when policy creation never began."""
+    if not isinstance(operation_id, str) or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', operation_id):
+        raise ReconciliationError('Invalid operation identity')
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        row = db.execute("SELECT p.preparation_id,p.attempt_id,p.attempt_nonce FROM preparations p JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=? AND p.status='prepared' AND o.status='verified' AND p.attempt_id=o.attempt_id AND p.attempt_nonce=o.attempt_nonce AND p.staging_path IS NOT NULL", (operation_id,)).fetchone()
+        if not row or db.execute("SELECT state FROM apply_requests WHERE operation_id=?", (operation_id,)).fetchone() != ('recovery_required',):
+            raise ReconciliationError('Prepared dispatch is unavailable')
+        if (db.execute("SELECT 1 FROM update_transactions WHERE operation_id=? OR phase != 'completed'", (operation_id,)).fetchone() or
+                db.execute('SELECT 1 FROM policy_probes WHERE operation_id=?', (operation_id,)).fetchone() or
+                db.execute("SELECT 1 FROM policy_approvals WHERE operation_id=? OR state IN ('candidate','activating','recovery_required')", (operation_id,)).fetchone() or
+                db.execute("SELECT 1 FROM extraction_probes WHERE status != 'removed'").fetchone() or
+                db.execute("SELECT 1 FROM apply_requests WHERE operation_id != ? AND state != 'completed'", (operation_id,)).fetchone()):
+            raise ReconciliationError('Dispatch may have started')
+        if not db.execute("SELECT 1 FROM extraction_probes WHERE operation_id=? AND preparation_id=? AND attempt_id=? AND attempt_nonce=? AND purpose='prepare' AND status='removed'", (operation_id, *row)).fetchone():
+            raise ReconciliationError('Staged extraction evidence is missing')
+        db.execute('CREATE TABLE IF NOT EXISTS apply_reconciliations (operation_id TEXT NOT NULL, preparation_id TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+        db.execute('INSERT INTO apply_reconciliations(operation_id,preparation_id) VALUES(?,?)', (operation_id, row[0]))
+        if db.execute("UPDATE apply_requests SET state='requested' WHERE operation_id=? AND state='recovery_required'", (operation_id,)).rowcount != 1:
+            raise ReconciliationError('Apply request changed')
+        db.execute('COMMIT')
+    except BaseException:
+        if db.in_transaction: db.execute('ROLLBACK')
+        raise
+
+
 def reconcile(db, operation_id):
     """Requeue one exact attempt without discarding its journal evidence."""
     if not isinstance(operation_id, str) or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', operation_id):

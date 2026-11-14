@@ -49,6 +49,22 @@ class ReconciliationTest(unittest.TestCase):
         with self.assertRaises(recovery.ReconciliationError):
             recovery.reconcile(self.db, OP)
 
+    def test_requeues_failed_dispatch_only_before_policy_work(self):
+        self.db.execute("UPDATE preparations SET status='prepared'")
+        self.db.execute('DELETE FROM policy_probes')
+        recovery.requeue_unstarted(self.db, OP)
+        self.assertEqual(self.db.execute('SELECT state FROM apply_requests').fetchone(), ('requested',))
+        self.assertEqual(self.db.execute('SELECT operation_id,preparation_id FROM apply_reconciliations').fetchone(), (OP, PREP))
+        with self.assertRaises(recovery.ReconciliationError): recovery.requeue_unstarted(self.db, OP)
+
+    def test_unstarted_dispatch_rejects_policy_or_switch_evidence(self):
+        self.db.execute("UPDATE preparations SET status='prepared'")
+        with self.assertRaises(recovery.ReconciliationError): recovery.requeue_unstarted(self.db, OP)
+        self.db.execute('DELETE FROM policy_probes')
+        self.db.execute("INSERT INTO update_transactions VALUES(?, 'intent')", (OP,))
+        with self.assertRaises(recovery.ReconciliationError): recovery.requeue_unstarted(self.db, OP)
+        self.assertEqual(self.db.execute('SELECT state FROM apply_requests').fetchone(), ('recovery_required',))
+
     def test_rejects_ambiguous_state_without_changing_journal(self):
         cases = [
             ("UPDATE operations SET status='verification_failed'", ()),

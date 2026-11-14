@@ -67,17 +67,37 @@ class ApplyQueueTest(unittest.TestCase):
     def test_supervisor_socket_sends_only_operation_identity(self):
         control = self.root / 'control'; control.mkdir(mode=0o750)
         path = control / 'command'; server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(path)); os.chmod(path, 0o600); server.listen(1)
+        server.bind(str(path)); os.chmod(path, 0o600); server.listen(3)
         received = []
         def serve():
-            with server.accept()[0] as peer:
-                received.append(json.loads(peer.recv(4096)))
-                peer.sendall(b'{"version":1,"status":"starting"}\n')
+            for response in ('waiting', 'ready', 'starting'):
+                with server.accept()[0] as peer:
+                    received.append(json.loads(peer.recv(4096)))
+                    peer.sendall(json.dumps({'version': 1, 'status': response}).encode() + b'\n')
         thread = threading.Thread(target=serve); thread.start()
         try:
             updater.dispatch_apply(str(path), self.op)
             thread.join(timeout=2)
-            self.assertEqual(received, [{'version': 1, 'type': 'apply', 'operationId': self.op}])
+            self.assertEqual(received, [{'version': 1, 'type': 'status'}, {'version': 1, 'type': 'status'},
+                                        {'version': 1, 'type': 'apply', 'operationId': self.op}])
+        finally:
+            server.close()
+
+    def test_failed_apply_is_not_retried(self):
+        control = self.root / 'control'; control.mkdir(mode=0o750)
+        path = control / 'command'; server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path)); os.chmod(path, 0o600); server.listen(2)
+        received = []
+        def serve():
+            for response in ('ready', 'failed'):
+                with server.accept()[0] as peer:
+                    received.append(json.loads(peer.recv(4096)))
+                    peer.sendall(json.dumps({'version': 1, 'status': response}).encode() + b'\n')
+        thread = threading.Thread(target=serve); thread.start()
+        try:
+            with self.assertRaises(RuntimeError): updater.dispatch_apply(str(path), self.op)
+            thread.join(timeout=2)
+            self.assertEqual([item['type'] for item in received], ['status', 'apply'])
         finally:
             server.close()
 

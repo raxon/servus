@@ -930,20 +930,34 @@ def dispatch_apply(socket_path, operation_id):
         raise RuntimeError('Invalid supervisor command')
     path = pathlib.Path(socket_path)
     trusted_directory(path.parent, 0o750)
-    before = path.lstat()
-    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) != 0o600:
-        raise RuntimeError('Supervisor command socket is not trusted')
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
-        peer.settimeout(1800)
-        peer.connect(socket_path)
-        _pid, uid, _gid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
-        after = path.lstat()
-        if uid != 0 or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            raise RuntimeError('Supervisor command peer is not trusted')
-        peer.sendall(json.dumps({'version': 1, 'type': 'apply', 'operationId': operation_id}, separators=(',', ':')).encode() + b'\n')
-        value = receive(peer, time.monotonic() + 1800)
-        if value != {'version': 1, 'status': 'starting'}:
-            raise RuntimeError('Supervisor did not confirm startup')
+    def request(message, timeout):
+        before = path.lstat()
+        if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) != 0o600:
+            raise RuntimeError('Supervisor command socket is not trusted')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(timeout)
+            peer.connect(socket_path)
+            _pid, uid, _gid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+            after = path.lstat()
+            if uid != 0 or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise RuntimeError('Supervisor command peer is not trusted')
+            peer.sendall(json.dumps(message, separators=(',', ':')).encode() + b'\n')
+            return receive(peer, time.monotonic() + timeout)
+
+    # Readiness checks are side-effect free; never retry an apply command.
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            status = request({'version': 1, 'type': 'status'}, 5)
+        except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
+            status = {'version': 1, 'status': 'waiting'}
+        if status == {'version': 1, 'status': 'ready'}:
+            break
+        if status != {'version': 1, 'status': 'waiting'} or time.monotonic() >= deadline:
+            raise RuntimeError('Supervisor is not ready')
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+    if request({'version': 1, 'type': 'apply', 'operationId': operation_id}, 1800) != {'version': 1, 'status': 'starting'}:
+        raise RuntimeError('Supervisor did not confirm startup')
 
 
 class ApplyWorker:
