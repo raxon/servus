@@ -178,12 +178,12 @@ def _find_latest(transport):
     return latest
 
 
-def _discover(transport, current):
-    current_version = parse_tag(current)
-    if current_version is None:
+def _discover(transport, current, *, initial=False):
+    current_version = None if initial else parse_tag(current)
+    if not initial and current_version is None:
         raise DiscoveryError('Current version must be a stable vMAJOR.MINOR.PATCH tag')
     version, tag, commit = _find_latest(transport)
-    if version <= current_version:
+    if current_version is not None and version <= current_version:
         status = 'no_newer_version' if version == current_version else 'ahead'
         return {'status': status, 'current': current, 'latest': tag}
     body, _ = transport.get(f'{REGISTRY}/token?service=ghcr.io&scope=repository%3Araxon%2Fservus%3Apull', limit=16384, accept='application/json')
@@ -235,12 +235,23 @@ def discover(transport, current, *, timeout_seconds=TIMEOUT):
         return _discover(transport, current)
 
 
+def discover_initial(transport, *, timeout_seconds=TIMEOUT):
+    """Find an unverified candidate for a fresh installation."""
+    if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or not 0 < timeout_seconds <= TIMEOUT:
+        raise DiscoveryError('Invalid discovery deadline')
+    with total_deadline(timeout_seconds):
+        return _discover(transport, None, initial=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--current', required=True, help='Currently installed stable version, such as v0.1.3')
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument('--current', help='Currently installed stable version, such as v0.1.3')
+    selection.add_argument('--initial', action='store_true', help='Find the latest candidate for a fresh installation')
     args = parser.parse_args()
     try:
-        result = discover(Transport(time.monotonic() + TIMEOUT), args.current)
+        transport = Transport(time.monotonic() + TIMEOUT)
+        result = discover_initial(transport) if args.initial else discover(transport, args.current)
     except (DiscoveryError, OSError):
         print('Release discovery failed.', file=sys.stderr)
         return 1

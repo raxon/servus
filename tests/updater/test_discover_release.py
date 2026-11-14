@@ -110,6 +110,20 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual([auth for path, auth in self.server.seen if path.startswith('/v2/')], ['Bearer synthetic-token'])
         self.assertEqual(sum(path == '/repos/raxon/servus' for path, _ in self.server.seen), 2)
 
+    def test_initial_discovery_accepts_first_stable_version_without_claiming_verification(self):
+        self.server.tags = [{'name': 'v0.0.0', 'commit': {'sha': 'a' * 40}}]
+        result = discovery.discover_initial(self.server.transport())
+        self.assertEqual(result, {'status': 'candidate', 'verified': False, 'tag': 'v0.0.0', 'commit': 'a' * 40, 'digest': 'sha256:' + hashlib.sha256(self.server.body).hexdigest()})
+
+    def test_initial_discovery_refuses_wrong_owner_and_reports_missing_image(self):
+        self.server.invalid_owner = True
+        with self.assertRaises(discovery.DiscoveryError): discovery.discover_initial(self.server.transport())
+        self.server.invalid_owner = False
+        self.server.manifest_status = 404
+        result = discovery.discover_initial(self.server.transport())
+        self.assertEqual(result['status'], 'release_pending')
+        self.assertFalse(result['verified'])
+
     def test_no_downgrade_or_repeat_and_no_registry_call(self):
         for current, status in [('v0.1.4', 'no_newer_version'), ('v0.2.0', 'ahead')]:
             result = discovery.discover(self.server.transport(), current)
