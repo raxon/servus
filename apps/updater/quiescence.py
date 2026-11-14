@@ -18,9 +18,10 @@ def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=N
     """Inspect all containers; only a separately approved ingress may hold Docker's socket."""
     if not isinstance(expected, set) or len(expected) != 3 or not all(re.fullmatch(r'[a-f0-9]{64}', item) for item in expected):
         raise QuiescenceError('Invalid control-plane container inventory')
-    if trusted_ingress is not None and (not isinstance(trusted_ingress, tuple) or len(trusted_ingress) != 3 or
+    if trusted_ingress is not None and (not isinstance(trusted_ingress, tuple) or len(trusted_ingress) != 4 or
         not all(isinstance(value, str) and value for value in trusted_ingress) or
-        not re.fullmatch(r'sha256:[a-f0-9]{64}', trusted_ingress[2])):
+        not re.fullmatch(r'[a-f0-9]{64}', trusted_ingress[0]) or
+        not re.fullmatch(r'sha256:[a-f0-9]{64}', trusted_ingress[3])):
         raise QuiescenceError('Invalid trusted ingress identity')
     ids = docker.call('ps', '-aq', '--no-trunc').decode('ascii').splitlines()
     if (len(ids) != len(set(ids)) or not expected.issubset(ids) or
@@ -54,7 +55,7 @@ def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=N
                     continue
                 source = os.path.realpath(source)
                 if socket_path == source or socket_path.startswith(source.rstrip('/') + '/'):
-                    identity = (labels.get('com.docker.swarm.service.name'), config.get('Image'), item.get('Image'))
+                    identity = (item['Id'], labels.get('com.docker.swarm.service.name'), config.get('Image'), item.get('Image'))
                     if not (trusted_ingress is not None and identity == trusted_ingress and source == socket_path and mount.get('RW') is False):
                         raise QuiescenceError('Unexpected container can access Docker API')
         for mount in mounts:

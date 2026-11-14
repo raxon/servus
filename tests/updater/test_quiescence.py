@@ -81,7 +81,7 @@ class DockerInventoryTest(unittest.TestCase):
         self.docker = mock.Mock()
         self.docker.call.return_value = ('\n'.join(item['Id'] for item in self.items) + '\n').encode()
         self.docker.inspect.return_value = self.items
-        self.trusted = ('panel-ingress', 'traefik:3.7.13', 'sha256:' + 'e' * 64)
+        self.trusted = ('d' * 64, 'panel-ingress', 'traefik:3.7.13', 'sha256:' + 'e' * 64)
 
     def check(self):
         module.ensure_no_other_data_mounts(self.docker, self.ids, '/var/lib/servus', trusted_ingress=self.trusted)
@@ -90,7 +90,7 @@ class DockerInventoryTest(unittest.TestCase):
         self.check()
         self.ingress['Image'] = 'sha256:' + 'f' * 64
         with self.assertRaises(module.QuiescenceError): self.check()
-        self.ingress['Image'] = self.trusted[2]
+        self.ingress['Image'] = self.trusted[3]
         self.ingress['HostConfig']['PidMode'] = 'host'
         with self.assertRaises(module.QuiescenceError): self.check()
         self.ingress['HostConfig']['PidMode'] = ''
@@ -105,6 +105,11 @@ class DockerInventoryTest(unittest.TestCase):
         with self.assertRaises(module.QuiescenceError): self.check()
         self.items[0]['Mounts'] = [{'Source': '/var/lib/servus', 'RW': True}]
         self.docker.inspect.return_value = self.items[:-1]
+        with self.assertRaises(module.QuiescenceError): self.check()
+
+    def test_rejects_another_container_with_the_same_image_and_labels(self):
+        self.ingress['Id'] = 'f' * 64
+        self.docker.call.return_value = ('\n'.join(item['Id'] for item in self.items) + '\n').encode()
         with self.assertRaises(module.QuiescenceError): self.check()
 
     def test_rejects_volume_aliases(self):
