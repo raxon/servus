@@ -15,7 +15,7 @@ spec.loader.exec_module(executor)
 DIGEST = 'sha256:' + 'a' * 64
 COMMIT = 'b' * 40
 TAG = 'v1.2.3'
-EXPECTED = {'image': 'ghcr.io/raxon/servus', 'digest': DIGEST, 'commit': COMMIT, 'tag': TAG, 'verified': True}
+EXPECTED = {'image': 'ghcr.io/raxon/servus', 'digest': DIGEST, 'commit': COMMIT, 'tag': TAG, 'verified': True, 'configDigest': 'sha256:' + 'c' * 64}
 
 
 class VerificationExecutorTest(unittest.TestCase):
@@ -29,7 +29,8 @@ class VerificationExecutorTest(unittest.TestCase):
     def test_result_must_match_every_identity_with_no_extra_or_duplicate_fields(self):
         self.assertEqual(executor.validate_result(json.dumps(EXPECTED).encode(), DIGEST, COMMIT, TAG), EXPECTED)
         for value in ({**EXPECTED, 'commit': 'c' * 40}, {**EXPECTED, 'verified': False}, {**EXPECTED, 'verified': 1},
-                      {**EXPECTED, 'extra': True}):
+                      {**EXPECTED, 'configDigest': None}, {**EXPECTED, 'configDigest': 'sha256:' + 'A' * 64},
+                      {key: value for key, value in EXPECTED.items() if key != 'configDigest'}, {**EXPECTED, 'extra': True}):
             with self.subTest(value=value), self.assertRaises(executor.ExecutorError):
                 executor.validate_result(json.dumps(value).encode(), DIGEST, COMMIT, TAG)
         with self.assertRaises(executor.ExecutorError):
@@ -44,7 +45,7 @@ class VerificationExecutorTest(unittest.TestCase):
         self.assertIn('--property=ProtectSystem=strict', command)
         self.assertIn('--property=NoNewPrivileges=yes', command)
         self.assertIn('--setenv=PATH=/usr/bin:/bin', command)
-        self.assertEqual(command[-8:], [executor.PYTHON, '-I', executor.VERIFIER, '--digest', DIGEST, '--commit', COMMIT, '--tag', TAG][-8:])
+        self.assertEqual(command[-8:], [executor.PYTHON, '-I', executor.VERIFIER, '--digest', DIGEST, '--commit', COMMIT, '--tag', TAG, '--include-config-digest'][-8:])
         self.assertNotIn('GITHUB_TOKEN', executor.ENV)
 
     def test_operation_identity_binds_transient_unit_and_rejects_invalid_id(self):

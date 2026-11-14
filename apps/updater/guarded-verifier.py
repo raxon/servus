@@ -97,7 +97,7 @@ def main():
         except KeyError:
             raise GuardError('Verifier group is not configured') from None
         lock_fence(ROOT, args.operation_id, args.attempt_id, args.nonce, verifier_gid)
-        os.execve(PYTHON, [PYTHON, '-I', VERIFIER, '--digest', args.digest, '--commit', args.commit, '--tag', args.tag], {'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'})
+        os.execve(PYTHON, [PYTHON, '-I', VERIFIER, '--digest', args.digest, '--commit', args.commit, '--tag', args.tag, '--include-config-digest'], {'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'})
     except (GuardError, OSError):
         print('Verification attempt was not authorized.', file=sys.stderr)
         return 1

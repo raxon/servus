@@ -66,7 +66,8 @@ assert observed, 'The actual verifier unit properties were not observed'
 result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 assert result.returncode == 0, 'Signed release verification failed'
 assert json.loads(result.stdout) == {'image': 'ghcr.io/raxon/servus', 'digest': DIGEST,
-                                     'commit': COMMIT, 'tag': TAG, 'verified': True}
+                                     'commit': COMMIT, 'tag': TAG, 'verified': True,
+                                     'configDigest': 'sha256:c709335f56dfa7e47c79ff6661e9c59776054a878c317fe2b3abea92c7f87298'}
 # Trace the actual executor's gh invocation without exposing its stderr. The
 # root-owned fixture wrapper runs the real binary with the original arguments.
 gh = pathlib.Path('/usr/bin/gh')

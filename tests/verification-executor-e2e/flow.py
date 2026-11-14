@@ -164,13 +164,13 @@ try:
     # Fixture-only diagnostics preserve helper behavior and log exception types
     # and errno values, never attempt identities or secret values.
     source = original_helper.decode('utf-8')
-    before = "        except (OSError, RuntimeError):\n            status = 'recovery_required'\n        self.journal.finish"
+    before = "        except (OSError, RuntimeError):\n            status = 'recovery_required'\n            config_digest = None\n        self.journal.finish"
     after = ("        except (OSError, RuntimeError) as error:\n"
              "            cause = error.__cause__\n"
              "            reason = str(error) if str(error) in ('Process table changed during scan', 'Process task table changed during scan', 'Process identities changed during scan', 'Verifier group is held by a live process') else 'other'\n"
              "            print('FIXTURE_REVOKE_EXCEPTION', type(error).__name__, getattr(error, 'errno', None), reason, "
              "type(cause).__name__, getattr(cause, 'errno', None), file=sys.stderr, flush=True)\n"
-             "            status = 'recovery_required'\n        self.journal.finish")
+             "            status = 'recovery_required'\n            config_digest = None\n        self.journal.finish")
     assert source.count(before) == 1
     source = source.replace(before, after)
     before = "            except (OSError, RuntimeError):\n                # A launcher exception after a process exists has an uncertain outcome."
@@ -266,6 +266,9 @@ try:
                 if line.startswith(('FIXTURE_REVOKE_EXCEPTION ', 'FIXTURE_PREPARE_EXCEPTION ')): print(line, flush=True)
         raise AssertionError('Signed image was not verified by the real helper')
     attempt, nonce = metadata(operation)
+    with sqlite3.connect(DATA / 'journal.sqlite') as database:
+        row = database.execute('SELECT status,attempt_id,attempt_nonce,config_digest FROM operations WHERE id=?', (operation,)).fetchone()
+        assert row == ('verified', attempt, nonce, 'sha256:c709335f56dfa7e47c79ff6661e9c59776054a878c317fe2b3abea92c7f87298')
     assert (FENCES / operation / 'state').read_bytes() == b'revoked\n'
     stale_guard(operation, attempt, nonce)
     print('PASS helper verifies the real attestation and revokes the used fence', flush=True)

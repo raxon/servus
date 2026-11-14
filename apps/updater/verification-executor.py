@@ -190,8 +190,11 @@ def validate_result(data, digest, commit, tag):
         result = json.loads(data.decode('utf-8'), object_pairs_hook=unique_object)
     except (UnicodeError, ValueError, RecursionError):
         raise ExecutorError('The verifier returned an invalid result') from None
+    config_digest = result.get('configDigest') if isinstance(result, dict) else None
     if (not isinstance(result, dict) or type(result.get('verified')) is not bool or
-        result != {'image': 'ghcr.io/raxon/servus', 'digest': digest, 'commit': commit, 'tag': tag, 'verified': True}):
+        not isinstance(config_digest, str) or not DIGEST.fullmatch(config_digest) or
+        result != {'image': 'ghcr.io/raxon/servus', 'digest': digest, 'commit': commit, 'tag': tag,
+                   'verified': True, 'configDigest': config_digest}):
         raise ExecutorError('The verifier result does not match the requested release')
     return result
 
@@ -212,7 +215,7 @@ def command_for(unit, digest, commit, tag, operation_id=None, attempt_id=None, n
     if guarded:
         prefix.append('--property=SupplementaryGroups=servus-verifier')
         return prefix + [PYTHON, '-I', GUARD, '--operation-id', operation_id, '--attempt-id', attempt_id, '--nonce', nonce, '--digest', digest, '--commit', commit, '--tag', tag]
-    return prefix + [PYTHON, '-I', VERIFIER, '--digest', digest, '--commit', commit, '--tag', tag]
+    return prefix + [PYTHON, '-I', VERIFIER, '--digest', digest, '--commit', commit, '--tag', tag, '--include-config-digest']
 
 
 def verify(digest, commit, tag, operation_id=None, attempt_id=None, nonce=None):

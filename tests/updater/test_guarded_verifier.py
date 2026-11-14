@@ -184,7 +184,7 @@ fd=g.lock_fence(__import__('pathlib').Path(sys.argv[2]),sys.argv[3],sys.argv[4],
         state=Path(tempfile.mkdtemp(prefix='servus-journal-',dir='/run'))
         journal=helper.Journal(state)
         commit='a'*40;digest='sha256:'+'b'*64;tag='v1.2.3'
-        output=json.dumps({'image':'ghcr.io/raxon/servus','commit':commit,'digest':digest,'tag':tag,'verified':True})
+        output=json.dumps({'image':'ghcr.io/raxon/servus','commit':commit,'digest':digest,'tag':tag,'verified':True,'configDigest':'sha256:'+'c'*64})
         def launch(op, pipe): return subprocess.Popen([sys.executable,'-I','-c','print('+repr(output)+')'],stdout=pipe,stderr=subprocess.DEVNULL)
         # Existing test fence is revoked before the worker creates its own operation directory.
         (self.fence/'state').unlink(); (self.fence/'lock').unlink(); self.fence.rmdir()

@@ -109,19 +109,23 @@ class Journal:
                     raise RuntimeError('Existing journal has unknown operations')
                 self.db.execute('DROP INDEX IF EXISTS one_active_operation')
                 self.db.execute('ALTER TABLE operations RENAME TO operations_old')
-            elif table and version not in (2, 3):
+            elif table and version not in (2, 3, 4):
                 raise RuntimeError('Unsupported updater journal version')
             elif not table and version != 0:
                 raise RuntimeError('Invalid updater journal')
-            self.db.execute("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, commit_sha TEXT NOT NULL, digest TEXT NOT NULL, tag TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('accepted','verifying','verified','verification_failed','recovery_required')), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, attempt_id TEXT, attempt_nonce TEXT)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, commit_sha TEXT NOT NULL, digest TEXT NOT NULL, tag TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('accepted','verifying','verified','verification_failed','recovery_required')), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, attempt_id TEXT, attempt_nonce TEXT, config_digest TEXT)")
             if table and version == 2:
                 self.db.execute('ALTER TABLE operations ADD COLUMN attempt_id TEXT')
                 self.db.execute('ALTER TABLE operations ADD COLUMN attempt_nonce TEXT')
+            if table and version in (2, 3):
+                self.db.execute('ALTER TABLE operations ADD COLUMN config_digest TEXT')
+                # Older verified records lack an authenticated config digest.
+                self.db.execute("UPDATE operations SET status='verification_failed' WHERE status='verified'")
             if table and version == 0:
                 self.db.execute("INSERT INTO operations(id,commit_sha,digest,tag,status,created_at) SELECT id,commit_sha,digest,tag,'accepted',created_at FROM operations_old")
                 self.db.execute('DROP TABLE operations_old')
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON operations ((1)) WHERE status IN ('accepted','verifying','recovery_required')")
-            self.db.execute('PRAGMA user_version=3')
+            self.db.execute('PRAGMA user_version=4')
             self.db.execute('COMMIT')
         except BaseException:
             self.db.execute('ROLLBACK')
@@ -191,10 +195,22 @@ class Journal:
             if self.db.in_transaction: self.db.execute('ROLLBACK')
             raise
 
-    def finish(self, operation_id, status):
+    def finish(self, operation, status, config_digest=None):
         if status not in ('verified','verification_failed','recovery_required'): raise ValueError('Invalid verification result')
-        cursor = self.db.execute("UPDATE operations SET status=? WHERE id=? AND status='verifying'", (status, operation_id))
+        if status == 'verified':
+            if not isinstance(config_digest, str) or not DIGEST_PATTERN.fullmatch(config_digest):
+                raise ValueError('Invalid verified configuration digest')
+        elif config_digest is not None:
+            raise ValueError('Unexpected configuration digest')
+        cursor = self.db.execute("UPDATE operations SET status=?,config_digest=? WHERE id=? AND status='verifying' AND attempt_id=? AND attempt_nonce=?",
+                                 (status, config_digest, operation['operationId'], operation['attemptId'], operation['attemptNonce']))
         if cursor.rowcount != 1: raise RuntimeError('Unexpected verification state')
+
+    def verified_config_digest(self, operation_id):
+        row = self.db.execute("SELECT config_digest FROM operations WHERE id=? AND status='verified'", (operation_id,)).fetchone()
+        if not row or not isinstance(row[0], str) or not DIGEST_PATTERN.fullmatch(row[0]):
+            raise ProtocolError('not_found')
+        return row[0]
 
     def status(self, operation_id):
         row = self.db.execute('SELECT id,commit_sha,digest,tag,status,created_at FROM operations WHERE id=?', (operation_id,)).fetchone()
@@ -578,12 +594,13 @@ class VerificationWorker:
         self.output.clear()
         self.eof = False
 
-    def finish(self, operation, status):
+    def finish(self, operation, status, config_digest=None):
         try:
             self.fence_revoke(operation)
         except (OSError, RuntimeError):
             status = 'recovery_required'
-        self.journal.finish(operation['operationId'], status)
+            config_digest = None
+        self.journal.finish(operation, status, config_digest)
 
     def tick(self):
         if self.process is None:
@@ -598,7 +615,7 @@ class VerificationWorker:
                 self.started = time.monotonic()
             except FencePreparationRejected:
                 self.clear_process()
-                self.journal.finish(operation['operationId'], 'verification_failed')
+                self.journal.finish(operation, 'verification_failed')
             except (OSError, RuntimeError):
                 # A launcher exception after a process exists has an uncertain outcome.
                 # Fence activation may have committed even if launch failed.
@@ -629,14 +646,18 @@ class VerificationWorker:
                 return
             if result is None or not self.eof: return
             status = 'recovery_required'
+            config_digest = None
             if result == 0:
                 try:
                     value = json.loads(self.output.decode('utf-8'), object_pairs_hook=no_duplicate_keys)
-                    if value == {'image': 'ghcr.io/raxon/servus', 'commit': operation['commit'], 'digest': operation['digest'], 'tag': operation['tag'], 'verified': True} and type(value.get('verified')) is bool:
+                    candidate = value.get('configDigest') if isinstance(value, dict) else None
+                    if (isinstance(candidate, str) and DIGEST_PATTERN.fullmatch(candidate) and
+                        value == {'image': 'ghcr.io/raxon/servus', 'commit': operation['commit'], 'digest': operation['digest'], 'tag': operation['tag'], 'verified': True, 'configDigest': candidate} and type(value.get('verified')) is bool):
                         status = 'verified'
+                        config_digest = candidate
                 except (UnicodeError, ValueError, RecursionError, AttributeError): pass
             self.clear_process()
-            self.finish(operation, status)
+            self.finish(operation, status, config_digest)
         except OSError:
             self.clear_process(kill=True)
             self.finish(operation, 'recovery_required')

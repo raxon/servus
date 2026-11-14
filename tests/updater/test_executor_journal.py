@@ -18,6 +18,7 @@ OTHER = '12345678-1234-4123-8123-123456789abd'
 COMMIT = 'a' * 40
 DIGEST = 'sha256:' + 'b' * 64
 TAG = 'v1.2.3'
+CONFIG = 'sha256:' + 'c' * 64
 
 
 def load():
@@ -92,23 +93,32 @@ class ExecutorJournalTest(unittest.TestCase):
     def test_success_exact_match_idempotency_and_next_request(self):
         self.assertEqual(self.submit()['status'], 'accepted')
         with self.assertRaises(self.mod.ProtocolError): self.submit(OTHER)
-        result = json.dumps({'image':'ghcr.io/raxon/servus','commit':COMMIT,'digest':DIGEST,'tag':TAG,'verified':True})
+        result = json.dumps({'image':'ghcr.io/raxon/servus','commit':COMMIT,'digest':DIGEST,'tag':TAG,'verified':True,'configDigest':CONFIG})
         worker = self.mod.VerificationWorker(self.journal, self.launcher(result), lambda _: None, lambda _: None)
         worker.tick()
+        attempt = worker.operation.copy()
         self.assertEqual(self.journal.status(ID)['status'], 'verifying')
         finish(worker)
         self.assertEqual(self.journal.status(ID)['status'], 'verified')
+        self.assertEqual(self.journal.verified_config_digest(ID), CONFIG)
+        self.assertNotIn('configDigest', self.journal.status(ID))
+        self.assertEqual(self.journal.db.execute('SELECT attempt_id,attempt_nonce,config_digest FROM operations WHERE id=?', (ID,)).fetchone(),
+                         (attempt['attemptId'], attempt['attemptNonce'], CONFIG))
+        self.journal.close()
+        self.journal = self.mod.Journal(self.state)
+        self.assertEqual(self.journal.verified_config_digest(ID), CONFIG)
         self.assertEqual(self.submit()['status'], 'verified')
         self.assertEqual(self.submit(OTHER)['status'], 'accepted')
         self.assertEqual(self.journal.db.execute('SELECT count(*) FROM operations').fetchone()[0], 2)
 
     def test_valid_output_with_revoke_failure_stays_recovery_required(self):
         self.submit()
-        result=json.dumps({'image':'ghcr.io/raxon/servus','commit':COMMIT,'digest':DIGEST,'tag':TAG,'verified':True})
+        result=json.dumps({'image':'ghcr.io/raxon/servus','commit':COMMIT,'digest':DIGEST,'tag':TAG,'verified':True,'configDigest':CONFIG})
         def deny(_): raise RuntimeError('fence is held')
         worker=self.mod.VerificationWorker(self.journal,self.launcher(result),lambda _: None,deny)
         worker.tick(); finish(worker)
         self.assertEqual(self.journal.status(ID)['status'],'recovery_required')
+        self.assertIsNone(self.journal.db.execute('SELECT config_digest FROM operations WHERE id=?', (ID,)).fetchone()[0])
         with self.assertRaises(self.mod.ProtocolError): self.journal.retry(ID)
 
     def test_recovery_keeps_durable_attempt_metadata(self):
@@ -119,7 +129,10 @@ class ExecutorJournalTest(unittest.TestCase):
         with self.assertRaises(self.mod.ProtocolError): self.journal.retry(ID)
 
     def test_mismatch_duplicate_json_and_failure_are_not_verified(self):
-        bad_values = [json.dumps({'image':'ghcr.io/raxon/servus','commit':'c'*40,'digest':DIGEST,'tag':TAG,'verified':True}),
+        good = {'image':'ghcr.io/raxon/servus','commit':COMMIT,'digest':DIGEST,'tag':TAG,'verified':True,'configDigest':CONFIG}
+        bad_values = [json.dumps({**good,'commit':'c'*40}), json.dumps({key:value for key,value in good.items() if key != 'configDigest'}),
+                      json.dumps({**good, 'configDigest':'sha256:'+'A'*64}), json.dumps({**good, 'configDigest':None}),
+                      json.dumps({**good, 'extra':True}),
                       '{"verified":true,"verified":true}', 'x'*16385]
         for bad in bad_values:
             with tempfile.TemporaryDirectory(prefix='servus-journal-case-') as tmp:
@@ -131,6 +144,35 @@ class ExecutorJournalTest(unittest.TestCase):
                     self.assertEqual(journal.status(ID)['status'], 'recovery_required')
                 finally:
                     journal.close()
+
+    def test_stale_attempt_cannot_commit_result(self):
+        self.submit()
+        operation = self.journal.claim()
+        for changed in ({**operation, 'attemptId': OTHER}, {**operation, 'attemptNonce': 'f'*64}):
+            with self.assertRaises(RuntimeError):
+                self.journal.finish(changed, 'verified', CONFIG)
+        self.assertEqual(self.journal.status(ID)['status'], 'verifying')
+        self.assertIsNone(self.journal.db.execute('SELECT config_digest FROM operations WHERE id=?', (ID,)).fetchone()[0])
+        self.journal.finish(operation, 'verified', CONFIG)
+        with self.assertRaises(RuntimeError): self.journal.finish(operation, 'verified', CONFIG)
+
+    def test_legacy_verified_records_are_reverified(self):
+        for version in (2, 3):
+            with self.subTest(version=version), tempfile.TemporaryDirectory(prefix='servus-legacy-journal-') as tmp:
+                path = pathlib.Path(tmp) / 'journal.sqlite'
+                with sqlite3.connect(path) as db:
+                    attempts = ', attempt_id TEXT, attempt_nonce TEXT' if version == 3 else ''
+                    db.execute("CREATE TABLE operations (id TEXT PRIMARY KEY, commit_sha TEXT NOT NULL, digest TEXT NOT NULL, tag TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL" + attempts + ")")
+                    db.execute("INSERT INTO operations(id,commit_sha,digest,tag,status,created_at) VALUES(?,?,?,?,?,?)", (ID,COMMIT,DIGEST,TAG,'verified','2026-01-01'))
+                    db.execute('PRAGMA user_version=' + str(version))
+                os.chmod(path, 0o600)
+                journal = self.mod.Journal(pathlib.Path(tmp))
+                try:
+                    self.assertEqual(journal.status(ID)['status'], 'verification_failed')
+                    self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 4)
+                    with self.assertRaises(self.mod.ProtocolError): journal.verified_config_digest(ID)
+                    self.assertEqual(journal.retry(ID)['status'], 'accepted')
+                finally: journal.close()
 
     def test_interrupted_verification_requires_explicit_retry_and_blocks_other(self):
         self.submit()
