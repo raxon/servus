@@ -58,6 +58,8 @@ class ReleaseArtifactTest(unittest.TestCase):
         self.assertNotIn('servus-supervisor.service', bootstrap['Unit']['Requires'].split())
         self.assertEqual(bootstrap['Service']['NoNewPrivileges'], 'true')
         self.assertEqual(bootstrap['Service']['EnvironmentFile'], '/etc/servus/updater.env')
+        supervisor = read('servus-supervisor.service')
+        self.assertIn('/usr/local/libexec/servus/supervisor-daemon.py', shlex.split(supervisor['Service']['ExecStart']))
 
     def test_stream_rejects_extra_changed_duplicate_and_links(self):
         expected = {'apps/example': (0o755, b'committed')}
