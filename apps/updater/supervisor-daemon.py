@@ -297,6 +297,30 @@ def complete_healthy_preparation(hub, approval_journal, operation_id, policy_pat
         raise supervisor.SupervisorError('Preparation cannot be completed') from error
 
 
+def finalize_started_update(hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env):
+    """Finalize only a matching durable start after every new role reconnects."""
+    if (hub is None or hub.used or set(hub.connections) != set(supervisor.ROLES) or
+        select.select(list(hub.connections.values()), [], [], 0)[0]):
+        return False
+    with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
+        try:
+            marker_fd = supervisor._open_root_file(operation.journal, 'maintenance.json', 0o600)
+        except FileNotFoundError:
+            return False
+        try:
+            marker = json.loads(os.read(marker_fd, 4097), object_pairs_hook=supervisor._pairs)
+        finally:
+            os.close(marker_fd)
+        if (not isinstance(marker, dict) or marker.get('state') != 'starting' or
+            not supervisor._uuid4(marker.get('operationId'))):
+            raise supervisor.SupervisorError('Maintenance requires recovery')
+        operation_id = marker['operationId']
+        if load_approved_policy(policy_path, approval_journal, accepted_env, expected_operation_id=operation_id) != hub.policy:
+            raise supervisor.SupervisorError('Active policy changed')
+        complete_healthy_preparation(hub, approval_journal, operation_id, policy_path, accepted_env, maintenance=operation)
+        return True
+
+
 class DaemonOwnership:
     """Serialize daemon lifetimes and remove only proven abandoned sockets."""
 
@@ -539,6 +563,13 @@ def run(args):
                     if changed:
                         hub.close()
                         hub = None
+            if host_apply and hub and not hub.used and set(hub.connections) == set(supervisor.ROLES):
+                try:
+                    finalize_started_update(hub, args.install_dir, args.gate_dir, args.journal_dir,
+                                            policy_path, args.approval_journal, accepted_env)
+                except (supervisor.SupervisorError, OSError, ValueError, sqlite3.Error):
+                    # Health and channels may still settle; uncertain state never completes.
+                    pass
     finally:
         if hub:
             hub.close()

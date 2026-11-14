@@ -46,7 +46,7 @@ class CompleteGenerationTest(unittest.TestCase):
         self.journal.db.execute('INSERT INTO policy_approvals VALUES (?,?,?,?,?,?,?,?,?)', (self.operation, attempt, nonce, preparation, root, root, '/root/policy', '/root/env', 'active'))
         self.pairs = [socket.socketpair() for _ in supervisor.ROLES]
         self.identities = {role: {'id': char * 64, 'pid': 123, 'cgroup': '/docker/' + char * 64} for role, char in zip(supervisor.ROLES, 'abc')}
-        self.hub = SimpleNamespace(policy=object(), identities=self.identities, connections=dict(zip(supervisor.ROLES, [pair[0] for pair in self.pairs])))
+        self.hub = SimpleNamespace(used=False, policy=object(), identities=self.identities, connections=dict(zip(supervisor.ROLES, [pair[0] for pair in self.pairs])))
         self.records = [{'Id': self.identities[role]['id'], 'State': {'Running': True, 'Health': {'Status': 'healthy'}}} for role in supervisor.ROLES]
 
     def tearDown(self):
@@ -95,6 +95,30 @@ class CompleteGenerationTest(unittest.TestCase):
         with mock.patch.object(supervisor, 'inspect_servus', return_value=self.identities), mock.patch.object(supervisor, '_docker', return_value=json.dumps(self.records).encode()):
             self.complete()
         self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone(), ('completed',))
+
+    def test_automatic_finalization_requires_all_authenticated_roles(self):
+        self.owner.close()
+        missing = self.hub.connections.pop('worker')
+        try:
+            self.assertFalse(daemon.finalize_started_update(self.hub, str(self.install), str(self.gate), str(self.maintenance), '/root/policy', str(self.state / 'journal.sqlite'), '/root/env'))
+            self.assertEqual(self.journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('starting',))
+        finally:
+            self.hub.connections['worker'] = missing
+        with mock.patch.object(supervisor, 'inspect_servus', return_value=self.identities), \
+             mock.patch.object(supervisor, '_docker', return_value=json.dumps(self.records).encode()), \
+             mock.patch.object(daemon, 'load_approved_policy', return_value=self.hub.policy) as approved:
+            self.assertTrue(daemon.finalize_started_update(self.hub, str(self.install), str(self.gate), str(self.maintenance), '/root/policy', str(self.state / 'journal.sqlite'), '/root/env'))
+        self.assertEqual(approved.call_args.kwargs, {'expected_operation_id': self.operation})
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('completed',))
+        self.assertFalse((self.maintenance / 'maintenance.json').exists())
+
+    def test_automatic_finalization_rejects_old_policy(self):
+        self.owner.close()
+        with mock.patch.object(daemon, 'load_approved_policy', return_value=object()):
+            with self.assertRaises(supervisor.SupervisorError):
+                daemon.finalize_started_update(self.hub, str(self.install), str(self.gate), str(self.maintenance), '/root/policy', str(self.state / 'journal.sqlite'), '/root/env')
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('starting',))
+        self.assertTrue((self.maintenance / 'maintenance.json').exists())
 
 
 if __name__ == '__main__':
