@@ -1,7 +1,10 @@
 import importlib.util
 import pathlib
+import os
 import sqlite3
+import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('reconcile_policy', ROOT / 'apps/updater/reconcile-policy-journal.py')
@@ -68,6 +71,76 @@ class ReconciliationTest(unittest.TestCase):
                 self.assertEqual(self.db.execute('SELECT status FROM preparations').fetchone()[0], 'recovery_required')
                 self.tearDown()
                 self.setUp()
+
+    @unittest.skipUnless(os.geteuid() == 0 and pathlib.Path('/proc/self/fd').exists(), 'Requires a Linux root fixture')
+    def test_archives_artifacts_and_journal_before_requeuing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_dir = pathlib.Path(directory) / 'policy'; policy_dir.mkdir(mode=0o700)
+            recovery_dir = pathlib.Path(directory) / 'recovery'; recovery_dir.mkdir(mode=0o700)
+            names = ('candidate-env-' + PREP + '.env', 'env-' + PREP + '.env', 'candidate-' + PREP + '.json')
+            for name in names:
+                path = policy_dir / name; path.write_text('private'); path.chmod(0o600)
+            policy_fd = os.open(policy_dir, os.O_RDONLY | os.O_DIRECTORY)
+            recovery_fd = os.open(recovery_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                recovery.archive_and_reconcile(self.db, OP, policy_fd, recovery_fd)
+            finally:
+                os.close(policy_fd); os.close(recovery_fd)
+            archive = recovery_dir / ('policy-recovery-' + PREP)
+            self.assertTrue(all((archive / name).read_text() == 'private' for name in names))
+            self.assertTrue(all(not (policy_dir / name).exists() for name in names))
+            with sqlite3.connect(archive / 'journal.sqlite') as backup:
+                self.assertEqual(backup.execute('SELECT status FROM preparations').fetchone(), ('recovery_required',))
+            self.assertEqual(self.db.execute('SELECT status FROM preparations').fetchone(), ('prepared',))
+
+    @unittest.skipUnless(os.geteuid() == 0 and pathlib.Path('/proc/self/fd').exists(), 'Requires a Linux root fixture')
+    def test_interrupted_archive_never_requeues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_dir = pathlib.Path(directory) / 'policy'; policy_dir.mkdir(mode=0o700)
+            recovery_dir = pathlib.Path(directory) / 'recovery'; recovery_dir.mkdir(mode=0o700)
+            for name in ('candidate-env-' + PREP + '.env', 'env-' + PREP + '.env', 'candidate-' + PREP + '.json'):
+                path = policy_dir / name; path.write_text('private'); path.chmod(0o600)
+            policy_fd = os.open(policy_dir, os.O_RDONLY | os.O_DIRECTORY)
+            recovery_fd = os.open(recovery_dir, os.O_RDONLY | os.O_DIRECTORY)
+            rename = os.rename
+            calls = []
+            def interrupt_second(*args, **kwargs):
+                calls.append(args[0])
+                if len(calls) == 2:
+                    raise OSError('interrupted')
+                return rename(*args, **kwargs)
+            try:
+                with mock.patch.object(recovery.os, 'rename', side_effect=interrupt_second):
+                    with self.assertRaises(OSError):
+                        recovery.archive_and_reconcile(self.db, OP, policy_fd, recovery_fd)
+            finally:
+                os.close(policy_fd); os.close(recovery_fd)
+            self.assertEqual(self.db.execute('SELECT status FROM preparations').fetchone(), ('recovery_required',))
+            self.assertEqual(self.db.execute('SELECT state FROM apply_requests').fetchone(), ('recovery_required',))
+            archive = recovery_dir / ('policy-recovery-' + PREP)
+            self.assertTrue((archive / 'journal.sqlite').exists())
+            self.assertTrue((archive / calls[0]).exists())
+            self.assertTrue((policy_dir / calls[1]).exists())
+
+    @unittest.skipUnless(os.geteuid() == 0 and pathlib.Path('/proc/self/fd').exists(), 'Requires a Linux root fixture')
+    def test_rejects_symlink_before_creating_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_dir = pathlib.Path(directory) / 'policy'; policy_dir.mkdir(mode=0o700)
+            recovery_dir = pathlib.Path(directory) / 'recovery'; recovery_dir.mkdir(mode=0o700)
+            names = ('candidate-env-' + PREP + '.env', 'env-' + PREP + '.env', 'candidate-' + PREP + '.json')
+            for name in names:
+                path = policy_dir / name; path.write_text('private'); path.chmod(0o600)
+            (policy_dir / names[0]).unlink()
+            (policy_dir / names[0]).symlink_to(policy_dir / names[1])
+            policy_fd = os.open(policy_dir, os.O_RDONLY | os.O_DIRECTORY)
+            recovery_fd = os.open(recovery_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(recovery.ReconciliationError):
+                    recovery.archive_and_reconcile(self.db, OP, policy_fd, recovery_fd)
+            finally:
+                os.close(policy_fd); os.close(recovery_fd)
+            self.assertEqual(list(recovery_dir.iterdir()), [])
+            self.assertEqual(self.db.execute('SELECT status FROM preparations').fetchone(), ('recovery_required',))
 
 
 if __name__ == '__main__':

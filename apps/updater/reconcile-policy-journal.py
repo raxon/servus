@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 
 
 class ReconciliationError(Exception):
@@ -41,6 +42,8 @@ def reconcile(db, operation_id):
             raise ReconciliationError('Update switching may have started')
         if db.execute("SELECT 1 FROM extraction_probes WHERE status != 'removed' LIMIT 1").fetchone():
             raise ReconciliationError('Extraction probes are not reconciled')
+        if db.execute("SELECT 1 FROM policy_probes WHERE state != 'removed' LIMIT 1").fetchone():
+            raise ReconciliationError('Policy probes are not reconciled')
         if not db.execute("SELECT 1 FROM extraction_probes WHERE operation_id=? AND attempt_id=? AND attempt_nonce=? AND preparation_id=? AND purpose='prepare' AND status='removed'", (operation_id, row[1], row[2], row[6])).fetchone():
             raise ReconciliationError('Staged extraction evidence is missing')
         if db.execute("SELECT 1 FROM policy_approvals WHERE operation_id=? OR state IN ('candidate','activating','recovery_required')", (operation_id,)).fetchone():
@@ -63,3 +66,64 @@ def reconcile(db, operation_id):
         if db.in_transaction:
             db.execute('ROLLBACK')
         raise
+
+
+def _private_directory(fd):
+    info = os.fstat(fd)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or
+            stat.S_IMODE(info.st_mode) != 0o700):
+        raise ReconciliationError('Recovery directory is unsafe')
+
+
+def archive_and_reconcile(db, operation_id, policy_fd, recovery_fd):
+    """Archive private artifacts and a database snapshot before requeuing.
+
+    Call only after externally fencing services, installation locks and Docker.
+    An interruption leaves the attempt in recovery and the archive intact.
+    """
+    _private_directory(policy_fd)
+    _private_directory(recovery_fd)
+    # Run all journal checks against a consistent in-memory snapshot before
+    # changing the filesystem. The real journal is checked again before commit.
+    check = sqlite3.connect(':memory:', isolation_level=None)
+    try:
+        db.backup(check)
+        reconcile(check, operation_id)
+        row = check.execute('SELECT preparation_id FROM preparations WHERE operation_id=?', (operation_id,)).fetchone()
+    finally:
+        check.close()
+    preparation_id = row[0]
+    names = ('candidate-env-' + preparation_id + '.env', 'env-' + preparation_id + '.env',
+             'candidate-' + preparation_id + '.json')
+    for name in names:
+        info = os.stat(name, dir_fd=policy_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or
+                info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise ReconciliationError('Candidate artifact is unsafe')
+    archive_name = 'policy-recovery-' + preparation_id
+    os.mkdir(archive_name, 0o700, dir_fd=recovery_fd)
+    os.fsync(recovery_fd)
+    archive_fd = os.open(archive_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=recovery_fd)
+    try:
+        _private_directory(archive_fd)
+        # The destination is newly created in a private, root-owned directory.
+        backup_path = '/proc/self/fd/' + str(archive_fd) + '/journal.sqlite'
+        backup = sqlite3.connect(backup_path)
+        try:
+            os.chmod(backup_path, 0o600)
+            db.backup(backup)
+        finally:
+            backup.close()
+        backup_fd = os.open('journal.sqlite', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=archive_fd)
+        try:
+            os.fsync(backup_fd)
+        finally:
+            os.close(backup_fd)
+        os.fsync(archive_fd)
+        for name in names:
+            os.rename(name, name, src_dir_fd=policy_fd, dst_dir_fd=archive_fd)
+            os.fsync(policy_fd)
+            os.fsync(archive_fd)
+        reconcile(db, operation_id)
+    finally:
+        os.close(archive_fd)
