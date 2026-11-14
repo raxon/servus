@@ -88,8 +88,13 @@ def check_updater(updater_dir, supervisor):
     finally: os.close(directory)
 
 
-def launch(journal, operation, active_env, docker_config, supervisor, daemon, extractor, backup, policy, *, inherited_lock=None, check=check_supervisor, updater_check=check_updater):
-    """Start exactly the verified initial image while preserving a durable recovery marker."""
+def launch(journal, operation, active_env, docker_config, supervisor, daemon, extractor, backup, policy, *, inherited_lock=None, check=check_supervisor, updater_check=check_updater, migration=None):
+    """Start the approved image; a migration caller must hold its durable fence.
+
+    Migration is an internal interface, not exposed by the first-install CLI.
+    Its coordinator must exclude legacy and external writers across the entire
+    verification and startup, including after a reboot or interrupted start.
+    """
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or not supervisor._uuid4(operation):
         raise InitialGenerationError('A valid isolated root operation is required')
     database = journal.db.execute('PRAGMA database_list').fetchone()
@@ -120,14 +125,18 @@ def launch(journal, operation, active_env, docker_config, supervisor, daemon, ex
         if manifest.get('deployment/compose-supervised.yaml') != (0o644,len(content),hashlib.sha256(content).hexdigest()):
             raise InitialGenerationError('Prepared Compose file changed')
         supervisor._verify_data_directory(approved.data_dir)
-        # An adoption record is a durable recovery boundary even if the target
-        # directory was subsequently emptied. Never treat it as a new install.
-        if (journal.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='initial_adoptions'").fetchone() and
-            journal.db.execute('SELECT 1 FROM initial_adoptions LIMIT 1').fetchone()):
+        adoption_exists=(journal.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='initial_adoptions'").fetchone() and
+                         journal.db.execute('SELECT 1 FROM initial_adoptions LIMIT 1').fetchone())
+        # A fresh install may never bypass even partially completed migration.
+        if adoption_exists and migration is None:
             raise InitialGenerationError('Existing migration requires recovery')
+        if migration is not None and not adoption_exists:
+            raise InitialGenerationError('Verified migration is unavailable')
         data = os.open(approved.data_dir,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
         try:
-            if os.listdir(data): raise InitialGenerationError('Existing data requires a verified migration')
+            contents=os.listdir(data)
+            if contents and migration is None: raise InitialGenerationError('Existing data requires a verified migration')
+            if not contents and migration is not None: raise InitialGenerationError('Migration data is missing')
         finally: os.close(data)
         fd=supervisor._trusted_directory(docker_config,0o700)
         try:
@@ -144,17 +153,25 @@ def launch(journal, operation, active_env, docker_config, supervisor, daemon, ex
         updater_check(approved.updater_dir,supervisor)
         if policy._docker(docker_config,'ps','-aq','--filter','label=com.docker.compose.project=servus','--no-trunc').strip():
             raise InitialGenerationError('Existing Servus containers require recovery')
-        journal.db.execute("CREATE TABLE IF NOT EXISTS initial_generations (operation_id TEXT PRIMARY KEY, phase TEXT NOT NULL CHECK(phase IN ('starting','started','recovery_required')))")
-        journal.db.execute('BEGIN IMMEDIATE')
-        try:
-            if journal.db.execute('SELECT 1 FROM initial_generations LIMIT 1').fetchone():
-                raise InitialGenerationError('Initial generation requires recovery')
-            journal.db.execute("INSERT INTO initial_generations VALUES (?,'starting')",(operation,))
-            journal.db.execute('COMMIT');intent=True
-        except BaseException:
-            if journal.db.in_transaction: journal.db.execute('ROLLBACK')
-            raise
+        if migration is not None:
+            migration.fence.assert_locked(operation,lock)
+            migration.adoption.claim(journal,operation,active_env,backup,migration.node_fd,supervisor,daemon,
+                                     migration.coordinator,migration.restore,migration.quiescence,install_lock=lock)
+            intent=True
+            migration.fence.assert_locked(operation,lock)
+        else:
+            journal.db.execute("CREATE TABLE IF NOT EXISTS initial_generations (operation_id TEXT PRIMARY KEY, phase TEXT NOT NULL CHECK(phase IN ('starting','started','recovery_required')))")
+            journal.db.execute('BEGIN IMMEDIATE')
+            try:
+                if journal.db.execute('SELECT 1 FROM initial_generations LIMIT 1').fetchone():
+                    raise InitialGenerationError('Initial generation requires recovery')
+                journal.db.execute("INSERT INTO initial_generations VALUES (?,'starting')",(operation,))
+                journal.db.execute('COMMIT');intent=True
+            except BaseException:
+                if journal.db.in_transaction: journal.db.execute('ROLLBACK')
+                raise
         compose=os.path.join(row[0],'deployment','compose-supervised.yaml')
+        if migration is not None:migration.fence.assert_locked(operation,lock)
         policy._docker(docker_config,'compose','--env-file',active_env,'-f',compose,'-p','servus','create','--no-build','--pull','never',timeout=180)
         candidates=supervisor.inspect_servus(approved,created=True)
         if not isinstance(candidates,dict) or set(candidates) != set(supervisor.ROLES):
@@ -166,6 +183,7 @@ def launch(journal, operation, active_env, docker_config, supervisor, daemon, ex
                 raise InitialGenerationError('Created container identity is invalid')
             ids.append(ident)
         for ident in ids:
+            if migration is not None:migration.fence.assert_locked(operation,lock)
             supervisor._docker('start',ident,timeout=30)
         if journal.db.execute("UPDATE initial_generations SET phase='started' WHERE operation_id=? AND phase='starting'",(operation,)).rowcount != 1:
             raise InitialGenerationError('Initial generation state changed')
@@ -173,8 +191,16 @@ def launch(journal, operation, active_env, docker_config, supervisor, daemon, ex
         return candidates
     except BaseException:
         if intent:
-            try: journal.db.execute("UPDATE initial_generations SET phase='recovery_required' WHERE operation_id=? AND phase='starting'",(operation,))
-            except BaseException: pass
+            try:
+                journal.db.execute('BEGIN IMMEDIATE')
+                journal.db.execute("UPDATE initial_generations SET phase='recovery_required' WHERE operation_id=? AND phase='starting'",(operation,))
+                if migration is not None:
+                    journal.db.execute("UPDATE initial_adoptions SET state='recovery_required' WHERE operation_id=? AND state='consumed'",(operation,))
+                journal.db.execute('COMMIT')
+            except BaseException:
+                if journal.db.in_transaction:
+                    try:journal.db.execute('ROLLBACK')
+                    except BaseException:pass
         raise
     finally:
         for fd in (deployment_fd,stage_fd,lock,directory):

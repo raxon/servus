@@ -27,6 +27,7 @@ initial=load('initial_generation','initial-generation.py')
 updater=load('initial_updater','servus-updater.py')
 policy=load('initial_policy','runtime-policy.py')
 backup=load('initial_backup','backup.py')
+adoption=load('initial_adoption','adoption-proof.py')
 
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
 class InitialGenerationTest(unittest.TestCase):
@@ -87,6 +88,72 @@ class InitialGenerationTest(unittest.TestCase):
                 with self.assertRaisesRegex(initial.InitialGenerationError,'migration requires recovery'):self.run_launch()
                 self.docker_call.assert_not_called()
                 self.assertFalse(self.journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='initial_generations'").fetchone())
+
+    def migration_fixture(self):
+        (self.data/'panel.sqlite').write_text('fixture')
+        self.journal.db.execute('CREATE TABLE initial_adoptions(operation_id TEXT,state TEXT)')
+        self.journal.db.execute("INSERT INTO initial_adoptions VALUES(?,'ready')",(self.op,))
+        def claim(journal,operation,*args,install_lock,**kwargs):
+            supervisor._assert_exclusive_flock(install_lock)
+            journal.db.execute('BEGIN IMMEDIATE')
+            try:
+                if journal.db.execute("UPDATE initial_adoptions SET state='consumed' WHERE operation_id=? AND state='ready'",(operation,)).rowcount != 1:
+                    raise ValueError('evidence unavailable')
+                journal.db.execute('CREATE TABLE initial_generations(operation_id TEXT,phase TEXT)')
+                journal.db.execute("INSERT INTO initial_generations VALUES(?,'starting')",(operation,))
+                journal.db.execute('COMMIT')
+            except BaseException:
+                if journal.db.in_transaction:journal.db.execute('ROLLBACK')
+                raise
+        return SimpleNamespace(fence=SimpleNamespace(assert_locked=mock.Mock()),adoption=SimpleNamespace(claim=mock.Mock(side_effect=claim)),
+                               node_fd=-1,coordinator=object(),restore=object(),quiescence=object())
+
+    def test_migration_claims_proof_before_starting_and_checks_fence(self):
+        migration=self.migration_fixture()
+        result,calls=self.run_launch(migration=migration)
+        self.assertEqual(result,self.ids)
+        self.assertEqual(len(calls),3)
+        self.assertEqual(migration.adoption.claim.call_count,1)
+        self.assertEqual(migration.fence.assert_locked.call_count,6)
+        self.assertEqual(self.journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('consumed',))
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('started',))
+
+    def test_migration_failure_after_claim_records_recovery_for_both_states(self):
+        migration=self.migration_fixture()
+        migration.fence.assert_locked.side_effect=[None,RuntimeError('lost fence')]
+        with self.assertRaisesRegex(RuntimeError,'lost fence'):self.run_launch(migration=migration)
+        self.docker_call.assert_called_once()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('recovery_required',))
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('recovery_required',))
+
+    def test_migration_rejects_missing_proof_or_data(self):
+        migration=self.migration_fixture()
+        (self.data/'panel.sqlite').unlink()
+        with self.assertRaises(initial.InitialGenerationError):self.run_launch(migration=migration)
+        migration.adoption.claim.assert_not_called()
+        self.docker_call.assert_not_called()
+        (self.data/'panel.sqlite').write_text('fixture')
+        self.journal.db.execute('DELETE FROM initial_adoptions')
+        with self.assertRaises(initial.InitialGenerationError):self.run_launch(migration=migration)
+        migration.adoption.claim.assert_not_called()
+
+    def test_migration_start_consumes_real_release_bound_evidence(self):
+        parent=self.root/'restores';parent.mkdir(mode=0o711)
+        data=parent/('restore-'+self.op);data.mkdir(mode=0o700);os.chown(data,1000,1000)
+        (data/'panel.sqlite').write_text('fixture');self.approved.data_dir=str(data)
+        snapshot=str(self.root/'backup');digest='sha256:'+'d'*64
+        identity=(os.stat(data).st_dev,os.stat(data).st_ino)
+        restored=SimpleNamespace(verify_staged=mock.Mock(return_value=identity))
+        quiet=SimpleNamespace(ensure_host_namespaces=mock.Mock(),ensure_no_uid_writers=mock.Mock(),ensure_no_open_data=mock.Mock())
+        migration=SimpleNamespace(fence=SimpleNamespace(assert_locked=mock.Mock()),adoption=adoption,node_fd=-1,
+                                  coordinator=object(),restore=restored,quiescence=quiet)
+        with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace):
+            adoption.record(self.journal,self.op,self.env,snapshot,digest,str(parent),backup,-1,supervisor,self.daemon,policy,
+                            migration.coordinator,restored,quiet)
+        self.run_launch(migration=migration)
+        self.assertEqual(self.journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('consumed',))
+        self.assertEqual(self.journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('started',))
+        self.assertEqual(restored.verify_staged.call_count,2)
 
     def test_existing_containers_and_changed_policy_are_rejected(self):
         self.docker_call.return_value=b'existing\n'
