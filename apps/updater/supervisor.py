@@ -159,10 +159,29 @@ def _freeze_json(value):
 
 
 def _normalize_host_config(host):
-    """Normalize Docker's unordered mount list without weakening its checks."""
+    """Normalize Docker's unordered mounts and equivalent default OOM flag."""
     if not isinstance(host, dict):
         raise SupervisorError('Runtime configuration is invalid')
     host = dict(host)
+    # Docker may report the default OOM setting as either null or false after
+    # a container starts. True must remain distinct and is never normalized.
+    if 'OomKillDisable' in host and (host['OomKillDisable'] is None or host['OomKillDisable'] is False):
+        host['OomKillDisable'] = False
+    binds = host.get('Binds')
+    if binds is not None:
+        if not isinstance(binds, list):
+            raise SupervisorError('Runtime mounts are invalid')
+        targets = set()
+        parsed = []
+        for bind in binds:
+            if not isinstance(bind, str):
+                raise SupervisorError('Runtime mounts are invalid')
+            parts = bind.rsplit(':', 2)
+            if len(parts) != 3 or not parts[0].startswith('/') or not parts[1].startswith('/') or not parts[2] or parts[1] in targets:
+                raise SupervisorError('Runtime mounts are invalid')
+            targets.add(parts[1])
+            parsed.append((parts[1], bind))
+        host['Binds'] = [value for _, value in sorted(parsed)]
     mounts = host.get('Mounts')
     if mounts is not None:
         if not isinstance(mounts, list):

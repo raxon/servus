@@ -8,18 +8,23 @@ expected policy from the running containers or applies updates.
 import argparse
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import select
 import signal
 import socket
+import sqlite3
 import stat
 import struct
 import sys
 import time
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import supervisor
+
+APPROVED_IMAGE = 'ghcr.io/raxon/servus'
 
 
 def load_policy(path):
@@ -58,6 +63,89 @@ def load_policy(path):
         return supervisor.RuntimePolicy(**document['policy'])
     except (TypeError, ValueError) as error:
         raise supervisor.SupervisorError('Invalid policy document') from error
+
+
+def _private_file(path, maximum):
+    if not isinstance(path, str):
+        raise supervisor.SupervisorError('Invalid protected path')
+    parent, name = os.path.split(path)
+    if not name or not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise supervisor.SupervisorError('Invalid protected path')
+    directory = supervisor._trusted_directory(parent, 0o700)
+    try:
+        fd = supervisor._open_root_file(directory, name, 0o600)
+        try:
+            before = os.fstat(fd)
+            if before.st_size > maximum:
+                raise supervisor.SupervisorError('Protected file is too large')
+            with os.fdopen(fd, 'rb', closefd=False) as source:
+                value = source.read(maximum + 1)
+            after = os.fstat(fd)
+            named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if (len(value) != before.st_size or len(value) > maximum or
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) !=
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) or
+                (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)):
+                raise supervisor.SupervisorError('Protected file changed while reading')
+            return value
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory)
+
+
+def load_approved_policy(path, approval_journal, accepted_env, *, expected_operation_id=None):
+    """Require a verified active approval and the unchanged accepted files."""
+    config = _private_file(accepted_env, 65536)
+    policy_data = _private_file(path, 1048576)
+    _private_file(approval_journal, 64 * 1024 * 1024)
+    try:
+        uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=ro'
+        with sqlite3.connect(uri, uri=True, timeout=2) as db:
+            row = db.execute("SELECT a.root_digest,a.env_digest,a.candidate_digest,a.operation_id,a.source_env_path FROM policy_approvals a JOIN operations o ON o.id=a.operation_id JOIN preparations p ON p.operation_id=a.operation_id WHERE a.policy_path=? AND a.accepted_env_path=? AND a.state='active' AND o.status='verified' AND o.attempt_id=a.attempt_id AND o.attempt_nonce=a.attempt_nonce AND o.digest=a.root_digest AND o.config_digest=a.image_config_digest AND p.status IN ('prepared','completed') AND p.attempt_id=a.attempt_id AND p.attempt_nonce=a.attempt_nonce AND p.preparation_id=a.preparation_id AND NOT EXISTS (SELECT 1 FROM policy_approvals WHERE state IN ('activating','recovery_required')) AND NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM policy_probes WHERE operation_id=a.operation_id AND preparation_id=a.preparation_id AND config_digest=a.env_digest AND state='removed')", (path, accepted_env)).fetchall()
+        if (len(row) != 1 or row[0][1] != 'sha256:' + hashlib.sha256(config).hexdigest() or
+            row[0][2] != 'sha256:' + hashlib.sha256(policy_data).hexdigest() or
+            (expected_operation_id is not None and row[0][3] != expected_operation_id)):
+            raise supervisor.SupervisorError('Active policy approval is invalid')
+        active_config = _private_file(row[0][4], 65536)
+        if row[0][1] != 'sha256:' + hashlib.sha256(active_config).hexdigest():
+            raise supervisor.SupervisorError('Active policy approval is invalid')
+        policy = load_policy(path)
+        if policy.image_reference != APPROVED_IMAGE + '@' + row[0][0]:
+            raise supervisor.SupervisorError('Active policy approval is invalid')
+        return policy
+    except (sqlite3.Error, ValueError, OSError) as error:
+        raise supervisor.SupervisorError('Active policy approval is unavailable') from error
+
+
+def complete_healthy_preparation(hub, approval_journal, operation_id, policy_path, accepted_env):
+    """Record completion only while all authenticated roles are healthy."""
+    if supervisor.inspect_servus(hub.policy) != hub.identities:
+        raise supervisor.SupervisorError('Container identity changed')
+    if select.select(list(hub.connections.values()), [], [], 0)[0]:
+        raise supervisor.SupervisorError('A component channel changed')
+    ids = [hub.identities[role]['id'] for role in supervisor.ROLES]
+    try:
+        records = json.loads(supervisor._docker('inspect', *ids), object_pairs_hook=supervisor._pairs)
+        if not isinstance(records, list) or len(records) != len(ids):
+            raise supervisor.SupervisorError('Container health is unavailable')
+        by_id = {item.get('Id'): item for item in records if isinstance(item, dict)}
+        if set(by_id) != set(ids):
+            raise supervisor.SupervisorError('Container health is unavailable')
+        for role in supervisor.ROLES:
+            state = by_id[hub.identities[role]['id']].get('State')
+            if (not isinstance(state, dict) or state.get('Running') is not True or
+                (role in ('api', 'agent') and (not isinstance(state.get('Health'), dict) or state['Health'].get('Status') != 'healthy'))):
+                raise supervisor.SupervisorError('Container health is unavailable')
+        uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=rw'
+        with sqlite3.connect(uri, uri=True, timeout=2) as db:
+            db.execute('BEGIN IMMEDIATE')
+            cursor = db.execute("UPDATE preparations SET status='completed' WHERE operation_id=? AND status='prepared' AND NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM policy_approvals a JOIN operations o ON o.id=a.operation_id WHERE a.operation_id=preparations.operation_id AND a.policy_path=? AND a.accepted_env_path=? AND a.state='active' AND a.attempt_id=preparations.attempt_id AND a.attempt_nonce=preparations.attempt_nonce AND a.preparation_id=preparations.preparation_id AND o.status='verified' AND o.attempt_id=a.attempt_id AND o.attempt_nonce=a.attempt_nonce AND o.digest=a.root_digest AND o.config_digest=a.image_config_digest)", (operation_id, policy_path, accepted_env))
+            if cursor.rowcount != 1:
+                raise supervisor.SupervisorError('Preparation cannot be completed')
+            db.commit()
+    except (sqlite3.Error, ValueError, OSError) as error:
+        raise supervisor.SupervisorError('Preparation cannot be completed') from error
 
 
 class DaemonOwnership:
@@ -162,7 +250,7 @@ def command_listener(directory):
         raise
 
 
-def handle_command(listener, hub, install_dir, gate_dir, journal_dir):
+def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env):
     connection, _ = listener.accept()
     try:
         _, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
@@ -170,14 +258,39 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir):
             raise supervisor.SupervisorError('Command peer rejected')
         deadline = time.monotonic() + 5
         request = supervisor._read_message(connection, deadline)
-        if (set(request) != {'version', 'type', 'operationId', 'timeoutMs'} or
-                type(request['version']) is not int or request['version'] != 1 or request['type'] != 'stop' or
-                not supervisor._uuid4(request['operationId']) or type(request['timeoutMs']) is not int or
-                not 1 <= request['timeoutMs'] <= 60000 or hub is None or hub.used or
-                set(hub.connections) != set(supervisor.ROLES)):
+        kind = request.get('type')
+        if kind == 'status' and set(request) == {'version', 'type'} and type(request.get('version')) is int and request['version'] == 1:
+            ready = (hub is not None and not hub.used and set(hub.connections) == set(supervisor.ROLES)
+                     and not select.select(list(hub.connections.values()), [], [], 0)[0])
+            if ready:
+                try:
+                    with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir):
+                        ready = load_approved_policy(policy_path, approval_journal, accepted_env) == hub.policy
+                except (supervisor.SupervisorError, OSError, ValueError):
+                    ready = False
+            supervisor._send_message(connection, {'version': 1, 'status': 'ready' if ready else 'waiting'}, time.monotonic() + 1)
+            return
+        if (type(request.get('version')) is not int or request['version'] != 1 or
+                not supervisor._uuid4(request.get('operationId')) or hub is None or hub.used or
+                set(hub.connections) != set(supervisor.ROLES) or
+                (kind == 'stop' and (set(request) != {'version', 'type', 'operationId', 'timeoutMs'} or
+                 type(request['timeoutMs']) is not int or not 1 <= request['timeoutMs'] <= 60000)) or
+                (kind == 'complete' and set(request) != {'version', 'type', 'operationId'}) or
+                kind not in ('stop', 'complete')):
             raise supervisor.SupervisorError('Invalid or unavailable command')
         with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
-            result = operation.stop_after_drain(hub, request['operationId'], request['timeoutMs'])
+            # The installation lock remains held through validation and drain.
+            # A changed approval, environment or candidate must never authorize
+            # a stop using channels registered under an earlier policy.
+            approved = load_approved_policy(policy_path, approval_journal, accepted_env,
+                                            expected_operation_id=request['operationId'] if kind == 'complete' else None)
+            if approved != hub.policy:
+                raise supervisor.SupervisorError('Active policy changed')
+            if kind == 'complete':
+                complete_healthy_preparation(hub, approval_journal, request['operationId'], policy_path, accepted_env)
+                result = 'completed'
+            else:
+                result = operation.stop_after_drain(hub, request['operationId'], request['timeoutMs'])
         supervisor._send_message(connection, {'version': 1, 'status': result}, time.monotonic() + 5)
     except (supervisor.SupervisorError, OSError, ValueError):
         try:
@@ -191,9 +304,6 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir):
 def run(args):
     if type(args.uid) is not int or args.uid <= 0 or type(args.gid) is not int or args.gid <= 0:
         raise supervisor.SupervisorError('Invalid component identity')
-    policy = load_policy(args.policy)
-    if policy.install_dir != args.install_dir or policy.gate_dir != args.gate_dir or policy.control_dir != args.socket_dir:
-        raise supervisor.SupervisorError('Policy paths do not match daemon configuration')
     endpoint = supervisor.ComponentEndpoint()
     control = control_fd = control_identity = hub = ownership = None
     stopping = False
@@ -204,6 +314,10 @@ def run(args):
     signal.signal(signal.SIGINT, stop)
     try:
         ownership = DaemonOwnership(args.socket_dir, args.journal_dir, args.gid)
+        with supervisor.MaintenanceSupervisor(args.install_dir, args.gate_dir, args.journal_dir):
+            policy = load_approved_policy(args.policy, args.approval_journal, args.accepted_env)
+        if policy.install_dir != args.install_dir or policy.gate_dir != args.gate_dir or policy.control_dir != args.socket_dir:
+            raise supervisor.SupervisorError('Policy paths do not match daemon configuration')
         tokens = endpoint.read_component_tokens(args.secret_dir, args.gid)
         listener = endpoint.listen(args.socket_dir, args.gid)
         control, control_fd, control_identity = command_listener(args.socket_dir)
@@ -223,7 +337,8 @@ def run(args):
                 hub = None
                 continue
             if control in ready:
-                handle_command(control, hub, args.install_dir, args.gate_dir, args.journal_dir)
+                handle_command(control, hub, args.install_dir, args.gate_dir, args.journal_dir,
+                               args.policy, args.approval_journal, args.accepted_env)
                 if hub and hub.used:
                     hub.close()
                     hub = None
@@ -258,7 +373,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    for name in ('policy', 'install-dir', 'gate-dir', 'journal-dir', 'secret-dir', 'socket-dir'):
+    for name in ('policy', 'install-dir', 'gate-dir', 'journal-dir', 'secret-dir', 'socket-dir', 'approval-journal', 'accepted-env'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--uid', type=int, required=True)
     parser.add_argument('--gid', type=int, required=True)

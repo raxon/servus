@@ -283,6 +283,25 @@ class SupervisorTest(unittest.TestCase):
             changed = copy.deepcopy(records); mutation(changed)
             with self.assertRaises(supervisor.SupervisorError): inspect(changed)
 
+    def test_oom_default_normalization_preserves_enabled_and_other_settings(self):
+        base = {'OomKillDisable': False, 'Privileged': False}
+        self.assertEqual(supervisor._normalize_host_config(base), supervisor._normalize_host_config({'OomKillDisable': None, 'Privileged': False}))
+        self.assertNotEqual(supervisor._normalize_host_config(base), supervisor._normalize_host_config({'OomKillDisable': True, 'Privileged': False}))
+        self.assertNotEqual(supervisor._normalize_host_config(base), supervisor._normalize_host_config({'OomKillDisable': None, 'Privileged': True}))
+        self.assertNotEqual(supervisor._normalize_host_config(base), supervisor._normalize_host_config({'Privileged': False}))
+
+    def test_bind_order_is_unordered_but_sources_options_and_targets_are_checked(self):
+        first = '/one:/target-one:rw'
+        second = '/two:/target-two:ro'
+        expected = supervisor._normalize_host_config({'Binds': [first, second]})
+        self.assertEqual(expected, supervisor._normalize_host_config({'Binds': [second, first]}))
+        for changed in ('/other:/target-one:rw', '/one:/target-one:ro', '/one:/elsewhere:rw'):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(expected, supervisor._normalize_host_config({'Binds': [changed, second]}))
+        for invalid in (['/one:/target-one:rw', '/two:/target-one:ro'], ['/one:/target'], ['/one:relative:rw'], [7], 'not-a-list'):
+            with self.subTest(invalid=invalid), self.assertRaises(supervisor.SupervisorError):
+                supervisor._normalize_host_config({'Binds': invalid})
+
     def test_crash_after_intent_refuses_automatic_reentry(self):
         program = '''import importlib.util,os,signal,sys,uuid
 s=importlib.util.spec_from_file_location('s',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)

@@ -1,4 +1,5 @@
 import fcntl
+import json
 import signal
 import threading
 import time
@@ -11,6 +12,7 @@ import socket
 import sys
 import tempfile
 import unittest
+import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'apps/updater'))
@@ -22,6 +24,68 @@ spec.loader.exec_module(daemon)
 
 @unittest.skipUnless(sys.platform == 'linux' and os.geteuid() == 0, 'Requires isolated Linux root')
 class DaemonTest(unittest.TestCase):
+    def test_status_rechecks_approval_with_lock_before_reporting_ready(self):
+        for scenario in ('valid', 'changed_env', 'recovery_required'):
+            with self.subTest(scenario=scenario):
+                command, client = socket.socketpair()
+                pairs = [socket.socketpair() for _ in supervisor.ROLES]
+                marker = object()
+                hub = SimpleNamespace(used=False, policy=marker,
+                                      connections=dict(zip(supervisor.ROLES, [pair[0] for pair in pairs])))
+                listener = SimpleNamespace(accept=lambda: (command, None))
+                state = {'locked': False}
+                class Operation:
+                    def __enter__(self): state['locked'] = True; return self
+                    def __exit__(self, *_): state['locked'] = False
+                def recheck(*_, **__):
+                    self.assertTrue(state['locked'])
+                    if scenario != 'valid': raise supervisor.SupervisorError('Approval invalid')
+                    return marker
+                client.sendall(b'{"version":1,"type":"status"}\n')
+                try:
+                    with mock.patch.object(supervisor, 'MaintenanceSupervisor', return_value=Operation()), \
+                         mock.patch.object(daemon, 'load_approved_policy', side_effect=recheck):
+                        daemon.handle_command(listener, hub, '/install', '/gate', '/journal', '/policy', '/approval', '/env')
+                    result = json.loads(client.recv(4096))
+                    self.assertEqual(result['status'], 'ready' if scenario == 'valid' else 'waiting')
+                finally:
+                    client.close()
+                    for first, second in pairs: first.close(); second.close()
+
+    def test_stop_rechecks_approval_while_installation_lock_is_held(self):
+        original = object()
+        for scenario in ('valid', 'changed_policy', 'changed_env', 'recovery_required'):
+            with self.subTest(scenario=scenario):
+                server, client = socket.socketpair()
+                listener = SimpleNamespace(accept=lambda: (server, None))
+                hub = SimpleNamespace(used=False, connections={role: object() for role in supervisor.ROLES}, policy=original)
+                state = {'locked': False, 'stopped': False, 'checked': False}
+                class Operation:
+                    def __enter__(self): state['locked'] = True; return self
+                    def __exit__(self, *_): state['locked'] = False
+                    def stop_after_drain(self, *_):
+                        self_assert(state['locked'] and state['checked'])
+                        state['stopped'] = True
+                        return 'stopped_unverified'
+                def self_assert(condition):
+                    self.assertTrue(condition)
+                def recheck(*_, **__):
+                    self.assertTrue(state['locked'])
+                    state['checked'] = True
+                    if scenario in ('changed_env', 'recovery_required'):
+                        raise supervisor.SupervisorError('Approval no longer valid')
+                    return object() if scenario == 'changed_policy' else original
+                message = {'version':1, 'type':'stop', 'operationId':str(uuid.uuid4()), 'timeoutMs':5000}
+                client.sendall(json.dumps(message).encode() + b'\n')
+                with mock.patch.object(supervisor, 'MaintenanceSupervisor', return_value=Operation()), \
+                     mock.patch.object(daemon, 'load_approved_policy', side_effect=recheck):
+                    daemon.handle_command(listener, hub, '/install', '/gate', '/journal', '/policy', '/approval', '/env')
+                result = json.loads(client.recv(4096))
+                client.close()
+                self.assertTrue(state['checked'])
+                self.assertEqual(state['stopped'], scenario == 'valid')
+                self.assertEqual(result['status'], 'stopped_unverified' if scenario == 'valid' else 'failed')
+
     def test_sigkill_abandoned_sockets_restarted_and_journal_blocks_recovery(self):
         with tempfile.TemporaryDirectory(dir='/root') as temporary:
             root = Path(temporary)
@@ -150,7 +214,8 @@ class DaemonTest(unittest.TestCase):
             journal.mkdir(mode=0o700)
             os.chown(control, 0, 1000)
             args = SimpleNamespace(uid=1000, gid=1000, policy='unused', install_dir='/install',
-                                   gate_dir='/gate', journal_dir=str(journal), secret_dir='/secrets', socket_dir=str(control))
+                                   gate_dir='/gate', journal_dir=str(journal), secret_dir='/secrets', socket_dir=str(control),
+                                   approval_journal='/approval', accepted_env='/env')
             policy = SimpleNamespace(install_dir='/install', gate_dir='/gate', control_dir=str(control))
             created = []
             first_inspection = threading.Event()
@@ -181,6 +246,14 @@ class DaemonTest(unittest.TestCase):
                 def close(self):
                     pass
             errors = []
+            startup = {'locked': False, 'validated': False}
+            class StartupLock:
+                def __enter__(self): startup['locked'] = True; return self
+                def __exit__(self, *_): startup['locked'] = False
+            def load_under_lock(*_):
+                self.assertTrue(startup['locked'])
+                startup['validated'] = True
+                return policy
             def target():
                 try:
                     daemon.run(args)
@@ -188,7 +261,8 @@ class DaemonTest(unittest.TestCase):
                     pass
                 except BaseException as error:
                     errors.append(error)
-            with mock.patch.object(daemon, 'load_policy', return_value=policy), \
+            with mock.patch.object(daemon, 'load_approved_policy', side_effect=load_under_lock), \
+                    mock.patch.object(supervisor, 'MaintenanceSupervisor', side_effect=lambda *_: StartupLock()), \
                     mock.patch.object(daemon.signal, 'signal'), \
                     mock.patch.object(supervisor.ComponentEndpoint, 'read_component_tokens', return_value={}), \
                     mock.patch.object(supervisor.ComponentEndpoint, 'listen', autospec=True, side_effect=listen), \
@@ -205,6 +279,7 @@ class DaemonTest(unittest.TestCase):
                     client.connect(str(control / 'socket'))
                 thread.join(5)
             self.assertFalse(thread.is_alive())
+            self.assertTrue(startup['validated'])
             self.assertEqual(errors, [])
             self.assertEqual(len(created), 2)
 

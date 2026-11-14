@@ -110,7 +110,7 @@ class Journal:
                     raise RuntimeError('Existing journal has unknown operations')
                 self.db.execute('DROP INDEX IF EXISTS one_active_operation')
                 self.db.execute('ALTER TABLE operations RENAME TO operations_old')
-            elif table and version not in (2, 3, 4, 5):
+            elif table and version not in (2, 3, 4, 5, 6):
                 raise RuntimeError('Unsupported updater journal version')
             elif not table and version != 0:
                 raise RuntimeError('Invalid updater journal')
@@ -126,11 +126,17 @@ class Journal:
                 self.db.execute("INSERT INTO operations(id,commit_sha,digest,tag,status,created_at) SELECT id,commit_sha,digest,tag,'accepted',created_at FROM operations_old")
                 self.db.execute('DROP TABLE operations_old')
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON operations ((1)) WHERE status IN ('accepted','verifying','recovery_required')")
-            self.db.execute("CREATE TABLE IF NOT EXISTS preparations (operation_id TEXT PRIMARY KEY REFERENCES operations(id), attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, preparation_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('preparing','prepared','recovery_required')), staging_path TEXT)")
+            if table and version == 5:
+                self.db.execute('DROP INDEX IF EXISTS one_active_preparation')
+                self.db.execute('ALTER TABLE preparations RENAME TO preparations_v5')
+            self.db.execute("CREATE TABLE IF NOT EXISTS preparations (operation_id TEXT PRIMARY KEY REFERENCES operations(id), attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, preparation_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('preparing','prepared','completed','recovery_required')), staging_path TEXT)")
+            if table and version == 5:
+                self.db.execute('INSERT INTO preparations SELECT * FROM preparations_v5')
+                self.db.execute('DROP TABLE preparations_v5')
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_preparation ON preparations ((1)) WHERE status IN ('preparing','prepared','recovery_required')")
             self.db.execute("CREATE TABLE IF NOT EXISTS extraction_probes (name TEXT PRIMARY KEY, operation_id TEXT NOT NULL REFERENCES operations(id), attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, preparation_id TEXT NOT NULL, purpose TEXT NOT NULL CHECK(purpose IN ('prepare','policy')), status TEXT NOT NULL CHECK(status IN ('intent','removed')))")
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_extraction_probe ON extraction_probes ((1)) WHERE status='intent'")
-            self.db.execute('PRAGMA user_version=5')
+            self.db.execute('PRAGMA user_version=6')
             self.db.execute('COMMIT')
         except BaseException:
             self.db.execute('ROLLBACK')

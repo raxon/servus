@@ -169,10 +169,30 @@ class ExecutorJournalTest(unittest.TestCase):
                 journal = self.mod.Journal(pathlib.Path(tmp))
                 try:
                     self.assertEqual(journal.status(ID)['status'], 'verification_failed')
-                    self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 5)
+                    self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 6)
                     with self.assertRaises(self.mod.ProtocolError): journal.verified_config_digest(ID)
                     self.assertEqual(journal.retry(ID)['status'], 'accepted')
                 finally: journal.close()
+
+    def test_v5_preparations_migrate_transactionally_and_remain_blocking(self):
+        with tempfile.TemporaryDirectory(prefix='servus-v5-journal-') as tmp:
+            path = pathlib.Path(tmp) / 'journal.sqlite'
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE operations (id TEXT PRIMARY KEY, commit_sha TEXT NOT NULL, digest TEXT NOT NULL, tag TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, attempt_id TEXT, attempt_nonce TEXT, config_digest TEXT)")
+                db.execute("CREATE TABLE preparations (operation_id TEXT PRIMARY KEY REFERENCES operations(id), attempt_id TEXT NOT NULL, attempt_nonce TEXT NOT NULL, preparation_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('preparing','prepared','recovery_required')), staging_path TEXT)")
+                db.execute("INSERT INTO operations VALUES (?,?,?,?,?,?,?,?,?)", (ID,COMMIT,DIGEST,TAG,'verified','2026-01-01',OTHER,'f'*64,CONFIG))
+                db.execute("INSERT INTO preparations VALUES (?,?,?,?,?,?)", (ID,OTHER,'f'*64,OTHER,'prepared','/srv/stage'))
+                db.execute('PRAGMA user_version=5')
+            os.chmod(path, 0o600)
+            journal = self.mod.Journal(pathlib.Path(tmp))
+            try:
+                self.assertEqual(journal.db.execute('PRAGMA user_version').fetchone()[0], 6)
+                self.assertEqual(journal.db.execute('SELECT status,staging_path FROM preparations').fetchone(), ('prepared','/srv/stage'))
+                with self.assertRaises(self.mod.ProtocolError): journal.submit(OTHER, COMMIT, DIGEST, TAG)
+                journal.db.execute("UPDATE preparations SET status='completed' WHERE operation_id=?", (ID,))
+                self.assertEqual(journal.submit(OTHER, COMMIT, DIGEST, TAG)['status'], 'accepted')
+            finally:
+                journal.close()
 
     def test_interrupted_verification_requires_explicit_retry_and_blocks_other(self):
         self.submit()

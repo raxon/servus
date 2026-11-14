@@ -8,9 +8,11 @@
 100644 apps/updater/prepare-verified.py
 100644 apps/updater/preparation-fence.py
 100644 apps/updater/provision-verifier-group.py
+100644 apps/updater/runtime-policy.py
 100755 apps/updater/servus-updater.py
 100644 apps/updater/supervisor-daemon.py
 100644 apps/updater/supervisor.py
+100644 apps/updater/validate-compose.py
 100644 apps/updater/verification-executor.py
 100644 apps/updater/verification-fence.py
 100644 apps/updater/verify-release.py
