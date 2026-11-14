@@ -94,10 +94,11 @@ class RecoveryFenceTest(unittest.TestCase):
                     calls.append(args[1])
             try:
                 fence.fenced_reconcile(self.db, OP, state_fd, install_fd, -1, -1, Journal,
-                                       execute=lambda command: INACTIVE if command[0].endswith('systemctl') else '')
+                                       execute=lambda command: INACTIVE if command[0].endswith('systemctl') else '',
+                                       preflight=lambda: calls.append('verified'))
             finally:
                 os.close(state_fd); os.close(install_fd)
-            self.assertEqual(calls, [OP])
+            self.assertEqual(calls, ['verified', OP])
 
     @unittest.skipUnless(os.geteuid() == 0, 'Requires root-owned lock fixtures')
     def test_refuses_held_lock_and_existing_maintenance_marker(self):

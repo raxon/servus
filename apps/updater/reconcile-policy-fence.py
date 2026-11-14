@@ -14,7 +14,7 @@ PROBE = re.compile(r'^servus-extract-[a-f0-9]{32}$')
 PROJECT = re.compile(r'^servusprobe[a-f0-9]{32}$')
 
 
-class FenceError(Exception):
+class FenceError(RuntimeError):
     pass
 
 
@@ -63,11 +63,13 @@ def assert_no_maintenance(state_fd):
         os.close(directory)
 
 
-def fenced_reconcile(db, operation_id, state_fd, install_fd, policy_fd, recovery_fd, journal_module, *, execute=None):
+def fenced_reconcile(db, operation_id, state_fd, install_fd, policy_fd, recovery_fd, journal_module, *, execute=None, preflight=None):
     """Apply the journal primitive while its host-side fences remain held."""
     with hold_locks(state_fd, install_fd):
         assert_no_maintenance(state_fd)
         assert_stopped(db, operation_id, execute=execute or run)
+        if preflight is not None:
+            preflight()
         journal_module.archive_and_reconcile(db, operation_id, policy_fd, recovery_fd)
 
 

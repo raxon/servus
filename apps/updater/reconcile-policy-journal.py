@@ -13,7 +13,7 @@ import sqlite3
 import stat
 
 
-class ReconciliationError(Exception):
+class ReconciliationError(RuntimeError):
     pass
 
 
