@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 import uuid
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -26,6 +27,52 @@ supervisor = load('snapshot_supervisor', 'apps/updater/supervisor.py')
 coordinator = load('update_coordinator', 'apps/updater/update-coordinator.py')
 updater = load('snapshot_updater', 'apps/updater/servus-updater.py')
 quiescence = load('snapshot_quiescence', 'apps/updater/quiescence.py')
+
+
+class RunningPreflightTest(unittest.TestCase):
+    def test_inspects_external_containers_before_draining(self):
+        identities={role:{'id':character * 64} for role,character in zip(('api','worker','agent'),'abc')}
+        hub=mock.Mock(identities=identities,policy=mock.Mock(data_dir='/var/lib/servus'))
+        guard=mock.Mock()
+        trusted=('d' * 64,'panel-ingress','traefik:3.7.13','sha256:' + 'e' * 64)
+        coordinator.preflight_external_containers(hub,supervisor,guard,trusted_ingress=trusted)
+        args,kwargs=guard.ensure_no_other_data_mounts.call_args
+        self.assertEqual(args[1],{item['id'] for item in identities.values()})
+        self.assertEqual(args[2],'/var/lib/servus')
+        self.assertEqual(kwargs,{'trusted_ingress':trusted,'allow_running_expected':True})
+
+    def test_rejects_unexpected_socket_access(self):
+        hub=mock.Mock(identities={role:{'id':character * 64} for role,character in zip(('api','worker','agent'),'abc')},
+                      policy=mock.Mock(data_dir='/var/lib/servus'))
+        guard=mock.Mock()
+        guard.ensure_no_other_data_mounts.side_effect=quiescence.QuiescenceError('Unexpected container can access Docker API')
+        with self.assertRaises(quiescence.QuiescenceError):
+            coordinator.preflight_external_containers(hub,supervisor,guard)
+
+    def test_failed_preflight_does_not_claim_update_or_stop_panel(self):
+        hub=object.__new__(supervisor.DrainHub)
+        hub.policy=SimpleNamespace(data_dir='/var/lib/servus')
+        hub.identities={role:{'id':character * 64} for role,character in zip(supervisor.ROLES,'abc')}
+        maintenance=object.__new__(supervisor.MaintenanceSupervisor)
+        maintenance.install_lock=1
+        ownership=SimpleNamespace(directory=1,assert_held=mock.Mock())
+        journal=mock.Mock()
+        journal.db.execute.side_effect=[SimpleNamespace(fetchone=lambda: (0,'main','/root/journal.sqlite')),
+                                        SimpleNamespace(fetchone=lambda: ('/root/accepted.env','/root/candidate.json'))]
+        daemon=SimpleNamespace(resolve_active_policy=mock.Mock(return_value=('/root/policy','/root/env',hub.policy)),
+                               approved_policy_binding=mock.Mock(return_value=object()))
+        guard=mock.Mock()
+        guard.ensure_no_other_data_mounts.side_effect=quiescence.QuiescenceError('Unexpected container can access Docker API')
+        node=SimpleNamespace(st_mode=0o100755,st_uid=0,st_nlink=1)
+        with mock.patch.object(supervisor,'_assert_exclusive_flock'), mock.patch.object(coordinator.os,'fstat',return_value=node), \
+             mock.patch.object(coordinator.os,'readlink',return_value='/root/control'), \
+             mock.patch.object(maintenance,'drained_window') as drain:
+            with self.assertRaises(quiescence.QuiescenceError):
+                coordinator.apply_prepared_update(journal,str(uuid.uuid4()),hub,maintenance,ownership,
+                    '/root/journal.sqlite','/root/active.env','/root/backups','/root/policies','/root/docker',
+                    1,supervisor,daemon,object(),object(),guard,object())
+        journal.claim_update.assert_not_called()
+        drain.assert_not_called()
 
 
 @unittest.skipUnless(os.geteuid() == 0 and pathlib.Path('/proc/self/fd').exists(), 'Requires Linux root')

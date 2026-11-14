@@ -177,6 +177,31 @@ def record_verified_snapshot(journal, operation_id, path, digest, lease, backup_
         raise
 
 
+def preflight_external_containers(hub, supervisor, quiescence, *, trusted_ingress=None):
+    """Reject unsafe external mounts before stopping the running control plane.
+
+    The snapshot still repeats this check after the drain under the startup gate.
+    """
+    class DockerInspection:
+        @staticmethod
+        def call(*args):
+            return supervisor._docker(*args)
+
+        @staticmethod
+        def inspect(*ids):
+            try:
+                return json.loads(supervisor._docker('inspect', *ids), object_pairs_hook=_pairs)
+            except (ValueError, UnicodeError, RecursionError):
+                raise UpdateError('Docker inspection is unavailable') from None
+
+    try:
+        expected = {hub.identities[role]['id'] for role in supervisor.ROLES}
+    except (KeyError, TypeError):
+        raise UpdateError('Authenticated drain identity is unavailable') from None
+    quiescence.ensure_no_other_data_mounts(DockerInspection(), expected, hub.policy.data_dir,
+                                           trusted_ingress=trusted_ingress, allow_running_expected=True)
+
+
 def capture_stopped_snapshot(journal, operation_id, lease, destination, node_fd,
                              supervisor, quiescence, backup_module, *, trusted_ingress=None):
     """Capture and verify a snapshot during a held, authenticated drain.
@@ -509,6 +534,7 @@ def apply_prepared_update(journal, operation_id, hub, maintenance, daemon_owners
         row = candidate_row()
     if not row or any(not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path for path in row):
         raise UpdateError('Prepared policy candidate is unavailable')
+    preflight_external_containers(hub, supervisor, quiescence, trusted_ingress=trusted_ingress)
     backup_fd = supervisor._trusted_directory(backup_root, 0o700)
     policy_fd = None
     try:
