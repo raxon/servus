@@ -232,7 +232,7 @@ class LockedActivationTests(unittest.TestCase):
             destination = self.private / 'backup'
             shutil.copytree(capture.dst, destination)
             digest = 'sha256:' + hashlib.sha256((destination / 'manifest.json').read_bytes()).hexdigest()
-            self.db.execute('UPDATE update_transactions SET backup_path=?,backup_manifest_digest=?', (str(destination), digest))
+            self.db.execute("UPDATE update_transactions SET phase='intent',backup_path=NULL,backup_manifest_digest=NULL WHERE operation_id=?", (self.op,))
             roles = supervisor.ROLES
             fields = {'image_reference': 'ghcr.io/raxon/servus@' + self.root_digest,
                 'image_id': 'sha256:' + 'b'*64, 'install_dir': str(self.install),
@@ -253,7 +253,11 @@ class LockedActivationTests(unittest.TestCase):
                                'sha256:' + hashlib.sha256(b'old policy').hexdigest(), None)
                     lease = supervisor.DrainLease(owner, self.op,
                         {role: str(uuid.uuid4()) for role in roles}, 30000, binding)
-                    lease.record('snapshotting'); lease.record('snapshot_verified')
+                    coordinator.begin_snapshot(self.journal, self.op, lease, supervisor)
+                    coordinator.record_verified_snapshot(self.journal, self.op, str(destination), digest,
+                        lease, backup, capture.node_fd, supervisor)
+                    self.assertEqual(self.db.execute('SELECT phase,backup_path,backup_manifest_digest FROM update_transactions WHERE operation_id=?',
+                                                     (self.op,)).fetchone(), ('snapshot_verified', str(destination), digest))
                     policy.activate_locked(self.journal, self.op, str(self.accepted), str(self.candidate),
                         str(self.target), str(self.active_env), lease, ownership, self.extractor,
                         supervisor, coordinator, backup, capture.node_fd)

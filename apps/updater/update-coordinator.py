@@ -98,6 +98,41 @@ def verify_snapshot(path, digest, backup_module, node_fd, supervisor):
         os.close(directory)
 
 
+def begin_snapshot(journal, operation_id, lease, supervisor):
+    """Record capture intent while the authenticated maintenance gate is held.
+
+    A drained lease does not prove every writer is stopped. The caller must
+    establish that independently before creating a snapshot.
+    """
+    if not supervisor._uuid4(operation_id) or not isinstance(lease, supervisor.DrainLease):
+        raise UpdateError('Invalid snapshot operation')
+    lease.assert_locked(operation_id, 'stopped_unverified')
+    db = journal.db
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        result = db.execute("UPDATE update_transactions SET phase='snapshotting' "
+            "WHERE operation_id=? AND phase='intent' AND backup_path IS NULL AND backup_manifest_digest IS NULL "
+            "AND EXISTS (SELECT 1 FROM operations o JOIN preparations p ON p.operation_id=o.id "
+            "WHERE o.id=update_transactions.operation_id AND o.status='verified' AND p.status='prepared' "
+            "AND o.digest=update_transactions.root_digest AND o.attempt_id=update_transactions.attempt_id "
+            "AND o.attempt_nonce=update_transactions.attempt_nonce AND p.attempt_id=update_transactions.attempt_id "
+            "AND p.attempt_nonce=update_transactions.attempt_nonce AND p.preparation_id=update_transactions.preparation_id)",
+            (operation_id,))
+        if result.rowcount != 1:
+            raise UpdateError('Snapshot does not match the active update')
+        lease.assert_locked(operation_id, 'stopped_unverified')
+        db.execute('COMMIT')
+    except BaseException:
+        if db.in_transaction:
+            db.execute('ROLLBACK')
+        raise
+    try:
+        lease.record('snapshotting')
+    except BaseException:
+        db.execute("UPDATE update_transactions SET phase='recovery_required' WHERE operation_id=? AND phase='snapshotting'", (operation_id,))
+        raise
+
+
 def record_verified_snapshot(journal, operation_id, path, digest, lease, backup_module, node_fd, supervisor):
     """Bind a validated snapshot to the exact prepared release under the drain lease.
 

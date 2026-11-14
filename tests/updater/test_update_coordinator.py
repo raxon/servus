@@ -108,10 +108,17 @@ class SnapshotVerificationTest(unittest.TestCase):
             journal.db.execute("INSERT INTO preparations(operation_id,attempt_id,attempt_nonce,preparation_id,status) VALUES(?,?,?,?,?)",
                                (operation, attempt, nonce, preparation, 'prepared'))
             journal.claim_update(operation)
-            journal.db.execute("UPDATE update_transactions SET phase='snapshotting' WHERE operation_id=?", (operation,))
             lease = object.__new__(supervisor.DrainLease)
             try:
                 with mock.patch.object(lease, 'assert_locked') as locked, mock.patch.object(lease, 'record') as record, mock.patch.object(backup, '_validate_staging'):
+                    journal.db.execute("UPDATE preparations SET attempt_nonce=? WHERE operation_id=?", ('d' * 64, operation))
+                    with self.assertRaisesRegex(coordinator.UpdateError, 'active update'):
+                        coordinator.begin_snapshot(journal, operation, lease, supervisor)
+                    self.assertEqual(journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('intent',))
+                    journal.db.execute("UPDATE preparations SET attempt_nonce=? WHERE operation_id=?", (nonce, operation))
+                    coordinator.begin_snapshot(journal, operation, lease, supervisor)
+                    record.assert_called_once_with('snapshotting')
+                    record.reset_mock()
                     (self.path / 'agent-token').write_text('d' * 64)
                     with self.assertRaisesRegex(coordinator.UpdateError, 'digest mismatch'):
                         coordinator.record_verified_snapshot(journal, operation, str(self.path), self.digest, lease, backup, -1, supervisor)
@@ -147,6 +154,25 @@ class SnapshotVerificationTest(unittest.TestCase):
                 with mock.patch.object(lease, 'assert_locked'), mock.patch.object(lease, 'record', side_effect=RuntimeError('lost lease')), mock.patch.object(backup, '_validate_staging'):
                     with self.assertRaisesRegex(RuntimeError, 'lost lease'):
                         coordinator.record_verified_snapshot(journal, operation, str(self.path), self.digest, lease, backup, -1, supervisor)
+                self.assertEqual(journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('recovery_required',))
+            finally:
+                journal.close()
+
+    def test_failed_snapshot_start_handoff_requires_recovery(self):
+        with tempfile.TemporaryDirectory(dir='/root') as state:
+            journal = updater.Journal(pathlib.Path(state))
+            operation, attempt, preparation = (str(uuid.uuid4()) for _ in range(3))
+            root = 'sha256:' + 'b' * 64
+            journal.db.execute("INSERT INTO operations(id,commit_sha,digest,tag,status,attempt_id,attempt_nonce,config_digest) VALUES(?,?,?,?,?,?,?,?)",
+                               (operation, 'c' * 40, root, 'v1.2.3', 'verified', attempt, 'a' * 64, root))
+            journal.db.execute("INSERT INTO preparations(operation_id,attempt_id,attempt_nonce,preparation_id,status) VALUES(?,?,?,?,?)",
+                               (operation, attempt, 'a' * 64, preparation, 'prepared'))
+            journal.claim_update(operation)
+            lease = object.__new__(supervisor.DrainLease)
+            try:
+                with mock.patch.object(lease, 'assert_locked'), mock.patch.object(lease, 'record', side_effect=RuntimeError('lost lease')):
+                    with self.assertRaisesRegex(RuntimeError, 'lost lease'):
+                        coordinator.begin_snapshot(journal, operation, lease, supervisor)
                 self.assertEqual(journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('recovery_required',))
             finally:
                 journal.close()
