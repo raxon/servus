@@ -1,4 +1,6 @@
 import importlib.util
+import configparser
+import shlex
 import io
 import os
 from pathlib import Path
@@ -40,6 +42,23 @@ def archive(items):
 
 
 class ReleaseArtifactTest(unittest.TestCase):
+    def test_bootstrap_unit_cannot_dispatch_updates(self):
+        def read(name):
+            parser = configparser.ConfigParser(interpolation=None, strict=True)
+            parser.read(ROOT / 'deployment/systemd' / name)
+            return parser
+        bootstrap = read('servus-updater-bootstrap.service')
+        normal = read('servus-updater.service')
+        initial = shlex.split(bootstrap['Service']['ExecStart'])
+        final = shlex.split(normal['Service']['ExecStart'])
+        self.assertNotIn('--supervisor-socket', initial)
+        self.assertIn('--supervisor-socket', final)
+        self.assertIn('servus-updater.service', bootstrap['Unit']['Conflicts'].split())
+        self.assertIn('servus-updater-socket.service', bootstrap['Unit']['Requires'].split())
+        self.assertNotIn('servus-supervisor.service', bootstrap['Unit']['Requires'].split())
+        self.assertEqual(bootstrap['Service']['NoNewPrivileges'], 'true')
+        self.assertEqual(bootstrap['Service']['EnvironmentFile'], '/etc/servus/updater.env')
+
     def test_stream_rejects_extra_changed_duplicate_and_links(self):
         expected = {'apps/example': (0o755, b'committed')}
         good = [('.', b'', 0o755, 'dir'), ('apps', b'', 0o755, 'dir'), ('apps/example', b'committed', 0o755, 'file')]

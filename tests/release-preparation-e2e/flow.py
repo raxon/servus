@@ -159,6 +159,9 @@ try:
     assert result.get('ok') and result['operation']['status'] in ('preparing','prepared')
     outcome = until(lambda: (s if (s := prepare_state(operation)) in ('prepared','recovery_required') else None), 'real release preparation', 300)
     assert outcome == 'prepared', 'Signed legacy release did not prepare'
+    if mode != 'tag':
+        denied = request('apply', operation)
+        assert denied == {'ok': False, 'error': 'unavailable'}, 'Bootstrap updater must not apply a release'
     assert_bundle(state_dir,operation)
     print('PASS real v0.1.5 attestation, IPC, systemd, GHCR pull and exact install inventory (' + mode + ')',flush=True)
     stop(helper); helper = None
