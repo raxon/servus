@@ -126,11 +126,7 @@ jobs:
           IMAGE_ID: ${{ steps.build.outputs.image_id }}
         run: |
           set -euo pipefail
-          [[ $(docker image inspect --format '{{.Id}}' "$IMAGE:$VERSION") == "$IMAGE_ID" ]] || { echo 'Image tag no longer references the tested image.' >&2; exit 1; }
-          docker push "$IMAGE:$VERSION" | tee "$RUNNER_TEMP/servus-image-push.log"
-          digest=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$RUNNER_TEMP/servus-image-push.log" | tail -n 1)
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'Registry did not return an image digest.' >&2; exit 1; }
-          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          bash "$GITHUB_WORKSPACE/scripts/push-tested-image.sh" "$IMAGE" "$VERSION" "$IMAGE_ID" "$RUNNER_TEMP/servus-image-push.log"
       - name: Attest tested image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
