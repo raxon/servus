@@ -18,7 +18,7 @@ const savedUpdate = z.strictObject({
   tag: z.string().regex(/^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/).max(64),
   commit: z.string().regex(/^[0-9a-f]{40}$/),
   digest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
-  stage: z.enum(["submit", "verifying", "preparing", "applying", "attention"]),
+  stage: z.enum(["submit", "verifying", "preparing", "applying", "verification_failed", "retry_verification", "attention"]),
 });
 type SavedUpdate = z.infer<typeof savedUpdate>;
 class StorageError extends Error {}
@@ -49,7 +49,7 @@ export function UpdateSettings() {
   });
 
   useEffect(() => {
-    if (!run || run.stage === "attention" || !capability.data?.applyAvailable) return;
+    if (!run || (run.stage === "attention" || run.stage === "verification_failed") || !capability.data?.applyAvailable) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const save = (next: SavedUpdate) => {
@@ -68,12 +68,18 @@ export function UpdateSettings() {
           save({ ...run, stage: "verifying" });
           return;
         }
+        if (run.stage === "retry_verification") {
+          setMessage("Retrying release verification...");
+          await api<{ operation: UpdateOperation }>(`${path}/retry`, { ...options, method: "POST", body: {} });
+          save({ ...run, stage: "verifying" });
+          return;
+        }
         if (run.stage === "verifying") {
           setMessage("Checking the release signature...");
           const { operation } = await api<{ operation: UpdateOperation }>(path, options);
           if (operation.status === "verified") { save({ ...run, stage: "preparing" }); return; }
           if (operation.status === "verification_failed" || operation.status === "recovery_required") {
-            save({ ...run, stage: "attention" });
+            save({ ...run, stage: operation.status === "verification_failed" ? "verification_failed" : "attention" });
             setFailure(operation.status === "verification_failed" ? "The release could not be verified. Check the update service logs." : "The update needs attention. Check the server before trying again.");
             return;
           }
@@ -128,9 +134,13 @@ export function UpdateSettings() {
       {capability.isPending ? <p>Checking update settings...</p> : capability.error ? <p role="alert">Could not load update settings.</p> : !capability.data?.applyAvailable ? <p>Updates are not configured on this installation.</p> : run ? (
         <>
           <p>Update {run.tag}</p>
-          <p role="status" aria-live="polite">{run.stage === "attention" ? "Update needs attention." : message || "Checking update progress..."}</p>
+          <p role="status" aria-live="polite">{run.stage === "attention" ? "Update needs attention." : run.stage === "verification_failed" ? "Release verification failed." : message || "Checking update progress..."}</p>
           {failure ? <div className="error-notice" role="alert">{failure}</div> : null}
-          {failure && run.stage !== "attention" ? <button type="button" className="button" onClick={() => { setFailure(""); setResume(value => value + 1); }}>Check again</button> : null}
+          {run.stage === "verification_failed" ? <button type="button" className="button" onClick={() => {
+            try { const next = { ...run, stage: "retry_verification" as const }; localStorage.setItem(storageKey, JSON.stringify(next)); setFailure(""); setRun(next); }
+            catch { setFailure("Could not save update progress in this browser. Enable browser storage and try again."); }
+          }}>Retry verification</button> : null}
+          {failure && run.stage !== "attention" && run.stage !== "verification_failed" ? <button type="button" className="button" onClick={() => { setFailure(""); setResume(value => value + 1); }}>Check again</button> : null}
         </>
       ) : (
         <>

@@ -33,7 +33,7 @@ try {
   browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
   const page = await browser.newPage();
   page.setDefaultTimeout(15000);
-  let applyCount = 0, applied = false, complete = false, discovered = 0;
+  let applyCount = 0, applied = false, complete = false, discovered = 0, retried = false;
   const candidate = { status: 'candidate', verified: false, tag: 'v0.1.6', commit: 'a'.repeat(40), digest: `sha256:${'b'.repeat(64)}` };
   let operationId;
   await page.route('**/api/v1/updates**', async route => {
@@ -47,13 +47,14 @@ try {
       operationId = route.request().postDataJSON().operationId;
       return ok({ operation: { operationId, status: 'accepted' } });
     }
+    if (path.endsWith('/retry')) { retried = true; return ok({ operation: { operationId, status: 'accepted' } }); }
     if (path.endsWith('/prepare')) return ok({ operation: { operationId, status: 'prepared' } });
     if (path.endsWith('/apply') && method === 'GET') {
       if (!applied) return route.fulfill({ status: 404, json: { error: { code: 'NOT_FOUND', message: 'Not found' } } });
       return ok({ operation: { operationId, status: complete ? 'completed' : 'awaiting_completion' } });
     }
     if (path.endsWith('/apply') && method === 'POST') { applied = true; applyCount++; return ok({ operation: { operationId, status: 'requested' } }); }
-    return ok({ operation: { operationId, status: 'verified' } });
+    return ok({ operation: { operationId, status: retried ? 'verified' : 'verification_failed' } });
   });
   await page.goto(origin);
   await page.getByLabel('Email address').fill('admin@example.test');
@@ -65,6 +66,9 @@ try {
   await page.getByText('Version v0.1.6 is available.', { exact: false }).waitFor();
   assert.equal(discovered, 2);
   await page.getByRole('button', { name: 'Install update' }).click();
+  await page.getByText('Release verification failed.').waitFor();
+  await page.reload();
+  await page.getByRole('button', { name: 'Retry verification' }).click();
   await page.getByText('Installing the update.', { exact: false }).waitFor();
   await page.waitForFunction(() => JSON.parse(localStorage.getItem('servus.update.operation.v1') || '{}').stage === 'applying');
   await page.waitForTimeout(500);
@@ -74,7 +78,7 @@ try {
   await page.getByText('Update installed.').waitFor();
   assert.equal(applyCount, 1);
   assert.equal(await page.evaluate(() => localStorage.getItem('servus.update.operation.v1')), null);
-  console.log('Update settings: discovery, installation and recovery after reload passed');
+  console.log('Update settings: discovery, verification retry, installation and recovery after reload passed');
 } finally {
   await browser?.close(); server.kill('SIGTERM'); await exited; await rm(directory, { recursive: true, force: true });
 }
