@@ -1,7 +1,7 @@
 [Unit]
 Description=Servus verified update coordinator
-Requires=docker.service servus-supervisor.service
-After=docker.service servus-supervisor.service
+Requires=docker.service servus-supervisor.service servus-updater-socket.service
+After=docker.service servus-supervisor.service servus-updater-socket.service
 
 [Service]
 Type=simple

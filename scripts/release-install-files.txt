@@ -8,6 +8,7 @@
 100644 apps/updater/prepare-verified.py
 100644 apps/updater/preparation-fence.py
 100644 apps/updater/provision-verifier-group.py
+100644 apps/updater/provision-socket.py
 100644 apps/updater/quiescence.py
 100644 apps/updater/runtime-policy.py
 100755 apps/updater/servus-updater.py
@@ -22,4 +23,5 @@
 100644 deployment/lifecycle-gate.sh
 100644 deployment/systemd/servus-supervisor.service
 100644 deployment/systemd/servus-updater.service
+100644 deployment/systemd/servus-updater-socket.service
 100755 scripts/install.sh

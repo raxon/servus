@@ -1,0 +1,17 @@
+[Unit]
+Description=Prepare Servus updater socket directory
+Before=docker.service
+RequiresMountsFor=/run
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/etc/servus/updater.env
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/servus/provision-socket.py --socket-gid ${SERVUS_UPDATER_SOCKET_GID}
+RemainAfterExit=yes
+NoNewPrivileges=true
+
+[Install]
+WantedBy=docker.service
