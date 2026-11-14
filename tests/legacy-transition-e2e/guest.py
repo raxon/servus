@@ -74,12 +74,14 @@ def after_reboot():
 
 
 def main():
-    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
+    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
     if sys.argv[1:]==['--after-reboot']:return after_reboot()
     recover_check=sys.argv[1:]==['--recover-check']
     early_check=sys.argv[1:]==['--early-recover']
     orchestrated=sys.argv[1:]==['--orchestrated']
-    full=sys.argv[1:] in (['--full'],['--recover-check'],['--early-recover'],['--orchestrated'])
+    bootstrap_fail=sys.argv[1:]==['--bootstrap-fail']
+    bootstrap_migrate=sys.argv[1:] in (['--bootstrap-migrate'],['--bootstrap-fail'])
+    full=sys.argv[1:] in (['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'])
     for path in ('/opt/servus','/etc/servus','/var/lib/servus','/var/lib/servus-updater'):
         if Path(path).exists():raise RuntimeError('Fixture requires an empty host')
     install=Path('/opt/servus');install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
@@ -133,7 +135,8 @@ def main():
         item=docker.inspect(ingress[0])[0];trusted=(item['Id'],'panel-ingress',item['Config']['Image'],item['Image'])
     op=str(uuid.uuid4());attempt=str(uuid.uuid4());prep=str(uuid.uuid4());nonce='c'*64
     root_digest=NEW.split('@')[1];config_digest='sha256:'+'b'*64
-    target=parent/('restore-'+op);target.mkdir(mode=0o700)
+    target=parent/('restore-'+op)
+    if not bootstrap_migrate:target.mkdir(mode=0o700)
     active='/active'
     if full:
         def run(*args,timeout=180):subprocess.run(args,check=True,timeout=timeout,stdin=subprocess.DEVNULL)
@@ -144,6 +147,33 @@ def main():
         run('/usr/bin/python3','-I','/usr/local/libexec/servus/provision-verifier-group.py')
         shutil.copyfile(BASE/'node','/usr/bin/node');os.chmod('/usr/bin/node',0o755)
         active=str(config/'servus.env')
+        if bootstrap_migrate:
+            shutil.copyfile(old_env,active);os.chmod(active,0o600)
+            run('/usr/bin/systemctl','daemon-reload')
+            args=['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-bootstrap.py','--operation',op,'--commit',
+                  '5c82968ef6ab05d416d95d301078d37c9d11cc36','--digest',root_digest,'--tag','v0.1.7','--old-compose',str(compose)]
+            invalid=args.copy();invalid[4]='invalid'
+            rejected=subprocess.run(invalid,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+            if rejected.returncode==0 or request('/health').get('version')!='0.1.5':raise RuntimeError('Invalid bootstrap changed the panel')
+            if bootstrap_fail:
+                invalid=args.copy();invalid[6]='0'*40
+                rejected=subprocess.run(invalid,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=1100)
+                if rejected.returncode==0 or request('/health').get('version')!='0.1.5':raise RuntimeError('Unverified release changed the panel')
+                if Path(active).read_bytes()!=old_env.read_bytes() or target.exists() or not (install/'.bootstrap-verification-v1').is_file():
+                    raise RuntimeError('Failed verification did not preserve legacy state')
+                status=subprocess.run(['/usr/bin/systemctl','is-active','--quiet','servus-updater-bootstrap.service'],timeout=30)
+                if status.returncode==0:raise RuntimeError('Failed verifier remains active')
+                print('PASS unverified release preserved legacy panel and configuration',flush=True)
+                return
+            run(*args,timeout=1500)
+            if request('/health').get('version')!='0.1.7':raise RuntimeError('Bootstrapped API is unavailable')
+            cookie='';csrf='';request('/auth/login','POST',{'email':'fixture@example.test','password':'isolated-fixture-password'})
+            if not any(item.get('id')==project for item in request('/projects')):raise RuntimeError('Project was not retained')
+            if request('/updates').get('applyAvailable') is not True:raise RuntimeError('Updater is unavailable')
+            if (install/'.bootstrap-verification-v1').exists() or (install/transition.MARKER).exists():raise RuntimeError('Migration marker remains')
+            if (config/('legacy-'+op+'.env')).read_bytes()!=old_env.read_bytes():raise RuntimeError('Original configuration was not retained')
+            print('PASS bootstrap verified signed release and migrated the legacy panel',flush=True)
+            return
         Path(active).write_text(f'SERVUS_IMAGE={NEW}\nSERVUS_DATA_DIR={target}\nSERVUS_PORT=4180\nSERVUS_INGRESS_PORT=18080\n'
             f'SERVUS_DOCKER_GID={gid}\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_PUBLIC_URL=http://127.0.0.1:4180\n'
             'SERVUS_ALLOWED_ORIGINS=http://127.0.0.1:4180\nSERVUS_SECURE_COOKIES=false\nSERVUS_SOURCE_REF=v0.1.7\n'
