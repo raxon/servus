@@ -1,9 +1,10 @@
 export type DrainResult = { status: 'drained' | 'uncertain' | 'timeout' };
+export type UncertaintySource = 'handler' | 'request_aborted' | 'response_closed' | 'closer' | 'unknown';
 
 // This is an in-process barrier only. A coordinator must also exclude other writers.
 export class MaintenanceGate {
   private draining = false;
-  private uncertain = false;
+  private readonly uncertainty = new Set<UncertaintySource>();
   private active = 0;
   private readonly waiters = new Set<() => void>();
   private readonly closers = new Set<() => void>();
@@ -26,7 +27,9 @@ export class MaintenanceGate {
     };
   }
 
-  markUncertain() { this.uncertain = true; }
+  markUncertain(source: UncertaintySource = 'unknown') { this.uncertainty.add(source); }
+
+  uncertaintySources(): readonly UncertaintySource[] { return [...this.uncertainty]; }
 
   registerCloser(close: () => void): () => void {
     if (this.draining) { close(); return () => {}; }
@@ -38,7 +41,7 @@ export class MaintenanceGate {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2147483647) throw new Error('Invalid drain timeout');
     this.draining = true;
     for (const close of [...this.closers]) {
-      try { close(); } catch { this.markUncertain(); }
+      try { close(); } catch { this.markUncertain('closer'); }
     }
     if (this.active) {
       const waited = await new Promise<boolean>(resolve => {
@@ -48,6 +51,6 @@ export class MaintenanceGate {
       });
       if (!waited) return {status:'timeout'};
     }
-    return {status:this.uncertain?'uncertain':'drained'};
+    return {status:this.uncertainty.size?'uncertain':'drained'};
   }
 }

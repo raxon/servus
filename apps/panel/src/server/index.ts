@@ -21,5 +21,9 @@ const app = await createApp({
   updaterApplyEnabled: process.env.PANEL_UPDATER_APPLY_ENABLED === 'true',
 });
 await app.listen({host:process.env.PANEL_HOST ?? '127.0.0.1',port:Number(process.env.PANEL_PORT ?? 4180)});
-const control = startSupervisorControl(controlConfig, 'api', timeout => maintenance!.drain(timeout));
+const control = startSupervisorControl(controlConfig, 'api', async timeout => {
+  const result = await maintenance!.drain(timeout);
+  if (result.status === 'uncertain') app.log.warn({sources:maintenance!.uncertaintySources()}, 'API drain is uncertain');
+  return result;
+});
 for(const signal of ['SIGINT','SIGTERM'] as const) process.on(signal,()=>{control?.abort();void app.close().then(()=>process.exit(process.exitCode || 0));});

@@ -64,6 +64,7 @@ describe('maintenance barrier',()=>{
     await entered.promise;controller.abort();await request;await new Promise(resolve=>setTimeout(resolve,30));
     expect(await gate.drain(10)).toEqual({status:'timeout'});
     const finish=gate.drain(1000);pending.resolve({online:true});expect(await finish).toEqual({status:'uncertain'});
+    expect(gate.uncertaintySources().some(source=>source==='request_aborted'||source==='response_closed')).toBe(true);
   });
   it('does not poison a later drain when a static asset download is cancelled',async()=>{
     const dir=mkdtempSync(join(tmpdir(),'panel-maintenance-')), webDir=join(dir,'web'), gate=new MaintenanceGate();
@@ -77,6 +78,27 @@ describe('maintenance barrier',()=>{
     await response.body!.cancel();await new Promise(resolve=>setTimeout(resolve,100));
     expect(await gate.drain(1000)).toEqual({status:'drained'});
   });
+  it('does not poison a later drain when the static index download is cancelled',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-maintenance-')),webDir=join(dir,'web'),gate=new MaintenanceGate();
+    mkdirSync(webDir,{recursive:true});writeFileSync(join(webDir,'index.html'),Buffer.alloc(32*1024*1024));
+    const store=new Store(dir),app=await createApp({dataDir:dir,store,maintenance:gate,webDir});
+    cleanup.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
+    let route='';app.addHook('onRequest',async req=>{route=req.routeOptions.url;});
+    const address=await app.listen({host:'127.0.0.1',port:0});
+    const response=await fetch(`${address}/index.html`);expect(response.status).toBe(200);expect(route).toBe('/*');
+    await response.body!.cancel();await new Promise(resolve=>setTimeout(resolve,100));
+    expect(await gate.drain(1000)).toEqual({status:'drained'});
+  });
+  it('does not poison a later drain when a SPA navigation download is cancelled',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-maintenance-')),webDir=join(dir,'web'),gate=new MaintenanceGate();
+    mkdirSync(webDir,{recursive:true});writeFileSync(join(webDir,'index.html'),Buffer.alloc(32*1024*1024));
+    const store=new Store(dir),app=await createApp({dataDir:dir,store,maintenance:gate,webDir});
+    cleanup.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
+    const address=await app.listen({host:'127.0.0.1',port:0});
+    const response=await fetch(`${address}/settings`,{headers:{accept:'text/html'}});expect(response.status).toBe(200);
+    await response.body!.cancel();await new Promise(resolve=>setTimeout(resolve,100));
+    expect(await gate.drain(1000)).toEqual({status:'drained'});
+  });
   it('still treats a disconnected dynamic asset route as uncertain',async()=>{
     const dir=mkdtempSync(join(tmpdir(),'panel-maintenance-')),store=new Store(dir),gate=new MaintenanceGate();
     const app=await createApp({dataDir:dir,store,maintenance:gate});
@@ -85,6 +107,17 @@ describe('maintenance barrier',()=>{
     app.get('/assets/dynamic',async()=>{entered.resolve();await pending.promise;return {ok:true};});
     const address=await app.listen({host:'127.0.0.1',port:0});const controller=new AbortController();
     const request=fetch(`${address}/assets/dynamic`,{signal:controller.signal}).catch(()=>undefined);
+    await entered.promise;controller.abort();await request;await new Promise(resolve=>setTimeout(resolve,30));
+    pending.resolve();expect(await gate.drain(1000)).toEqual({status:'uncertain'});
+  });
+  it('does not treat a custom wildcard route as a static file server',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-maintenance-')),store=new Store(dir),gate=new MaintenanceGate();
+    const app=await createApp({dataDir:dir,store,maintenance:gate,webDir:join(dir,'missing')});
+    cleanup.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
+    const entered=deferred<void>(),pending=deferred<void>();
+    app.get('/*',async()=>{entered.resolve();await pending.promise;return {ok:true};});
+    const address=await app.listen({host:'127.0.0.1',port:0});const controller=new AbortController();
+    const request=fetch(`${address}/custom`,{signal:controller.signal}).catch(()=>undefined);
     await entered.promise;controller.abort();await request;await new Promise(resolve=>setTimeout(resolve,30));
     pending.resolve();expect(await gate.drain(1000)).toEqual({status:'uncertain'});
   });

@@ -46,6 +46,7 @@ export async function createApp(options: AppOptions) {
   const requestReleases = new WeakMap<FastifyRequest, () => void>();
   const upgrades = new WeakSet<FastifyRequest>();
   const readOnlyStreams = new WeakSet<FastifyRequest>();
+  let staticFilesRegistered = false;
   if (maintenance) {
     app.addHook('onRoute', route => {
       if (!route.url.startsWith('/api/') || route.url === '/api/v1/health' || route.url.endsWith('/console')) return;
@@ -54,7 +55,7 @@ export async function createApp(options: AppOptions) {
         const done=maintenance.beginWork();
         try {
           const result=original.call(this,req,reply);
-          if (!result || typeof (result as Promise<unknown>).then !== 'function') maintenance.markUncertain();
+          if (!result || typeof (result as Promise<unknown>).then !== 'function') maintenance.markUncertain('handler');
           return await result;
         } finally { done(); }
       };
@@ -65,12 +66,12 @@ export async function createApp(options: AppOptions) {
       const done=maintenance.admit();
       if (!done) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Service is temporarily unavailable'}});
       requestReleases.set(req,done);
-      const staticAsset=(req.method==='GET'||req.method==='HEAD')&&req.routeOptions.url==='/*'&&path?.startsWith('/assets/')===true;
+      const staticAsset=staticFilesRegistered&&(req.method==='GET'||req.method==='HEAD')&&req.routeOptions.url==='/*';
       let finished=false;
       reply.raw.once('finish',()=>{finished=true;});
-      req.raw.once('aborted',()=>{if(!staticAsset&&!readOnlyStreams.has(req))maintenance.markUncertain();done();});
+      req.raw.once('aborted',()=>{if(!staticAsset&&!readOnlyStreams.has(req))maintenance.markUncertain('request_aborted');done();});
       reply.raw.once('close',()=>{
-        if (!staticAsset && !readOnlyStreams.has(req) && !upgrades.has(req) && !finished) maintenance.markUncertain();
+        if (!staticAsset && !readOnlyStreams.has(req) && !upgrades.has(req) && !finished) maintenance.markUncertain('response_closed');
         done();
       });
     });
@@ -253,6 +254,7 @@ export async function createApp(options: AppOptions) {
   const webDir=resolve(options.webDir ?? 'dist/web');
   if(existsSync(webDir)) {
     await app.register(staticFiles,{root:webDir,prefix:'/'});
+    staticFilesRegistered = true;
     app.setNotFoundHandler((req,reply)=>{
       if(req.method==='GET'&&!req.url.startsWith('/api/')&&req.headers.accept?.includes('text/html'))return reply.sendFile('index.html');
       return reply.code(404).send({error:{code:'NOT_FOUND',message:'Not found'}});
