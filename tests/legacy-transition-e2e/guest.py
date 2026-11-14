@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -20,7 +21,7 @@ from unittest import mock
 
 if os.geteuid()!=0 or not os.uname().nodename.startswith('colima-servus-legacy-e2e-'):
     raise SystemExit('A disposable legacy fixture VM is required')
-BASE=Path('/run/servus-legacy-fixture')
+BASE=Path('/var/lib/servus-test-fixture' if sys.argv[1:]==['--after-reboot'] else '/run/servus-legacy-fixture')
 sys.path.insert(0,str(BASE/'apps/updater'))
 import supervisor
 
@@ -42,8 +43,38 @@ verifier=load('fixture_verifier','verify-release.py')
 OLD='ghcr.io/raxon/servus@sha256:32f7cccf97841716ffae6bbff4f4234d5c3575e3b3ad9daa61dcf5afba72a13c'
 NEW='ghcr.io/raxon/servus@sha256:68e56744e3a81249154e90012a7440041f87b965686f1c52e5e31bf3be0113c4'
 
+def after_reboot():
+    info=json.loads((BASE/'post-reboot.json').read_text());origin='http://127.0.0.1:4180';cookie='';csrf=''
+    def request(path,method='GET',body=None):
+        nonlocal cookie,csrf
+        headers={'origin':origin,'accept':'application/json'}
+        if cookie:headers['cookie']=cookie
+        if csrf:headers['x-csrf-token']=csrf
+        payload=None
+        if body is not None:payload=json.dumps(body).encode();headers['content-type']='application/json'
+        with urllib.request.urlopen(urllib.request.Request(origin+'/api/v1'+path,data=payload,headers=headers,method=method),timeout=8) as response:
+            value=json.load(response);new_cookie=response.headers.get('set-cookie')
+            if new_cookie:cookie=new_cookie.split(';',1)[0]
+            if isinstance(value,dict) and value.get('csrfToken'):csrf=value['csrfToken']
+            return value
+    end=time.monotonic()+240
+    while True:
+        try:
+            if request('/health').get('version')=='0.1.7':break
+        except (OSError,ValueError):pass
+        if time.monotonic()>=end:raise RuntimeError('Migrated API did not recover after reboot')
+        time.sleep(1)
+    request('/auth/login','POST',{'email':'fixture@example.test','password':'isolated-fixture-password'})
+    if not any(item.get('id')==info['project'] for item in request('/projects')):raise RuntimeError('Project was not retained after reboot')
+    if request('/updates').get('applyAvailable') is not True:raise RuntimeError('Updater is unavailable after reboot')
+    for unit in ('servus-supervisor.service','servus-updater.service','servus-updater-socket.service'):
+        subprocess.run(['/usr/bin/systemctl','is-active','--quiet',unit],check=True,timeout=15)
+    print('PASS reboot preserved login, project, supervisor and updater',flush=True)
+
+
 def main():
-    if sys.argv[1:] not in ([],['--full']):raise RuntimeError('Invalid fixture mode')
+    if sys.argv[1:] not in ([],['--full'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
+    if sys.argv[1:]==['--after-reboot']:return after_reboot()
     full=sys.argv[1:]==['--full']
     for path in ('/opt/servus','/etc/servus','/var/lib/servus','/var/lib/servus-updater'):
         if Path(path).exists():raise RuntimeError('Fixture requires an empty host')
@@ -164,7 +195,12 @@ def main():
         daemon=SimpleNamespace(resolve_active_policy=lambda *_:('/policy','/accepted',approved))
     fence=fence_module.MigrationFence(journal,op,active,str(data),old_ids,supervisor,daemon,adoption,quiet,docker)
     node_fd=os.open(BASE/'node',os.O_RDONLY|os.O_NOFOLLOW);lock=os.open(install/'install.lock',os.O_RDONLY)
-    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    deadline=time.monotonic()+30
+    while True:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+        except BlockingIOError:
+            if time.monotonic()>=deadline:raise RuntimeError('Installation lock remained busy')
+            time.sleep(.1)
     def start(*args,**kwargs):
         kwargs['migration'].fence.assert_locked(op,lock)
         adoption.claim(journal,op,'/active',backup,node_fd,supervisor,daemon,coordinator,restore,quiet,install_lock=lock)
@@ -209,6 +245,22 @@ def main():
                 raise RuntimeError('Migration was not finalized')
             for unit in ('servus-supervisor.service','servus-updater.service','servus-updater-socket.service'):
                 run('/usr/bin/systemctl','is-enabled','--quiet',unit)
+            # Colima installs the amd64 emulator transiently and its cloud-init
+            # reprovisioning stops Docker at every boot. Restore those fixture
+            # prerequisites before checking the application's own autostart.
+            entry=Path('/proc/sys/fs/binfmt_misc/qemu-x86_64').read_text().splitlines()
+            details=dict(line.split(' ',1) for line in entry if ' ' in line)
+            magic,mask=details.get('magic'),details.get('mask')
+            if (details.get('interpreter')!='/usr/bin/qemu-x86_64' or not isinstance(magic,str) or not isinstance(mask,str) or
+                not re.fullmatch(r'[0-9a-f]+',magic) or not re.fullmatch(r'[0-9a-f]+',mask) or len(magic)!=len(mask) or len(magic)%2):
+                raise RuntimeError('Fixture emulator identity is unavailable')
+            def escape(value):return ''.join('\\x'+value[index:index+2] for index in range(0,len(value),2))
+            Path('/etc/binfmt.d/servus-fixture-x86_64.conf').write_text(':qemu-x86_64:M::'+escape(magic)+':'+escape(mask)+':/usr/bin/qemu-x86_64:POCF\n')
+            Path('/etc/systemd/system/servus-fixture-docker.service').write_text('[Unit]\nAfter=cloud-final.service\n[Service]\nType=oneshot\nExecStart=/usr/bin/systemctl start docker.service\n[Install]\nWantedBy=cloud-final.service\n')
+            run('/usr/bin/systemctl','daemon-reload')
+            run('/usr/bin/systemctl','enable','servus-fixture-docker.service')
+            persistent=Path('/var/lib/servus-test-fixture');shutil.copytree(BASE,persistent)
+            (persistent/'post-reboot.json').write_text(json.dumps({'project':project}));os.chmod(persistent/'post-reboot.json',0o600)
             print('PASS signed release, supervisor completion, updater discovery, service enablement and retained login',flush=True)
             return
         script="import {Store} from '/app/dist/server/store.js';const s=new Store('/fixture');if(!s.db.prepare('SELECT 1 FROM projects WHERE id=?').get(process.argv[1]))process.exit(2);s.close()"

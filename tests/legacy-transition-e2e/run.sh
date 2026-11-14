@@ -44,3 +44,15 @@ guest sudo docker pull --platform linux/amd64 ghcr.io/raxon/servus@sha256:68e567
 guest sudo docker pull node:24-bookworm-slim >/dev/null
 guest sudo sh -c 'set -e; id=$(docker create --pull=never --entrypoint=/bin/false node:24-bookworm-slim); trap "docker rm $id >/dev/null" EXIT; docker cp "$id:/usr/local/bin/node" /run/servus-legacy-fixture/node; chmod 755 /run/servus-legacy-fixture/node'
 guest sudo systemd-run --quiet --scope --property=MemoryAccounting=yes /usr/bin/python3 -I -B /run/servus-legacy-fixture/guest.py "$@"
+if [ "${1:-}" = '--full' ]; then
+  before=$(guest cat /proc/sys/kernel/random/boot_id)
+  guest sudo systemctl reboot >/dev/null 2>&1 || true
+  changed=0
+  for _ in $(seq 1 90); do
+    current=$(guest cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+    if [ -n "$current" ] && [ "$current" != "$before" ]; then changed=1; break; fi
+    sleep 2
+  done
+  [ "$changed" = 1 ] || { printf 'Test VM did not reboot.\n' >&2; exit 1; }
+  guest sudo /usr/bin/python3 -I -B /var/lib/servus-test-fixture/guest.py --after-reboot
+fi
