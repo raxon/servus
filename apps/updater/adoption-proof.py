@@ -110,3 +110,35 @@ def verify(journal, operation, active_env, backup, node_fd, supervisor, daemon, 
     current=journal.db.execute("SELECT preparation_id,attempt_id,attempt_nonce,root_digest,config_digest,policy_path,accepted_env,active_env,snapshot_path,snapshot_digest,data_parent,data_dev,data_ino,state FROM initial_adoptions WHERE operation_id=?",(operation,)).fetchone()
     if current!=row:raise AdoptionError('Migration evidence changed')
     return identity
+
+
+def claim(journal, operation, active_env, backup, node_fd, supervisor, daemon, coordinator, restore, quiescence, *, install_lock):
+    """Atomically consume a verified adoption and record startup intent.
+
+    This only records intent. The caller must maintain the independent durable
+    writer and startup fence through verification, claiming, and startup.
+    Interrupted starts require recovery and cannot be retried as new installs.
+    """
+    db=journal.db
+    try:
+        before=db.execute("SELECT preparation_id,attempt_id,attempt_nonce,root_digest,config_digest,policy_path,accepted_env,active_env,snapshot_path,snapshot_digest,data_parent,data_dev,data_ino,state FROM initial_adoptions WHERE operation_id=?",(operation,)).fetchone()
+    except Exception as error:raise AdoptionError('Adoption evidence is unavailable') from error
+    identity=verify(journal,operation,active_env,backup,node_fd,supervisor,daemon,coordinator,restore,quiescence,install_lock=install_lock)
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        policy_path,accepted,approved,binding=_binding(journal,operation,active_env,supervisor,daemon)
+        row=db.execute("SELECT preparation_id,attempt_id,attempt_nonce,root_digest,config_digest,policy_path,accepted_env,active_env,snapshot_path,snapshot_digest,data_parent,data_dev,data_ino,state FROM initial_adoptions WHERE operation_id=?",(operation,)).fetchone()
+        if not row or row!=before or row[:8]!=(*binding,policy_path,accepted,active_env) or row[-1]!='ready' or tuple(row[11:13])!=identity:
+            raise AdoptionError('Migration evidence changed')
+        _check_paths(row[8],row[9],row[10],operation,approved)
+        db.execute("CREATE TABLE IF NOT EXISTS initial_generations (operation_id TEXT PRIMARY KEY, phase TEXT NOT NULL CHECK(phase IN ('starting','started','recovery_required')))")
+        if db.execute('SELECT 1 FROM initial_generations LIMIT 1').fetchone():
+            raise AdoptionError('Initial generation requires recovery')
+        if db.execute("UPDATE initial_adoptions SET state='consumed' WHERE operation_id=? AND state='ready'",(operation,)).rowcount!=1:
+            raise AdoptionError('Migration evidence changed')
+        db.execute("INSERT INTO initial_generations VALUES (?,'starting')",(operation,))
+        db.execute('COMMIT')
+    except BaseException:
+        if db.in_transaction:db.execute('ROLLBACK')
+        raise
+    return identity

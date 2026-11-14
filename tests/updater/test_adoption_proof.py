@@ -50,6 +50,8 @@ class AdoptionProofTest(unittest.TestCase):
         return adoption.record(self.journal,self.op,self.active_env,self.snapshot,self.digest,self.parent,object(),-1,supervisor,self.daemon,policy,object(),self.restore,self.quiet,**kwargs)
     def verify(self,fd):
         return adoption.verify(self.journal,self.op,self.active_env,object(),-1,supervisor,self.daemon,object(),self.restore,self.quiet,install_lock=fd)
+    def claim(self,fd):
+        return adoption.claim(self.journal,self.op,self.active_env,object(),-1,supervisor,self.daemon,object(),self.restore,self.quiet,install_lock=fd)
     def lock(self):
         fd=os.open(self.install/'install.lock',os.O_RDONLY);fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);return fd
 
@@ -122,6 +124,51 @@ class AdoptionProofTest(unittest.TestCase):
         self.approved.data_dir=self.snapshot
         with self.assertRaises(adoption.AdoptionError):self.record()
         self.restore.verify_staged.assert_not_called()
+
+    def test_claim_atomically_consumes_evidence_and_records_startup(self):
+        fd=self.lock()
+        try:
+            self.record(inherited_lock=fd)
+            self.assertEqual(self.claim(fd),(123,456))
+            self.assertEqual(self.journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('consumed',))
+            self.assertEqual(self.journal.db.execute('SELECT operation_id,phase FROM initial_generations').fetchone(),(self.op,'starting'))
+            with self.assertRaises(adoption.AdoptionError):self.claim(fd)
+        finally:os.close(fd)
+
+    def test_claim_rolls_back_when_a_generation_already_exists(self):
+        fd=self.lock()
+        try:
+            self.record(inherited_lock=fd)
+            self.journal.db.execute('CREATE TABLE initial_generations(operation_id TEXT,phase TEXT)')
+            self.journal.db.execute("INSERT INTO initial_generations VALUES(?,'recovery_required')",(str(uuid.uuid4()),))
+            with self.assertRaises(adoption.AdoptionError):self.claim(fd)
+            self.assertEqual(self.journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('ready',))
+        finally:os.close(fd)
+
+    def test_claim_rechecks_binding_after_verification(self):
+        fd=self.lock()
+        try:
+            self.record(inherited_lock=fd)
+            original=adoption.verify
+            def changed(*args,**kwargs):
+                result=original(*args,**kwargs)
+                self.journal.db.execute("UPDATE initial_adoptions SET state='recovery_required'")
+                return result
+            with mock.patch.object(adoption,'verify',side_effect=changed):
+                with self.assertRaises(adoption.AdoptionError):self.claim(fd)
+            self.assertFalse(self.journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='initial_generations'").fetchone())
+        finally:os.close(fd)
+
+    def test_claim_rolls_back_consumption_if_startup_intent_fails(self):
+        fd=self.lock()
+        try:
+            self.record(inherited_lock=fd)
+            self.journal.db.execute('CREATE TABLE initial_generations(operation_id TEXT,phase TEXT)')
+            self.journal.db.execute("CREATE TRIGGER reject_generation BEFORE INSERT ON initial_generations BEGIN SELECT RAISE(ABORT, 'fixture'); END")
+            with self.assertRaises(Exception):self.claim(fd)
+            self.assertEqual(self.journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('ready',))
+            self.assertIsNone(self.journal.db.execute('SELECT * FROM initial_generations').fetchone())
+        finally:os.close(fd)
 
 
 if __name__=='__main__':unittest.main()

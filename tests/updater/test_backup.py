@@ -307,6 +307,9 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
                 with mock.patch.object(supervisor,'RuntimePolicy',SimpleNamespace):
                     identity=adoption.record(journal,UUID,active,str(snapshot),digest,str(parent),backup,self.node_fd,supervisor,daemon,runtime,coordinator,restore,quiet,inherited_lock=lock)
                     self.assertEqual(adoption.verify(journal,UUID,active,backup,self.node_fd,supervisor,daemon,coordinator,restore,quiet,install_lock=lock),identity)
+                    self.assertEqual(adoption.claim(journal,UUID,active,backup,self.node_fd,supervisor,daemon,coordinator,restore,quiet,install_lock=lock),identity)
+                    self.assertEqual(journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('consumed',))
+                    self.assertEqual(journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('starting',))
             finally:os.close(lock);journal.close()
             script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==5||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
             subprocess.run([NODE,'--input-type=module','-e',script,destination,self.ref],check=True,timeout=20)
