@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -I
 """Verify a release and bootstrap a prepared legacy migration on this host."""
 import argparse
+import fcntl
 import importlib.util
 import os
 import pathlib
@@ -20,18 +21,19 @@ def run(args,timeout):
     if result.returncode:raise BootstrapError('A bootstrap operation failed')
 
 
-def bootstrap(operation,commit,digest,tag,old_compose,supervisor,daemon,policy,updater,initial_bootstrap,*,execute=run):
+def bootstrap(operation,commit,digest,tag,old_compose,supervisor,daemon,policy,updater,initial_bootstrap,*,execute=run,resume=False,provision=None):
     if (not supervisor._uuid4(operation) or not isinstance(commit,str) or not re.fullmatch(r'[a-f0-9]{40}',commit) or
         not isinstance(digest,str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',digest) or
         not isinstance(tag,str) or len(tag)>64 or not re.fullmatch(r'v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)',tag) or
         not isinstance(old_compose,str) or not os.path.isabs(old_compose) or os.path.normpath(old_compose)!=old_compose):
         raise BootstrapError('Invalid migration request')
     base='/usr/local/libexec/servus';active='/etc/servus/servus.env';state='/var/lib/servus-updater'
-    install=supervisor._trusted_directory('/opt/servus',0o700);lock=None;verification_started=False
+    if type(resume) is not bool:raise BootstrapError('Invalid resume mode')
+    install=supervisor._trusted_directory('/opt/servus',0o700);lock=service_lock=None;verification_started=False
     marker_name='.bootstrap-verification-v1';marker=('servus-bootstrap-verification-v1 '+operation+'\n').encode('ascii');identity=None
     try:
         lock=policy._installation_lock(install,supervisor)
-        for name in (marker_name,'.legacy-migration-v1','.initial-handoff-v1'):
+        for name in ('.legacy-migration-v1','.initial-handoff-v1'):
             try:os.stat(name,dir_fd=install,follow_symlinks=False)
             except FileNotFoundError:pass
             else:raise BootstrapError('Existing migration requires inspection')
@@ -46,28 +48,64 @@ def bootstrap(operation,commit,digest,tag,old_compose,supervisor,daemon,policy,u
         finally:os.close(directory)
         for unit in ('servus-supervisor.service','servus-updater.service','servus-updater-bootstrap.service'):
             if not initial_bootstrap.inactive(unit):raise BootstrapError('Existing updater service requires inspection')
-        fd=os.open(marker_name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=install)
-        try:
-            os.fchmod(fd,0o600)
-            with os.fdopen(fd,'wb',closefd=False) as output:output.write(marker);output.flush();os.fsync(fd)
-            info=os.fstat(fd);identity=(info.st_dev,info.st_ino)
-        finally:os.close(fd)
-        os.fsync(install)
-        execute(['/usr/bin/systemctl','daemon-reload'],45)
-        execute(['/usr/bin/systemctl','start','servus-updater-socket.service'],45)
-        execute(['/usr/bin/systemctl','start','servus-updater-bootstrap.service'],45);verification_started=True
-        initial_bootstrap.wait_socket('/run/servus-updater/control/updater.sock',supervisor)
-        execute(['/usr/bin/setpriv','--reuid=1000','--regid=1000','--clear-groups','/usr/bin/python3','-I',base+'/bootstrap-release.py',
-                 '--operation',operation,'--commit',commit,'--digest',digest,'--tag',tag],960)
-        execute(['/usr/bin/systemctl','stop','servus-updater-bootstrap.service'],45);verification_started=False
-        if policy._read_private_file(active,65536)!=old:raise BootstrapError('Legacy configuration changed')
-        config=supervisor._trusted_directory('/etc/servus',0o700)
-        try:policy._publish_private(config,'legacy-'+operation+'.env',old)
-        finally:os.close(config)
+        if resume:
+            if provision is None:raise BootstrapError('Legacy inspection is unavailable')
+            fd=supervisor._open_root_file(install,marker_name,0o600)
+            try:
+                info=os.fstat(fd);identity=(info.st_dev,info.st_ino)
+                if os.read(fd,len(marker)+1)!=marker:raise BootstrapError('Bootstrap marker differs')
+            finally:os.close(fd)
+            state_fd=supervisor._trusted_directory(state,0o700)
+            try:service_lock=supervisor._open_root_file(state_fd,'service.lock',0o600)
+            finally:os.close(state_fd)
+            fcntl.flock(service_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            journal=updater.Journal(pathlib.Path(state))
+            try:
+                db=journal.db
+                if (db.execute('SELECT commit_sha,digest,tag,status FROM operations WHERE id=?',(operation,)).fetchone()!=(commit,digest,tag,'verified') or
+                    db.execute('SELECT status FROM preparations WHERE operation_id=?',(operation,)).fetchone()!=('prepared',)):
+                    raise BootstrapError('Verified preparation differs')
+                for table in ('policy_approvals','legacy_transitions','legacy_stop_operations','initial_generations','update_transactions'):
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone() and db.execute('SELECT 1 FROM '+table+' LIMIT 1').fetchone():
+                        raise BootstrapError('Migration has already advanced')
+            finally:journal.close()
+            if policy._read_private_file('/etc/servus/legacy-'+operation+'.env',65536)!=old:
+                raise BootstrapError('Saved legacy configuration differs')
+            if provision.validate_legacy_runtime('/etc/servus',install,supervisor,policy,'/dev/null')!=old:
+                raise BootstrapError('Legacy installation changed')
+            for name in ('legacy-recovery-'+operation,'legacy-snapshot-'+operation):
+                if os.path.lexists(os.path.join(state,name)):raise BootstrapError('Migration storage already exists')
+        else:
+            fd=os.open(marker_name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=install)
+            try:
+                os.fchmod(fd,0o600)
+                with os.fdopen(fd,'wb',closefd=False) as output:output.write(marker);output.flush();os.fsync(fd)
+                info=os.fstat(fd);identity=(info.st_dev,info.st_ino)
+            finally:os.close(fd)
+            os.fsync(install)
+            execute(['/usr/bin/systemctl','daemon-reload'],45)
+            execute(['/usr/bin/systemctl','start','servus-updater-socket.service'],45)
+            execute(['/usr/bin/systemctl','start','servus-updater-bootstrap.service'],45);verification_started=True
+            initial_bootstrap.wait_socket('/run/servus-updater/control/updater.sock',supervisor)
+            execute(['/usr/bin/setpriv','--reuid=1000','--regid=1000','--clear-groups','/usr/bin/python3','-I',base+'/bootstrap-release.py',
+                     '--operation',operation,'--commit',commit,'--digest',digest,'--tag',tag],960)
+            execute(['/usr/bin/systemctl','stop','servus-updater-bootstrap.service'],45);verification_started=False
+            if policy._read_private_file(active,65536)!=old:raise BootstrapError('Legacy configuration changed')
+            config=supervisor._trusted_directory('/etc/servus',0o700)
+            try:policy._publish_private(config,'legacy-'+operation+'.env',old)
+            finally:os.close(config)
         data_parent='/var/lib/servus-migration';varlib=supervisor._trusted_directory('/var/lib')
         try:
-            try:os.mkdir('servus-migration',0o711,dir_fd=varlib);os.fsync(varlib)
-            except FileExistsError:pass
+            try:os.mkdir('servus-migration',0o711,dir_fd=varlib);created=True
+            except FileExistsError:created=False
+            parent=os.open('servus-migration',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=varlib)
+            try:
+                info=os.fstat(parent);named=os.stat('servus-migration',dir_fd=varlib,follow_symlinks=False)
+                if (info.st_uid,info.st_gid)!=(0,0) or (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino):
+                    raise BootstrapError('Unsafe migration data parent')
+                if created or (resume and stat.S_IMODE(info.st_mode)==0o700 and not os.listdir(parent)):
+                    os.fchmod(parent,0o711);os.fsync(parent);os.fsync(varlib)
+            finally:os.close(parent)
         finally:os.close(varlib)
         parent_fd=supervisor._trusted_directory(data_parent,0o711)
         try:
@@ -90,6 +128,7 @@ def bootstrap(operation,commit,digest,tag,old_compose,supervisor,daemon,policy,u
             if policy._read_private_file(active,65536)!=old:raise BootstrapError('Legacy configuration changed')
             policy._replace_private(config,'servus.env',new)
         finally:os.close(config)
+        if service_lock is not None:os.close(service_lock);service_lock=None
         os.close(lock);lock=None
         execute(['/usr/bin/python3','-I',base+'/legacy-run.py','--operation',operation,'--old-env','/etc/servus/legacy-'+operation+'.env',
                  '--old-compose',old_compose,'--recovery-dir',state+'/legacy-recovery-'+operation,
@@ -113,6 +152,7 @@ def bootstrap(operation,commit,digest,tag,old_compose,supervisor,daemon,policy,u
         if verification_started:
             try:execute(['/usr/bin/systemctl','stop','servus-updater-bootstrap.service'],45)
             except Exception:pass
+        if service_lock is not None:os.close(service_lock)
         if lock is not None:os.close(lock)
         os.close(install)
 
@@ -120,6 +160,7 @@ def bootstrap(operation,commit,digest,tag,old_compose,supervisor,daemon,policy,u
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ('operation','commit','digest','tag','old-compose'):parser.add_argument('--'+name,required=True)
+    parser.add_argument('--resume',action='store_true')
     args=parser.parse_args()
     if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated:
         print('Migration bootstrap requires isolated Linux root.',file=sys.stderr);return 1
@@ -138,14 +179,14 @@ def main():
             spec=importlib.util.spec_from_file_location('servus_legacy_bootstrap_'+name.replace('-','_'),path)
             if not spec or not spec.loader:raise BootstrapError('Module unavailable')
             module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
-        initial=load('initial-generation');initial_bootstrap=load('bootstrap-initial')
+        initial=load('initial-generation');initial_bootstrap=load('bootstrap-initial');provision=load('provision-host')
         supervisor,daemon,_,_,policy,updater=initial.trusted_modules()
         directory=supervisor._trusted_directory(str(base))
         try:
             for name in ('bootstrap-release.py','legacy-run.py'):
                 fd=supervisor._open_root_file(directory,name,0o644);os.close(fd)
         finally:os.close(directory)
-        bootstrap(args.operation,args.commit,args.digest,args.tag,args.old_compose,supervisor,daemon,policy,updater,initial_bootstrap)
+        bootstrap(args.operation,args.commit,args.digest,args.tag,args.old_compose,supervisor,daemon,policy,updater,initial_bootstrap,resume=args.resume,provision=provision)
         print('Signed legacy migration completed.')
         return 0
     except Exception as error:

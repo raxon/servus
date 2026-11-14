@@ -75,22 +75,25 @@ def after_reboot():
 
 
 def main():
-    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'],['--host-bootstrap'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
+    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'],['--bootstrap-resume'],['--host-bootstrap'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
     if sys.argv[1:]==['--after-reboot']:return after_reboot()
     recover_check=sys.argv[1:]==['--recover-check']
     early_check=sys.argv[1:]==['--early-recover']
     orchestrated=sys.argv[1:]==['--orchestrated']
     bootstrap_fail=sys.argv[1:]==['--bootstrap-fail']
+    bootstrap_resume=sys.argv[1:]==['--bootstrap-resume']
     host_bootstrap=sys.argv[1:]==['--host-bootstrap']
-    bootstrap_migrate=sys.argv[1:] in (['--bootstrap-migrate'],['--bootstrap-fail'],['--host-bootstrap'])
-    full=sys.argv[1:] in (['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'],['--host-bootstrap'])
+    bootstrap_migrate=sys.argv[1:] in (['--bootstrap-migrate'],['--bootstrap-fail'],['--bootstrap-resume'],['--host-bootstrap'])
+    full=sys.argv[1:] in (['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--bootstrap-migrate'],['--bootstrap-fail'],['--bootstrap-resume'],['--host-bootstrap'])
     for path in ('/opt/servus','/etc/servus','/var/lib/servus','/var/lib/servus-updater'):
         if Path(path).exists():raise RuntimeError('Fixture requires an empty host')
     install=Path('/opt/servus');install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
     config=Path('/etc/servus');config.mkdir(mode=0o700)
     data=Path('/var/lib/servus');data.mkdir(mode=0o700);os.chown(data,1000,1000)
     state=Path('/var/lib/servus-updater');state.mkdir(mode=0o700);docker_config=state/'docker-config';docker_config.mkdir(mode=0o700)
-    parent=Path('/var/lib/servus-migration');parent.mkdir(mode=0o711)
+    parent=Path('/var/lib/servus-migration')
+    if not bootstrap_migrate:parent.mkdir(mode=0o711)
+    elif bootstrap_resume:parent.mkdir(mode=0o700)
     snapshot=state/'snapshot';snapshot.mkdir(mode=0o700);recovery_dir=state/'recovery';recovery_dir.mkdir(mode=0o700)
     compose=install/'compose.yaml';shutil.copyfile(BASE/'compose.yaml',compose);compose.chmod(0o644)
     old_env=config/'old.env';gid=os.stat('/var/run/docker.sock').st_gid
@@ -177,6 +180,8 @@ def main():
         shutil.copyfile(BASE/'node','/usr/bin/node');os.chmod('/usr/bin/node',0o755)
         active=str(config/'servus.env')
         if bootstrap_migrate:
+            if bootstrap_resume:
+                (install/'.servus-install').write_text('servus-installer-v1\n');(install/'.servus-install').chmod(0o600)
             shutil.copyfile(old_env,active);os.chmod(active,0o600)
             run('/usr/bin/systemctl','daemon-reload')
             args=['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-bootstrap.py','--operation',op,'--commit',
@@ -194,6 +199,14 @@ def main():
                 if status.returncode==0:raise RuntimeError('Failed verifier remains active')
                 print('PASS unverified release preserved legacy panel and configuration',flush=True)
                 return
+            if bootstrap_resume:
+                failed=subprocess.run(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=1100)
+                if failed.returncode==0 or request('/health').get('version')!='0.1.5' or not (install/'.bootstrap-verification-v1').is_file():
+                    raise RuntimeError('Interrupted bootstrap state was not preserved')
+                wrong=args.copy();wrong[6]='0'*40;wrong.append('--resume')
+                rejected=subprocess.run(wrong,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+                if rejected.returncode==0 or request('/health').get('version')!='0.1.5':raise RuntimeError('Wrong release was resumed')
+                args.append('--resume')
             run(*args,timeout=1500)
             if request('/health').get('version')!='0.1.7':raise RuntimeError('Bootstrapped API is unavailable')
             cookie='';csrf='';request('/auth/login','POST',{'email':'fixture@example.test','password':'isolated-fixture-password'})
