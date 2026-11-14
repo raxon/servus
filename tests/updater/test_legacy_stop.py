@@ -1,5 +1,6 @@
 import fcntl
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -19,6 +20,9 @@ def load(name,filename):
 
 legacy=load('legacy_stop','legacy-stop.py')
 updater=load('legacy_stop_updater','servus-updater.py')
+recovery=load('legacy_recovery','legacy-recovery.py')
+policy=load('legacy_recovery_policy','runtime-policy.py')
+backup=load('legacy_recovery_backup','backup.py')
 
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
 class LegacyStopTest(unittest.TestCase):
@@ -114,5 +118,41 @@ class LegacyStopTest(unittest.TestCase):
             legacy.protect(self.journal,self.operation,'/active','/parent',-1,supervisor,object(),self.adoption,self.quiet,self.docker,object(),SimpleNamespace(_pairs=dict),restored,install_lock=self.lock)
         self.assertEqual(os.stat(self.source).st_uid,0)
         self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_protections').fetchone(),('recovery_required',))
+    def recovery_fixture(self):
+        self.stop();env=self.root/'legacy.env';env.write_text('SERVUS_IMAGE='+self.image+'\nSERVUS_DATA_DIR='+str(self.source)+'\n');env.chmod(0o600)
+        compose=self.root/'compose.yaml';compose.write_text('fixture\n');compose.chmod(0o644)
+        destination=self.root/'recovery';destination.mkdir(mode=0o700)
+        services={}
+        for role,cid in self.old.items():
+            self.items[cid]['Config']['Env']=['PANEL_DATA_DIR='+str(self.source)]
+            volumes=[{'type':'bind','source':str(self.source),'target':str(self.source)}]
+            if role=='agent':volumes.append({'type':'bind','source':'/var/run/docker.sock','target':'/var/run/docker.sock'})
+            services[role]={'image':self.image,'environment':{'PANEL_DATA_DIR':str(self.source)},'command':self.items[cid]['Config']['Cmd'],'volumes':volumes}
+        original=self.docker.call
+        def call(*args,**kwargs):
+            if args[0]=='compose':return json.dumps({'services':services}).encode()
+            return original(*args,**kwargs)
+        self.docker.call=call
+        def run():
+            return recovery.capture(self.journal,self.operation,'/active',str(env),str(compose),str(destination),supervisor,object(),self.adoption,policy,backup,self.quiet,self.docker,install_lock=self.lock)
+        return run,env,compose,destination,services
+    def test_recovery_inputs_match_legacy_runtime_and_remain_private(self):
+        run,env,compose,destination,_=self.recovery_fixture()
+        env_hash,compose_hash=run()
+        self.assertEqual((destination/'legacy.env').read_bytes(),env.read_bytes())
+        self.assertEqual((destination/'compose.yaml').read_bytes(),compose.read_bytes())
+        self.assertEqual((destination/'legacy.env').stat().st_mode & 0o777,0o600)
+        self.assertEqual(self.journal.db.execute('SELECT env_digest,compose_digest,state FROM legacy_recovery').fetchone(),(env_hash,compose_hash,'verified'))
+        with self.assertRaises(recovery.RecoveryError):run()
+    def test_recovery_rejects_mismatched_compose_before_writing(self):
+        run,_,_,destination,services=self.recovery_fixture()
+        services['api']['environment']['PANEL_DATA_DIR']='/other'
+        with self.assertRaises(recovery.RecoveryError):run()
+        self.assertEqual(list(destination.iterdir()),[])
+    def test_recovery_preserves_failed_capture_state(self):
+        run,_,_,_,_=self.recovery_fixture()
+        with mock.patch.object(policy,'_publish_private',side_effect=OSError('fixture')):
+            with self.assertRaises(OSError):run()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_recovery').fetchone(),('recovery_required',))
 
 if __name__=='__main__':unittest.main()
