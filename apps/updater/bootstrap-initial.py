@@ -107,6 +107,9 @@ def bootstrap(operation,commit,digest,tag,install_dir,config_dir,state_dir,super
         try:os.stat('.initial-handoff-v1',dir_fd=install,follow_symlinks=False)
         except FileNotFoundError:pass
         else:raise BootstrapError('A previous handoff requires recovery')
+        try:os.stat('.legacy-migration-v1',dir_fd=install,follow_symlinks=False)
+        except FileNotFoundError:pass
+        else:raise BootstrapError('A legacy migration requires recovery')
         fd=os.open(MARKER,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=install)
         try:
             os.fchmod(fd,0o600)

@@ -339,6 +339,7 @@ main() {
   flock -n 9 || fail 'Another Servus installation is running.'
   [[ ! -e $install_dir/.initial-handoff-v1 && ! -L $install_dir/.initial-handoff-v1 ]] || fail 'An interrupted initial handoff requires recovery before installation.'
   [[ ! -e $install_dir/.bootstrap-verification-v1 && ! -L $install_dir/.bootstrap-verification-v1 ]] || fail 'An interrupted bootstrap verification requires recovery before installation.'
+  [[ ! -e $install_dir/.legacy-migration-v1 && ! -L $install_dir/.legacy-migration-v1 ]] || fail 'An interrupted legacy migration requires recovery before installation.'
   [[ ! -e $install_dir/.lifecycle-enabled-v1 && ! -L $install_dir/.lifecycle-enabled-v1 ]] || fail 'A supervised installation must be managed through the panel updater.'
   [[ ! -e $config_dir/servus-origin-migration.pending && ! -L $config_dir/servus-origin-migration.pending ]] || fail 'An unfinished origin migration requires recovery before installation.'
   [[ ! -L $config_dir/servus.env ]] || fail 'Configuration must not be a symlink.'

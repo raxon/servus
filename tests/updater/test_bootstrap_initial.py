@@ -94,6 +94,12 @@ class BootstrapInitialTest(unittest.TestCase):
         self.inactive.return_value=True;self.env.write_text('SERVUS_IMAGE=changed\n');self.env.chmod(0o600)
         with self.assertRaises(initial.BootstrapError):self.execute()
 
+    def test_interrupted_legacy_migration_blocks_bootstrap(self):
+        (self.install/'.legacy-migration-v1').write_text('interrupted')
+        with self.assertRaisesRegex(initial.BootstrapError,'legacy migration requires recovery'):self.execute()
+        self.assertFalse((self.install/initial.MARKER).exists())
+        self.assertFalse(any('bootstrap-release.py' in ' '.join(event) for event in self.events))
+
     def test_wait_socket_requires_root_peer_and_unchanged_socket(self):
         control=self.root/'control';control.mkdir(mode=0o710);os.chown(control,0,1000);control.chmod(0o710)
         path=control/'updater.sock';listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)

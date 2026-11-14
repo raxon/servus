@@ -14,6 +14,7 @@
 100644 apps/updater/install-host.py
 100644 apps/updater/legacy-recovery.py
 100644 apps/updater/legacy-stop.py
+100644 apps/updater/legacy-transition.py
 100644 apps/updater/migration-fence.py
 100644 apps/updater/preflight.py
 100644 apps/updater/prepare-verified.py

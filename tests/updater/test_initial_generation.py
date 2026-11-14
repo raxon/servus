@@ -91,6 +91,8 @@ class InitialGenerationTest(unittest.TestCase):
                 self.assertFalse(self.journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='initial_generations'").fetchone())
 
     def migration_fixture(self):
+        (self.install/'.legacy-migration-v1').write_text('servus-legacy-migration-v1 '+self.op+'\n')
+        (self.install/'.legacy-migration-v1').chmod(0o600)
         (self.data/'panel.sqlite').write_text('fixture')
         self.journal.db.execute('CREATE TABLE initial_adoptions(operation_id TEXT,state TEXT)')
         self.journal.db.execute("INSERT INTO initial_adoptions VALUES(?,'ready')",(self.op,))
@@ -139,6 +141,8 @@ class InitialGenerationTest(unittest.TestCase):
         migration.adoption.claim.assert_not_called()
 
     def test_migration_start_consumes_real_release_bound_evidence(self):
+        (self.install/'.legacy-migration-v1').write_text('servus-legacy-migration-v1 '+self.op+'\n')
+        (self.install/'.legacy-migration-v1').chmod(0o600)
         parent=self.root/'restores';parent.mkdir(mode=0o711)
         data=parent/('restore-'+self.op);data.mkdir(mode=0o700);os.chown(data,1000,1000)
         (data/'panel.sqlite').write_text('fixture');self.approved.data_dir=str(data)
@@ -162,6 +166,17 @@ class InitialGenerationTest(unittest.TestCase):
         self.assertEqual(self.journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('consumed',))
         self.assertEqual(self.journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('started',))
         self.assertEqual(restored.verify_staged.call_count,2)
+
+    def test_fresh_start_refuses_interrupted_migration_marker(self):
+        (self.install/'.legacy-migration-v1').write_text('interrupted')
+        with self.assertRaisesRegex(initial.InitialGenerationError,'migration requires recovery'):self.run_launch()
+        self.docker_call.assert_not_called()
+
+    def test_migration_requires_matching_durable_marker(self):
+        migration=self.migration_fixture()
+        (self.install/'.legacy-migration-v1').write_text('servus-legacy-migration-v1 '+str(uuid.uuid4())+'\n')
+        with self.assertRaisesRegex(initial.InitialGenerationError,'marker does not match'):self.run_launch(migration=migration)
+        migration.adoption.claim.assert_not_called()
 
     def test_existing_containers_and_changed_policy_are_rejected(self):
         self.docker_call.return_value=b'existing\n'

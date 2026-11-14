@@ -109,6 +109,17 @@ def launch(journal, operation, active_env, docker_config, supervisor, daemon, ex
         lock = policy._installation_lock(directory, supervisor, inherited_lock)
         if daemon.resolve_active_policy(approval_journal, active_env) != (path, snapshot, approved):
             raise InitialGenerationError('Active policy changed')
+        marker_name='.legacy-migration-v1'
+        try:os.stat(marker_name,dir_fd=directory,follow_symlinks=False);marker_exists=True
+        except FileNotFoundError:marker_exists=False
+        if marker_exists and migration is None:raise InitialGenerationError('Existing migration requires recovery')
+        if migration is not None:
+            if not marker_exists:raise InitialGenerationError('Migration marker is unavailable')
+            marker=supervisor._open_root_file(directory,marker_name,0o600)
+            try:
+                expected=('servus-legacy-migration-v1 '+operation+'\n').encode('ascii')
+                if os.read(marker,len(expected)+1)!=expected:raise InitialGenerationError('Migration marker does not match')
+            finally:os.close(marker)
         row = journal.db.execute("SELECT p.staging_path,o.digest FROM preparations p JOIN operations o ON o.id=p.operation_id JOIN policy_approvals a ON a.operation_id=o.id WHERE o.id=? AND o.status='verified' AND p.status='prepared' AND a.state='active' AND a.policy_path=? AND a.accepted_env_path=? AND a.source_env_path=? AND p.attempt_id=o.attempt_id AND p.attempt_nonce=o.attempt_nonce AND a.attempt_id=o.attempt_id AND a.attempt_nonce=o.attempt_nonce AND a.preparation_id=p.preparation_id AND a.root_digest=o.digest AND a.image_config_digest=o.config_digest AND NOT EXISTS(SELECT 1 FROM update_transactions)", (operation,path,snapshot,active_env)).fetchone()
         if (not row or not isinstance(row[0],str) or not os.path.isabs(row[0]) or os.path.normpath(row[0]) != row[0] or
             not re.fullmatch(r'servus-install-[a-f0-9]{32}',os.path.basename(row[0])) or
