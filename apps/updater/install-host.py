@@ -7,9 +7,11 @@ files are never replaced; an interrupted identical installation can be retried.
 """
 import argparse
 import fcntl
+import hashlib
 import os
 import secrets
 import stat
+import subprocess
 import sys
 
 MODULES = (
@@ -24,6 +26,11 @@ MODULES = (
 UNITS = ('servus-supervisor.service','servus-updater.service',
          'servus-updater-bootstrap.service','servus-updater-socket.service')
 MAX_FILE = 4 * 1024 * 1024
+LEGACY_VERIFIERS = {
+    'verification-executor.py':'1b7cd6b9932008cf20ab57cee11a8b3bd8b79e58171308bcf8e180326415d71f',
+    'verify-release.py':'84c3c5f1b643aafad0e79cefe2678c871322c0fbe5532c8fb5f0efa934cf0c02',
+}
+ADOPTION_MARKER='.bootstrap-verification-v1'
 
 
 class InstallHostError(Exception):
@@ -101,7 +108,16 @@ def publish(parent,name,data,mode):
         os.close(fd);os.unlink(temporary,dir_fd=parent);os.fsync(parent)
 
 
-def install(source,install_dir,libexec_parent,unit_dir,*,inherited_lock=None):
+def services_inactive():
+    for unit in ('servus-supervisor.service','servus-updater.service','servus-updater-bootstrap.service','servus-updater-socket.service'):
+        result=subprocess.run(['/usr/bin/systemctl','show','--property=ActiveState','--value',unit],stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,cwd='/',
+                              env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C'},timeout=10)
+        if result.returncode!=0 or result.stdout!=b'inactive\n':return False
+    return True
+
+
+def install(source,install_dir,libexec_parent,unit_dir,*,inherited_lock=None,adopt_legacy_verifier=False):
     if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated:
         raise InstallHostError('Isolated Linux root is required')
     install_fd=directory(install_dir,0o700);lock=src=modules=units=base=parent=dest=unit_target=None
@@ -117,6 +133,9 @@ def install(source,install_dir,libexec_parent,unit_dir,*,inherited_lock=None):
             if (held.st_dev,held.st_ino)!=(info.st_dev,info.st_ino):raise InstallHostError('Inherited lock does not match')
             duplicate=os.dup(inherited_lock);os.close(lock);lock=duplicate
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        try:os.stat(ADOPTION_MARKER,dir_fd=install_fd,follow_symlinks=False)
+        except FileNotFoundError:pass
+        else:raise InstallHostError('Existing bootstrap requires inspection')
         src=directory(source)
         modules=directory(source+'/apps/updater');units=directory(source+'/deployment/systemd')
         module_data={name:read_file(modules,name,0o755 if name=='servus-updater.py' else 0o644) for name in MODULES}
@@ -132,12 +151,49 @@ def install(source,install_dir,libexec_parent,unit_dir,*,inherited_lock=None):
             except FileNotFoundError:continue
             if existing!=data:raise InstallHostError('Existing systemd unit differs')
         dest=child(parent,'servus',0o755)
+        conflicts={};conflict_modes={}
         for name,data in module_data.items():
-            try:existing=read_file(dest,name,0o755 if name=='servus-updater.py' else 0o644)
+            mode=0o755 if name=='servus-updater.py' else 0o644
+            try:existing=read_file(dest,name,mode)
             except FileNotFoundError:continue
-            if existing!=data:raise InstallHostError('Existing updater module differs')
+            except InstallHostError:
+                if not adopt_legacy_verifier or name not in LEGACY_VERIFIERS:raise
+                existing=read_file(dest,name,0o755)
+                conflicts[name]=existing;conflict_modes[name]=0o755;continue
+            if existing!=data:conflicts[name]=existing;conflict_modes[name]=mode
+        if conflicts:
+            if (not adopt_legacy_verifier or set(conflicts)!=set(LEGACY_VERIFIERS) or
+                any(hashlib.sha256(content).hexdigest()!=LEGACY_VERIFIERS[name] for name,content in conflicts.items()) or
+                any(mode!=0o755 for mode in conflict_modes.values()) or
+                not services_inactive()):raise InstallHostError('Existing updater module differs')
+            try:os.stat('legacy-verifier-v0.1.5',dir_fd=install_fd,follow_symlinks=False)
+            except FileNotFoundError:pass
+            else:raise InstallHostError('Legacy verifier backup already exists')
+            marker=os.open(ADOPTION_MARKER,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=install_fd)
+            try:
+                os.fchmod(marker,0o600)
+                with os.fdopen(marker,'wb',closefd=False) as output:
+                    output.write(b'servus-legacy-verifier-adoption-v1\n');output.flush();os.fsync(marker)
+            finally:os.close(marker)
+            os.fsync(install_fd)
+            backup=child(install_fd,'legacy-verifier-v0.1.5',0o700)
+            try:
+                for name,data in conflicts.items():publish(backup,name,data,0o755)
+                for name,data in conflicts.items():
+                    if read_file(dest,name,0o755)!=data or read_file(backup,name,0o755)!=data:raise InstallHostError('Legacy verifier changed')
+                    os.unlink(name,dir_fd=dest);os.fsync(dest)
+            finally:os.close(backup)
         for name,data in module_data.items():publish(dest,name,data,0o755 if name=='servus-updater.py' else 0o644)
         for name,data in unit_data.items():publish(unit_target,name,data,0o644)
+        if conflicts:
+            fd=os.open(ADOPTION_MARKER,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=install_fd)
+            try:
+                info=os.fstat(fd);named=os.stat(ADOPTION_MARKER,dir_fd=install_fd,follow_symlinks=False)
+                if ((info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode),info.st_nlink)!=(0,0,0o600,1) or
+                    (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino) or os.read(fd,64)!=b'servus-legacy-verifier-adoption-v1\n'):
+                    raise InstallHostError('Legacy verifier marker changed')
+            finally:os.close(fd)
+            os.unlink(ADOPTION_MARKER,dir_fd=install_fd);os.fsync(install_fd)
     finally:
         for fd in (dest,unit_target,parent,base,units,modules,src,lock,install_fd):
             if fd is not None:os.close(fd)
@@ -146,8 +202,9 @@ def install(source,install_dir,libexec_parent,unit_dir,*,inherited_lock=None):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--source',required=True)
     parser.add_argument('--install-dir',default='/opt/servus');parser.add_argument('--install-lock-fd',type=int)
+    parser.add_argument('--adopt-legacy-verifier',action='store_true')
     args=parser.parse_args();os.umask(0o077)
-    try:install(args.source,args.install_dir,'/usr/local/libexec','/etc/systemd/system',inherited_lock=args.install_lock_fd)
+    try:install(args.source,args.install_dir,'/usr/local/libexec','/etc/systemd/system',inherited_lock=args.install_lock_fd,adopt_legacy_verifier=args.adopt_legacy_verifier)
     except Exception:
         print('Updater host files could not be installed safely.',file=sys.stderr);return 1
     return 0

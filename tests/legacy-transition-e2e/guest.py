@@ -5,6 +5,7 @@ By default startup and release approval are simulated. The --full mode uses the
 real verification services, runtime policy and supervisor on the disposable VM.
 """
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -140,7 +141,14 @@ def main():
     active='/active'
     if full:
         def run(*args,timeout=180):subprocess.run(args,check=True,timeout=timeout,stdin=subprocess.DEVNULL)
-        run('/usr/bin/python3','-I',str(BASE/'apps/updater/install-host.py'),'--source',str(BASE),'--install-dir',str(install))
+        host_args=['/usr/bin/python3','-I',str(BASE/'apps/updater/install-host.py'),'--source',str(BASE),'--install-dir',str(install)]
+        if bootstrap_migrate:host_args.append('--adopt-legacy-verifier')
+        run(*host_args)
+        if bootstrap_migrate:
+            for name,digest in (('verification-executor.py','1b7cd6b9932008cf20ab57cee11a8b3bd8b79e58171308bcf8e180326415d71f'),
+                                ('verify-release.py','84c3c5f1b643aafad0e79cefe2678c871322c0fbe5532c8fb5f0efa934cf0c02')):
+                if hashlib.sha256((install/'legacy-verifier-v0.1.5'/name).read_bytes()).hexdigest()!=digest:
+                    raise RuntimeError('Legacy verifier backup differs')
         run('/usr/bin/python3','-I','/usr/local/libexec/servus/install-gh.py','--install-dir',str(install),timeout=240)
         run('/usr/bin/python3','-I','/usr/local/libexec/servus/provision-host.py')
         run('/usr/bin/python3','-I','/usr/local/libexec/servus/provision-host.py','--runtime')

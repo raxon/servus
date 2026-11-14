@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -84,5 +85,45 @@ class HostFileInstallTest(unittest.TestCase):
                 with self.assertRaises(BlockingIOError):fcntl.flock(contender,fcntl.LOCK_EX|fcntl.LOCK_NB)
             finally:os.close(contender)
         finally:os.close(wrong);os.close(held)
+
+    def legacy_verifiers(self):
+        dest=self.libexec/'servus';dest.mkdir(mode=0o755)
+        values={name:('legacy fixture '+name).encode() for name in module.LEGACY_VERIFIERS}
+        for name,data in values.items():
+            (dest/name).write_bytes(data);(dest/name).chmod(0o755)
+        return values,{name:hashlib.sha256(data).hexdigest() for name,data in values.items()}
+
+    def test_adopts_only_approved_inactive_legacy_verifiers_and_keeps_backup(self):
+        values,hashes=self.legacy_verifiers()
+        with mock.patch.dict(module.LEGACY_VERIFIERS,hashes,clear=True),mock.patch.object(module,'services_inactive',return_value=True):
+            with self.assertRaises(module.InstallHostError):self.run_install()
+            self.run_install(adopt_legacy_verifier=True)
+        for name,data in values.items():
+            self.assertEqual((self.install/'legacy-verifier-v0.1.5'/name).read_bytes(),data)
+            self.assertEqual((self.libexec/'servus'/name).read_bytes(),(self.source/'apps/updater'/name).read_bytes())
+        self.assertFalse((self.install/module.ADOPTION_MARKER).exists())
+
+    def test_adoption_rejects_running_services_and_unrecognized_files(self):
+        values,hashes=self.legacy_verifiers()
+        with mock.patch.dict(module.LEGACY_VERIFIERS,hashes,clear=True),mock.patch.object(module,'services_inactive',return_value=False):
+            with self.assertRaises(module.InstallHostError):self.run_install(adopt_legacy_verifier=True)
+        (self.libexec/'servus'/'verify-release.py').write_bytes(b'unrecognized')
+        with mock.patch.dict(module.LEGACY_VERIFIERS,hashes,clear=True),mock.patch.object(module,'services_inactive',return_value=True):
+            with self.assertRaises(module.InstallHostError):self.run_install(adopt_legacy_verifier=True)
+        self.assertFalse((self.install/module.ADOPTION_MARKER).exists())
+        self.assertEqual((self.libexec/'servus'/'verification-executor.py').read_bytes(),values['verification-executor.py'])
+
+    def test_interrupted_adoption_keeps_marker_and_original_backup(self):
+        values,hashes=self.legacy_verifiers();original=module.publish
+        def interrupted(parent,name,data,mode):
+            if name=='backup.py':raise OSError('fixture interruption')
+            return original(parent,name,data,mode)
+        with mock.patch.dict(module.LEGACY_VERIFIERS,hashes,clear=True),mock.patch.object(module,'services_inactive',return_value=True):
+            with mock.patch.object(module,'publish',side_effect=interrupted):
+                with self.assertRaises(OSError):self.run_install(adopt_legacy_verifier=True)
+            self.assertTrue((self.install/module.ADOPTION_MARKER).is_file())
+            for name,data in values.items():self.assertEqual((self.install/'legacy-verifier-v0.1.5'/name).read_bytes(),data)
+            with self.assertRaises(module.InstallHostError):self.run_install(adopt_legacy_verifier=True)
+            with self.assertRaises(module.InstallHostError):self.run_install()
 
 if __name__=='__main__':unittest.main()
