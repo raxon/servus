@@ -36,7 +36,7 @@ def bootstrap(journal, operation, accepted_env, install_dir, control_dir, policy
 def _bootstrap_locked(journal, operation, accepted_env, install_dir, control_dir, policy_root,
                       extractor, supervisor, policy, *, resolve_child=None, verify_active=None, inherited_lock=None):
     if not supervisor._uuid4(operation): raise BootstrapError('Invalid operation identity')
-    row = journal.db.execute("SELECT p.preparation_id,p.staging_path,o.digest FROM preparations p JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=? AND p.status='prepared' AND o.status='verified' AND p.attempt_id=o.attempt_id AND p.attempt_nonce=o.attempt_nonce", (operation,)).fetchone()
+    row = journal.db.execute("SELECT p.preparation_id,p.staging_path,o.digest,p.status FROM preparations p JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=? AND p.status IN ('prepared','completed') AND o.status='verified' AND p.attempt_id=o.attempt_id AND p.attempt_nonce=o.attempt_nonce", (operation,)).fetchone()
     if (not row or not supervisor._uuid4(row[0]) or not isinstance(row[1], str) or
         not os.path.isabs(row[1]) or os.path.normpath(row[1]) != row[1] or
         not re.fullmatch(r'servus-install-[a-f0-9]{32}', os.path.basename(row[1])) or
@@ -60,9 +60,13 @@ def _bootstrap_locked(journal, operation, accepted_env, install_dir, control_dir
             if verified.install_dir != install_dir or verified.control_dir != control_dir:
                 raise BootstrapError('The active policy does not match this installation')
             return active
+        if row[3] != 'prepared':
+            raise BootstrapError('A completed preparation requires an active policy')
         if approval[:4] != (operation, 'candidate', candidate, accepted_env) or approval[4] is not None:
             raise BootstrapError('An existing policy requires recovery')
     else:
+        if row[3] != 'prepared':
+            raise BootstrapError('A completed preparation requires an active policy')
         policy.produce(journal, operation, os.path.dirname(row[1]), accepted_env, install_dir,
                        candidate, extractor, supervisor, resolve_child=resolve_child, inherited_lock=inherited_lock)
     return policy.activate(journal, operation, accepted_env, candidate, active, install_dir,

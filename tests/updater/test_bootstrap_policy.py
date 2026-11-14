@@ -115,6 +115,26 @@ class BootstrapPolicyTest(unittest.TestCase):
             self.env.write_text('SERVUS_IMAGE=changed\n');self.env.chmod(0o600)
             with self.assertRaises(supervisor.SupervisorError): self.invoke(verify_active=verify)
 
+    def test_completed_preparation_requires_the_same_verified_active_policy(self):
+        snapshot=self.private/('env-'+self.prep+'.env')
+        snapshot.write_bytes(self.env.read_bytes());snapshot.chmod(0o600)
+        self.active.write_bytes(self.candidate.read_bytes());self.active.chmod(0o600)
+        self.db.execute("UPDATE preparations SET status='completed'")
+        self.db.execute("UPDATE policy_approvals SET state='active',policy_path=?,accepted_env_path=?",(str(self.active),str(snapshot)))
+        journal_file=self.private/'journal.sqlite';disk=sqlite3.connect(journal_file)
+        self.db.backup(disk);disk.close();journal_file.chmod(0o600)
+        def verify(path,accepted,operation):
+            return daemon.load_approved_policy(path,str(journal_file),accepted,expected_operation_id=operation)
+        with mock.patch.object(daemon,'load_policy',return_value=self.policy_value), mock.patch.object(policy,'produce') as produce, mock.patch.object(policy,'activate') as activate:
+            self.assertEqual(self.invoke(verify_active=verify),str(self.active))
+            produce.assert_not_called();activate.assert_not_called()
+            self.active.write_text('tampered');self.active.chmod(0o600)
+            with self.assertRaises(supervisor.SupervisorError): self.invoke(verify_active=verify)
+        self.db.execute("UPDATE policy_approvals SET state='candidate'")
+        with self.assertRaises(bootstrap.BootstrapError): self.invoke(verify_active=verify)
+        self.db.execute('DELETE FROM policy_approvals')
+        with self.assertRaises(bootstrap.BootstrapError): self.invoke(verify_active=verify)
+
     def test_new_candidate_is_generated_before_activation(self):
         self.db.execute('DELETE FROM policy_approvals')
         with mock.patch.object(policy,'produce') as produce, mock.patch.object(policy,'activate',return_value=str(self.active)) as activate:
