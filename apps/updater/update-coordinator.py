@@ -6,7 +6,9 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import time
+from types import SimpleNamespace
 
 
 class UpdateError(Exception):
@@ -420,3 +422,74 @@ def start_generation(journal, operation_id, lease, daemon_ownership, approval_jo
     except BaseException:
         journal.db.execute("UPDATE update_transactions SET phase='recovery_required' WHERE operation_id=? AND phase='starting'", (operation_id,))
         raise
+
+
+def apply_prepared_update(journal, operation_id, hub, maintenance, daemon_ownership,
+                          approval_journal, active_env, backup_root, policy_root, docker_config,
+                          node_fd, supervisor, daemon, extractor, runtime_policy, quiescence,
+                          backup_module, *, trusted_ingress=None):
+    """Run the prepared generation up to authenticated post-start finalization.
+
+    All paths, modules, the Node descriptor and ingress identity must be supplied
+    by trusted root configuration, never by the requesting panel process. The
+    caller holds the installation and daemon locks and owns the live drain hub.
+    """
+    if (not supervisor._uuid4(operation_id) or not isinstance(hub, supervisor.DrainHub) or
+        not isinstance(maintenance, supervisor.MaintenanceSupervisor)):
+        raise UpdateError('Invalid update context')
+    supervisor._assert_exclusive_flock(maintenance.install_lock)
+    control_dir = os.readlink('/proc/self/fd/' + str(daemon_ownership.directory))
+    daemon_ownership.assert_held(control_dir)
+    node = os.fstat(node_fd)
+    if (not stat.S_ISREG(node.st_mode) or node.st_uid != 0 or node.st_nlink != 1 or
+        node.st_mode & 0o022 or not node.st_mode & 0o111):
+        raise UpdateError('Trusted Node executable is unavailable')
+    database = journal.db.execute('PRAGMA database_list').fetchone()
+    if not database or os.path.realpath(database[2]) != os.path.realpath(approval_journal):
+        raise UpdateError('Approval journal does not match update journal')
+    old_policy, old_env, active = daemon.resolve_active_policy(approval_journal, active_env)
+    if active != hub.policy:
+        raise UpdateError('The authenticated generation changed')
+    binding = daemon.approved_policy_binding(hub, old_policy, approval_journal, old_env)
+    row = journal.db.execute("SELECT a.source_env_path,a.candidate_path FROM policy_approvals a "
+        "JOIN operations o ON o.id=a.operation_id JOIN preparations p ON p.operation_id=a.operation_id "
+        "WHERE a.operation_id=? AND a.state='candidate' AND o.status='verified' AND p.status='prepared' "
+        "AND a.attempt_id=o.attempt_id AND a.attempt_nonce=o.attempt_nonce AND a.root_digest=o.digest "
+        "AND a.image_config_digest=o.config_digest AND a.attempt_id=p.attempt_id "
+        "AND a.attempt_nonce=p.attempt_nonce AND a.preparation_id=p.preparation_id", (operation_id,)).fetchone()
+    if not row or any(not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path for path in row):
+        raise UpdateError('Prepared policy candidate is unavailable')
+    backup_fd = supervisor._trusted_directory(backup_root, 0o700)
+    policy_fd = None
+    try:
+        policy_fd = supervisor._trusted_directory(policy_root, 0o700)
+        backup_name = 'update-' + operation_id
+        policy_name = 'policy-' + operation_id + '.json'
+        for directory, name in ((backup_fd, backup_name), (policy_fd, policy_name)):
+            try:
+                os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise UpdateError('Update output already exists')
+        journal.claim_update(operation_id)
+        try:
+            os.mkdir(backup_name, 0o700, dir_fd=backup_fd)
+            os.fsync(backup_fd)
+            destination = os.path.join(backup_root, backup_name)
+            target_policy = os.path.join(policy_root, policy_name)
+            with maintenance.drained_window(hub, operation_id, policy_binding=binding) as lease:
+                capture_stopped_snapshot(journal, operation_id, lease, destination, node_fd,
+                                         supervisor, quiescence, backup_module, trusted_ingress=trusted_ingress)
+                runtime_policy.activate_locked(journal, operation_id, row[0], row[1], target_policy,
+                    active_env, lease, daemon_ownership, extractor, supervisor, SimpleNamespace(verify_snapshot=verify_snapshot), backup_module, node_fd)
+                candidates = create_generation(journal, operation_id, lease, daemon_ownership, approval_journal,
+                    active_env, docker_config, supervisor, daemon, extractor, runtime_policy, backup_module, node_fd)
+                return start_generation(journal, operation_id, lease, daemon_ownership, approval_journal,
+                    active_env, candidates, supervisor, daemon, backup_module, node_fd)
+        except BaseException:
+            journal.db.execute("UPDATE update_transactions SET phase='recovery_required' WHERE operation_id=? AND phase NOT IN ('completed','recovery_required')", (operation_id,))
+            raise
+    finally:
+        if policy_fd is not None:
+            os.close(policy_fd)
+        os.close(backup_fd)
