@@ -1,9 +1,10 @@
 #!/usr/bin/python3 -I
 """Stage a verified snapshot for a migration without changing the source data.
 
-The caller must hold the installation lock and establish writer exclusion when
-capturing the snapshot. This helper neither authorizes an adoption nor starts
-containers. An interrupted staging directory must be inspected by the caller.
+The caller must hold the installation lock and exclude unauthorized writers
+throughout capture, staging and the handoff to the new generation. This helper
+neither authorizes an adoption nor starts containers. An interrupted staging
+directory must be inspected by the caller.
 """
 import hashlib
 import json
@@ -38,7 +39,7 @@ def stage(snapshot, digest, parent_path, operation, backup, node_fd, supervisor,
             files = manifest['files']
         except (ValueError, KeyError, TypeError) as error:
             raise RestoreError('Invalid snapshot manifest') from error
-        parent = supervisor._trusted_directory(parent_path, 0o700)
+        parent = supervisor._trusted_directory(parent_path, 0o711)
         info = os.fstat(parent)
         if info.st_gid != 0:
             raise RestoreError('Unsafe migration parent')
@@ -86,8 +87,8 @@ def stage(snapshot, digest, parent_path, operation, backup, node_fd, supervisor,
         os.fsync(target)
         destination = os.path.join(parent_path, name)
         coordinator.verify_snapshot(destination, digest, backup, node_fd, supervisor)
-        # The parent stays root-only, so no unprivileged process can reach the
-        # data through the host path while ownership is transferred.
+        # The caller must maintain writer exclusion while ownership transfers.
+        # The root-owned parent permits traversal but not directory listing.
         for relative in files:
             parts = relative.split('/')
             child = None

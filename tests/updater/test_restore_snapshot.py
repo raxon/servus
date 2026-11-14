@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import stat
 import sys
 import tempfile
@@ -35,7 +36,7 @@ class RestoreSnapshotTest(unittest.TestCase):
         self.source = self.root / 'snapshot'
         self.parent = self.root / 'migrations'
         self.source.mkdir(mode=0o700)
-        self.parent.mkdir(mode=0o700)
+        self.parent.mkdir(mode=0o711)
         for folder in ('secrets', 'database-roots'):
             (self.source / folder).mkdir(mode=0o700)
         for name in ('panel.sqlite', 'agent.sqlite'):
@@ -65,9 +66,9 @@ class RestoreSnapshotTest(unittest.TestCase):
             return Path(restore.stage(str(self.source), self.digest, str(self.parent), self.operation,
                                       backup, -1, supervisor, coordinator))
 
-    def test_restores_exact_inventory_under_root_only_parent(self):
+    def test_restores_exact_inventory_under_root_owned_traversable_parent(self):
         target = self.run_stage()
-        self.assertEqual(stat.S_IMODE(self.parent.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.parent.stat().st_mode), 0o711)
         self.assertEqual((target.stat().st_uid, target.stat().st_gid, stat.S_IMODE(target.stat().st_mode)), (1000, 1000, 0o700))
         self.assertFalse((target / 'manifest.json').exists())
         self.assertEqual(set(path.name for path in target.iterdir()), {'panel.sqlite', 'agent.sqlite', 'secret-key', 'agent-token', 'secrets', 'database-roots'})
@@ -111,6 +112,29 @@ class RestoreSnapshotTest(unittest.TestCase):
         target = self.parent / ('restore-' + self.operation)
         self.assertEqual(target.stat().st_uid, 0)
         self.assertEqual((self.source / 'agent-token').read_bytes(), b'a' * 64)
+
+    @unittest.skipUnless(Path('/.dockerenv').is_file(), 'Requires a disposable Docker container')
+    def test_data_owner_can_read_sqlite_without_listing_migration_parent(self):
+        with tempfile.TemporaryDirectory(prefix='servus-restore-fixture-', dir='/var/lib') as path:
+            root = Path(path); root.chmod(0o711)
+            snapshot = root / 'snapshot'; shutil.copytree(self.source, snapshot)
+            parent = root / 'migrations'; parent.mkdir(mode=0o711)
+            with mock.patch.object(backup, '_validate_staging'):
+                target = restore.stage(str(snapshot), self.digest, str(parent), self.operation,
+                                       backup, -1, supervisor, coordinator)
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    os.setgroups([]); os.setgid(1000); os.setuid(1000)
+                    try: os.listdir(parent)
+                    except PermissionError: pass
+                    else: os._exit(1)
+                    with sqlite3.connect('file:' + target + '/panel.sqlite?mode=ro', uri=True) as db:
+                        if db.execute('SELECT id FROM fixture').fetchone() != (1,): os._exit(1)
+                    os._exit(0)
+                except BaseException: os._exit(1)
+            _, status = os.waitpid(pid, 0)
+            self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0)
 
 
 if __name__ == '__main__': unittest.main()

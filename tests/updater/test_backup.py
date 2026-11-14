@@ -279,7 +279,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         coordinator=load('restore_real_coordinator','update-coordinator.py')
         restore=load('restore_real_snapshot','restore-snapshot.py')
         with tempfile.TemporaryDirectory(dir='/root') as protected:
-            parent=pathlib.Path(protected)/'migration';parent.mkdir(mode=0o700)
+            parent=pathlib.Path(protected)/'migration';parent.mkdir(mode=0o711)
             snapshot=pathlib.Path(protected)/'snapshot';shutil.copytree(self.dst,snapshot)
             manifest=(snapshot/'manifest.json').read_bytes()
             destination=restore.stage(str(snapshot),'sha256:'+hashlib.sha256(manifest).hexdigest(),str(parent),UUID,
