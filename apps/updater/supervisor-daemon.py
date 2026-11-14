@@ -6,6 +6,7 @@ No production policy provisioner is implemented yet. This daemon never derives
 expected policy from the running containers or applies updates.
 """
 import argparse
+from contextlib import closing
 import errno
 import fcntl
 import hashlib
@@ -101,7 +102,7 @@ def load_approved_policy(path, approval_journal, accepted_env, *, expected_opera
     _private_file(approval_journal, 64 * 1024 * 1024)
     try:
         uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=ro'
-        with sqlite3.connect(uri, uri=True, timeout=2) as db:
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
             row = db.execute("SELECT a.root_digest,a.env_digest,a.candidate_digest,a.operation_id,a.source_env_path FROM policy_approvals a JOIN operations o ON o.id=a.operation_id JOIN preparations p ON p.operation_id=a.operation_id WHERE a.policy_path=? AND a.accepted_env_path=? AND a.state='active' AND o.status='verified' AND o.attempt_id=a.attempt_id AND o.attempt_nonce=a.attempt_nonce AND o.digest=a.root_digest AND o.config_digest=a.image_config_digest AND p.status IN ('prepared','completed') AND p.attempt_id=a.attempt_id AND p.attempt_nonce=a.attempt_nonce AND p.preparation_id=a.preparation_id AND NOT EXISTS (SELECT 1 FROM policy_approvals WHERE state IN ('activating','recovery_required')) AND NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM policy_probes WHERE operation_id=a.operation_id AND preparation_id=a.preparation_id AND config_digest=a.env_digest AND state='removed')", (path, accepted_env)).fetchall()
         if (len(row) != 1 or row[0][1] != 'sha256:' + hashlib.sha256(config).hexdigest() or
             row[0][2] != 'sha256:' + hashlib.sha256(policy_data).hexdigest() or
@@ -135,13 +136,13 @@ def resolve_active_policy(approval_journal, active_env):
     _private_file(approval_journal, 64 * 1024 * 1024)
     try:
         uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=ro'
-        with sqlite3.connect(uri, uri=True, timeout=2) as db:
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
             rows = db.execute("SELECT policy_path,accepted_env_path,source_env_path FROM policy_approvals WHERE state='active'").fetchall()
         if len(rows) != 1 or rows[0][2] != active_env or not all(isinstance(item, str) and item for item in rows[0]):
             raise supervisor.SupervisorError('Active policy generation is unavailable')
         path, accepted_env, _ = rows[0]
         policy = load_approved_policy(path, approval_journal, accepted_env)
-        with sqlite3.connect(uri, uri=True, timeout=2) as db:
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
             current = db.execute("SELECT policy_path,accepted_env_path,source_env_path FROM policy_approvals WHERE state='active'").fetchall()
         if current != rows:
             raise supervisor.SupervisorError('Active policy generation changed')
@@ -150,7 +151,7 @@ def resolve_active_policy(approval_journal, active_env):
         raise supervisor.SupervisorError('Active policy generation is unavailable') from error
 
 
-def complete_healthy_preparation(hub, approval_journal, operation_id, policy_path, accepted_env):
+def complete_healthy_preparation(hub, approval_journal, operation_id, policy_path, accepted_env, *, maintenance=None):
     """Record completion only while all authenticated roles are healthy."""
     if supervisor.inspect_servus(hub.policy) != hub.identities:
         raise supervisor.SupervisorError('Container identity changed')
@@ -170,12 +171,44 @@ def complete_healthy_preparation(hub, approval_journal, operation_id, policy_pat
                 (role in ('api', 'agent') and (not isinstance(state.get('Health'), dict) or state['Health'].get('Status') != 'healthy'))):
                 raise supervisor.SupervisorError('Container health is unavailable')
         uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=rw'
-        with sqlite3.connect(uri, uri=True, timeout=2) as db:
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
             db.execute('BEGIN IMMEDIATE')
-            cursor = db.execute("UPDATE preparations SET status='completed' WHERE operation_id=? AND status='prepared' AND NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM policy_approvals a JOIN operations o ON o.id=a.operation_id WHERE a.operation_id=preparations.operation_id AND a.policy_path=? AND a.accepted_env_path=? AND a.state='active' AND a.attempt_id=preparations.attempt_id AND a.attempt_nonce=preparations.attempt_nonce AND a.preparation_id=preparations.preparation_id AND o.status='verified' AND o.attempt_id=a.attempt_id AND o.attempt_nonce=a.attempt_nonce AND o.digest=a.root_digest AND o.config_digest=a.image_config_digest)", (operation_id, policy_path, accepted_env))
+            update = db.execute('SELECT phase,preparation_id,attempt_id,attempt_nonce,root_digest FROM update_transactions WHERE operation_id=?', (operation_id,)).fetchone()
+            marker_identity = None
+            if update:
+                if maintenance is None or update[0] not in ('starting', 'completed'):
+                    raise supervisor.SupervisorError('Update is not ready for completion')
+                state_fd = supervisor._open_root_file(maintenance.gate, 'state', 0o644)
+                try:
+                    if os.read(state_fd, 64) != b'servus-lifecycle-v1 normal\n':
+                        raise supervisor.SupervisorError('Startup gate is not open')
+                finally:
+                    os.close(state_fd)
+                marker_fd = supervisor._open_root_file(maintenance.journal, 'maintenance.json', 0o600)
+                try:
+                    marker_identity = os.fstat(marker_fd)
+                    marker = json.loads(os.read(marker_fd, 4097), object_pairs_hook=supervisor._pairs)
+                    if (not isinstance(marker, dict) or set(marker) != {'version', 'operationId', 'state', 'requestIds', 'timeoutMs'} or
+                        type(marker['version']) is not int or marker['version'] != 1 or marker['operationId'] != operation_id or marker['state'] != 'starting'):
+                        raise supervisor.SupervisorError('Maintenance state does not match the update')
+                finally:
+                    os.close(marker_fd)
+            cursor = db.execute("UPDATE preparations SET status='completed' WHERE operation_id=? AND status=? AND NOT EXISTS (SELECT 1 FROM extraction_probes WHERE status='intent') AND EXISTS (SELECT 1 FROM policy_approvals a JOIN operations o ON o.id=a.operation_id WHERE a.operation_id=preparations.operation_id AND a.policy_path=? AND a.accepted_env_path=? AND a.state='active' AND a.attempt_id=preparations.attempt_id AND a.attempt_nonce=preparations.attempt_nonce AND a.preparation_id=preparations.preparation_id AND o.status='verified' AND o.attempt_id=a.attempt_id AND o.attempt_nonce=a.attempt_nonce AND o.digest=a.root_digest AND o.config_digest=a.image_config_digest)", (operation_id, 'completed' if update and update[0] == 'completed' else 'prepared', policy_path, accepted_env))
             if cursor.rowcount != 1:
                 raise supervisor.SupervisorError('Preparation cannot be completed')
+            if update and update[0] == 'starting':
+                cursor = db.execute("UPDATE update_transactions SET phase='completed' WHERE operation_id=? AND phase='starting' AND EXISTS (SELECT 1 FROM preparations p JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=update_transactions.operation_id AND p.status='completed' AND p.preparation_id=update_transactions.preparation_id AND p.attempt_id=update_transactions.attempt_id AND p.attempt_nonce=update_transactions.attempt_nonce AND o.status='verified' AND o.attempt_id=update_transactions.attempt_id AND o.attempt_nonce=update_transactions.attempt_nonce AND o.digest=update_transactions.root_digest)", (operation_id,))
+                if cursor.rowcount != 1:
+                    raise supervisor.SupervisorError('Update cannot be completed')
+            if supervisor.inspect_servus(hub.policy) != hub.identities or select.select(list(hub.connections.values()), [], [], 0)[0]:
+                raise supervisor.SupervisorError('Component identity changed during completion')
             db.commit()
+            if marker_identity is not None:
+                named = os.stat('maintenance.json', dir_fd=maintenance.journal, follow_symlinks=False)
+                if (named.st_dev, named.st_ino) != (marker_identity.st_dev, marker_identity.st_ino):
+                    raise supervisor.SupervisorError('Maintenance state changed')
+                os.unlink('maintenance.json', dir_fd=maintenance.journal)
+                os.fsync(maintenance.journal)
     except (sqlite3.Error, ValueError, OSError) as error:
         raise supervisor.SupervisorError('Preparation cannot be completed') from error
 
@@ -340,7 +373,7 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
             if approved != hub.policy:
                 raise supervisor.SupervisorError('Active policy changed')
             if kind == 'complete':
-                complete_healthy_preparation(hub, approval_journal, request['operationId'], policy_path, accepted_env)
+                complete_healthy_preparation(hub, approval_journal, request['operationId'], policy_path, accepted_env, maintenance=operation)
                 result = 'completed'
             else:
                 result = operation.stop_after_drain(hub, request['operationId'], request['timeoutMs'])
