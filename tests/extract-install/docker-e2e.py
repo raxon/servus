@@ -6,6 +6,7 @@ import pathlib
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -22,9 +23,13 @@ def docker(*args):
 def main():
     if os.geteuid() != 0:
         raise SystemExit('Linux root is required')
+    if sys.argv[1:] not in ([], ['--expect-unsupported']):
+        raise SystemExit('Invalid fixture mode')
+    unsupported = bool(sys.argv[1:])
     temporary = tempfile.mkdtemp(prefix='servus-extract-fixture-', dir='/run')
     image = 'servus-extract-fixture:' + secrets.token_hex(12)
     observed = []
+    commands = []
     original = extractor._docker
     try:
         context = pathlib.Path(temporary, 'context')
@@ -41,12 +46,23 @@ def main():
         staging = pathlib.Path(temporary, 'staging')
         staging.mkdir(mode=0o700)
         def tracked(*args, **kwargs):
+            commands.append(args[0])
             if args[0] == 'cp':
                 cid = args[1].split(':', 1)[0]
                 assert docker('inspect', '--format', '{{.Image}} {{.State.Status}}', cid) == image_id + ' created'
                 observed.append(cid)
             return original(*args, **kwargs)
         extractor._docker = tracked
+        if unsupported:
+            try:
+                extractor.extract(image_id, str(staging))
+            except extractor.ExtractionError:
+                pass
+            else:
+                raise AssertionError('Unsupported Docker must reject extraction')
+            assert commands == ['image'] and not observed and not list(staging.iterdir())
+            print('Unsupported Docker rejected extraction without creating a probe')
+            return
         result = pathlib.Path(extractor.extract(image_id, str(staging)))
         assert len(observed) == 1
         assert subprocess.run(['/usr/bin/docker', 'inspect', observed[0]], stdout=subprocess.DEVNULL,
