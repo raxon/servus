@@ -1,5 +1,6 @@
 import importlib.util
 import errno
+import hashlib
 from contextlib import closing
 import io
 import json
@@ -266,6 +267,27 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==5)process.exit(2);s.close()"
         subprocess.run([NODE,'--input-type=module','-e',script,str(restored_dir)],check=True,timeout=20)
         self.assertEqual(self.panel.execute('PRAGMA user_version').fetchone(),(4,))
+
+    def test_v4_capture_stages_verified_restore_and_preserves_source(self):
+        self.panel.execute('ALTER TABLE service_secret_refs DROP COLUMN purpose')
+        self.panel.execute('PRAGMA user_version=4');self.panel.commit();self.fix_permissions()
+        self.capture()
+        def load(name, filename):
+            spec=importlib.util.spec_from_file_location(name,ROOT/'apps/updater'/filename)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+        supervisor=load('restore_real_supervisor','supervisor.py')
+        coordinator=load('restore_real_coordinator','update-coordinator.py')
+        restore=load('restore_real_snapshot','restore-snapshot.py')
+        with tempfile.TemporaryDirectory(dir='/root') as protected:
+            parent=pathlib.Path(protected)/'migration';parent.mkdir(mode=0o700)
+            snapshot=pathlib.Path(protected)/'snapshot';shutil.copytree(self.dst,snapshot)
+            manifest=(snapshot/'manifest.json').read_bytes()
+            destination=restore.stage(str(snapshot),'sha256:'+hashlib.sha256(manifest).hexdigest(),str(parent),UUID,
+                                      backup,self.node_fd,supervisor,coordinator)
+            script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==5||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+            subprocess.run([NODE,'--input-type=module','-e',script,destination,self.ref],check=True,timeout=20)
+            self.assertEqual(self.panel.execute('PRAGMA user_version').fetchone(),(4,))
+            self.assertEqual((pathlib.Path(destination)/'panel.sqlite').stat().st_uid,1000)
 
     def test_wrong_key_or_corrupted_ciphertext_is_rejected(self):
         (self.src/'secret-key').write_text('43'*32); self.fix_permissions()

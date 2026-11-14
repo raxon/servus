@@ -17,7 +17,7 @@ MODULES = (
     'discover-release.py','extract-install.py','guarded-verifier.py','initial-generation.py',
     'install-gh.py','install-host.py','preflight.py','prepare-verified.py','preparation-fence.py',
     'provision-verifier-group.py','provision-socket.py','provision-host.py','quiescence.py',
-    'runtime-policy.py','servus-updater.py','supervisor-daemon.py','supervisor.py',
+    'restore-snapshot.py','runtime-policy.py','servus-updater.py','supervisor-daemon.py','supervisor.py',
     'update-coordinator.py','validate-compose.py','verification-executor.py',
     'verification-fence.py','verify-release.py',
 )

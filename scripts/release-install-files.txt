@@ -18,6 +18,7 @@
 100644 apps/updater/provision-socket.py
 100644 apps/updater/provision-host.py
 100644 apps/updater/quiescence.py
+100644 apps/updater/restore-snapshot.py
 100644 apps/updater/runtime-policy.py
 100755 apps/updater/servus-updater.py
 100644 apps/updater/supervisor-daemon.py
