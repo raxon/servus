@@ -424,10 +424,54 @@ def start_generation(journal, operation_id, lease, daemon_ownership, approval_jo
         raise
 
 
+def prepare_update_policy(journal, operation_id, active_env, policy_root, maintenance, supervisor,
+                          extractor, runtime_policy, *, resolve_child=None):
+    """Derive a private candidate from the active config and verified image."""
+    row = journal.db.execute("SELECT p.preparation_id,p.staging_path,o.digest FROM preparations p "
+        "JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=? AND p.status='prepared' AND o.status='verified' "
+        "AND p.attempt_id=o.attempt_id AND p.attempt_nonce=o.attempt_nonce", (operation_id,)).fetchone()
+    if (not row or not supervisor._uuid4(row[0]) or not isinstance(row[1], str) or not os.path.isabs(row[1]) or
+        os.path.normpath(row[1]) != row[1] or not re.fullmatch(r'servus-install-[a-f0-9]{32}', os.path.basename(row[1])) or
+        not isinstance(row[2], str) or not re.fullmatch(r'sha256:[a-f0-9]{64}', row[2])):
+        raise UpdateError('Verified preparation is unavailable')
+    previous = runtime_policy._read_private_file(active_env, 65536)
+    env = runtime_policy._env(previous)
+    if 'SERVUS_IMAGE' not in env:
+        raise UpdateError('Active image is unavailable')
+    lines = previous.splitlines(keepends=True)
+    replacement = ('SERVUS_IMAGE=ghcr.io/raxon/servus@' + row[2]).encode('ascii')
+    candidate = b''.join(replacement + (b'\n' if line.endswith(b'\n') else b'') if line.startswith(b'SERVUS_IMAGE=') else line for line in lines)
+    candidate_env = runtime_policy._env(candidate)
+    if (candidate_env.get('SERVUS_IMAGE') != 'ghcr.io/raxon/servus@' + row[2] or
+        any(candidate_env.get(key) != value for key, value in env.items() if key != 'SERVUS_IMAGE') or set(candidate_env) != set(env)):
+        raise UpdateError('Candidate environment is invalid')
+    directory = supervisor._trusted_directory(policy_root, 0o700)
+    input_name = 'candidate-env-' + row[0] + '.env'
+    output_name = 'candidate-' + row[0] + '.json'
+    try:
+        try:
+            os.stat(output_name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise UpdateError('Candidate policy already exists')
+        input_path = os.path.join(policy_root, input_name)
+        try:
+            runtime_policy._publish_private(directory, input_name, candidate)
+        except FileExistsError:
+            if runtime_policy._read_private_file(input_path, 65536) != candidate:
+                raise UpdateError('Candidate environment changed') from None
+        install_dir = os.readlink('/proc/self/fd/' + str(maintenance.install))
+        return runtime_policy.produce(journal, operation_id, os.path.dirname(row[1]), input_path, install_dir,
+            os.path.join(policy_root, output_name), extractor, supervisor, resolve_child=resolve_child, lock_owner=maintenance)
+    finally:
+        os.close(directory)
+
+
 def apply_prepared_update(journal, operation_id, hub, maintenance, daemon_ownership,
                           approval_journal, active_env, backup_root, policy_root, docker_config,
                           node_fd, supervisor, daemon, extractor, runtime_policy, quiescence,
-                          backup_module, *, trusted_ingress=None):
+                          backup_module, *, trusted_ingress=None, resolve_child=None):
     """Run the prepared generation up to authenticated post-start finalization.
 
     All paths, modules, the Node descriptor and ingress identity must be supplied
@@ -451,12 +495,18 @@ def apply_prepared_update(journal, operation_id, hub, maintenance, daemon_owners
     if active != hub.policy:
         raise UpdateError('The authenticated generation changed')
     binding = daemon.approved_policy_binding(hub, old_policy, approval_journal, old_env)
-    row = journal.db.execute("SELECT a.source_env_path,a.candidate_path FROM policy_approvals a "
+    def candidate_row():
+        return journal.db.execute("SELECT a.source_env_path,a.candidate_path FROM policy_approvals a "
         "JOIN operations o ON o.id=a.operation_id JOIN preparations p ON p.operation_id=a.operation_id "
         "WHERE a.operation_id=? AND a.state='candidate' AND o.status='verified' AND p.status='prepared' "
         "AND a.attempt_id=o.attempt_id AND a.attempt_nonce=o.attempt_nonce AND a.root_digest=o.digest "
         "AND a.image_config_digest=o.config_digest AND a.attempt_id=p.attempt_id "
         "AND a.attempt_nonce=p.attempt_nonce AND a.preparation_id=p.preparation_id", (operation_id,)).fetchone()
+    row = candidate_row()
+    if row is None:
+        prepare_update_policy(journal, operation_id, active_env, policy_root, maintenance, supervisor,
+                              extractor, runtime_policy, resolve_child=resolve_child)
+        row = candidate_row()
     if not row or any(not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path for path in row):
         raise UpdateError('Prepared policy candidate is unavailable')
     backup_fd = supervisor._trusted_directory(backup_root, 0o700)

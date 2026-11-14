@@ -1,4 +1,5 @@
 import importlib.util
+import fcntl
 import os
 from pathlib import Path
 import sys
@@ -22,6 +23,8 @@ def load(name, path):
 
 coordinator = load('apply_coordinator', 'apps/updater/update-coordinator.py')
 updater = load('apply_updater', 'apps/updater/servus-updater.py')
+policy = load('apply_runtime_policy', 'apps/updater/runtime-policy.py')
+extractor = load('apply_extractor', 'apps/updater/extract-install.py')
 
 
 @unittest.skipUnless(sys.platform == 'linux' and os.geteuid() == 0, 'Requires isolated Linux root')
@@ -83,6 +86,47 @@ class ApplyPreparedTest(unittest.TestCase):
         with mock.patch.object(supervisor, '_assert_exclusive_flock'):
             with self.assertRaises(coordinator.UpdateError): self.execute()
         self.assertEqual(self.journal.db.execute('SELECT count(*) FROM update_transactions').fetchone(), (0,))
+
+    def test_candidate_environment_changes_only_verified_image_under_held_lock(self):
+        install, gate, maintenance, staging = (self.root / name for name in ('install', 'gate', 'maintenance', 'staging'))
+        install.mkdir(mode=0o700); gate.mkdir(mode=0o755); maintenance.mkdir(mode=0o700); staging.mkdir(mode=0o700)
+        (install / 'install.lock').touch(mode=0o600); (gate / 'lock').touch(mode=0o644)
+        (gate / 'state').write_bytes(b'servus-lifecycle-v1 normal\n'); (gate / 'state').chmod(0o644)
+        stage = staging / ('servus-install-' + 'd' * 32); stage.mkdir(mode=0o700)
+        self.journal.db.execute('UPDATE preparations SET staging_path=?', (str(stage),))
+        active = self.root / 'active.env'
+        before = b'SERVUS_IMAGE=ghcr.io/raxon/servus@sha256:' + b'f' * 64 + b'\nSERVUS_PORT=4180\n'
+        active.write_bytes(before); active.chmod(0o600)
+        with supervisor.MaintenanceSupervisor(str(install), str(gate), str(maintenance)) as owner:
+            def produce(_journal, op, parent, input_path, install_path, output_path, _extractor, _supervisor, **kwargs):
+                self.assertEqual(op, self.op); self.assertEqual(parent, str(staging)); self.assertEqual(install_path, str(install))
+                self.assertIs(kwargs['lock_owner'], owner)
+                candidate = Path(input_path).read_bytes()
+                self.assertEqual(policy._env(candidate)['SERVUS_IMAGE'], 'ghcr.io/raxon/servus@sha256:' + 'a' * 64)
+                self.assertEqual(policy._env(candidate)['SERVUS_PORT'], '4180')
+                return output_path
+            with mock.patch.object(policy, 'produce', side_effect=produce) as generated:
+                result = coordinator.prepare_update_policy(self.journal, self.op, str(active), str(self.policies), owner, supervisor, object(), policy)
+                self.assertTrue(result.startswith(str(self.policies / 'candidate-')))
+                self.assertEqual(active.read_bytes(), before)
+                self.assertEqual(generated.call_count, 1)
+
+    def test_policy_generation_borrows_without_releasing_install_lock(self):
+        install, gate, maintenance, staging = (self.root / name for name in ('install', 'gate', 'maintenance', 'staging'))
+        install.mkdir(mode=0o700); gate.mkdir(mode=0o755); maintenance.mkdir(mode=0o700); staging.mkdir(mode=0o700)
+        (install / 'install.lock').touch(mode=0o600); (gate / 'lock').touch(mode=0o644)
+        (gate / 'state').write_bytes(b'servus-lifecycle-v1 normal\n'); (gate / 'state').chmod(0o644)
+        with supervisor.MaintenanceSupervisor(str(install), str(gate), str(maintenance)) as owner:
+            with mock.patch.object(policy, '_record_identity', side_effect=policy.PolicyError('fixture')):
+                with self.assertRaises(policy.PolicyError):
+                    policy.produce(self.journal, self.op, str(staging), '/root/not-read', str(install),
+                                   str(self.policies / 'candidate.json'), extractor, supervisor, lock_owner=owner)
+            contender = os.open(install / 'install.lock', os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError): fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                supervisor._assert_exclusive_flock(owner.install_lock)
+            finally:
+                os.close(contender)
 
 
 if __name__ == '__main__': unittest.main()

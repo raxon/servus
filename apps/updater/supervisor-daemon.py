@@ -215,7 +215,7 @@ class HostApply:
 
     def __call__(self, operation_id, hub, maintenance):
         modules = {name: self._load('servus_host_' + name.replace('-', '_'), name + '.py', 0o755 if name == 'servus-updater' else 0o644)
-                   for name in ('servus-updater', 'update-coordinator', 'runtime-policy', 'extract-install', 'quiescence', 'backup')}
+                   for name in ('servus-updater', 'update-coordinator', 'runtime-policy', 'extract-install', 'quiescence', 'backup', 'verify-release')}
         node_fd = self._node()
         journal = None
         try:
@@ -225,10 +225,15 @@ class HostApply:
             journal = modules['servus-updater'].Journal(state)
             daemon = SimpleNamespace(resolve_active_policy=resolve_active_policy, approved_policy_binding=approved_policy_binding)
             ingress = tuple(self.config['trustedIngress']) if self.config['trustedIngress'] is not None else None
+            def resolve_child(root, config):
+                verifier = modules['verify-release']
+                registry = verifier.Registry(time.monotonic() + verifier.TOTAL_SECONDS)
+                registry.authenticate()
+                return verifier.revalidate_amd64_identity(registry, root, config)
             return modules['update-coordinator'].apply_prepared_update(journal, operation_id, hub, maintenance,
                 self.ownership, self.approval_journal, self.active_env, self.config['backupRoot'], self.config['policyRoot'],
                 self.config['dockerConfig'], node_fd, supervisor, daemon, modules['extract-install'], modules['runtime-policy'],
-                modules['quiescence'], modules['backup'], trusted_ingress=ingress)
+                modules['quiescence'], modules['backup'], trusted_ingress=ingress, resolve_child=resolve_child)
         finally:
             if journal is not None:
                 journal.close()

@@ -59,7 +59,7 @@ class DaemonTest(unittest.TestCase):
             updater_module = SimpleNamespace(Journal=mock.Mock(return_value=journal))
             apply = mock.Mock(return_value={'fixture': True})
             modules = {'servus-updater': updater_module, 'update-coordinator': SimpleNamespace(apply_prepared_update=apply),
-                       'runtime-policy': object(), 'extract-install': object(), 'quiescence': object(), 'backup': object()}
+                       'runtime-policy': object(), 'extract-install': object(), 'quiescence': object(), 'backup': object(), 'verify-release': object()}
             def load(_module_name, filename, mode):
                 return modules[filename.removesuffix('.py')]
             operation = str(uuid.uuid4()); hub = object(); maintenance = object()

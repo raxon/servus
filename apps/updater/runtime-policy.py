@@ -245,7 +245,7 @@ def _record_candidate(db, operation_id, attempt_id, nonce, preparation_id, proje
         raise
 
 
-def produce(journal, operation_id, staging_parent, accepted_env_path, install_dir, output_path, extractor, supervisor, *, resolve_child=None):
+def produce(journal, operation_id, staging_parent, accepted_env_path, install_dir, output_path, extractor, supervisor, *, resolve_child=None, lock_owner=None):
     """Produce a policy only after durable intent, validation and probe cleanup.
 
     The caller must load these modules from trusted root-owned code. This
@@ -263,9 +263,19 @@ def produce(journal, operation_id, staging_parent, accepted_env_path, install_di
     output_fd = extractor._trusted_parent(output_parent)
     install_fd = lock_fd = None
     try:
-        install_fd = supervisor._trusted_directory(install_dir)
-        lock_fd = supervisor._open_root_file(install_fd, 'install.lock', 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if lock_owner is None:
+            install_fd = supervisor._trusted_directory(install_dir)
+            lock_fd = supervisor._open_root_file(install_fd, 'install.lock', 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            if not isinstance(lock_owner, supervisor.MaintenanceSupervisor):
+                raise PolicyError('A current installation lock is required')
+            supervisor._assert_exclusive_flock(lock_owner.install_lock)
+            install_fd = supervisor._trusted_directory(install_dir)
+            held, requested = os.fstat(lock_owner.install), os.fstat(install_fd)
+            if (held.st_dev, held.st_ino) != (requested.st_dev, requested.st_ino):
+                raise PolicyError('Installation lock belongs to another installation')
+            lock_fd = os.dup(lock_owner.install_lock)
         db = journal.db
         row = _record_identity(db, operation_id)
     except BaseException:
