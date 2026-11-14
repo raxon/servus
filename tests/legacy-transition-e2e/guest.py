@@ -196,7 +196,14 @@ def main():
                 time.sleep(1)
             cookie='';csrf='';request('/auth/login','POST',{'email':'fixture@example.test','password':'isolated-fixture-password'})
             if not any(item.get('id')==project for item in request('/projects')):raise RuntimeError('Project was not retained')
-            print('PASS real signed release, supervisor, legacy migration and retained login',flush=True)
+            if request('/updates').get('applyAvailable') is not True:raise RuntimeError('Updater is not enabled in the panel')
+            end=time.monotonic()+180
+            while journal.db.execute('SELECT status FROM preparations WHERE operation_id=?',(op,)).fetchone()!=('completed',):
+                if time.monotonic()>=end:raise RuntimeError('Supervisor did not finalize the initial generation')
+                time.sleep(1)
+            discovery=request('/updates/discovery')
+            if not isinstance(discovery.get('discovery'),dict):raise RuntimeError('Updater discovery is unavailable')
+            print('PASS signed release, supervisor completion, updater discovery and retained login',flush=True)
             return
         script="import {Store} from '/app/dist/server/store.js';const s=new Store('/fixture');if(!s.db.prepare('SELECT 1 FROM projects WHERE id=?').get(process.argv[1]))process.exit(2);s.close()"
         command('run','--rm','--network','none','--platform','linux/amd64','--user','node','--mount','type=bind,src='+approved.data_dir+',dst=/fixture',
