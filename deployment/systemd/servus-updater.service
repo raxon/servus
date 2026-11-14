@@ -16,5 +16,4 @@ RestartSec=5
 NoNewPrivileges=true
 
 [Install]
-WantedBy=multi-user.target
-WantedBy=docker.service
+WantedBy=multi-user.target docker.service
