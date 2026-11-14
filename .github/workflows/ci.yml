@@ -124,7 +124,7 @@ jobs:
             --tmpfs /run:rw,nosuid,nodev,size=16m \
             --tmpfs /root:rw,nosuid,nodev,size=16m \
             --entrypoint python3 "$image" -I -B -c \
-            'import sys,unittest; sys.path.insert(0,"tests/updater"); suite=unittest.defaultTestLoader.loadTestsFromNames(["test_backup", "test_update_coordinator", "test_updater.JournalContractTest", "test_runtime_policy.LockedActivationTests.test_real_snapshot_and_held_locks_with_synthetic_drain"]); result=unittest.TextTestRunner(verbosity=2).run(suite); sys.exit(0 if result.wasSuccessful() and result.testsRun > 1 and not result.skipped else 1)'
+            'import sys,unittest; sys.path.insert(0,"tests/updater"); suite=unittest.defaultTestLoader.loadTestsFromNames(["test_backup", "test_update_coordinator", "test_updater.JournalContractTest", "test_runtime_policy.LockedActivationTests"]); result=unittest.TextTestRunner(verbosity=2).run(suite); sys.exit(0 if result.wasSuccessful() and result.testsRun > 1 and not result.skipped else 1)'
           docker run --rm --user 0:0 --network none --read-only --cgroupns=private --memory 1200m --pids-limit 256 \
             --tmpfs /tmp:rw,nosuid,nodev,size=256m --tmpfs /run:rw,nosuid,nodev,size=16m --tmpfs /root:rw,nosuid,nodev,size=16m \
             --env SERVUS_CGROUP_EXPECT=private --entrypoint python3 "$image" -I -B -c \

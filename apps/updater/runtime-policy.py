@@ -148,6 +148,23 @@ def _publish_private(directory_fd, name, content):
         except FileNotFoundError: pass
 
 
+def _replace_private(directory_fd, name, content):
+    temporary = '.private-' + secrets.token_hex(16)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
+    try:
+        with os.fdopen(fd, 'wb', closefd=False) as stream:
+            os.fchmod(fd, 0o600)
+            stream.write(content)
+            stream.flush()
+            os.fsync(fd)
+        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        os.close(fd)
+        try: os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError: pass
+
+
 def _json(content):
     def unique(pairs):
         result = {}
@@ -622,8 +639,6 @@ def activate_locked(journal, operation_id, accepted_env_path, candidate_path, po
         candidate = _read_private_file(candidate_path, 1024 * 1024)
         config = _read_private_file(accepted_env_path, 65536)
         live_config = _read_private_file(active_env_path, 65536)
-        if config != live_config:
-            raise PolicyError('Active environment does not match the candidate')
         db.execute('BEGIN IMMEDIATE')
         try:
             if db.execute("SELECT 1 FROM policy_approvals WHERE state IN ('activating','recovery_required') LIMIT 1").fetchone():
@@ -650,6 +665,11 @@ def activate_locked(journal, operation_id, accepted_env_path, candidate_path, po
             if (old[3] != 'sha256:' + hashlib.sha256(_read_private_file(old[2], 65536)).hexdigest() or
                     old[4] != 'sha256:' + hashlib.sha256(_read_private_file(old[1], 1024 * 1024)).hexdigest()):
                 raise PolicyError('Previous approved policy changed')
+            if old[3] != 'sha256:' + hashlib.sha256(live_config).hexdigest():
+                raise PolicyError('Active environment does not match the previous policy')
+            previous_env, next_env = _env(live_config), _env(config)
+            if (set(previous_env) != set(next_env) or any(previous_env[key] != next_env[key] for key in previous_env if key != 'SERVUS_IMAGE')):
+                raise PolicyError('Update changes unrelated installation configuration')
             # A valid old approval is not sufficient unless it is the policy
             # under which the currently held hub was authenticated and drained.
             lease.assert_active_policy(old[1], old[3], old[4])
@@ -677,7 +697,7 @@ def activate_locked(journal, operation_id, accepted_env_path, candidate_path, po
             lease.assert_snapshot_verified(operation_id)
             daemon_ownership.assert_held(control_dir)
             lease.assert_active_policy(old[1], old[3], old[4])
-            if _read_private_file(active_env_path, 65536) != config:
+            if _read_private_file(active_env_path, 65536) != live_config:
                 raise PolicyError('Active environment changed')
             cursor = db.execute("UPDATE policy_approvals SET state='activating',policy_path=?,source_env_path=? WHERE operation_id=? AND state='candidate'", (policy_path, active_env_path, operation_id))
             if cursor.rowcount != 1:
@@ -687,6 +707,14 @@ def activate_locked(journal, operation_id, accepted_env_path, candidate_path, po
         except BaseException:
             if db.in_transaction: db.execute('ROLLBACK')
             raise
+        env_parent, env_name = os.path.split(active_env_path)
+        env_fd = extractor._trusted_parent(env_parent)
+        try:
+            if not env_name or _read_private_file(active_env_path, 65536) != live_config:
+                raise PolicyError('Active environment changed')
+            _replace_private(env_fd, env_name, config)
+        finally:
+            os.close(env_fd)
         _publish_private(output_fd, name, candidate)
         lease.assert_snapshot_verified(operation_id)
         daemon_ownership.assert_held(control_dir)

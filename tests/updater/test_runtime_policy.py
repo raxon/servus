@@ -127,7 +127,7 @@ class LockedActivationTests(unittest.TestCase):
         self.active_env = self.private/'active.env'; self.old_snapshot = self.private/'old.env'
         self.old_policy = self.private/'old.json'; self.candidate = self.private/'candidate.json'
         self.target = self.private/'new.json'
-        for path, content in ((self.accepted,self.env),(self.snapshot,self.env),(self.active_env,self.env),
+        for path, content in ((self.accepted,self.env),(self.snapshot,self.env),(self.active_env,self.old_env),
                               (self.old_snapshot,self.old_env),(self.old_policy,b'old policy')):
             path.write_bytes(content); path.chmod(0o600)
         self.candidate.write_text(json.dumps({'version':1,'policy':{'image_reference':'ghcr.io/raxon/servus@'+self.root_digest,'install_dir':str(self.install),'control_dir':str(self.control)}}))
@@ -281,6 +281,7 @@ class LockedActivationTests(unittest.TestCase):
     def test_verified_snapshot_atomically_supersedes_old_policy(self):
         self.assertEqual(self.activate(),str(self.target))
         self.assertEqual(self.target.read_bytes(),self.candidate.read_bytes())
+        self.assertEqual(self.active_env.read_bytes(),self.env)
         self.assertEqual(self.db.execute('SELECT state FROM policy_approvals WHERE operation_id=?',(self.old_op,)).fetchone()[0],'superseded')
         self.assertEqual(self.db.execute('SELECT state,source_env_path FROM policy_approvals WHERE operation_id=?',(self.op,)).fetchone(),('active',str(self.active_env)))
         self.assertEqual(len(self.calls),1)
@@ -301,6 +302,7 @@ class LockedActivationTests(unittest.TestCase):
         self.coordinator.verify_snapshot=rejected
         with self.assertRaises(policy.PolicyError): self.activate()
         self.assertFalse(self.target.exists())
+        self.assertEqual(self.active_env.read_bytes(),self.old_env)
         self.assertEqual(self.db.execute('SELECT state FROM policy_approvals WHERE operation_id=?',(self.old_op,)).fetchone()[0],'active')
 
     def test_unrelated_drained_hub_cannot_authorize_swap(self):
@@ -308,6 +310,34 @@ class LockedActivationTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyError): self.activate()
         self.assertFalse(self.target.exists())
         self.assertEqual(self.db.execute('SELECT state FROM policy_approvals WHERE operation_id=?',(self.old_op,)).fetchone()[0],'active')
+
+    def test_active_environment_drift_cannot_be_overwritten(self):
+        changed = self.old_env + b'SERVUS_PORT=9000\n'
+        self.active_env.write_bytes(changed)
+        with self.assertRaises(policy.PolicyError): self.activate()
+        self.assertEqual(self.active_env.read_bytes(), changed)
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.db.execute('SELECT state FROM policy_approvals WHERE operation_id=?',(self.op,)).fetchone()[0],'candidate')
+
+    def test_candidate_cannot_change_other_configuration(self):
+        old = self.old_env + b'SERVUS_PORT=4180\n'
+        new = self.env + b'SERVUS_PORT=9000\n'
+        self.old_snapshot.write_bytes(old); self.active_env.write_bytes(old)
+        self.accepted.write_bytes(new); self.snapshot.write_bytes(new)
+        self.db.execute('UPDATE policy_approvals SET env_digest=? WHERE operation_id=?', ('sha256:'+hashlib.sha256(old).hexdigest(), self.old_op))
+        self.db.execute('UPDATE policy_approvals SET env_digest=? WHERE operation_id=?', ('sha256:'+hashlib.sha256(new).hexdigest(), self.op))
+        self.db.execute('UPDATE policy_probes SET config_digest=? WHERE operation_id=?', ('sha256:'+hashlib.sha256(new).hexdigest(), self.op))
+        with self.assertRaisesRegex(policy.PolicyError, 'unrelated'):
+            self.activate()
+        self.assertEqual(self.active_env.read_bytes(), old)
+        self.assertFalse(self.target.exists())
+
+    def test_failure_between_environment_and_policy_requires_recovery(self):
+        with mock.patch.object(policy, '_publish_private', side_effect=OSError('injected failure')):
+            with self.assertRaises(OSError): self.activate()
+        self.assertEqual(self.active_env.read_bytes(), self.env)
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.db.execute('SELECT state FROM policy_approvals WHERE operation_id=?',(self.op,)).fetchone()[0],'recovery_required')
 
     def test_failure_after_publication_requires_recovery(self):
         original=policy._publish_private
@@ -317,6 +347,7 @@ class LockedActivationTests(unittest.TestCase):
         with mock.patch.object(policy,'_publish_private',side_effect=publish_then_fail):
             with self.assertRaises(OSError): self.activate()
         self.assertTrue(self.target.exists())
+        self.assertEqual(self.active_env.read_bytes(),self.env)
         self.assertEqual(self.db.execute('SELECT state FROM policy_approvals WHERE operation_id=?',(self.op,)).fetchone()[0],'recovery_required')
         self.assertEqual(self.db.execute('SELECT state FROM policy_approvals WHERE operation_id=?',(self.old_op,)).fetchone()[0],'active')
 
