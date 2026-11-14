@@ -2,6 +2,7 @@
 Description=Servus host maintenance supervisor
 Requires=docker.service
 After=docker.service
+PartOf=docker.service
 Before=servus.service
 
 [Service]
@@ -18,3 +19,4 @@ NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
+WantedBy=docker.service
