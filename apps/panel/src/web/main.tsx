@@ -68,6 +68,7 @@ import { api, errorMessage, RequestError, setCsrfToken } from "./api.js";
 import { CreateService } from "./ServiceCreate.js";
 import { AccountLinkSettings, CentralAccessSettings, CentralSignIn } from "./CentralAccess.js";
 import { LocalPasswordSettings } from "./LocalPassword.js";
+import { UpdateSettings } from "./UpdateSettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
@@ -1702,6 +1703,7 @@ function SettingsPage() {
         </section>
       </div>
       <LocalPasswordSettings />
+      {user.role === "admin" ? <UpdateSettings /> : null}
       {user.role === "admin" ? <CentralAccessSettings /> : null}
       <AccountLinkSettings />
       {user.role === "admin" ? <ProjectAccess /> : null}
