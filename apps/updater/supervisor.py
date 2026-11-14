@@ -769,7 +769,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
             if (by_name.st_dev, by_name.st_ino) != (by_fd.st_dev, by_fd.st_ino):
                 raise SupervisorError('Lifecycle lock changed')
             self._record(request_id, 'stopped_unverified', request_ids, timeout_ms)
-            lease = DrainLease(self, request_id, request_ids, timeout_ms, policy_binding)
+            lease = DrainLease(self, request_id, request_ids, timeout_ms, policy_binding, hub=hub)
             yield lease
             completed = lease._settled
         except BaseException:
@@ -799,7 +799,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
 class DrainLease:
     """An exclusive gate lease scoped to one durable maintenance intent."""
 
-    def __init__(self, owner, operation_id, request_ids, timeout_ms, policy_binding=None):
+    def __init__(self, owner, operation_id, request_ids, timeout_ms, policy_binding=None, *, hub=None):
         self._owner = owner
         self._operation_id = operation_id
         self._request_ids = request_ids
@@ -808,6 +808,7 @@ class DrainLease:
         self._state = 'stopped_unverified'
         self._active = True
         self._policy_binding = policy_binding[:3] if policy_binding is not None else None
+        self._hub = hub
 
     def assert_locked(self, operation_id, state):
         """Recheck the host lock identities and the still-closed startup gate."""

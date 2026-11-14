@@ -25,6 +25,7 @@ backup = load('snapshot_backup', 'apps/updater/backup.py')
 supervisor = load('snapshot_supervisor', 'apps/updater/supervisor.py')
 coordinator = load('update_coordinator', 'apps/updater/update-coordinator.py')
 updater = load('snapshot_updater', 'apps/updater/servus-updater.py')
+quiescence = load('snapshot_quiescence', 'apps/updater/quiescence.py')
 
 
 @unittest.skipUnless(os.geteuid() == 0 and pathlib.Path('/proc/self/fd').exists(), 'Requires Linux root')
@@ -174,6 +175,39 @@ class SnapshotVerificationTest(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, 'lost lease'):
                         coordinator.begin_snapshot(journal, operation, lease, supervisor)
                 self.assertEqual(journal.db.execute('SELECT phase FROM update_transactions').fetchone(), ('recovery_required',))
+            finally:
+                journal.close()
+
+    def test_capture_rechecks_writers_and_refuses_to_publish_after_drift(self):
+        with tempfile.TemporaryDirectory(dir='/root') as state, tempfile.TemporaryDirectory(dir='/root') as destination:
+            journal = updater.Journal(pathlib.Path(state))
+            operation, attempt, preparation = (str(uuid.uuid4()) for _ in range(3))
+            root = 'sha256:' + 'b' * 64
+            journal.db.execute("INSERT INTO operations(id,commit_sha,digest,tag,status,attempt_id,attempt_nonce,config_digest) VALUES(?,?,?,?,?,?,?,?)",
+                               (operation, 'c' * 40, root, 'v1.2.3', 'verified', attempt, 'a' * 64, root))
+            journal.db.execute("INSERT INTO preparations(operation_id,attempt_id,attempt_nonce,preparation_id,status) VALUES(?,?,?,?,?)",
+                               (operation, attempt, 'a' * 64, preparation, 'prepared'))
+            journal.claim_update(operation)
+            lease = object.__new__(supervisor.DrainLease)
+            hub = mock.create_autospec(supervisor.DrainHub, instance=True)
+            hub.used = True; hub.expected_uid = 1000
+            hub.policy = mock.create_autospec(supervisor.RuntimePolicy, instance=True)
+            hub.policy.data_dir = str(self.path)
+            hub.identities = {role: {'id': char * 64} for role, char in zip(supervisor.ROLES, 'abc')}
+            lease._hub = hub; lease._policy_binding = ('/root/policy', 'a', 'b')
+            try:
+                with mock.patch.object(lease, 'assert_locked'), mock.patch.object(lease, 'record'), \
+                     mock.patch.object(supervisor, '_verify_data_directory'), \
+                     mock.patch.object(quiescence, 'ensure_host_namespaces'), \
+                     mock.patch.object(quiescence, 'ensure_no_other_data_mounts'), \
+                     mock.patch.object(quiescence, 'ensure_no_mount_aliases'), \
+                     mock.patch.object(quiescence, 'ensure_no_open_data'), \
+                     mock.patch.object(quiescence, 'ensure_no_uid_writers', side_effect=[None, quiescence.QuiescenceError('writer')]), \
+                     mock.patch.object(backup, '_capture_quiescent') as capture:
+                    with self.assertRaisesRegex(quiescence.QuiescenceError, 'writer'):
+                        coordinator.capture_stopped_snapshot(journal, operation, lease, destination, -1, supervisor, quiescence, backup)
+                    capture.assert_called_once()
+                self.assertEqual(journal.db.execute('SELECT phase,backup_path FROM update_transactions').fetchone(), ('recovery_required', None))
             finally:
                 journal.close()
 

@@ -62,7 +62,12 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn(name, entries)
             self.assertIn(mode, ('100644', '100755'))
             entries[name] = int(mode[-3:], 8)
-        self.assertEqual(entries, extractor.FILES)
+        self.assertTrue(set(extractor.FILES).issubset(entries))
+        self.assertTrue(all(entries[name] == mode for name, mode in extractor.FILES.items()))
+        for name in set(entries) - set(extractor.FILES):
+            self.assertTrue(extractor._allowed_addition(name), name)
+        self.assertEqual(entries['apps/updater/quiescence.py'], 0o644)
+        self.assertEqual(entries['apps/updater/update-coordinator.py'], 0o644)
 
     def test_exact_archive_preserves_content(self):
         result = extractor._read_archive(make_archive())

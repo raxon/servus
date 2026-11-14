@@ -172,3 +172,74 @@ def record_verified_snapshot(journal, operation_id, path, digest, lease, backup_
     except BaseException:
         db.execute("UPDATE update_transactions SET phase='recovery_required' WHERE operation_id=? AND phase='snapshot_verified'", (operation_id,))
         raise
+
+
+def capture_stopped_snapshot(journal, operation_id, lease, destination, node_fd,
+                             supervisor, quiescence, backup_module, *, trusted_ingress=None):
+    """Capture and verify a snapshot during a held, authenticated drain.
+
+    The root caller must supply the verified release's Node executable and an
+    ingress identity from protected installation policy, never from a request.
+    Root, Docker and any explicitly trusted ingress are inside the trust boundary.
+    This operation does not start containers or apply the new release.
+    """
+    if not isinstance(lease, supervisor.DrainLease):
+        raise UpdateError('A current maintenance lease is required')
+    lease.assert_locked(operation_id, 'stopped_unverified')
+    hub = lease._hub
+    if (not isinstance(hub, supervisor.DrainHub) or hub.used is not True or
+        lease._policy_binding is None or hub.expected_uid != 1000 or
+        not isinstance(hub.policy, supervisor.RuntimePolicy) or set(hub.identities) != set(supervisor.ROLES)):
+        raise UpdateError('Authenticated drain identity is unavailable')
+    try:
+        expected = {hub.identities[role]['id'] for role in supervisor.ROLES}
+    except (KeyError, TypeError):
+        raise UpdateError('Authenticated drain identity is unavailable') from None
+    data_dir = hub.policy.data_dir
+    supervisor._verify_data_directory(data_dir)
+
+    class DockerInspection:
+        @staticmethod
+        def call(*args):
+            return supervisor._docker(*args)
+
+        @staticmethod
+        def inspect(*ids):
+            try:
+                return json.loads(supervisor._docker('inspect', *ids), object_pairs_hook=_pairs)
+            except (ValueError, UnicodeError, RecursionError):
+                raise UpdateError('Docker inspection is unavailable') from None
+
+    docker = DockerInspection()
+    def check():
+        lease.assert_locked(operation_id, 'snapshotting')
+        quiescence.ensure_host_namespaces()
+        quiescence.ensure_no_other_data_mounts(docker, expected, data_dir, trusted_ingress=trusted_ingress)
+        quiescence.ensure_no_mount_aliases(docker, data_dir)
+        quiescence.ensure_no_open_data(data_dir)
+        quiescence.ensure_no_uid_writers(hub.expected_uid)
+        lease.assert_locked(operation_id, 'snapshotting')
+
+    source_fd = destination_fd = None
+    try:
+        destination_fd = supervisor._trusted_directory(destination, 0o700)
+        source_fd = os.open(data_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        begin_snapshot(journal, operation_id, lease, supervisor)
+        check()
+        backup_module._capture_quiescent(source_fd, destination_fd, node_fd, source_uid=hub.expected_uid, reader_gid=65534)
+        check()
+        manifest_fd, _ = backup_module._file(destination_fd, 'manifest.json', 0, os.fstat(destination_fd).st_dev)
+        try:
+            digest = 'sha256:' + hashlib.sha256(backup_module._read(manifest_fd)).hexdigest()
+        finally:
+            os.close(manifest_fd)
+        record_verified_snapshot(journal, operation_id, destination, digest, lease, backup_module, node_fd, supervisor)
+        return digest
+    except BaseException:
+        journal.db.execute("UPDATE update_transactions SET phase='recovery_required' WHERE operation_id=? AND phase IN ('snapshotting','snapshot_verified')", (operation_id,))
+        raise
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)

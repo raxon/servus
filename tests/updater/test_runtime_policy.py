@@ -198,7 +198,6 @@ class LockedActivationTests(unittest.TestCase):
         # This fixture constructs the lease directly: it tests the real lock and
         # snapshot verifiers, but does not claim an authenticated Docker drain.
         import copy
-        import shutil
         def load(name, path):
             module_spec = importlib.util.spec_from_file_location(name, ROOT / path)
             module = importlib.util.module_from_spec(module_spec)
@@ -218,6 +217,7 @@ class LockedActivationTests(unittest.TestCase):
             if old_module is None: sys.modules.pop('supervisor', None)
             else: sys.modules['supervisor'] = old_module
         coordinator = load('policy_integration_coordinator', 'apps/updater/update-coordinator.py')
+        quiescence = load('policy_integration_quiescence', 'apps/updater/quiescence.py')
         gate = self.root / 'gate'; gate.mkdir(mode=0o755)
         journal_dir = self.root / 'journal'; journal_dir.mkdir(mode=0o700)
         self.control.chmod(0o750)
@@ -228,10 +228,9 @@ class LockedActivationTests(unittest.TestCase):
         capture = CaptureTest('test_real_store_agent_committed_wal_and_isolated_restore')
         capture.setUp()
         try:
-            capture.panel.close(); capture.agent.close(); capture.capture()
+            capture.panel.close(); capture.agent.close()
             destination = self.private / 'backup'
-            shutil.copytree(capture.dst, destination)
-            digest = 'sha256:' + hashlib.sha256((destination / 'manifest.json').read_bytes()).hexdigest()
+            destination.mkdir(mode=0o700)
             self.db.execute("UPDATE update_transactions SET phase='intent',backup_path=NULL,backup_manifest_digest=NULL WHERE operation_id=?", (self.op,))
             roles = supervisor.ROLES
             fields = {'image_reference': 'ghcr.io/raxon/servus@' + self.root_digest,
@@ -251,11 +250,21 @@ class LockedActivationTests(unittest.TestCase):
                 try:
                     binding = (str(self.old_policy), 'sha256:' + hashlib.sha256(self.old_env).hexdigest(),
                                'sha256:' + hashlib.sha256(b'old policy').hexdigest(), None)
+                    hub = mock.create_autospec(supervisor.DrainHub, instance=True)
+                    hub.used = True; hub.expected_uid = 1000
+                    hub.policy = mock.create_autospec(supervisor.RuntimePolicy, instance=True)
+                    hub.policy.data_dir = str(capture.src)
+                    hub.identities = {role: {'id': char * 64} for role, char in zip(roles, 'abc')}
                     lease = supervisor.DrainLease(owner, self.op,
-                        {role: str(uuid.uuid4()) for role in roles}, 30000, binding)
-                    coordinator.begin_snapshot(self.journal, self.op, lease, supervisor)
-                    coordinator.record_verified_snapshot(self.journal, self.op, str(destination), digest,
-                        lease, backup, capture.node_fd, supervisor)
+                        {role: str(uuid.uuid4()) for role in roles}, 30000, binding, hub=hub)
+                    with mock.patch.object(supervisor, '_verify_data_directory'), \
+                         mock.patch.object(quiescence, 'ensure_host_namespaces'), \
+                         mock.patch.object(quiescence, 'ensure_no_other_data_mounts'), \
+                         mock.patch.object(quiescence, 'ensure_no_mount_aliases'), \
+                         mock.patch.object(quiescence, 'ensure_no_open_data'), \
+                         mock.patch.object(quiescence, 'ensure_no_uid_writers'):
+                        digest = coordinator.capture_stopped_snapshot(self.journal, self.op, lease, str(destination),
+                            capture.node_fd, supervisor, quiescence, backup)
                     self.assertEqual(self.db.execute('SELECT phase,backup_path,backup_manifest_digest FROM update_transactions WHERE operation_id=?',
                                                      (self.op,)).fetchone(), ('snapshot_verified', str(destination), digest))
                     policy.activate_locked(self.journal, self.op, str(self.accepted), str(self.candidate),
