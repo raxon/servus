@@ -31,7 +31,7 @@ class LegacyStopTest(unittest.TestCase):
         self.image='ghcr.io/raxon/servus@sha256:'+'d'*64
         self.binding=(str(uuid.uuid4()),str(uuid.uuid4()),'e'*64,'sha256:'+'f'*64,'sha256:'+'1'*64)
         self.approved=SimpleNamespace(install_dir=str(self.install),data_dir=str(self.root/'restore'))
-        self.adoption=SimpleNamespace(_binding=mock.Mock(return_value=('/policy','/accepted',self.approved,self.binding)))
+        self.adoption=SimpleNamespace(_binding=mock.Mock(return_value=('/policy','/accepted',self.approved,self.binding)),_check_paths=mock.Mock())
         self.quiet=SimpleNamespace(ensure_host_namespaces=mock.Mock(),ensure_restart_fenced=mock.Mock(),ensure_no_other_data_mounts=mock.Mock(),
                                    ensure_no_mount_aliases=mock.Mock(),ensure_no_open_data=mock.Mock(),ensure_no_uid_writers=mock.Mock())
         self.items={}
@@ -98,5 +98,21 @@ class LegacyStopTest(unittest.TestCase):
         self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_snapshots').fetchone(),('recovery_required',))
         self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_stop_operations').fetchone(),('recovery_required',))
         with self.assertRaises(legacy.LegacyStopError):run()
+    def test_protect_requires_staged_data_and_records_original_identity(self):
+        self.stop();self.journal.db.execute('CREATE TABLE legacy_snapshots(operation_id TEXT,path TEXT,digest TEXT,state TEXT)')
+        self.journal.db.execute("INSERT INTO legacy_snapshots VALUES(?,?,?,'verified')",(self.operation,'/snapshot','sha256:'+'9'*64))
+        restored=SimpleNamespace(verify_staged=mock.Mock(return_value=(11,12)))
+        result=legacy.protect(self.journal,self.operation,'/active','/parent',-1,supervisor,object(),self.adoption,self.quiet,self.docker,object(),SimpleNamespace(_pairs=dict),restored,install_lock=self.lock)
+        self.assertEqual(result,(11,12));self.assertEqual((os.stat(self.source).st_uid,os.stat(self.source).st_gid),(0,0))
+        self.assertEqual(self.journal.db.execute('SELECT state,target_dev,target_ino FROM legacy_protections').fetchone(),('protected',11,12))
+        self.assertEqual(restored.verify_staged.call_count,2)
+    def test_failed_protection_records_recovery_after_ownership_change(self):
+        self.stop();self.journal.db.execute('CREATE TABLE legacy_snapshots(operation_id TEXT,path TEXT,digest TEXT,state TEXT)')
+        self.journal.db.execute("INSERT INTO legacy_snapshots VALUES(?,?,?,'verified')",(self.operation,'/snapshot','sha256:'+'9'*64))
+        restored=SimpleNamespace(verify_staged=mock.Mock(side_effect=[(11,12),RuntimeError('staged data changed')]))
+        with self.assertRaisesRegex(RuntimeError,'staged data changed'):
+            legacy.protect(self.journal,self.operation,'/active','/parent',-1,supervisor,object(),self.adoption,self.quiet,self.docker,object(),SimpleNamespace(_pairs=dict),restored,install_lock=self.lock)
+        self.assertEqual(os.stat(self.source).st_uid,0)
+        self.assertEqual(self.journal.db.execute('SELECT state FROM legacy_protections').fetchone(),('recovery_required',))
 
 if __name__=='__main__':unittest.main()

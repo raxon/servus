@@ -323,14 +323,17 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         supervisor=load('legacy_capture_supervisor','supervisor.py')
         coordinator=load('legacy_capture_coordinator','update-coordinator.py')
         legacy=load('legacy_capture','legacy-stop.py')
+        restore=load('legacy_capture_restore','restore-snapshot.py')
+        adoption_module=load('legacy_capture_adoption','adoption-proof.py')
         updater=load('legacy_capture_updater','servus-updater.py')
         with tempfile.TemporaryDirectory(dir='/root') as protected:
             root=pathlib.Path(protected);install=root/'install';install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
             state=root/'state';state.mkdir(mode=0o700);snapshot=root/'snapshot';snapshot.mkdir(mode=0o700)
             journal=updater.Journal(state);attempt='12345678-1234-4123-8123-123456789abd';prep='12345678-1234-4123-8123-123456789abe'
             image='sha256:'+'a'*64;config='sha256:'+'b'*64;nonce='c'*64;binding=(prep,attempt,nonce,image,config)
-            approved=SimpleNamespace(install_dir=str(install),data_dir=str(root/'target'))
-            adoption=SimpleNamespace(_binding=lambda *_:('/policy','/accepted',approved,binding))
+            parent=root/'restores';parent.mkdir(mode=0o711)
+            approved=SimpleNamespace(install_dir=str(install),data_dir=str(parent/('restore-'+UUID)))
+            adoption=SimpleNamespace(_binding=lambda *_:('/policy','/accepted',approved,binding),_check_paths=adoption_module._check_paths)
             old={role:letter*64 for role,letter in zip(('api','worker','agent'),'def')}
             source=os.stat(self.src)
             journal.db.execute('CREATE TABLE legacy_stop_operations(operation_id TEXT PRIMARY KEY,preparation_id TEXT,attempt_id TEXT,nonce TEXT,root_digest TEXT,config_digest TEXT,policy_path TEXT,accepted_env TEXT,active_env TEXT,source TEXT,source_dev INTEGER,source_ino INTEGER,old_image TEXT,old_image_id TEXT,old_ids TEXT,state TEXT)')
@@ -344,6 +347,13 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
                 self.assertEqual(journal.db.execute('SELECT path,digest,state FROM legacy_snapshots').fetchone(),(str(snapshot),digest,'verified'))
                 self.assertEqual('sha256:'+hashlib.sha256((snapshot/'manifest.json').read_bytes()).hexdigest(),digest)
                 coordinator.verify_snapshot(str(snapshot),digest,backup,self.node_fd,supervisor)
+                restore.stage(str(snapshot),digest,str(parent),UUID,backup,self.node_fd,supervisor,coordinator)
+                with mock.patch.object(supervisor,'_verify_data_directory'):
+                    legacy.protect(journal,UUID,'/active',str(parent),self.node_fd,supervisor,object(),adoption,quiet,object(),backup,coordinator,restore,install_lock=lock)
+                self.assertEqual(journal.db.execute('SELECT state FROM legacy_protections').fetchone(),('protected',))
+                self.assertEqual((os.stat(self.src).st_uid,os.stat(self.src).st_gid),(0,0))
+                self.assertEqual(restore.verify_staged(str(snapshot),digest,str(parent),UUID,backup,self.node_fd,supervisor,coordinator),
+                                 (os.stat(approved.data_dir).st_dev,os.stat(approved.data_dir).st_ino))
             finally:os.close(lock);journal.close()
 
     def test_wrong_key_or_corrupted_ciphertext_is_rejected(self):

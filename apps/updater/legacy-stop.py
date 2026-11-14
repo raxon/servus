@@ -199,3 +199,83 @@ def capture(journal,operation,active_env,destination,node_fd,supervisor,daemon,a
     finally:
         if destination_fd is not None:os.close(destination_fd)
         os.close(source_fd)
+
+
+def protect(journal,operation,active_env,parent,node_fd,supervisor,daemon,adoption,quiescence,docker,backup,coordinator,restore,
+            *,install_lock,trusted_ingress=None):
+    """Protect original data only after its snapshot and staged copy validate.
+
+    The old containers remain stopped and present. A caller must retain its
+    startup fence and implement recovery before attempting the next step.
+    """
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or not supervisor._uuid4(operation):
+        raise LegacyStopError('Isolated Linux root is required')
+    policy_path,accepted,approved,binding=adoption._binding(journal,operation,active_env,supervisor,daemon)
+    directory=supervisor._trusted_directory(approved.install_dir,0o700)
+    try:
+        expected=supervisor._open_root_file(directory,'install.lock',0o600)
+        try:
+            held,named=os.fstat(install_lock),os.fstat(expected)
+            if (held.st_dev,held.st_ino)!=(named.st_dev,named.st_ino):raise LegacyStopError('Installation lock does not match')
+            supervisor._assert_exclusive_flock(install_lock)
+        finally:os.close(expected)
+    finally:os.close(directory)
+    db=journal.db
+    row=db.execute('SELECT preparation_id,attempt_id,nonce,root_digest,config_digest,policy_path,accepted_env,active_env,source,source_dev,source_ino,old_image,old_image_id,old_ids,state FROM legacy_stop_operations WHERE operation_id=?',(operation,)).fetchone()
+    snapshot=db.execute('SELECT path,digest,state FROM legacy_snapshots WHERE operation_id=?',(operation,)).fetchone()
+    if not row or row[:8]!=(*binding,policy_path,accepted,active_env) or row[-1]!='stopped' or not snapshot or snapshot[2]!='verified':
+        raise LegacyStopError('Verified stopped installation is unavailable')
+    source,dev,ino=row[8:11];path,digest,_=snapshot
+    adoption._check_paths(path,digest,parent,operation,approved)
+    try:old_ids=json.loads(row[13],object_pairs_hook=coordinator._pairs)
+    except (ValueError,TypeError,UnicodeError) as error:raise LegacyStopError('Legacy container identity is invalid') from error
+    if (not isinstance(old_ids,dict) or set(old_ids)!={'api','worker','agent'} or
+        any(not isinstance(value,str) or not re.fullmatch(r'[a-f0-9]{64}',value) for value in old_ids.values()) or len(set(old_ids.values()))!=3):
+        raise LegacyStopError('Legacy container identity is invalid')
+    supervisor._verify_data_directory(source)
+    source_fd=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        def check(owner):
+            supervisor._assert_exclusive_flock(install_lock)
+            current=os.fstat(source_fd);named=os.stat(source,follow_symlinks=False)
+            if ((current.st_dev,current.st_ino)!=(dev,ino) or (named.st_dev,named.st_ino)!=(dev,ino) or
+                (current.st_uid,current.st_gid,stat.S_IMODE(current.st_mode))!=(owner,owner,0o700)):
+                raise LegacyStopError('Legacy data directory changed')
+            if adoption._binding(journal,operation,active_env,supervisor,daemon)!=(policy_path,accepted,approved,binding):raise LegacyStopError('Approved release changed')
+            current_row=db.execute('SELECT preparation_id,attempt_id,nonce,root_digest,config_digest,policy_path,accepted_env,active_env,source,source_dev,source_ino,old_image,old_image_id,old_ids,state FROM legacy_stop_operations WHERE operation_id=?',(operation,)).fetchone()
+            if current_row!=row or db.execute('SELECT path,digest,state FROM legacy_snapshots WHERE operation_id=?',(operation,)).fetchone()!=snapshot:
+                raise LegacyStopError('Migration evidence changed')
+            quiescence.ensure_host_namespaces()
+            quiescence.ensure_restart_fenced(docker,set(old_ids.values()))
+            quiescence.ensure_no_other_data_mounts(docker,set(old_ids.values()),source,trusted_ingress=trusted_ingress)
+            quiescence.ensure_no_mount_aliases(docker,source)
+            quiescence.ensure_no_open_data(source)
+            quiescence.ensure_no_uid_writers(1000)
+        check(1000)
+        target=restore.verify_staged(path,digest,parent,operation,backup,node_fd,supervisor,coordinator)
+        check(1000)
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            check(1000)
+            db.execute("CREATE TABLE IF NOT EXISTS legacy_protections(operation_id TEXT PRIMARY KEY,source TEXT NOT NULL,source_dev INTEGER NOT NULL,source_ino INTEGER NOT NULL,snapshot_digest TEXT NOT NULL,target_dev INTEGER NOT NULL,target_ino INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN ('protecting','protected','recovery_required'))) ")
+            if db.execute('SELECT 1 FROM legacy_protections LIMIT 1').fetchone():raise LegacyStopError('Existing protection requires recovery')
+            db.execute("INSERT INTO legacy_protections VALUES(?,?,?,?,?,?,?,'protecting')",(operation,source,dev,ino,digest,*target))
+            db.execute('COMMIT')
+        except BaseException:
+            if db.in_transaction:db.execute('ROLLBACK')
+            raise
+        try:
+            check(1000)
+            os.fchown(source_fd,0,0);os.fsync(source_fd)
+            check(0)
+            if restore.verify_staged(path,digest,parent,operation,backup,node_fd,supervisor,coordinator)!=target:
+                raise LegacyStopError('Staged data changed')
+            check(0)
+            if db.execute("UPDATE legacy_protections SET state='protected' WHERE operation_id=? AND state='protecting'",(operation,)).rowcount!=1:
+                raise LegacyStopError('Protection state changed')
+            return target
+        except BaseException:
+            try:db.execute("UPDATE legacy_protections SET state='recovery_required' WHERE operation_id=? AND state='protecting'",(operation,))
+            except BaseException:pass
+            raise
+    finally:os.close(source_fd)
