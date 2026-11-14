@@ -38,7 +38,7 @@ async function api<T>(path: string, body?: unknown, method = 'POST', extra: Reco
 const setup = await api<{required:boolean}>('/setup');
 if (setup.required) {
   credentials = { email: 'admin@localhost.test', password: randomBytes(24).toString('base64url') };
-  const session = await api<SessionResponse>('/setup', { token: readFileSync(resolve(dataDir,'bootstrap-token'),'utf8').trim(), ...credentials });
+  const session = await api<SessionResponse>('/setup', credentials);
   csrf = session.csrfToken;
   writeFileSync(credentialsPath, JSON.stringify({ url: base, ...credentials },null,2)+'\n', {mode:0o600});
 } else {

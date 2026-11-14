@@ -5,6 +5,7 @@ import { z } from 'zod';
 import type { User } from '../shared/types.js';
 import { AppError } from './errors.js';
 import { hashToken, type Store } from './store.js';
+import { verifyPassword } from './auth.js';
 
 const prefix='/api/v1/auth/central';
 const callbackPath='/api/v1/auth/oidc/callback';
@@ -135,7 +136,7 @@ export function registerCentralAuth(app:FastifyInstance,options:Options) {
     store.db.transaction(()=>{
       const current=store.db.prepare('SELECT issuer,client_id AS clientId,revoke_token AS revokeToken FROM central_config WHERE id=1').get() as {issuer:string;clientId:string;revokeToken:string}|undefined;
       if(current)store.db.prepare('INSERT OR REPLACE INTO central_pending_revocations VALUES (?,?,?)').run(current.clientId,new URL(current.issuer).origin,current.revokeToken);
-      store.db.prepare('DELETE FROM sessions WHERE token_hash IN (SELECT token_hash FROM central_sessions)').run();store.db.prepare('DELETE FROM central_config').run();store.db.prepare('DELETE FROM central_pairings').run();store.db.prepare('DELETE FROM central_transactions').run();store.db.prepare('DELETE FROM central_invitations WHERE used_at IS NULL').run();store.recordAudit(actor.id,'central.disconnect','central');
+      store.db.prepare('DELETE FROM sessions WHERE token_hash IN (SELECT token_hash FROM central_sessions)').run();store.db.prepare('DELETE FROM central_config').run();store.db.prepare('DELETE FROM central_pairings').run();store.db.prepare('DELETE FROM central_transactions').run();store.db.prepare('DELETE FROM central_link_proofs').run();store.db.prepare('DELETE FROM central_invitations WHERE used_at IS NULL').run();store.recordAudit(actor.id,'central.disconnect','central');
     })();
     return {success:true,pendingRevocations:await retryRevocations()};
   });
@@ -147,13 +148,60 @@ export function registerCentralAuth(app:FastifyInstance,options:Options) {
     store.recordAudit(actor.id,'central.invitation.create',hashToken(token));
     return {token,expiresAt:until};
   });
+  app.get(`${prefix}/link/status`,async req=>{
+    const {user}=options.session(req);
+    const issuer=(store.db.prepare('SELECT issuer FROM central_config WHERE id=1').get() as {issuer:string}|undefined)?.issuer;
+    const linked=!!issuer&&!!store.db.prepare('SELECT 1 FROM external_identities WHERE issuer=? AND user_id=?').get(issuer,user.id);
+    const hasPassword=!!store.db.prepare('SELECT 1 FROM local_credentials WHERE user_id=?').get(user.id);
+    return {linked,canLink:!!issuer&&hasPassword&&!linked};
+  });
+  app.post(`${prefix}/link/start`,{config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async(req,reply)=>{
+    expireUnconfirmed();
+    const {user}=options.session(req,true);
+    const {password}=z.object({password:z.string().min(1).max(128)}).strict().parse(req.body);
+    const credential=store.db.prepare('SELECT password_hash AS passwordHash FROM local_credentials WHERE user_id=?').get(user.id) as {passwordHash:string}|undefined;
+    if(!credential)throw new AppError('LINK_UNAVAILABLE','This account does not have a local password',409);
+    if(!await verifyPassword(password,credential.passwordHash))throw new AppError('INVALID_CREDENTIALS','Email or password is incorrect',401);
+    const sessionToken=req.cookies.panel_session!;
+    const c=config(store);
+    if(store.db.prepare('SELECT 1 FROM external_identities WHERE issuer=? AND user_id=?').get(c.issuer,user.id))throw new AppError('IDENTITY_CONFLICT','This account is already linked',409);
+    const oidcConfig=await discover(c);
+    if(options.session(req,true).user.id!==user.id)throw new AppError('UNAUTHORIZED','Sign in to continue',401);
+    const state=random(),cookie=random(),nonce=random(),verifier=oidc.randomPKCECodeVerifier(),until=expires(300_000);
+    store.db.prepare('DELETE FROM central_transactions WHERE expires_at<=?').run(new Date().toISOString());
+    store.db.prepare('INSERT INTO central_transactions(state_hash,cookie_hash,verifier,nonce,invitation_hash,expires_at,link_user_id,link_session_hash) VALUES (?,?,?,?,NULL,?,?,?)').run(hashToken(state),hashToken(cookie),store.vault.seal(verifier),nonce,until,user.id,hashToken(sessionToken));
+    reply.setCookie(temporaryCookie,cookie,{path:callbackPath,httpOnly:true,secure:true,sameSite:'lax',maxAge:300});
+    return {authorizationUrl:oidc.buildAuthorizationUrl(oidcConfig,{redirect_uri:c.callbackUrl,scope:'openid email',state,nonce,code_challenge:await oidc.calculatePKCECodeChallenge(verifier),code_challenge_method:'S256'}).href};
+  });
+  app.post(`${prefix}/link/finish`,{config:{rateLimit:{max:10,timeWindow:'1 minute'}}},async req=>{
+    const {user}=options.session(req,true),sessionToken=req.cookies.panel_session!;
+    const {proof}=z.object({proof:z.string().regex(/^[A-Za-z0-9_-]{43}$/)}).strict().parse(req.body);
+    const key=hashToken(proof),sessionHash=hashToken(sessionToken);
+    const result=store.db.transaction(()=>{
+      const row=store.db.prepare('SELECT user_id AS userId,session_hash AS sessionHash,issuer,subject,expires_at AS expiresAt FROM central_link_proofs WHERE token_hash=?').get(key) as {userId:string;sessionHash:string;issuer:string;subject:string;expiresAt:string}|undefined;
+      if(!row||row.userId!==user.id||row.sessionHash!==sessionHash||row.expiresAt<=new Date().toISOString())return 'invalid';
+      store.db.prepare('DELETE FROM central_link_proofs WHERE token_hash=?').run(key);
+      const current=store.db.prepare('SELECT issuer FROM central_config WHERE id=1').get() as {issuer:string}|undefined;
+      if(!current||current.issuer!==row.issuer)return 'invalid';
+      const existing=store.db.prepare('SELECT user_id AS userId FROM external_identities WHERE issuer=? AND subject=?').get(row.issuer,row.subject) as {userId:string}|undefined;
+      if(existing&&existing.userId!==user.id)return 'conflict';
+      const owned=store.db.prepare('SELECT subject FROM external_identities WHERE issuer=? AND user_id=?').get(row.issuer,user.id) as {subject:string}|undefined;
+      if(owned&&owned.subject!==row.subject)return 'conflict';
+      if(!existing)store.db.prepare('INSERT INTO external_identities VALUES (?,?,?)').run(row.issuer,row.subject,user.id);
+      store.recordAudit(user.id,'central.identity.link',user.id);
+      return 'ok';
+    }).immediate();
+    if(result==='invalid')throw new AppError('LINK_EXPIRED','Linking has expired or the session changed',403);
+    if(result==='conflict')throw new AppError('IDENTITY_CONFLICT','The identity is already linked to another account',409);
+    return {success:true};
+  });
   app.post(`${prefix}/start`,{config:{rateLimit:{max:15,timeWindow:'1 minute'}}},async(req,reply)=>{
     expireUnconfirmed();
     const {invitation}=z.object({invitation:z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional()}).strict().parse(req.body??{});
     const c=config(store),oidcConfig=await discover(c),state=random(),cookie=random(),nonce=random(),verifier=oidc.randomPKCECodeVerifier();
     const until=expires(300_000);
     store.db.prepare('DELETE FROM central_transactions WHERE expires_at<=?').run(new Date().toISOString());
-    store.db.prepare('INSERT INTO central_transactions VALUES (?,?,?,?,?,?)').run(hashToken(state),hashToken(cookie),store.vault.seal(verifier),nonce,invitation?hashToken(invitation):null,until);
+    store.db.prepare('INSERT INTO central_transactions(state_hash,cookie_hash,verifier,nonce,invitation_hash,expires_at) VALUES (?,?,?,?,?,?)').run(hashToken(state),hashToken(cookie),store.vault.seal(verifier),nonce,invitation?hashToken(invitation):null,until);
     reply.setCookie(temporaryCookie,cookie,{path:callbackPath,httpOnly:true,secure:true,sameSite:'lax',maxAge:300});
     const destination=oidc.buildAuthorizationUrl(oidcConfig,{redirect_uri:c.callbackUrl,scope:'openid email',state,nonce,code_challenge:await oidc.calculatePKCECodeChallenge(verifier),code_challenge_method:'S256'});
     return {authorizationUrl:destination.href};
@@ -163,7 +211,7 @@ export function registerCentralAuth(app:FastifyInstance,options:Options) {
     reply.clearCookie(temporaryCookie,{path:callbackPath,secure:true,sameSite:'lax'});
     const key=hashToken(state);
     const tx=store.db.transaction(()=>{
-      const row=store.db.prepare('SELECT cookie_hash AS cookieHash,verifier,nonce,invitation_hash AS invitationHash,expires_at AS expiresAt FROM central_transactions WHERE state_hash=?').get(key) as {cookieHash:string;verifier:string;nonce:string;invitationHash:string|null;expiresAt:string}|undefined;
+      const row=store.db.prepare('SELECT cookie_hash AS cookieHash,verifier,nonce,invitation_hash AS invitationHash,expires_at AS expiresAt,link_user_id AS linkUserId,link_session_hash AS linkSessionHash FROM central_transactions WHERE state_hash=?').get(key) as {cookieHash:string;verifier:string;nonce:string;invitationHash:string|null;expiresAt:string;linkUserId:string|null;linkSessionHash:string|null}|undefined;
       store.db.prepare('DELETE FROM central_transactions WHERE state_hash=?').run(key);return row;
     })();
     if(!tx||tx.expiresAt<=new Date().toISOString()||tx.cookieHash!==hashToken(cookie))throw new AppError('OIDC_STATE','Sign in expired or is invalid',401);
@@ -178,6 +226,16 @@ export function registerCentralAuth(app:FastifyInstance,options:Options) {
     catch { throw new AppError('OIDC_IDENTITY','Identity information could not be verified',403); }
     if(typeof profile.email!=='string'||profile.email_verified!==true)throw new AppError('OIDC_IDENTITY','A verified email is required',403);
     const subject=claims.sub,email=profile.email.toLowerCase();
+    if(tx.linkUserId&&tx.linkSessionHash) {
+      const savedSession=store.db.prepare('SELECT user_id AS userId,expires_at AS expiresAt,absolute_expires_at AS absoluteExpiresAt FROM sessions WHERE token_hash=?').get(tx.linkSessionHash) as {userId:string;expiresAt:string;absoluteExpiresAt:string}|undefined;
+      const currentTime=new Date().toISOString();
+      if(!savedSession||savedSession.userId!==tx.linkUserId||savedSession.expiresAt<=currentTime||savedSession.absoluteExpiresAt<=currentTime)throw new AppError('LINK_EXPIRED','Linking has expired or the session changed',403);
+      const proof=random(),scriptNonce=random();
+      store.db.prepare('DELETE FROM central_link_proofs WHERE expires_at<=?').run(currentTime);
+      store.db.prepare('INSERT INTO central_link_proofs VALUES (?,?,?,?,?,?)').run(hashToken(proof),tx.linkUserId,tx.linkSessionHash,c.issuer,subject,expires(60_000));
+      const script=`(async()=>{try{const s=await fetch('/api/v1/auth/session');if(!s.ok)throw 0;const a=await s.json();const r=await fetch('/api/v1/auth/central/link/finish',{method:'POST',headers:{'content-type':'application/json','x-csrf-token':a.csrfToken},body:JSON.stringify({proof:'${proof}'})});if(!r.ok)throw 0;location.replace('/');}catch{document.getElementById('result').textContent='Could not link the account. Return to your panel and try again.';}})()`;
+      return reply.type('text/html; charset=utf-8').header('Content-Security-Policy',`default-src 'none'; connect-src 'self'; script-src 'nonce-${scriptNonce}'; base-uri 'none'; frame-ancestors 'none'`).send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Link account</title></head><body><p id="result">Linking your account...</p><script nonce="${scriptNonce}">${script}</script></body></html>`);
+    }
     const user=store.db.transaction(()=>{
       const existing=store.db.prepare('SELECT u.id,u.email,u.role,u.created_at AS createdAt FROM external_identities i JOIN users u ON u.id=i.user_id WHERE i.issuer=? AND i.subject=?').get(c.issuer,subject) as User|undefined;
       if(existing)return existing;

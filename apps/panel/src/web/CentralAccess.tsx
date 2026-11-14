@@ -40,6 +40,50 @@ export function CentralSignIn() {
   );
 }
 
+export function AccountLinkSettings() {
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const status = useQuery({
+    queryKey: ["central-account-link"],
+    queryFn: () => api<{ linked: boolean; canLink: boolean }>("/auth/central/link/status"),
+    retry: false,
+  });
+  const link = useMutation({
+    mutationFn: () => api<{ authorizationUrl: string }>("/auth/central/link/start", {
+      method: "POST",
+      body: { password },
+    }),
+    onSuccess: ({ authorizationUrl }) => {
+      setPassword("");
+      window.location.assign(authorizationUrl);
+    },
+    onError: () => setPassword(""),
+  });
+  return (
+    <section className="surface details-card central-settings">
+      <div className="card-heading"><ShieldCheck size={19} /><h2>Link your account</h2></div>
+      <Notice error={status.error} />
+      {status.isPending ? <p>Checking account...</p> : status.data?.linked ? (
+        <p>Your local account is linked to a Servus account.</p>
+      ) : status.data?.canLink ? (
+        <>
+          <p>Link your local account to a Servus account to use central sign-in. Your existing project access stays with this account.</p>
+          <form onSubmit={(event) => { event.preventDefault(); link.mutate(); }}>
+            <label>Local account password
+              <input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required />
+            </label>
+            <button type="button" className="button button-small" onClick={() => setShowPassword(!showPassword)} aria-pressed={showPassword}>
+              {showPassword ? "Hide password" : "Show password"}
+            </button>{" "}
+            <button type="submit" className="button button-primary" disabled={link.isPending}>{link.isPending ? "Starting..." : "Continue to Servus"}</button>
+          </form>
+          <Notice error={link.error} />
+        </>
+      ) : status.data ? <p>Linking requires a local password and a connected identity service.</p> : null}
+    </section>
+  );
+}
+
 export function CentralAccessSettings() {
   const client = useQueryClient();
   const [serviceUrl, setServiceUrl] = useState("");
@@ -57,12 +101,12 @@ export function CentralAccessSettings() {
   });
   const redeem = useMutation({
     mutationFn: (pairingId: string) => api<{ connected: true }>("/auth/central/redeem", { method: "POST", body: { pairingId } }),
-    onSuccess: () => { setPairing(null); void refresh(); void client.invalidateQueries({ queryKey: ["central-pending"] }); },
+    onSuccess: () => { setPairing(null); void refresh(); void client.invalidateQueries({ queryKey: ["central-pending"] }); void client.invalidateQueries({ queryKey: ["central-account-link"] }); },
     onError: () => { void client.invalidateQueries({ queryKey: ["central-pending"] }); void refresh(); },
   });
   const disconnect = useMutation({
     mutationFn: () => api<{ success: true; pendingRevocations: number }>("/auth/central", { method: "DELETE" }),
-    onSuccess: (value) => { setInvitation(null); setPairing(null); client.setQueryData(["central-revocations"], { pendingRevocations: value.pendingRevocations }); void client.invalidateQueries({ queryKey: ["central-pending"] }); void refresh(); },
+    onSuccess: (value) => { setInvitation(null); setPairing(null); client.setQueryData(["central-revocations"], { pendingRevocations: value.pendingRevocations }); void client.invalidateQueries({ queryKey: ["central-pending"] }); void client.invalidateQueries({ queryKey: ["central-account-link"] }); void refresh(); },
   });
   const retryRevocations = useMutation({
     mutationFn: () => api<{ pendingRevocations: number }>("/auth/central/retry-revocations", { method: "POST", body: {} }),

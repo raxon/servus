@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Action, ActionEvent, ActionType, ClaimedJob, Project, Service, ServiceInput, ServicePatch, ServiceState, User } from '../shared/types.js';
 import { AppError } from './errors.js';
@@ -34,17 +34,15 @@ const actionColumns = `id, project_id AS projectId, service_id AS serviceId, typ
 export class Store {
   readonly db: Database.Database;
   readonly orm;
-  readonly bootstrapPath: string;
   readonly vault: SecretVault;
   constructor(readonly dataDir: string) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-    this.bootstrapPath = join(dataDir, 'bootstrap-token');
     this.db = new Database(join(dataDir, 'panel.sqlite'));
     this.db.pragma('busy_timeout = 5000');
     retryStartupLock(()=>this.db.pragma('journal_mode = WAL'));
     this.db.pragma('foreign_keys = ON');
     const version = this.db.pragma('user_version', { simple: true }) as number;
-    if (version > 3) throw new Error('This database requires a newer panel release');
+    if (version > 4) throw new Error('This database requires a newer panel release');
     if (version === 0) this.db.transaction(() => {
       const currentVersion = this.db.pragma('user_version', { simple: true }) as number;
       if(currentVersion>=1)return;
@@ -97,12 +95,17 @@ export class Store {
         PRAGMA user_version = 3;
       `);
     }).immediate();
+    this.db.transaction(()=>{
+      if(Number(this.db.pragma('user_version',{simple:true}))>=4)return;
+      this.db.exec(`
+        ALTER TABLE central_transactions ADD COLUMN link_user_id TEXT REFERENCES users(id);
+        ALTER TABLE central_transactions ADD COLUMN link_session_hash TEXT;
+        CREATE TABLE central_link_proofs (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, session_hash TEXT NOT NULL, issuer TEXT NOT NULL, subject TEXT NOT NULL, expires_at TEXT NOT NULL);
+        PRAGMA user_version = 4;
+      `);
+    }).immediate();
     this.orm = drizzle(this.db, { schema });
     this.vault = new SecretVault(dataDir);
-    if (!this.isSetup() && !existsSync(this.bootstrapPath)) {
-      try { writeFileSync(this.bootstrapPath, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 }); }
-      catch(error) { if(!(error instanceof Error&&'code' in error&&error.code==='EEXIST'))throw error; }
-    }
   }
   close() { this.db.close(); }
   isSetup() { return (this.db.prepare('SELECT count(*) AS count FROM users WHERE role = ?').get('admin') as { count: number }).count > 0; }
@@ -112,15 +115,16 @@ export class Store {
     this.db.prepare('INSERT INTO local_credentials VALUES (?,?)').run(user.id,passwordHash);
     return user;
   }
-  setup(token: string, email: string, passwordHash: string): User {
+  setup(email: string, passwordHash: string): User {
     return this.db.transaction(() => {
       if (this.isSetup()) throw new AppError('SETUP_COMPLETE', 'Setup is already complete', 409);
-      const expected = readFileSync(this.bootstrapPath, 'utf8').trim();
-      if (!timingSafeEqual(Buffer.from(hashToken(token),'hex'),Buffer.from(hashToken(expected),'hex'))) throw new AppError('INVALID_BOOTSTRAP_TOKEN', 'Invalid setup token', 403);
       return this.createUser(email, passwordHash, 'admin');
     }).immediate();
   }
-  removeBootstrapToken() { if (existsSync(this.bootstrapPath)) unlinkSync(this.bootstrapPath); }
+  removeLegacyBootstrapToken() {
+    try { unlinkSync(join(this.dataDir,'bootstrap-token')); }
+    catch { /* The legacy file does not participate in setup. */ }
+  }
   findUser(email: string) {
     return this.db.prepare('SELECT u.id,u.email,u.role,u.created_at AS createdAt,c.password_hash AS passwordHash FROM users u JOIN local_credentials c ON c.user_id=u.id WHERE u.email = ?').get(email.toLowerCase()) as (User & { passwordHash: string }) | undefined;
   }
@@ -307,6 +311,8 @@ export class Store {
       if(action.type==='deploy') {
         const job=this.db.prepare('SELECT snapshot FROM jobs WHERE action_id=?').get(actionId) as {snapshot:string};
         if((JSON.parse(job.snapshot) as Service).source?.type!=='git')this.db.prepare('UPDATE services SET source_commit=NULL WHERE id=?').run(action.serviceId);
+        const service=this.getService(action.serviceId);
+        if(service)this.reserveDomains(service);
       }
       if(action.type==='destroy') {
         this.db.prepare('DELETE FROM domain_reservations WHERE service_id=?').run(action.serviceId);
@@ -323,6 +329,8 @@ export class Store {
       this.db.prepare("UPDATE actions SET status='failed',phase='failed',error=?,updated_at=?,finished_at=? WHERE id=?").run(error.slice(0,2000),now(),now(),actionId);
       this.db.prepare("UPDATE jobs SET status='failed',lease_until=NULL WHERE action_id=?").run(actionId);
       this.updateServiceRuntime(action.serviceId,{state:'failed',lastError:error.slice(0,2000)});
+      const service=this.getService(action.serviceId);
+      if(service&&action.type==='deploy')this.reserveDomains(service);
       this.appendEvent(actionId,'error',error); return true;
     }).immediate();
   }
@@ -363,9 +371,22 @@ export class Store {
     return config;
   }
   private reserveDomains(service:Service) {
-    const domains=(service.kind??'app')==='app'?(service.domains??[{hostname:service.hostname,port:service.port}]):[];
+    const domainNames=(item:Service)=>(item.kind??'app')==='app'?(item.domains??[{hostname:item.hostname,port:item.port}]).map(domain=>domain.hostname):[];
+    const names=new Set(domainNames(service));
+    const snapshots=this.db.prepare(`SELECT j.snapshot,j.status FROM jobs j JOIN actions a ON a.id=j.action_id
+      WHERE j.service_id=? AND a.type='deploy' AND j.status IN ('queued','running','succeeded','failed') ORDER BY j.rowid DESC`).all(service.id) as {snapshot:string;status:string}[];
+    let deployedFound=false;
+    for(const row of snapshots) {
+      const snapshot=JSON.parse(row.snapshot) as Service;
+      if(row.status==='queued'||row.status==='running')for(const hostname of domainNames(snapshot))names.add(hostname);
+      else if(row.status==='failed'&&!deployedFound)for(const hostname of domainNames(snapshot))names.add(hostname);
+      else if(!deployedFound&&service.deployedRevision!==null&&snapshot.revision===service.deployedRevision) {
+        for(const hostname of domainNames(snapshot))names.add(hostname);
+        deployedFound=true;
+      }
+    }
     this.db.prepare('DELETE FROM domain_reservations WHERE service_id=?').run(service.id);
-    try{for(const domain of domains)this.db.prepare('INSERT INTO domain_reservations(hostname,service_id) VALUES (?,?)').run(domain.hostname,service.id);}
+    try{for(const hostname of names)this.db.prepare('INSERT INTO domain_reservations(hostname,service_id) VALUES (?,?)').run(hostname,service.id);}
     catch(error){this.constraintError(error);}
   }
   connectionInfo(serviceId:string,reveal=false):import('../shared/types.js').ConnectionInfo {

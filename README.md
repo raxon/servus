@@ -46,7 +46,7 @@ On the target Linux host, install from a local checkout with:
 sudo bash scripts/install.sh --source "$(pwd)"
 ```
 
-The installer exposes management HTTP on port 4180 and application HTTP ingress on port 80 by default. Read [the installation guide](deployment/README.md) for host settings, port options and bootstrap access. Use a tested immutable source revision for a release. Each installed panel needs its own address and management TLS configuration.
+The installer binds the management panel to `127.0.0.1:4180` by default. Application HTTP ingress uses port 80. To reach a VPS panel from your computer, use the SSH tunnel in the [installation guide](deployment/README.md). Use a tested immutable source revision for a release. Each installed panel needs its own address and management TLS configuration.
 
 ## Website
 
@@ -111,7 +111,7 @@ This starts the separate Colima profile `panel-dev`, builds Servus and supervise
 
 Source builds use `docker buildx`. If `DOCKER_CONFIG` is unset, the local supervisor detects the Homebrew plugin at `/opt/homebrew/lib/docker/cli-plugins/docker-buildx` and writes a local plugin configuration under `.data/docker-config/`.
 
-Open <http://localhost:4180>. Read `.data/bootstrap-token` and use it to create the first administrator, choosing a password with at least 12 characters. The token is removed after setup. Control-plane data and encrypted secret files live under `.data/`, which is excluded from Git and the Docker build context.
+Open <http://localhost:4180> and create the first local administrator with an email address and a password of at least 8 characters. Until setup is complete, restrict access to the panel to the administrator: anyone who can reach an unconfigured instance can create the first account. Control-plane data and encrypted secret files live under `.data/`, which is excluded from Git and the Docker build context.
 
 For an existing local Linux Docker daemon:
 
@@ -162,7 +162,7 @@ All endpoints use `/api/v1`. Authentication uses a session cookie. Read the `csr
 
 | Endpoint                                                   | Contract                                                         |
 | ---------------------------------------------------------- | ---------------------------------------------------------------- |
-| `GET /setup`, `POST /setup`                                | Setup status, then `{token,email,password}`                      |
+| `GET /setup`, `POST /setup`                                | Setup status, then `{email,password}`                      |
 | `POST /auth/login`, `GET /auth/session`                    | Login accepts `{email,password}`, both return `{user,csrfToken}` |
 | `GET/POST /projects`                                       | List or create projects                                          |
 | `GET/PATCH/DELETE /projects/:id`                           | Read, edit or delete an empty project                            |
@@ -190,8 +190,9 @@ From an isolated Linux Docker environment:
 export DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
 docker compose build
 docker compose up -d
-docker compose exec api cat /var/lib/panel/bootstrap-token
 ```
+
+Open <http://localhost:4180> and create the first local administrator, or sign in if setup is complete.
 
 The `panel-data` volume stores SQLite, agent state and secret material. Keep live SQLite files on local storage. This root Compose package binds the management interface to localhost. The VPS installer has separate port and host settings described in its installation guide. Configure management HTTPS and secure cookies before exposing the panel publicly, and decide separately whether application ingress should be reachable remotely.
 

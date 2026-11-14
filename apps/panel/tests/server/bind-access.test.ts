@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../../src/server/app.js';
@@ -14,7 +14,7 @@ async function fixture() {
   const app = await createApp({ dataDir: directory, store });
   cleanup.push(async () => { await app.close(); store.close(); rmSync(directory, { recursive: true, force: true }); });
   const setup = await app.inject({ method: 'POST', url: '/api/v1/setup', payload: {
-    token: readFileSync(store.bootstrapPath, 'utf8'), email: 'admin@example.test', password: 'local-test-password',
+    email: 'admin@example.test', password: 'local-test-password',
   } });
   const admin = { cookie: `panel_session=${setup.cookies[0]!.value}`, 'x-csrf-token': setup.json().csrfToken };
   const project = store.createProject('bind-access');

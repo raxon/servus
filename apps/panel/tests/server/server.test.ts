@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -13,8 +13,7 @@ async function fixture() {
   const dir=mkdtempSync(join(tmpdir(),'panel-server-')),store=new Store(dir);
   const app=await createApp({dataDir:dir,store});
   cleanups.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
-  const token=readFileSync(store.bootstrapPath,'utf8');
-  const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{token,email:'admin@example.test',password:'a-long-local-password'}});
+  const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'admin@example.test',password:'a-long-local-password'}});
   expect(setup.statusCode).toBe(200);
   const auth=setup.json(),cookie=setup.cookies.find(c=>c.name==='panel_session')!.value;
   const headers={cookie:`panel_session=${cookie}`,'x-csrf-token':auth.csrfToken};
@@ -22,20 +21,50 @@ async function fixture() {
 }
 
 describe('authentication and request security',()=>{
-  it('requires the single-use private bootstrap token and hashes session credentials',async()=>{
+  it('creates one local administrator and hashes session credentials',async()=>{
     const dir=mkdtempSync(join(tmpdir(),'panel-setup-')),store=new Store(dir),app=await createApp({dataDir:dir,store});
     cleanups.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
-    expect(statSync(store.bootstrapPath).mode&0o777).toBe(0o600);
-    const wrong=await app.inject({method:'POST',url:'/api/v1/setup',payload:{token:'wrong',email:'admin@example.test',password:'a-long-local-password'}});
-    expect(wrong.statusCode).toBe(403);expect(store.isSetup()).toBe(false);
-    const token=readFileSync(store.bootstrapPath,'utf8');
-    const created=await app.inject({method:'POST',url:'/api/v1/setup',payload:{token,email:'admin@example.test',password:'a-long-local-password'}});
+    expect(existsSync(join(dir,'bootstrap-token'))).toBe(false);
+    expect((await app.inject({url:'/api/v1/setup'})).json()).toEqual({required:true});
+    const badOrigin=await app.inject({method:'POST',url:'/api/v1/setup',headers:{origin:'https://attacker.test'},payload:{email:'admin@example.test',password:'a-long-local-password'}});
+    expect(badOrigin.statusCode).toBe(403);expect(store.isSetup()).toBe(false);
+    const short=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'admin@example.test',password:'short'}});
+    expect(short.statusCode).toBe(400);expect(store.isSetup()).toBe(false);
+    const created=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'admin@example.test',password:'a-long-local-password'}});
     expect(created.statusCode).toBe(200);
     const raw=created.cookies[0]!.value;
     expect((store.db.prepare('SELECT token_hash FROM sessions').get() as {token_hash:string}).token_hash).not.toBe(raw);
-    const repeated=await app.inject({method:'POST',url:'/api/v1/setup',payload:{token,email:'second@example.test',password:'a-long-local-password'}});
+    const repeated=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'second@example.test',password:'a-long-local-password'}});
     expect(repeated.statusCode).toBe(409);
+    expect((await app.inject({url:'/api/v1/setup'})).json()).toEqual({required:false});
     expect(created.headers['set-cookie']).toContain('HttpOnly');expect(created.headers['set-cookie']).toContain('SameSite=Strict');
+  });
+  it('completes a previously unfinished installation without the legacy token',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-legacy-setup-'));writeFileSync(join(dir,'bootstrap-token'),'legacy-token');
+    const store=new Store(dir),app=await createApp({dataDir:dir,store});
+    cleanups.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
+    const created=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'admin@example.test',password:'a-long-local-password'}});
+    expect(created.statusCode).toBe(200);expect(existsSync(join(dir,'bootstrap-token'))).toBe(false);
+  });
+  it('allows exactly one concurrent first administrator',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-setup-race-')),store=new Store(dir),secondStore=new Store(dir),app=await createApp({dataDir:dir,store}),secondApp=await createApp({dataDir:dir,store:secondStore});
+    cleanups.push(async()=>{await app.close();await secondApp.close();store.close();secondStore.close();rmSync(dir,{recursive:true,force:true});});
+    const responses=await Promise.all([app,secondApp].map((instance,index)=>instance.inject({method:'POST',url:'/api/v1/setup',payload:{email:`admin${index}@example.test`,password:'a-long-local-password'}})));
+    expect(responses.map(response=>response.statusCode).sort()).toEqual([200,409]);
+    expect((store.db.prepare("SELECT count(*) AS count FROM users WHERE role='admin'").get() as {count:number}).count).toBe(1);
+  });
+  it('enforces an eight-character minimum for local setup and login',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-password-bounds-')),store=new Store(dir),app=await createApp({dataDir:dir,store});
+    cleanups.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
+    const email='bounds@example.test';
+    expect((await app.inject({method:'POST',url:'/api/v1/setup',payload:{email,password:'1234567'}})).statusCode).toBe(400);
+    expect(store.isSetup()).toBe(false);
+    expect((await app.inject({method:'POST',url:'/api/v1/setup',payload:{email,password:'12345678'}})).statusCode).toBe(200);
+    expect((await app.inject({method:'POST',url:'/api/v1/auth/login',payload:{email,password:'1234567'}})).statusCode).toBe(400);
+    expect((await app.inject({method:'POST',url:'/api/v1/auth/login',payload:{email,password:'12345678'}})).statusCode).toBe(200);
+    const legacyEmail='legacy@example.test',legacyPassword='a-long-existing-password';
+    store.createUser(legacyEmail,await hashPassword(legacyPassword));
+    expect((await app.inject({method:'POST',url:'/api/v1/auth/login',payload:{email:legacyEmail,password:legacyPassword}})).statusCode).toBe(200);
   });
   it('denies anonymous, missing-CSRF and foreign-origin mutation, and revokes logout',async()=>{
     const {app,headers}=await fixture();
@@ -122,7 +151,7 @@ describe('durable job ownership',()=>{
     expect(store.db.pragma('journal_mode',{simple:true})).toBe('wal');store.close();
     expect(await exited).toBe(0);
   });
-  it('initializes schema and bootstrap token safely across concurrent processes',async()=>{
+  it('initializes the schema safely across concurrent processes',async()=>{
     const dir=mkdtempSync(join(tmpdir(),'panel-concurrent-init-'));
     cleanups.push(async()=>rmSync(dir,{recursive:true,force:true}));
     const source=`import { Store } from ${JSON.stringify(new URL('../../src/server/store.ts',import.meta.url).href)};process.stdout.write('ready');process.stdin.once('data',()=>{const store=new Store(${JSON.stringify(dir)});store.close();process.stdin.pause();});`;
@@ -137,8 +166,8 @@ describe('durable job ownership',()=>{
     for(const worker of workers)worker.child.stdin.end('go');
     const results=await Promise.all(workers.map(worker=>worker.result));
     expect(results).toEqual(results.map(()=>({code:0,stderr:''})));
-    const store=new Store(dir);expect(store.db.pragma('user_version',{simple:true})).toBe(3);store.close();
-    expect(readFileSync(join(dir,'bootstrap-token'),'utf8')).toHaveLength(64);
+    const store=new Store(dir);expect(store.db.pragma('user_version',{simple:true})).toBe(4);store.close();
+    expect(existsSync(join(dir,'bootstrap-token'))).toBe(false);
   });
   it('reclaims expired jobs, preserves snapshots and fences stale worker completion',async()=>{
     const {store,auth}=await fixture(),project=store.createProject('queue');

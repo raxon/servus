@@ -66,8 +66,9 @@ import type {
 } from "../shared/types.js";
 import { api, errorMessage, RequestError, setCsrfToken } from "./api.js";
 import { CreateService } from "./ServiceCreate.js";
-import { CentralAccessSettings, CentralSignIn } from "./CentralAccess.js";
+import { AccountLinkSettings, CentralAccessSettings, CentralSignIn } from "./CentralAccess.js";
 import { ProjectAccess } from "./ProjectAccess.js";
+import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
   DatabaseConnection,
   DestroyService,
@@ -204,12 +205,11 @@ function AuthForm({ setup }: { setup: boolean }) {
   const client = useQueryClient();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [token, setToken] = useState("");
   const mutation = useMutation({
     mutationFn: () =>
       api<SessionResponse>(setup ? "/setup" : "/auth/login", {
         method: "POST",
-        body: { email, password, ...(setup ? { token } : {}) },
+        body: { email, password },
       }),
     onSuccess: (data) => {
       setCsrfToken(data.csrfToken);
@@ -217,126 +217,44 @@ function AuthForm({ setup }: { setup: boolean }) {
     },
   });
   return (
-    <div className="auth-layout">
-      <aside className="auth-story">
-        <Brand />
-        <div className="auth-story-body">
-          <span className="eyebrow light">
-            SELF-HOSTED APPLICATION MANAGEMENT
-          </span>
-          <h1>
-            Manage your
-            <br />
-            applications.
-          </h1>
-          <p>
-            Deploy Docker images and inspect service status, configuration
-            revisions, and operation output.
-          </p>
-          <div className="auth-feature">
-            <ShieldCheck size={20} />
-            <span>Project-scoped service management</span>
+    <main className="setup-screen">
+      <header className="setup-topbar"><Brand /></header>
+      <div className="setup-shell">
+        <div className="setup-intro">
+          <div className="setup-intro-copy">
+            <p className="setup-kicker">YOUR SERVER, YOUR SPACE</p>
+            <h1>{setup ? "Welcome to" : "Welcome back to"}<br /><em>your server.</em></h1>
+            <p className="setup-intro-description">{setup ? "A home for the applications you run. Set up your administrator account to get started." : "Sign in to manage your applications and check their status."}</p>
           </div>
-          <div className="auth-feature">
-            <Terminal size={20} />
-            <span>Deployment history and runtime status</span>
+          <div className="setup-diagram" aria-hidden="true">
+            <div className="setup-diagram-grid" />
+            <div className="setup-diagram-line" />
+            <div className="setup-diagram-orbit">
+              <div className="setup-diagram-node"><Server size={27} strokeWidth={1.4} /></div>
+            </div>
+            <div className="setup-diagram-caption"><span />YOUR LOCAL SERVER</div>
           </div>
         </div>
-        <div className="auth-bottom">
-          <span className="status-dot" /> Local installation
-        </div>
-      </aside>
-      <main className="auth-form-area">
-        <form
-          className="auth-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            mutation.mutate();
-          }}
-        >
-          <div className="auth-icon">
-            <Server size={24} />
+        <section className="setup-form-side" aria-labelledby="setup-form-heading">
+          <div className="setup-form-inner">
+            <h2 id="setup-form-heading">{setup ? <>Create your<br />administrator account</> : "Sign in to your account"}</h2>
+            <form className="setup-form" onSubmit={(event) => { event.preventDefault(); mutation.mutate(); }}>
+              <label htmlFor="setup-email">Email address</label>
+              <input id="setup-email" name="email" type="email" autoComplete="username" placeholder="you@example.com" maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} required />
+              <label htmlFor="setup-password">Password</label>
+              <input id="setup-password" name="password" type="password" autoComplete={setup ? "new-password" : "current-password"} placeholder={setup ? "At least 8 characters" : "Enter your password"} minLength={setup ? 8 : undefined} maxLength={128} value={password} onChange={(event) => setPassword(event.target.value)} required aria-describedby={setup ? "setup-password-hint" : undefined} />
+              {setup ? <p id="setup-password-hint" className="setup-password-hint">Use at least 8 characters.</p> : null}
+              <ErrorNotice error={mutation.error} />
+              <button className="setup-submit" type="submit" disabled={mutation.isPending}>
+                {mutation.isPending ? <Spinner label={setup ? "Creating administrator" : "Signing in"} /> : <>{setup ? "Create administrator" : "Sign in"} <ArrowRight size={18} aria-hidden="true" /></>}
+              </button>
+            </form>
+            {!setup ? <CentralSignIn /> : null}
+            <p className="setup-security-note"><ShieldCheck size={16} aria-hidden="true" /> {setup ? "This account is local to your installation." : "Local sign-in uses an account on this installation."}</p>
           </div>
-          <span className="eyebrow">
-            {setup ? "FIRST-TIME SETUP" : "WELCOME BACK"}
-          </span>
-          <h2>
-            {setup ? "Create your workspace" : "Sign in to your workspace"}
-          </h2>
-          <p className="muted">
-            {setup
-              ? "Set up the administrator for this installation."
-              : "Access projects, services, and deployment history."}
-          </p>
-          {setup ? (
-            <label>
-              Bootstrap token
-              <input
-                name="token"
-                value={token}
-                onChange={(event) => setToken(event.target.value)}
-                required
-                autoComplete="off"
-                placeholder="Token from your local installation"
-              />
-              <small>
-                Find the one-time token in your installation data directory.
-              </small>
-            </label>
-          ) : null}
-          <label>
-            Email address
-            <input
-              name="email"
-              type="email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              required
-              autoComplete="username"
-              placeholder="you@example.com"
-            />
-          </label>
-          <label>
-            Password
-            <input
-              name="password"
-              type="password"
-              value={password}
-              minLength={setup ? 12 : undefined}
-              onChange={(event) => setPassword(event.target.value)}
-              required
-              autoComplete={setup ? "new-password" : "current-password"}
-              placeholder={
-                setup ? "At least 12 characters" : "Enter your password"
-              }
-            />
-          </label>
-          <ErrorNotice error={mutation.error} />
-          <button
-            className="button button-primary auth-submit"
-            type="submit"
-            disabled={mutation.isPending}
-          >
-            {mutation.isPending ? (
-              <Spinner label={setup ? "Creating workspace" : "Signing in"} />
-            ) : (
-              <>
-                {setup ? "Create workspace" : "Sign in"}
-                <ArrowRight size={17} />
-              </>
-            )}
-          </button>
-          <div className="auth-note">
-            <ShieldCheck size={15} />
-            <span>Your local account password stays on this installation.</span>
-          </div>
-          {!setup ? <CentralSignIn /> : null}
-        </form>
-        <div className="auth-footer">
-          Servus <span>/</span> servus.run
-        </div>
-      </main>
-    </div>
+        </section>
+      </div>
+    </main>
   );
 }
 
@@ -487,10 +405,6 @@ function Shell() {
             <strong>{locationName}</strong>
           </div>
           <div className="topbar-right">
-            <span className="local-pill">
-              <span className="status-dot" />
-              LOCAL INSTANCE
-            </span>
             <span className="top-avatar">{user.email[0]?.toUpperCase()}</span>
           </div>
         </header>
@@ -569,6 +483,7 @@ function CreateProject({ onClose }: { onClose: () => void }) {
         body: { name, description },
       }),
     onSuccess: (project) => {
+      notifyProjectCreated();
       void client.invalidateQueries({ queryKey: ["projects"] });
       onClose();
       void navigate({
@@ -640,6 +555,7 @@ function CreateProject({ onClose }: { onClose: () => void }) {
 }
 
 function Dashboard() {
+  const { user } = useAuth();
   const projects = useProjects();
   const actions = useActions();
   const runtime = useRuntime();
@@ -664,13 +580,13 @@ function Dashboard() {
           <h1>Your workspace</h1>
           <p>Projects, services, and deployment operations.</p>
         </div>
-        <button
+        {user.role === "admin" ? <button
           className="button button-primary"
           onClick={() => setShowCreate(true)}
         >
           <Plus size={17} />
           New project
-        </button>
+        </button> : null}
       </div>
       <div className="summary-grid">
         <Summary
@@ -737,7 +653,7 @@ function Dashboard() {
             <div>
               <h2>
                 Projects{" "}
-                <span className="count-pill">{projects.data?.length ?? 0}</span>
+                <span className="count-pill">{projects.isPending ? "..." : projects.error ? "--" : projects.data?.length ?? 0}</span>
               </h2>
               <p>Manage related services within a project.</p>
             </div>
@@ -749,7 +665,6 @@ function Dashboard() {
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
               />
-              <kbd>/</kbd>
             </div>
           </div>
           <ErrorNotice error={projects.error} />
@@ -757,7 +672,7 @@ function Dashboard() {
             <div className="surface loading-surface">
               <Spinner label="Loading projects" />
             </div>
-          ) : projects.data?.length ? (
+          ) : projects.error ? null : projects.data?.length ? (
             <div className="project-grid">
               {visible.map((project) => (
                 <ProjectCard key={project.id} project={project} />
@@ -781,22 +696,14 @@ function Dashboard() {
               </div>
               <span className="eyebrow">PROJECTS</span>
               <h2>No projects yet</h2>
-              <p>
-                Create a project to group your applications.
-                <br />
-                Then deploy an image and follow its progress.
-              </p>
-              <button
+              <p>{user.role === "admin" ? "Create a project to group your applications, then add a service to deploy." : "Ask an administrator to give you access to a project."}</p>
+              {user.role === "admin" ? <button
                 className="button button-primary"
                 onClick={() => setShowCreate(true)}
               >
                 <Plus size={16} />
                 Create your first project
-              </button>
-              <div className="empty-footnote">
-                <ShieldCheck size={14} />
-                Everything stays on your own server.
-              </div>
+              </button> : null}
             </div>
           )}
           <div className="section-heading activity-heading">
@@ -1046,7 +953,7 @@ function ProjectPage() {
       <div className="project-meta">
         <span>
           <Box size={15} />
-          {services.data?.length ?? 0} services
+          {services.isPending ? "Loading services" : services.error ? "Services unavailable" : `${services.data?.length ?? 0} services`}
         </span>
         <span>
           <ShieldCheck size={15} />
@@ -1070,7 +977,7 @@ function ProjectPage() {
         <div className="surface loading-surface">
           <Spinner label="Loading services" />
         </div>
-      ) : services.data?.length ? (
+      ) : services.error ? null : services.data?.length ? (
         <div className="services-table surface">
           <div className="service-table-head">
             <span>Service</span>
@@ -1153,7 +1060,8 @@ function ProjectPage() {
           <p>Deployment progress and recent operations.</p>
         </div>
       </div>
-      <ActionsTable actions={actions.data ?? []} loading={actions.isPending} />
+      <ErrorNotice error={actions.error} />
+      {!actions.error ? <ActionsTable actions={actions.data ?? []} loading={actions.isPending} /> : null}
       {create && projectId ? (
         <CreateService projectId={projectId} onClose={() => setCreate(false)} />
       ) : null}
@@ -1777,6 +1685,7 @@ function SettingsPage() {
         </section>
       </div>
       {user.role === "admin" ? <CentralAccessSettings /> : null}
+      <AccountLinkSettings />
       {user.role === "admin" ? <ProjectAccess /> : null}
     </>
   );
@@ -1839,6 +1748,7 @@ createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <AuthGate />
+      <PanelNotifications />
     </QueryClientProvider>
   </React.StrictMode>,
 );

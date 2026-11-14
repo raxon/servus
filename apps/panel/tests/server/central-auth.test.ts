@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../../src/server/app.js';
@@ -11,7 +11,7 @@ async function fixture() {
   const dir=mkdtempSync(join(tmpdir(),'panel-central-')),store=new Store(dir);
   const app=await createApp({dataDir:dir,store,allowedOrigins:['https://panel.example.test'],secureCookies:true});
   cleanups.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
-  const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{token:readFileSync(store.bootstrapPath,'utf8'),email:'admin@example.test',password:'a-long-local-password'}});
+  const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'admin@example.test',password:'a-long-local-password'}});
   const headers={cookie:`panel_session=${setup.cookies[0]!.value}`,'x-csrf-token':setup.json().csrfToken};
   return {store,app,headers,user:setup.json().user};
 }
@@ -63,6 +63,56 @@ describe('central identity security',()=>{
     store.db.prepare('INSERT INTO users VALUES (?,?,?,?,?)').run('external-user','external@example.test','external-credentials','member',new Date().toISOString());
     const response=await app.inject({method:'POST',url:'/api/v1/auth/login',payload:{email:'external@example.test',password:'a-long-local-password'}});
     expect(response.statusCode).toBe(401);expect(response.json().error.code).toBe('INVALID_CREDENTIALS');
+  });
+  it('requires the current session, CSRF and the local password to initiate linking',async()=>{
+    const {app,store,headers}=await fixture();
+    store.db.prepare('INSERT INTO central_config VALUES (1,?,?,?,?,?)').run('https://auth.example.test/api/auth','client',store.vault.seal('secret'),'https://panel.example.test/api/v1/auth/oidc/callback',store.vault.seal('revoke'));
+    expect((await app.inject({url:'/api/v1/auth/central/link/status',headers})).json()).toEqual({linked:false,canLink:true});
+    const url='/api/v1/auth/central/link/start';
+    expect((await app.inject({method:'POST',url,payload:{password:'a-long-local-password'}})).statusCode).toBe(401);
+    expect((await app.inject({method:'POST',url,headers:{cookie:headers.cookie},payload:{password:'a-long-local-password'}})).statusCode).toBe(403);
+    const invalid=await app.inject({method:'POST',url,headers,payload:{password:'incorrect-password'}});
+    expect(invalid.statusCode).toBe(401);expect(invalid.json().error.code).toBe('INVALID_CREDENTIALS');
+    expect((store.db.prepare('SELECT count(*) AS count FROM central_transactions').get() as {count:number}).count).toBe(0);
+  });
+  it('binds a one-time linking proof to the initiating session and preserves local login',async()=>{
+    const {app,store,headers,user}=await fixture();
+    const issuer='https://auth.example.test/api/auth',subject='external-subject',proof='q'.repeat(43);
+    store.db.prepare('INSERT INTO central_config VALUES (1,?,?,?,?,?)').run(issuer,'client',store.vault.seal('secret'),'https://panel.example.test/api/v1/auth/oidc/callback',store.vault.seal('revoke'));
+    const token=headers.cookie.split('=')[1]!;
+    store.db.prepare('INSERT INTO central_link_proofs VALUES (?,?,?,?,?,?)').run(hashToken(proof),user.id,hashToken(token),issuer,subject,new Date(Date.now()+60_000).toISOString());
+    const otherSession=store.createSession(user.id),otherHeaders={cookie:`panel_session=${otherSession.token}`,'x-csrf-token':otherSession.csrfToken};
+    const url='/api/v1/auth/central/link/finish';
+    expect((await app.inject({method:'POST',url,headers:otherHeaders,payload:{proof}})).statusCode).toBe(403);
+    expect((await app.inject({method:'POST',url,headers:{cookie:headers.cookie},payload:{proof}})).statusCode).toBe(403);
+    expect((await app.inject({method:'POST',url,headers,payload:{proof}})).statusCode).toBe(200);
+    expect((await app.inject({method:'POST',url,headers,payload:{proof}})).statusCode).toBe(403);
+    expect((await app.inject({url:'/api/v1/auth/central/link/status',headers})).json()).toEqual({linked:true,canLink:false});
+    const login=await app.inject({method:'POST',url:'/api/v1/auth/login',payload:{email:'admin@example.test',password:'a-long-local-password'}});
+    expect(login.statusCode).toBe(200);
+  });
+  it('rejects an identity linked to another user and consumes the proof',async()=>{
+    const {app,store,headers,user}=await fixture();
+    const issuer='https://auth.example.test/api/auth',subject='already-linked',proof='r'.repeat(43),other=store.createUser('other@example.test','unused');
+    store.db.prepare('INSERT INTO central_config VALUES (1,?,?,?,?,?)').run(issuer,'client',store.vault.seal('secret'),'https://panel.example.test/api/v1/auth/oidc/callback',store.vault.seal('revoke'));
+    store.db.prepare('INSERT INTO external_identities VALUES (?,?,?)').run(issuer,subject,other.id);
+    store.db.prepare('INSERT INTO central_link_proofs VALUES (?,?,?,?,?,?)').run(hashToken(proof),user.id,hashToken(headers.cookie.split('=')[1]!),issuer,subject,new Date(Date.now()+60_000).toISOString());
+    const response=await app.inject({method:'POST',url:'/api/v1/auth/central/link/finish',headers,payload:{proof}});
+    expect(response.statusCode).toBe(409);expect(response.json().error.code).toBe('IDENTITY_CONFLICT');
+    expect(store.db.prepare('SELECT user_id FROM external_identities WHERE issuer=? AND subject=?').get(issuer,subject)).toEqual({user_id:other.id});
+    expect((await app.inject({method:'POST',url:'/api/v1/auth/central/link/finish',headers,payload:{proof}})).statusCode).toBe(403);
+  });
+  it('rejects expired proofs and proofs from a logged-out session',async()=>{
+    const {app,store,headers,user}=await fixture();
+    const issuer='https://auth.example.test/api/auth',token=headers.cookie.split('=')[1]!,url='/api/v1/auth/central/link/finish';
+    store.db.prepare('INSERT INTO central_config VALUES (1,?,?,?,?,?)').run(issuer,'client',store.vault.seal('secret'),'https://panel.example.test/api/v1/auth/oidc/callback',store.vault.seal('revoke'));
+    const expired='s'.repeat(43),loggedOut='t'.repeat(43);
+    store.db.prepare('INSERT INTO central_link_proofs VALUES (?,?,?,?,?,?)').run(hashToken(expired),user.id,hashToken(token),issuer,'subject',new Date(Date.now()-1000).toISOString());
+    store.db.prepare('INSERT INTO central_link_proofs VALUES (?,?,?,?,?,?)').run(hashToken(loggedOut),user.id,hashToken(token),issuer,'subject',new Date(Date.now()+60_000).toISOString());
+    expect((await app.inject({method:'POST',url,headers,payload:{proof:expired}})).statusCode).toBe(403);
+    await app.inject({method:'POST',url:'/api/v1/auth/logout',headers});
+    expect((await app.inject({method:'POST',url,headers,payload:{proof:loggedOut}})).statusCode).toBe(401);
+    expect(store.db.prepare('SELECT 1 FROM external_identities WHERE issuer=?').get(issuer)).toBeUndefined();
   });
   it('lets only administrators grant and revoke project membership',async()=>{
     const {store,app,headers}=await fixture();

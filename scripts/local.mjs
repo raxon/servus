@@ -56,4 +56,4 @@ for (const component of ['agent', 'server', 'worker']) launch(component);
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
 console.log('Panel: http://localhost:4180');
-console.log(`First setup token: ${resolve(dataDir, 'bootstrap-token')} (shown only in this local file).`);
+console.log('Open the panel to sign in, or create the first local administrator if setup is required.');

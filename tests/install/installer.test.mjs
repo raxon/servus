@@ -4,7 +4,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSyn
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 
 const installer = fileURLToPath(new URL('../../scripts/install.sh', import.meta.url));
 const directories = [];
@@ -33,11 +34,37 @@ function run(f, args, script = 'source "$1"; shift; "$@"') {
 function succeeds(result) { assert.equal(result.status, 0, result.stderr); }
 function fails(result, pattern) { assert.notEqual(result.status, 0, result.stdout);assert.match(result.stderr, pattern); }
 
+function writeTestDatabase(path, version = 2) {
+  const result = spawnSync('python3', ['-c', 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute("PRAGMA user_version="+sys.argv[2]); db.commit(); db.close()', path, String(version)], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+}
+test('success instructions cover first setup and reruns without exposing a token', () => {
+  const f=fixture();
+  const result=run(f,['print_success','https://panel.example.test', '/etc/servus/servus.env', '/opt/servus', '127.0.0.1', '4180']);
+  succeeds(result);
+  assert.match(result.stdout,/Configured panel origin: https:\/\/panel\.example\.test/);
+  assert.match(result.stdout,/Management listener: 127\.0\.0\.1:4180/);
+  assert.doesNotMatch(result.stdout,/is listening at https/);
+  assert.match(result.stdout,/sign in, or create the first local administrator if setup is required/);
+  assert.doesNotMatch(result.stdout,/bootstrap|setup token/i);
+});
 test('help works without touching installation directories', () => {
   const f=fixture();const r=run(f,['main','--help']);succeeds(r);assert.match(r.stdout,/--dry-run/);assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
 });
 test('dry run validates a supported arm64 checkout without mutating the host', () => {
   const f=fixture();const r=run(f,['main','--dry-run','--source',f.source,'--port','4280','--ingress-port','28080']);succeeds(r);assert.match(r.stdout,/ubuntu 24.04 \(arm64\)/);assert.match(r.stdout,/Panel port: 4280/);assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
+});
+test('management binds to localhost by default and rejects a new public installation', () => {
+  const f=fixture(); delete f.env.SERVUS_BIND_ADDRESS;
+  const local=run(f,['main','--dry-run']);succeeds(local);assert.match(local.stdout,/Management bind address: 127\.0\.0\.1/);
+  f.env.SERVUS_BIND_ADDRESS='0.0.0.0';
+  fails(run(f,['main','--dry-run']),/cannot bind publicly/);
+  fails(run(f,['main','--source',f.source]),/cannot bind publicly/);
+  assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
+  assert.equal(existsSync(f.env.SERVUS_CONFIG_DIR),false);
+  assert.equal(existsSync(f.env.SERVUS_DATA_DIR),false);
+  f.env.SERVUS_BIND_ADDRESS='127.0.0.1';f.env.SERVUS_PUBLIC_URL='https://panel.example.test';
+  succeeds(run(f,['main','--dry-run']));
 });
 test('dry run rejects unsupported operating systems', () => {
   const f=fixture();f.command('uname','echo Darwin');fails(run(f,['main','--dry-run']),/requires Linux/);
@@ -59,6 +86,32 @@ test('refs and hostnames reject shell metacharacters and traversal', () => {
   const f=fixture();for(const value of ['../../etc','main;echo bad','-main','feature//one'])fails(run(f,['main','--dry-run','--ref',value]),/Invalid source ref/);
   fails(run(f,['main','--dry-run','--hostname','example.test;echo']),/Invalid hostname/);
   for(const value of ['-label.example','label-.example','a..b','999.1.1.1','01.2.3.4'])fails(run(f,['main','--dry-run','--hostname',value]),/Invalid/);
+});
+test('pinned image mode requires a matching registry digest and an explicit full commit', () => {
+  const f=fixture(), digest='a'.repeat(64), image=`ghcr.io/raxon/servus@sha256:${digest}`, commit='b'.repeat(40);
+  for(const invalid of ['', 'ghcr.io/raxon/servus:latest', `docker.io/raxon/servus@sha256:${digest}`, `ghcr.io/raxon/servus@sha256:${'a'.repeat(63)}`, `ghcr.io/raxon/servus@sha256:${'A'.repeat(64)}`]) {
+    fails(run(f,['main','--dry-run','--image',invalid,'--ref',commit]),/Image must/);
+  }
+  fails(run(f,['main','--dry-run','--image',image]),/requires --ref/);
+  for(const invalid of ['main','b'.repeat(39),'B'.repeat(40)]) fails(run(f,['main','--dry-run','--image',image,'--ref',invalid]),/requires --ref/);
+  fails(run(f,['main','--dry-run','--image',image,'--ref',commit,'--source',f.source]),/cannot be combined/);
+  const result=run(f,['main','--dry-run','--image',image,'--ref',commit]);succeeds(result);
+  assert.match(result.stdout,new RegExp(`Image: ${image}`));
+  assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
+});
+test('swarm advertise address accepts a usable explicit IPv4 address', () => {
+  const f=fixture();
+  for(const invalid of ['','example.com','1.2.3','10.0.0.999','01.2.3.4','127.0.0.1','0.0.0.0','255.255.255.255','10.2.3.4;evil']) {
+    fails(run(f,['main','--dry-run','--swarm-advertise-addr',invalid]),/Swarm advertise address|Invalid/);
+  }
+  const result=run(f,['main','--dry-run','--swarm-advertise-addr','10.19.0.6']);succeeds(result);
+  assert.match(result.stdout,/Swarm advertise address: 10\.19\.0\.6/);
+});
+test('new swarm receives only the explicitly requested advertise address', () => {
+  const f=fixture();f.env.SERVUS_TEST_ROOT=f.root;
+  f.command('docker',`case "$1" in service) exit 1;; ps) exit 0;; info) echo inactive;; swarm) printf '%s\\n' "$@" > "$SERVUS_TEST_ROOT/swarm-args";; build) echo "intentional build failure" >&2; exit 42;; *) exit 0;; esac`);
+  fails(run(f,['--source',f.source,'--swarm-advertise-addr','10.19.0.6'],'source "$1"; shift; install_dependencies() { :; }; main "$@"'),/intentional build failure/);
+  assert.deepEqual(readFileSync(join(f.root,'swarm-args'),'utf8').trim().split('\n'),['swarm','init','--advertise-addr','10.19.0.6']);
 });
 test('public origins normalize case and browser default ports', () => {
   const f=fixture();for(const [input,output] of [['https://Panel.Example:00443','https://panel.example'],['http://Panel.Example:00080','http://panel.example'],['http://Panel.Example:04180','http://panel.example:4180']]){
@@ -113,26 +166,118 @@ test('Swarm initialization does not print join credentials into install output',
 test('failed update build preserves previous environment and database bytes', () => {
   const f=fixture();for(const p of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(p);
   writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
-  const env=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://192.0.2.10:4180\nSERVUS_BIND_ADDRESS=0.0.0.0\nSERVUS_IMAGE=previous-image\n`;
+  const env=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://192.0.2.10:4180\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_IMAGE=previous-image\n`;
   writeFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),env);writeFileSync(join(f.env.SERVUS_DATA_DIR,'panel.sqlite'),'database-must-survive');
   fails(run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; main "$@"'),/intentional build failure/);
   assert.equal(readFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),'utf8'),env);assert.equal(readFileSync(join(f.env.SERVUS_DATA_DIR,'panel.sqlite'),'utf8'),'database-must-survive');assert.deepEqual(readdirSync(f.env.SERVUS_INSTALL_DIR).filter(n=>n.startsWith('.staging.')),[]);
 });
-test('Compose startup failure restores the previous environment and containers', () => {
-  const f=fixture();for(const p of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(p);
-  writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');const previous=join(f.env.SERVUS_INSTALL_DIR,'releases/previous');mkdirSync(join(previous,'deployment'),{recursive:true});writeFileSync(join(previous,'deployment/compose.yaml'),'services: {}');symlinkSync(previous,join(f.env.SERVUS_INSTALL_DIR,'current'));
-  const env=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://192.0.2.10:4180\nSERVUS_BIND_ADDRESS=0.0.0.0\nSERVUS_IMAGE=previous-image\n`;
-  writeFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),env);writeFileSync(join(f.env.SERVUS_DATA_DIR,'panel.sqlite'),'database-must-survive');f.env.SERVUS_TEST_ROOT=f.root;
-  f.command('stat','if [[ $2 == %u ]]; then echo 1000; else echo 0; fi');
-  f.command('docker',`case "$1" in
+test('failed update requires manual recovery without starting the previous image', () => {
+  for(const failure of ['startup','readiness']) {
+    const f=fixture();for(const p of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(p);
+    writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+    const previous=join(f.env.SERVUS_INSTALL_DIR,'releases/previous');mkdirSync(join(previous,'deployment'),{recursive:true});writeFileSync(join(previous,'deployment/compose.yaml'),'services: {}');symlinkSync(previous,join(f.env.SERVUS_INSTALL_DIR,'current'));
+    const env=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://localhost:4180\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_IMAGE=previous-image\n`;
+    writeFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),env);
+    const db=join(f.env.SERVUS_DATA_DIR,'panel.sqlite'), agent=join(f.env.SERVUS_DATA_DIR,'agent.sqlite');writeTestDatabase(db);writeFileSync(agent,'agent-database');const original=readFileSync(db);
+    Object.assign(f.env,{SERVUS_TEST_ROOT:f.root,SERVUS_TEST_FAILURE:failure});
+    f.command('stat','if [[ $2 == %u ]]; then echo 1000; else echo 0; fi');f.command('sleep','exit 0');f.command('seq','echo 1');f.command('curl','exit 22');
+    f.command('docker',`case "$1" in
 service) exit 1;; ps) exit 0;; info) echo inactive;; swarm|build) exit 0;;
 compose) if [[ " $* " == *" up "* ]]; then
- if [[ ! -f $SERVUS_TEST_ROOT/up-called ]]; then touch "$SERVUS_TEST_ROOT/up-called"; echo 'intentional startup failure' >&2; exit 17; fi
- touch "$SERVUS_TEST_ROOT/rollback-started"
- fi; exit 0;;
-*) exit 0;; esac`);
-  const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; main "$@"');fails(result,/Previous containers restored/);assert.match(result.stderr,/intentional startup failure/);
-  assert.ok(existsSync(join(f.root,'rollback-started')));assert.equal(readFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),'utf8'),env);assert.equal(readFileSync(join(f.env.SERVUS_DATA_DIR,'panel.sqlite'),'utf8'),'database-must-survive');assert.deepEqual(readdirSync(f.env.SERVUS_INSTALL_DIR).filter(n=>n.startsWith('.staging.')),[]);
+ if [[ -f $SERVUS_TEST_ROOT/up-called ]]; then touch "$SERVUS_TEST_ROOT/rollback-started"; exit 0; fi
+ touch "$SERVUS_TEST_ROOT/up-called"; [[ $SERVUS_TEST_FAILURE == readiness ]] && exit 0; exit 17; fi;; esac`);
+    const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; main "$@"');
+    fails(result,/Manual recovery required: the new panel did not become healthy/);
+    assert.match(result.stderr,/previous image was not started.*Database migrations are not rolled back/i);
+    assert.equal(existsSync(join(f.root,'rollback-started')),false);
+    const retained=readdirSync(join(f.env.SERVUS_INSTALL_DIR,'releases')).find(name=>name.endsWith('-previous.env'));
+    assert.ok(retained);assert.equal(readFileSync(join(f.env.SERVUS_INSTALL_DIR,'releases',retained),'utf8'),env);
+    assert.deepEqual(readFileSync(db),original);assert.equal(readFileSync(agent,'utf8'),'agent-database');
+    assert.equal(realpathSync(join(f.env.SERVUS_INSTALL_DIR,'current')),previous);
+  }
+});
+
+test('an existing public installation cannot upgrade without a verifiable admin', () => {
+  for (const state of ['missing', 'no-admin', 'admin', 'unreadable', 'symlink']) {
+    const f=fixture();for(const path of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(path);
+    writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+    const env=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://192.0.2.10:4180\nSERVUS_BIND_ADDRESS=0.0.0.0\nSERVUS_IMAGE=previous-image\n`;
+    const config=join(f.env.SERVUS_CONFIG_DIR,'servus.env'), db=join(f.env.SERVUS_DATA_DIR,'panel.sqlite');writeFileSync(config,env);
+    if(state==='no-admin'||state==='admin') {
+      const created=spawnSync('python3',['-c',`import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]);c.execute("CREATE TABLE users(id TEXT, role TEXT)")
+if sys.argv[2] == 'admin': c.execute("INSERT INTO users VALUES('admin-id','admin')")
+c.commit();c.close()`,db,state],{encoding:'utf8'});assert.equal(created.status,0,created.stderr);
+    } else if(state==='unreadable')writeFileSync(db,'invalid-database');
+    else if(state==='symlink') {const target=join(f.root,'external');writeFileSync(target,'external-data');symlinkSync(target,db);}
+    const original=existsSync(db)?readFileSync(db):null;
+    const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; main "$@"');
+    fails(result,state==='admin'?/intentional build failure/:/no verifiable administrator/);
+    assert.equal(readFileSync(config,'utf8'),env);
+    if(state!=='admin')assert.equal(existsSync(join(f.env.SERVUS_INSTALL_DIR,'install.lock')),false);
+    if(original)assert.deepEqual(readFileSync(db),original);
+    else assert.equal(existsSync(db),false);
+  }
+});
+test('admin check sees committed records in an open SQLite WAL', async () => {
+  const f=fixture();mkdirSync(f.env.SERVUS_DATA_DIR);const db=join(f.env.SERVUS_DATA_DIR,'panel.sqlite');
+  const writer=spawn('python3',['-u','-c',`import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]);c.execute('PRAGMA journal_mode=WAL');c.execute('PRAGMA wal_autocheckpoint=0')
+c.execute('CREATE TABLE users(id TEXT, role TEXT)');c.execute("INSERT INTO users VALUES('id','admin')");c.commit()
+print('ready',flush=True);sys.stdin.read();c.close()`,db],{stdio:['pipe','pipe','pipe']});
+  try {
+    const [ready]=await once(writer.stdout,'data');assert.match(String(ready),/ready/);
+    assert.ok(existsSync(`${db}-wal`));succeeds(run(f,['has_configured_admin',f.env.SERVUS_DATA_DIR]));
+  } finally { writer.stdin.end();await once(writer,'exit'); }
+});
+
+test('image pull failure and revision mismatch preserve existing configuration and data', () => {
+  for (const failure of ['pull','revision']) {
+    const f=fixture(),commit='b'.repeat(40),image=`ghcr.io/raxon/servus@sha256:${'a'.repeat(64)}`;
+    for(const path of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(path);
+    writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+    const env=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://192.0.2.10:4180\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_IMAGE=previous-image\n`;
+    writeFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),env);
+    writeFileSync(join(f.env.SERVUS_DATA_DIR,'panel.sqlite'),'existing-database');
+    f.env.SERVUS_TEST_ROOT=f.root;f.env.SERVUS_TEST_FAILURE=failure;
+    f.command('docker',`case "$1" in service) exit 1;; ps) exit 0;; info) echo inactive;; swarm) exit 0;; pull) if [[ $SERVUS_TEST_FAILURE == pull ]]; then echo 'pull failed' >&2; exit 42; fi;; image) echo wrong-revision;; build|compose) touch "$SERVUS_TEST_ROOT/unexpected-command"; exit 90;; esac`);
+    f.command('curl','touch "$SERVUS_TEST_ROOT/unexpected-command"; exit 90');
+    const result=run(f,['--image',image,'--ref',commit],'source "$1"; shift; install_dependencies() { :; }; main "$@"');
+    fails(result,failure==='pull'?/pull failed/:/revision label does not match/);
+    assert.equal(readFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),'utf8'),env);
+    assert.equal(readFileSync(join(f.env.SERVUS_DATA_DIR,'panel.sqlite'),'utf8'),'existing-database');
+    assert.equal(existsSync(join(f.root,'unexpected-command')),false);
+  }
+});
+test('pinned image uses matching source and retains the previous configuration on startup failure', () => {
+  const f=fixture(),commit='b'.repeat(40),image=`ghcr.io/raxon/servus@sha256:${'a'.repeat(64)}`;
+  for(const path of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(path);
+  writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+  const previous=join(f.env.SERVUS_INSTALL_DIR,'releases/previous');mkdirSync(join(previous,'deployment'),{recursive:true});writeFileSync(join(previous,'deployment/compose.yaml'),'services: {}');symlinkSync(previous,join(f.env.SERVUS_INSTALL_DIR,'current'));
+  const env=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://192.0.2.10:4180\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_IMAGE=previous-image\n`;
+  writeFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),env);const db=join(f.env.SERVUS_DATA_DIR,'panel.sqlite');writeTestDatabase(db);const original=readFileSync(db);
+  const archiveFile=archive(f,[{name:'checkout/Dockerfile',data:'FROM scratch\n'},{name:'checkout/apps/panel/package.json',data:'{}'},{name:'checkout/deployment/compose.yaml',data:'services: {}'}]);
+  Object.assign(f.env,{SERVUS_TEST_ROOT:f.root,SERVUS_TEST_COMMIT:commit,SERVUS_TEST_ARCHIVE:archiveFile});
+  f.command('stat','if [[ $2 == %u ]]; then echo 1000; else echo 0; fi');
+  f.command('curl',`if [[ -f "$SERVUS_TEST_ROOT/rollback-started" ]]; then echo '{"status":"ok","version":"0.1.0"}'; exit 0; fi
+[[ "$*" == *"https://github.com/raxon/servus/archive/$SERVUS_TEST_COMMIT.tar.gz"* ]] || exit 41
+while [[ $# -gt 0 ]]; do if [[ $1 == -o ]]; then cp "$SERVUS_TEST_ARCHIVE" "$2"; exit; fi; shift; done
+exit 42`);
+  f.command('docker',`case "$1" in
+service) exit 1;; ps) exit 0;; info) echo inactive;; swarm) exit 0;;
+pull) printf '%s' "$2" > "$SERVUS_TEST_ROOT/pulled";; image) echo "$SERVUS_TEST_COMMIT";;
+build) touch "$SERVUS_TEST_ROOT/built"; exit 42;;
+compose) if [[ " $* " == *" up "* ]]; then
+ if [[ ! -f $SERVUS_TEST_ROOT/up-called ]]; then cp "$3" "$SERVUS_TEST_ROOT/observed.env"; touch "$SERVUS_TEST_ROOT/up-called"; exit 17; fi
+ touch "$SERVUS_TEST_ROOT/rollback-started"; fi;; esac`);
+  const result=run(f,['--image',image,'--ref',commit],'source "$1"; shift; install_dependencies() { :; }; main "$@"');
+  fails(result,/Manual recovery required.*previous image was not started/i);
+  assert.equal(readFileSync(join(f.root,'pulled'),'utf8'),image);assert.equal(existsSync(join(f.root,'built')),false);
+  assert.match(readFileSync(join(f.root,'observed.env'),'utf8'),new RegExp(`SERVUS_IMAGE=${image}`));
+  assert.equal(existsSync(join(f.root,'rollback-started')),false);
+  const retained=readdirSync(join(f.env.SERVUS_INSTALL_DIR,'releases')).find(name=>name.endsWith('-previous.env'));
+  assert.ok(retained);assert.equal(readFileSync(join(f.env.SERVUS_INSTALL_DIR,'releases',retained),'utf8'),env);
+  assert.deepEqual(readFileSync(db),original);
 });
 
 function archive(f, entries) {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
@@ -22,7 +22,7 @@ const defaultAgent:typeof agentRequest=async<T>(path:string)=>{
 async function fixture(options:Partial<AppOptions>={}) {
   const dir=mkdtempSync(join(tmpdir(),'panel-advanced-')),store=new Store(dir),app=await createApp({dataDir:dir,store,agentRequest:defaultAgent,...options});
   cleanup.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
-  const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{token:readFileSync(store.bootstrapPath,'utf8'),email:'admin@example.test',password:'local-testing-password'}});
+  const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'admin@example.test',password:'local-testing-password'}});
   const auth=setup.json(),cookie=`panel_session=${setup.cookies.find(c=>c.name==='panel_session')!.value}`;
   const headers={cookie,'x-csrf-token':auth.csrfToken};
   const project=store.createProject('advanced');
@@ -106,6 +106,39 @@ describe('versioned configuration and secret ownership',()=>{
     const response=await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:1,hostname:'changed.localhost',port:3000}});
     expect(response.statusCode).toBe(200);expect(response.json().hostname).toBe('changed.localhost');
     expect(response.json().domains).toEqual([{hostname:'changed.localhost',port:3000,primary:true},{hostname:'secondary.localhost',port:8080}]);
+  });
+  it('reserves deployed and in-flight domains until a later deployment replaces them',async()=>{
+    const {app,store,headers,create,auth}=await fixture();
+    const first=await create({...appInput,hostname:'active.localhost'});
+    const {service}=first.json();
+    finishFirst(store);
+    const update=(revision:number,hostname:string)=>app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:revision,hostname}});
+    const collision=(hostname:string,key:string)=>create({...appInput,name:key,hostname},key);
+    expect((await update(1,'pending.localhost')).statusCode).toBe(200);
+    expect((await collision('active.localhost','collision1')).statusCode).toBe(409);
+    const deploy=store.createAction(service.id,'deploy',auth.user.id,'domain-deploy');
+    const job=store.claimNextJob('domain-worker',60000)!;
+    expect(job.actionId).toBe(deploy.id);
+    expect((await update(2,'next.localhost')).statusCode).toBe(200);
+    expect((await collision('pending.localhost','collision2')).statusCode).toBe(409);
+    expect((await collision('active.localhost','collision3')).statusCode).toBe(409);
+    expect(store.completeAction(deploy.id,'domain-worker',{state:'running',deployedRevision:2})).toBe(true);
+    expect((await collision('pending.localhost','collision4')).statusCode).toBe(409);
+    expect((await collision('active.localhost','available')).statusCode).toBe(202);
+  });
+  it('retains a failed deployment domain until a later deployment succeeds',async()=>{
+    const {app,store,headers,create,auth}=await fixture();
+    const {service}=(await create({...appInput,hostname:'live.localhost'})).json();finishFirst(store);
+    const update=(revision:number,hostname:string)=>app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:revision,hostname}});
+    expect((await update(1,'attempt.localhost')).statusCode).toBe(200);
+    const action=store.createAction(service.id,'deploy',auth.user.id,'failed-domain');store.claimNextJob('failed-domain-worker',60000);
+    expect((await update(2,'planned.localhost')).statusCode).toBe(200);
+    expect(store.failAction(action.id,'failed-domain-worker','Failed to start')).toBe(true);
+    expect((await create({...appInput,name:'new-one',hostname:'live.localhost'},'new-one')).statusCode).toBe(409);
+    expect((await create({...appInput,name:'new-two',hostname:'attempt.localhost'},'new-two')).statusCode).toBe(409);
+    const resolved=store.createAction(service.id,'deploy',auth.user.id,'reconciled-domain');store.claimNextJob('reconciled-worker',60000);
+    expect(store.completeAction(resolved.id,'reconciled-worker',{state:'running',deployedRevision:3})).toBe(true);
+    expect((await create({...appInput,name:'new-two',hostname:'attempt.localhost'},'new-two')).statusCode).toBe(202);
   });
   it('rejects a database credential reference bound to another service',async()=>{
     const {create}=await fixture();
@@ -253,7 +286,7 @@ describe('v1 to v2 migration',()=>{
     db.prepare('INSERT INTO actions VALUES (?,?,?,?,?,?,?,?,?,?,?)').run('legacy-action','legacy','service','admin','deploy','queued','queued',null,'2026-01-01','2026-01-01',null);
     db.prepare('INSERT INTO jobs(id,action_id,service_id,snapshot,status,created_at) VALUES (?,?,?,?,?,?)').run('legacy-job','legacy-action','service',JSON.stringify(legacySnapshot),'queued','2026-01-01');
     db.close();const store=new Store(dir);cleanup.push(async()=>store.close());
-    expect(store.db.pragma('user_version',{simple:true})).toBe(3);expect(store.getProject('legacy')!.description).toBe('existing data');expect(store.getService('service')!.kind).toBe('app');
+    expect(store.db.pragma('user_version',{simple:true})).toBe(4);expect(store.getProject('legacy')!.description).toBe('existing data');expect(store.getService('service')!.kind).toBe('app');
     const recovered=store.claimNextJob('migration-worker',60000)!;expect(recovered.actionId).toBe('legacy-action');expect(recovered.snapshot).toEqual(legacySnapshot);
     expect(store.updateService('service',{expectedRevision:1,environment:[{name:'TOKEN',secret:true,value:'migration-secret-123'}]}).environment![0]!.secretRef).toBeTruthy();
   });

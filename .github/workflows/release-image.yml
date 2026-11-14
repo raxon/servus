@@ -1,0 +1,87 @@
+name: Release container image
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+jobs:
+  release-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release ref
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Expected a stable vMAJOR.MINOR.PATCH tag.' >&2; exit 1; }
+          python3 -c 'import json, os; version=json.load(open("package.json"))["version"]; assert os.environ["RELEASE_TAG"] == "v"+version, "Tag and package version do not match"'
+          commit=$(git rev-parse --verify 'HEAD^{commit}')
+          git merge-base --is-ancestor "$commit" refs/remotes/origin/main || { echo 'Release commit is not on main.' >&2; exit 1; }
+          image="ghcr.io/${REPOSITORY,,}"
+          printf 'commit=%s\nimage=%s\ntag=%s\n' "$commit" "$image" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Verify workspace
+        run: |
+          npm install --global npm@11.19.1
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+      - name: Build image from the checked-out commit
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          VERSION: ${{ steps.release.outputs.tag }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=$REPOSITORY_URL" \
+            --label "org.opencontainers.image.revision=$COMMIT" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --tag "$IMAGE:$VERSION" .
+      - name: Test the built image on amd64
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          VERSION: ${{ steps.release.outputs.tag }}
+        run: bash scripts/verify-image.sh "$IMAGE:$VERSION"
+      - name: Authenticate to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$REGISTRY_USER" --password-stdin
+      - name: Push tested image and record digest
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          VERSION: ${{ steps.release.outputs.tag }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE:$VERSION" | tee "$RUNNER_TEMP/servus-image-push.log"
+          digest=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$RUNNER_TEMP/servus-image-push.log" | tail -n 1)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'Registry did not return an image digest.' >&2; exit 1; }
+          {
+            echo '### Container image'
+            printf -- '- Version: `%s`\n' "$VERSION"
+            printf -- '- Commit: `%s`\n' "$COMMIT"
+            printf -- '- Image: `%s@%s`\n' "$IMAGE" "$digest"
+            echo '- Tested architecture: linux/amd64'
+          } >> "$GITHUB_STEP_SUMMARY"

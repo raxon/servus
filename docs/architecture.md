@@ -56,7 +56,7 @@ The development Compose package at root is separate from the installer package. 
 
 ## Website and domain
 
-`apps/website` builds static assets for `servus.run`. Its Cloudflare configuration belongs to that app. The website does not receive Docker credentials, the panel database or the local bootstrap token.
+`apps/website` builds static assets for `servus.run`. Its Cloudflare configuration belongs to that app. The website does not receive Docker credentials, the panel database or its local credentials.
 
 Before website development or a build, `scripts/prepare-website.mjs` copies the canonical installer into the website's public directory. This produces `/install.sh` from the same source that installer tests exercise.
 
@@ -72,6 +72,6 @@ The domain is for the website and installation assets. Each installed panel has 
 
 ## Boundaries to preserve
 
-The website can change independently of the panel runtime. Branding changes must leave service ownership labels, SQLite identifiers and persisted state intact. Installer upgrades must preserve application volumes and configuration. Secrets, bootstrap credentials and private keys stay outside source control and public build outputs.
+The website can change independently of the panel runtime. Branding changes must leave service ownership labels, SQLite identifiers and persisted state intact. Installer upgrades must preserve application volumes and configuration. Secrets, local credentials and private keys stay outside source control and public build outputs.
 
 The current license is PolyForm Noncommercial 1.0.0. Public descriptions must reflect that license and the local pilot's tested capabilities.

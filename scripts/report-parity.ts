@@ -354,7 +354,6 @@ function loadPackage(projectRoot: string) {
     "freshSetup",
     "login",
     "logoutRevokedSession",
-    "bootstrapRemoved",
     "runtimeOnline",
     "realDeployment",
     "encryptedAgentSnapshot",

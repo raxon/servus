@@ -18,7 +18,7 @@ import { registerCentralAuth } from './central-auth.js';
 const prefix = '/api/v1';
 const cookieName = 'panel_session';
 const slug = nameSchema;
-const credentials = z.object({ email: z.string().email().max(254), password: z.string().min(12).max(128) });
+const credentials = z.object({ email: z.string().email().max(254), password: z.string().min(8).max(128) });
 
 export interface AppOptions {
   dataDir: string; webDir?: string; store?: Store; logger?: boolean;
@@ -79,9 +79,9 @@ export async function createApp(options: AppOptions) {
   app.get('/health', async () => ({status:'ok',version:'0.1.0'}));
   app.get(`${prefix}/setup`, async () => ({required:!store.isSetup()}));
   app.post(`${prefix}/setup`, {config:{rateLimit:{max:5,timeWindow:'1 minute'}}}, async (req,reply) => {
-    const input = credentials.extend({token:z.string().min(1).max(256)}).parse(req.body);
-    const user = store.setup(input.token,input.email,await hashPassword(input.password));
-    store.removeBootstrapToken();
+    const input = credentials.strict().parse(req.body);
+    const user = store.setup(input.email,await hashPassword(input.password));
+    store.removeLegacyBootstrapToken();
     return setSession(reply,user);
   });
   app.post(`${prefix}/auth/login`, {config:{rateLimit:{max:10,timeWindow:'1 minute'}}}, async (req,reply) => {

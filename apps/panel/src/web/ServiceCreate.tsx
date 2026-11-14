@@ -10,6 +10,7 @@ import type {
   SourceConfig,
 } from "../shared/types.js";
 import { api } from "./api.js";
+import { notifyServiceQueued } from "./notifications.js";
 import { FeatureError, FeatureLoading, FeatureModal } from "./feature-ui.js";
 
 const kinds: {
@@ -102,6 +103,7 @@ export function CreateService({
       );
     },
     onSuccess: ({ service }) => {
+      notifyServiceQueued();
       void client.invalidateQueries({ queryKey: ["projects"] });
       void client.invalidateQueries({ queryKey: ["services", projectId] });
       void client.invalidateQueries({ queryKey: ["actions"] });
@@ -168,6 +170,7 @@ export function CreateService({
               placeholder={kind === "app" ? "web" : kind}
               required
             />
+            <small>Use lowercase letters, numbers, and hyphens.</small>
           </label>
           {kind === "app" ? (
             <label>
@@ -253,6 +256,7 @@ export function CreateService({
                   placeholder="web.localhost"
                   autoCapitalize="none"
                 />
+                <small>Point this domain to your server. A .localhost address is for local use.</small>
               </label>
               <label>
                 Container port
@@ -264,6 +268,7 @@ export function CreateService({
                   onChange={(event) => setPort(Number(event.target.value))}
                   required
                 />
+                <small>The port your application listens on inside the container.</small>
               </label>
             </div>
           ) : (
