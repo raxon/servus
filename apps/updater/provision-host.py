@@ -4,6 +4,10 @@
 Existing files and directories are verified, never silently replaced. Service
 installation, policy activation, and live panel changes are separate steps.
 """
+import argparse
+import hashlib
+import importlib.util
+import json
 import os
 import re
 import secrets
@@ -106,14 +110,108 @@ def prepare(config_dir, state_dir):
         os.close(config)
 
 
+
+def trusted_ingress(docker_config, runtime):
+    raw = runtime._docker(docker_config, 'ps', '--no-trunc', '--filter', 'label=com.docker.swarm.service.name=panel-ingress', '--format', '{{.ID}}', limit=8192)
+    try: ids = raw.decode('ascii').splitlines()
+    except UnicodeError as error: raise ProvisionError('Invalid ingress inventory') from error
+    if not ids: return None
+    if len(ids) != 1 or not re.fullmatch(r'[a-f0-9]{64}', ids[0]): raise ProvisionError('Invalid ingress inventory')
+    item = runtime._json(runtime._docker(docker_config, 'inspect', ids[0], limit=1024 * 1024))
+    if not isinstance(item, list) or len(item) != 1 or not isinstance(item[0], dict): raise ProvisionError('Invalid ingress identity')
+    item = item[0]; config = item.get('Config') or {}; labels = config.get('Labels') or {}; host = item.get('HostConfig') or {}
+    mounts = item.get('Mounts'); image = item.get('Image'); state = item.get('State') or {}
+    if (item.get('Id') != ids[0] or labels.get('com.docker.swarm.service.name') != 'panel-ingress' or
+        config.get('Image') != 'traefik:3.7.13' or not isinstance(image, str) or not re.fullmatch(r'sha256:[a-f0-9]{64}', image) or
+        state.get('Running') is not True or host.get('Privileged') is not False or host.get('PidMode') == 'host' or
+        host.get('CapAdd') not in (None, []) or host.get('Devices') not in (None, []) or host.get('DeviceRequests') not in (None, []) or
+        not isinstance(mounts, list)):
+        raise ProvisionError('Untrusted ingress identity')
+    socket_path = os.path.realpath('/var/run/docker.sock')
+    matching = [mount for mount in mounts if isinstance(mount, dict) and isinstance(mount.get('Source'), str) and os.path.realpath(mount['Source']) == socket_path]
+    if len(matching) != 1 or matching[0].get('RW') is not False:
+        raise ProvisionError('Untrusted ingress socket')
+    return [ids[0], 'panel-ingress', config['Image'], image]
+
+
+def finalize(config_dir, state_dir, install_dir, node_path, supervisor, daemon, backup, runtime):
+    """Bind host service configuration to an already approved generation."""
+    if os.geteuid() != 0: raise ProvisionError('Root is required')
+    prepare(config_dir, state_dir)
+    gate = config_dir + '/lifecycle'; control = config_dir + '/supervisor-control'; secret_dir = config_dir + '/supervisor-secrets'
+    journal = state_dir + '/journal.sqlite'; active_env = config_dir + '/servus.env'; policy_root = state_dir + '/policies'
+    backup_root = state_dir + '/backups'; docker_config = state_dir + '/docker-config'; maintenance = state_dir + '/maintenance'
+    with supervisor.MaintenanceSupervisor(install_dir, gate, maintenance):
+        policy_path, accepted_env, approved = daemon.resolve_active_policy(journal, active_env)
+        expected_secrets = {role: secret_dir + '/' + role for role in supervisor.ROLES}
+        if (approved.install_dir != install_dir or approved.gate_dir != gate or approved.control_dir != control or
+            dict(approved.secret_sources) != expected_secrets or approved.updater_dir != '/run/servus-updater/control' or
+            os.path.dirname(policy_path) != policy_root or os.path.dirname(accepted_env) != policy_root):
+            raise ProvisionError('Approved policy does not match the host')
+        supervisor.ComponentEndpoint().read_component_tokens(secret_dir, 1000)
+        control_info = os.stat(control, follow_symlinks=False)
+        if control_info.st_uid != 0 or control_info.st_gid != 1000 or stat.S_IMODE(control_info.st_mode) != 0o750:
+            raise ProvisionError('Untrusted supervisor control directory')
+        for path, mode in ((control, 0o750), (secret_dir, 0o700), (policy_root, 0o700), (backup_root, 0o700), (docker_config, 0o700)):
+            fd = supervisor._trusted_directory(path, mode); os.close(fd)
+        parent, name = os.path.split(node_path); node_parent = supervisor._trusted_directory(parent)
+        try: node = supervisor._open_root_file(node_parent, name, 0o755)
+        finally: os.close(node_parent)
+        try:
+            digest = hashlib.sha256()
+            while chunk := os.read(node, 65536): digest.update(chunk)
+            os.lseek(node, 0, os.SEEK_SET)
+            backup._verify_node(node, '0' * 64, [{'value':'AAAAAAAAAAAAAAAAAPE7Iln+jhkZLh/RZ/oXyrXa','json':True}])
+            ingress = trusted_ingress(docker_config, runtime)
+            settings = {'backupRoot':backup_root,'policyRoot':policy_root,'dockerConfig':docker_config,
+                        'nodePath':node_path,'nodeSha256':digest.hexdigest(),'trustedIngress':ingress}
+            config = directory(config_dir, 0o700)
+            try:
+                publish_once(config, 'update-apply.json', (json.dumps(settings,sort_keys=True,separators=(',',':'))+'\n').encode())
+                values = {'SERVUS_POLICY':policy_path,'SERVUS_INSTALL_DIR':install_dir,'SERVUS_GATE_DIR':gate,
+                          'SERVUS_JOURNAL_DIR':maintenance,'SERVUS_SECRET_DIR':secret_dir,'SERVUS_SOCKET_DIR':control,
+                          'SERVUS_APPROVAL_JOURNAL':journal,'SERVUS_ACCEPTED_ENV':accepted_env,
+                          'SERVUS_COMPONENT_UID':'1000','SERVUS_COMPONENT_GID':'1000',
+                          'SERVUS_SUPERVISOR_UPDATE_ARGS':'"--active-env '+active_env+' --apply-config '+config_dir+'/update-apply.json"'}
+                content=''.join(key+'='+value+'\n' for key,value in values.items()).encode('ascii')
+                publish_once(config, 'supervisor.env', content)
+            finally: os.close(config)
+        finally: os.close(node)
+
+
+def trusted_modules():
+    root = directory(os.path.dirname(os.path.realpath(__file__)))
+    def load(name, filename):
+        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root)
+        try:
+            info=os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o644:
+                raise ProvisionError('Untrusted updater module')
+        finally: os.close(fd)
+        spec=importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(os.path.realpath(__file__)), filename))
+        if not spec or not spec.loader: raise ProvisionError('Updater module unavailable')
+        module=importlib.util.module_from_spec(spec);sys.modules[name]=module;spec.loader.exec_module(module)
+        return module
+    try:
+        supervisor=load('supervisor','supervisor.py')
+        return supervisor,load('servus_config_daemon','supervisor-daemon.py'),load('servus_config_backup','backup.py'),load('servus_config_policy','runtime-policy.py')
+    finally: os.close(root)
+
 def main():
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
         print('Host preparation requires isolated Linux root.', file=sys.stderr); return 1
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--finalize', action='store_true')
+    args = parser.parse_args()
     os.umask(0o077)
     try:
-        prepare('/etc/servus', '/var/lib/servus-updater')
+        if args.finalize:
+            supervisor, daemon, backup, runtime = trusted_modules()
+            finalize('/etc/servus', '/var/lib/servus-updater', '/opt/servus', '/usr/bin/node', supervisor, daemon, backup, runtime)
+        else:
+            prepare('/etc/servus', '/var/lib/servus-updater')
         return 0
-    except (OSError, UnicodeError, ProvisionError):
+    except Exception:
         print('Updater host state could not be prepared safely.', file=sys.stderr); return 1
 
 
