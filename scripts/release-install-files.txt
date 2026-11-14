@@ -18,6 +18,7 @@
 100644 apps/updater/legacy-recovery.py
 100644 apps/updater/legacy-rollback-early.py
 100644 apps/updater/legacy-rollback.py
+100644 apps/updater/legacy-run.py
 100644 apps/updater/legacy-stop.py
 100644 apps/updater/legacy-transition.py
 100644 apps/updater/migration-fence.py

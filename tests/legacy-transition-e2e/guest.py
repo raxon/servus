@@ -74,11 +74,12 @@ def after_reboot():
 
 
 def main():
-    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--early-recover'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
+    if sys.argv[1:] not in ([],['--full'],['--recover-check'],['--early-recover'],['--orchestrated'],['--after-reboot']):raise RuntimeError('Invalid fixture mode')
     if sys.argv[1:]==['--after-reboot']:return after_reboot()
     recover_check=sys.argv[1:]==['--recover-check']
     early_check=sys.argv[1:]==['--early-recover']
-    full=sys.argv[1:] in (['--full'],['--recover-check'],['--early-recover'])
+    orchestrated=sys.argv[1:]==['--orchestrated']
+    full=sys.argv[1:] in (['--full'],['--recover-check'],['--early-recover'],['--orchestrated'])
     for path in ('/opt/servus','/etc/servus','/var/lib/servus','/var/lib/servus-updater'):
         if Path(path).exists():raise RuntimeError('Fixture requires an empty host')
     install=Path('/opt/servus');install.mkdir(mode=0o700);(install/'install.lock').touch(mode=0o600)
@@ -157,6 +158,22 @@ def main():
             '/usr/local/libexec/servus/bootstrap-release.py','--operation',op,'--commit','5c82968ef6ab05d416d95d301078d37c9d11cc36',
             '--digest',root_digest,'--tag','v0.1.7',timeout=960)
         run('/usr/bin/systemctl','stop','servus-updater-bootstrap.service')
+        if orchestrated:
+            args=['/usr/bin/python3','-I','/usr/local/libexec/servus/legacy-run.py','--operation',op,'--old-env',str(old_env),
+                  '--old-compose',str(compose),'--recovery-dir',str(recovery_dir),'--snapshot-dir',str(snapshot)]
+            rejected=args.copy();rejected[4]=str(uuid.uuid4())
+            invalid=subprocess.run(rejected,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=60)
+            if invalid.returncode==0 or request('/health').get('version')!='0.1.5':raise RuntimeError('Unknown migration changed the legacy panel')
+            run(*args,timeout=1200)
+            if request('/health').get('version')!='0.1.7':raise RuntimeError('Migrated API is unavailable')
+            cookie='';csrf='';request('/auth/login','POST',{'email':'fixture@example.test','password':'isolated-fixture-password'})
+            if not any(item.get('id')==project for item in request('/projects')):raise RuntimeError('Project was not retained')
+            if request('/updates').get('applyAvailable') is not True:raise RuntimeError('Updater is unavailable')
+            if (install/transition.MARKER).exists():raise RuntimeError('Migration marker remains')
+            for unit in ('servus-supervisor.service','servus-updater.service','servus-updater-socket.service'):
+                run('/usr/bin/systemctl','is-enabled','--quiet',unit)
+            print('PASS orchestrated signed migration retained login and project with updater enabled',flush=True)
+            return
         if early_check:
             run('/usr/bin/systemctl','stop','servus-updater-socket.service')
             service_lock=os.open(state/'service.lock',os.O_RDONLY|os.O_NOFOLLOW);fcntl.flock(service_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
