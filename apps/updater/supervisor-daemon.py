@@ -267,6 +267,10 @@ def complete_healthy_preparation(hub, approval_journal, operation_id, policy_pat
             db.execute('BEGIN IMMEDIATE')
             update = db.execute('SELECT phase,preparation_id,attempt_id,attempt_nonce,root_digest FROM update_transactions WHERE operation_id=?', (operation_id,)).fetchone()
             marker_identity = None
+            if not update and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='initial_generations'").fetchone():
+                initial = db.execute('SELECT operation_id,phase FROM initial_generations').fetchall()
+                if initial != [(operation_id, 'started')]:
+                    raise supervisor.SupervisorError('Initial generation is not ready for completion')
             if update:
                 if maintenance is None or update[0] not in ('starting', 'completed'):
                     raise supervisor.SupervisorError('Update is not ready for completion')
@@ -318,11 +322,17 @@ def finalize_initial_preparation(hub, operation, policy_path, approval_journal, 
         with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
             if db.execute("SELECT 1 FROM update_transactions WHERE phase != 'completed' OR phase IS NULL LIMIT 1").fetchone():
                 return False
+            has_initial = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='initial_generations'").fetchone()
+            if has_initial:
+                initial = db.execute('SELECT operation_id,phase FROM initial_generations').fetchall()
+                if len(initial) != 1 or initial[0][1] != 'started': return False
             rows = db.execute("SELECT a.operation_id FROM policy_approvals a JOIN preparations p ON p.operation_id=a.operation_id WHERE a.state='active' AND a.policy_path=? AND a.accepted_env_path=? AND p.status='prepared' AND NOT EXISTS (SELECT 1 FROM update_transactions t WHERE t.operation_id=a.operation_id)", (policy_path, accepted_env)).fetchall()
         if not rows: return False
         if len(rows) != 1 or not supervisor._uuid4(rows[0][0]):
             raise supervisor.SupervisorError('Initial preparation is invalid')
         operation_id = rows[0][0]
+        if has_initial and initial[0][0] != operation_id:
+            raise supervisor.SupervisorError('Initial generation does not match the active policy')
         if load_approved_policy(policy_path, approval_journal, accepted_env, expected_operation_id=operation_id) != hub.policy:
             raise supervisor.SupervisorError('Active policy changed')
         complete_healthy_preparation(hub, approval_journal, operation_id, policy_path, accepted_env, maintenance=operation)

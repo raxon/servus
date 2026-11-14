@@ -6,6 +6,7 @@
 100644 apps/updater/discover-release.py
 100644 apps/updater/extract-install.py
 100644 apps/updater/guarded-verifier.py
+100644 apps/updater/initial-generation.py
 100644 apps/updater/preflight.py
 100644 apps/updater/prepare-verified.py
 100644 apps/updater/preparation-fence.py

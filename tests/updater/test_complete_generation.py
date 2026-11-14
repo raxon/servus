@@ -107,6 +107,21 @@ class CompleteGenerationTest(unittest.TestCase):
             self.assertFalse(daemon.finalize_started_update(self.hub, str(self.install), str(self.gate), str(self.maintenance), '/root/policy', str(self.state / 'journal.sqlite'), '/root/env'))
         self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone(), ('completed',))
 
+    def test_initial_start_must_finish_before_health_can_complete_preparation(self):
+        self.journal.db.execute('DELETE FROM update_transactions')
+        self.journal.db.execute('CREATE TABLE initial_generations(operation_id TEXT PRIMARY KEY,phase TEXT NOT NULL)')
+        self.journal.db.execute("INSERT INTO initial_generations VALUES(?,'starting')",(self.operation,))
+        (self.maintenance/'maintenance.json').unlink();self.owner.close()
+        with mock.patch.object(supervisor,'inspect_servus',return_value=self.identities), \
+             mock.patch.object(supervisor,'_docker',return_value=json.dumps(self.records).encode()), \
+             mock.patch.object(daemon,'load_approved_policy',return_value=self.hub.policy):
+            self.assertFalse(daemon.finalize_started_update(self.hub,str(self.install),str(self.gate),str(self.maintenance),'/root/policy',str(self.state/'journal.sqlite'),'/root/env'))
+            with self.assertRaises(supervisor.SupervisorError): self.complete()
+            self.journal.db.execute("UPDATE initial_generations SET phase='recovery_required'")
+            self.assertFalse(daemon.finalize_started_update(self.hub,str(self.install),str(self.gate),str(self.maintenance),'/root/policy',str(self.state/'journal.sqlite'),'/root/env'))
+            self.journal.db.execute("UPDATE initial_generations SET phase='started'")
+            self.assertTrue(daemon.finalize_started_update(self.hub,str(self.install),str(self.gate),str(self.maintenance),'/root/policy',str(self.state/'journal.sqlite'),'/root/env'))
+
     def test_initial_generation_rejects_unhealthy_or_unapproved_components(self):
         self.journal.db.execute('DELETE FROM update_transactions')
         (self.maintenance / 'maintenance.json').unlink()
