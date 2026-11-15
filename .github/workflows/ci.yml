@@ -9,6 +9,11 @@ permissions:
 
 jobs:
   verify:
+    name: Verify (${{ matrix.suite }})
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [workspace, system, browser]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -26,30 +31,40 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Check types
+        if: matrix.suite == 'workspace'
         run: npm run typecheck
       - name: Test panel
+        if: matrix.suite == 'workspace'
         run: npm run test:panel
       - name: Test console drain with Docker
+        if: matrix.suite == 'system'
         run: node --import tsx tests/integration/console-exec.mjs
       - name: Test installer
+        if: matrix.suite == 'workspace'
         run: npm run test:installer
       - name: Test signed installer handoff
+        if: matrix.suite == 'system'
         run: |
           docker run --rm --network none \
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
             python:3.12-slim \
             sh -ec 'ln -s /usr/local/bin/python3 /usr/bin/python3; python3 -I /workspace/tests/install/signed-bootstrap-e2e.py'
       - name: Test VPS harness
+        if: matrix.suite == 'workspace'
         run: npm run test:vps-harness
       - name: Test logical database export and restore
+        if: matrix.suite == 'system'
         run: bash tests/database-export-e2e/run.sh
       - name: Test release discovery
+        if: matrix.suite == 'workspace'
         run: python3 -B -m unittest discover -s tests/updater -p 'test_discover_release.py'
       - name: Test release artifact
+        if: matrix.suite == 'system'
         env:
           SERVUS_RELEASE_DOCKER_TEST: '1'
         run: python3 -B -m unittest discover -s tests/release -v
       - name: Test updater in isolated Linux
+        if: matrix.suite == 'system'
         run: |
           docker run --rm --network none \
             --tmpfs /tmp:rw,nosuid,nodev,size=256m \
@@ -61,16 +76,20 @@ jobs:
             --workdir /work python:3.12-slim \
             sh -ec 'mkdir -p apps tests scripts deployment; cp -R /source/apps/updater apps/; cp -R /source/tests/updater tests/; cp -R /source/deployment/systemd deployment/; cp /source/release-install-files.txt scripts/; exec python3 -I -B -m unittest discover -s tests/updater'
       - name: Test lifecycle gate
+        if: matrix.suite == 'system'
         env:
           SERVUS_LIFECYCLE_TEST_CONTEXT: default
         run: node --test tests/lifecycle-gate/gate.test.mjs
       - name: Test updater socket access
+        if: matrix.suite == 'system'
         env:
           SERVUS_SOCKET_TEST_CONTEXT: default
         run: node tests/integration/updater-socket.mjs
       - name: Validate supervised Compose template
+        if: matrix.suite == 'system'
         run: node tests/integration/supervised-compose.mjs
       - name: Test installation file extraction with Docker
+        if: matrix.suite == 'system'
         run: |
           set -euo pipefail
           name="servus-extract-dind-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -112,8 +131,10 @@ jobs:
             cleanup
           done
       - name: Build workspace
+        if: matrix.suite == 'browser'
         run: npm run build
       - name: Test session isolation in Chromium
+        if: matrix.suite == 'browser'
         run: |
           npx playwright install --with-deps chromium
           node tests/integration/session-races.mjs
@@ -121,6 +142,7 @@ jobs:
           node tests/integration/database-export.mjs
           node tests/integration/update-settings.mjs
       - name: Test control-plane capture and restore
+        if: matrix.suite == 'browser'
         run: |
           set -euo pipefail
           scratch=$(mktemp -d)
