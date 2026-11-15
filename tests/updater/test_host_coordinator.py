@@ -112,11 +112,17 @@ class HostCoordinatorTest(unittest.TestCase):
             with self.assertRaises(coordinator.HostPreparationError):
                 coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=mock.Mock(),**args)
             fcntl.flock(self.install_lock,fcntl.LOCK_UN)
-            self.db.execute('CREATE TABLE host_switches(operation_id TEXT,phase TEXT)')
-            self.db.execute("INSERT INTO host_switches VALUES(?,'intent')",(self.fixture.op,))
+            self.db.execute('CREATE TABLE host_switches(operation_id TEXT,image_digest TEXT,phase TEXT)')
+            self.db.execute("INSERT INTO host_switches VALUES(?,?,'intent')",(self.fixture.op,self.fixture.digest))
             with self.assertRaises(coordinator.HostPreparationError):
                 coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=mock.Mock(),**args)
             self.db.execute('DELETE FROM host_switches')
+            self.db.execute("INSERT INTO host_switches VALUES(?,?,'rolled_back')",(self.fixture.op,self.fixture.digest))
+            inspector=SimpleNamespace(inspect_exchange=mock.Mock(return_value='exchanged'))
+            args.update(host_switch=inspector,exchange=object(),active_parent=state_fd,candidate_parent=install_fd)
+            with self.assertRaises(coordinator.HostPreparationError):
+                coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=mock.Mock(),**args)
+            inspector.inspect_exchange.return_value='original'
             self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT,image_digest TEXT,phase TEXT)')
             self.db.execute("INSERT INTO host_unit_masks VALUES(?,?,'masking')",(self.fixture.op,self.fixture.digest))
             with self.assertRaises(coordinator.HostPreparationError):

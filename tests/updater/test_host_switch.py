@@ -20,7 +20,7 @@ import supervisor
 def load(name):
     spec=importlib.util.spec_from_file_location(name.replace('-','_'),ROOT/'apps/updater'/name)
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
-bundle=load('host-bundle.py');coordinator=load('host-coordinator.py');exchange=load('host-exchange.py');switch=load('host-switch.py');daemon=load('supervisor-daemon.py')
+bundle=load('host-bundle.py');coordinator=load('host-coordinator.py');exchange=load('host-exchange.py');switch=load('host-switch.py');daemon=load('supervisor-daemon.py');unit_mask_module=load('host-unit-mask.py')
 
 
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
@@ -175,6 +175,33 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
             os.chmod(path,0o666)
             with self.assertRaises(switch.HostSwitchError):switch.assert_supervisor_ready(str(path),self.op,supervisor=supervisor,bundle=bundle)
         finally:server.close()
+
+    def test_recovery_restores_previous_runtime_after_journal_failure(self):
+        unit_dir=self.root/'units';unit_dir.mkdir(mode=0o755);units_fd=os.open(unit_dir,os.O_RDONLY|os.O_DIRECTORY)
+        originals={name:('unit:'+name).encode() for name in unit_mask_module.UNITS}
+        for name,data in originals.items():
+            path=unit_dir/name;path.write_bytes(data);path.chmod(0o644)
+        def state(name):
+            active='inactive' if name=='servus-updater-bootstrap.service' else 'active'
+            sub='dead' if active=='inactive' else 'running'
+            kind='static' if active=='inactive' else 'enabled'
+            return f'LoadState=loaded\nActiveState={active}\nSubState={sub}\nUnitFileState={kind}\n'
+        try:
+            unit_mask_module.mask_units(self.db,self.op,self.digest,originals,state=self.s,install=self.i,units=units_fd,
+                service_lock=self.sl,install_lock=self.il,supervisor=supervisor,coordinator=coordinator,execute=state)
+            self.apply()
+            self.db.execute("CREATE TRIGGER deny_recovery BEFORE UPDATE ON host_preparations BEGIN SELECT RAISE(ABORT,'fixture'); END")
+            args=dict(state_fd=self.s,install_fd=self.i,units_fd=units_fd,active_parent=self.a,candidate_parent=self.c,
+                      host_lock=self.hl,service_lock=self.sl,install_lock=self.il,supervisor=supervisor,unit_mask=unit_mask_module,
+                      host_switch=switch,bundle=bundle,exchange=exchange,fence=self.fence,run=mock.Mock())
+            with self.assertRaises(sqlite3.IntegrityError):coordinator.recover_exchange(self.db,self.op,self.digest,**args)
+            self.assertEqual(self.observe(),'original');self.assertEqual(self.db.execute('select phase from host_unit_masks').fetchone(),('masked',))
+            self.db.execute('DROP TRIGGER deny_recovery')
+            coordinator.recover_exchange(self.db,self.op,self.digest,**args)
+            self.assertEqual(self.observe(),'original');self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('rolled_back',))
+            self.assertEqual(self.db.execute('select phase from host_unit_masks').fetchone(),('restored',))
+            for name,data in originals.items():self.assertEqual((unit_dir/name).read_bytes(),data)
+        finally:os.close(units_fd)
 
     def test_activation_orders_handoff_and_reacquires_install_lock(self):
         calls=[]

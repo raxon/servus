@@ -107,8 +107,9 @@ def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_l
 
 
 def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_fd, install_fd, units_fd,
-                            host_lock, supervisor, unit_mask, bundle, ready, run=subprocess.run):
-    """Recover a journaled stop before a runtime exchange begins.
+                            host_lock, supervisor, unit_mask, bundle, ready, run=subprocess.run,
+                            host_switch=None, exchange=None, active_parent=None, candidate_parent=None):
+    """Recover a journaled stop before exchange or after verified rollback.
 
     The caller holds the host operation lock, supplies independently verified
     original unit bytes, and checks the authenticated control-plane readiness.
@@ -135,8 +136,12 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         if not row or row[0]!=image_digest or row[1] not in ('stopping','stopped'):
             raise HostPreparationError('Updater stop is not eligible for recovery')
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_switches'").fetchone():
-            if db.execute('SELECT 1 FROM host_switches WHERE operation_id=?',(operation_id,)).fetchone():
-                raise HostPreparationError('Host exchange has already begun')
+            switched=db.execute('SELECT image_digest,phase FROM host_switches WHERE operation_id=?',(operation_id,)).fetchone()
+            if switched:
+                if (switched!=(image_digest,'rolled_back') or host_switch is None or exchange is None or
+                    active_parent is None or candidate_parent is None or
+                    host_switch.inspect_exchange(db,operation_id,active_parent,candidate_parent,exchange,bundle)!='original'):
+                    raise HostPreparationError('Host exchange requires recovery')
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_unit_masks'").fetchone():
             mask=db.execute('SELECT image_digest,phase FROM host_unit_masks WHERE operation_id=?',(operation_id,)).fetchone()
             if mask and mask != (image_digest,'restored'):
@@ -193,6 +198,39 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         if db.in_transaction:db.execute('ROLLBACK')
         raise
 
+
+
+def recover_exchange(db, operation_id, image_digest, *, state_fd, install_fd, units_fd, active_parent,
+                     candidate_parent, host_lock, service_lock, install_lock, supervisor, unit_mask,
+                     host_switch, bundle, exchange, fence, run=subprocess.run):
+    """Restore the previous runtime and unit files after an interrupted exchange.
+
+    The caller owns all three locks. Services remain stopped at return; their
+    restart and authenticated readiness are separate recovery steps.
+    """
+    _same_lock(supervisor,state_fd,'host.lock',host_lock)
+    coordinator=SimpleNamespace(_same_lock=_same_lock)
+    args=dict(state=state_fd,install=install_fd,units=units_fd,host_lock=host_lock,service_lock=service_lock,
+              install_lock=install_lock,supervisor=supervisor,coordinator=coordinator)
+    row=db.execute('SELECT image_digest,phase FROM host_switches WHERE operation_id=?',(operation_id,)).fetchone()
+    if not row or row[0]!=image_digest or row[1] not in ('intent','exchanged','rolled_back'):
+        raise HostPreparationError('Host exchange is not eligible for recovery')
+    unit_mask.remask_for_recovery(db,operation_id,image_digest,**args)
+    unit_mask.stop_masked_units(db,operation_id,image_digest,fence=fence,run=run,**args)
+    switch_args=dict(state_fd=state_fd,install_fd=install_fd,service_lock=service_lock,install_lock=install_lock,
+                     active_parent=active_parent,candidate_parent=candidate_parent,supervisor=supervisor,
+                     coordinator=coordinator,bundle=bundle,exchange=exchange,fence=fence)
+    position=host_switch.inspect_exchange(db,operation_id,active_parent,candidate_parent,exchange,bundle)
+    row=db.execute('SELECT image_digest,phase FROM host_switches WHERE operation_id=?',(operation_id,)).fetchone()
+    if row is None or row[0]!=image_digest:raise HostPreparationError('Host exchange journal changed')
+    if row[1]=='rolled_back':
+        if position!='original':raise HostPreparationError('Previous runtime is unavailable')
+    elif position=='exchanged':host_switch.rollback_exchanged(db,operation_id,**switch_args)
+    elif position=='original':host_switch.reconcile_original(db,operation_id,**switch_args)
+    else:raise HostPreparationError('Host exchange position is unknown')
+    _same_lock(supervisor,state_fd,'host.lock',host_lock)
+    unit_mask.restore_from_journal(db,operation_id,image_digest,state=state_fd,install=install_fd,units=units_fd,
+        service_lock=service_lock,install_lock=install_lock,supervisor=supervisor,coordinator=coordinator)
 
 def activate_prepared(db, operation_id, image_digest, originals, initial_states, modules, cli, pin, *,
                       state_fd, install_fd, units_fd, active_parent, candidate_parent, host_lock, service_lock,
