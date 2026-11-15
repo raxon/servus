@@ -102,6 +102,25 @@ class HostBundleTest(unittest.TestCase):
             with self.subTest(required=required),self.assertRaises(bundle.HostBundleError):
                 bundle.collect_units(self.fd,self.manifest,required)
 
+    def test_adoption_preflight_accepts_only_old_or_verified_new_unit_bytes(self):
+        spec=importlib.util.spec_from_file_location('install_host',ROOT/'apps/updater/install-host.py')
+        installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
+        directory=self.root/'units';directory.mkdir(mode=0o755)
+        fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
+        old={'servus-updater.service':(0o644,b'old')}
+        new={'servus-updater.service':(0o644,b'new'),'servus-host-update.timer':(0o644,b'timer')}
+        path=directory/'servus-updater.service';path.write_bytes(b'old');path.chmod(0o644)
+        try:
+            pending=bundle.inspect_unit_adoption(fd,old,new,read_file=installer.read_file)
+            self.assertEqual(set(pending),set(new))
+            path.write_bytes(b'new')
+            self.assertEqual(bundle.inspect_unit_adoption(fd,old,new,read_file=installer.read_file),('servus-host-update.timer',))
+            (directory/'servus-host-update.timer').write_bytes(b'wrong')
+            with self.assertRaises(bundle.HostBundleError):bundle.inspect_unit_adoption(fd,old,new,read_file=installer.read_file)
+            (directory/'servus-host-update.timer').unlink();path.unlink();path.symlink_to('/etc/passwd')
+            with self.assertRaises(OSError):bundle.inspect_unit_adoption(fd,old,new,read_file=installer.read_file)
+        finally:os.close(fd)
+
     def test_collects_exact_bytes_and_future_signed_modules(self):
         self.add('future.py', b'future', 0o644)
         self.assertEqual(self.collect(), {'core.py': (0o644, b'core'), 'future.py': (0o644, b'future'),

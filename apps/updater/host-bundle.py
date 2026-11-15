@@ -190,6 +190,40 @@ def collect_units(stage_fd, manifest, required):
         if deployment is not None:os.close(deployment)
 
 
+def inspect_unit_adoption(units_fd, old_units, new_units, *, read_file):
+    """Validate a resumable transition between two verified unit inventories.
+
+    The caller must obtain both inventories from trusted release manifests and
+    serialize this check with any later installation of the returned units.
+    """
+    info=os.fstat(units_fd)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or
+        stat.S_IMODE(info.st_mode)!=0o755 or not isinstance(old_units,dict) or
+        not isinstance(new_units,dict) or not new_units or len(new_units)>MAX_MODULES or
+        not set(old_units).issubset(new_units) or not callable(read_file)):
+        raise HostBundleError('Invalid unit adoption input')
+    for inventory in (old_units,new_units):
+        total=0
+        for name,value in inventory.items():
+            if (not isinstance(name,str) or not UNIT_NAME.fullmatch(name) or
+                not isinstance(value,tuple) or len(value)!=2 or value[0]!=0o644 or
+                not isinstance(value[1],bytes) or len(value[1])>MAX_MODULE):
+                raise HostBundleError('Invalid unit adoption inventory')
+            total+=len(value[1])
+            if total>MAX_TOTAL:raise HostBundleError('Unit adoption inventory is too large')
+    pending=[]
+    for name,(_,target) in sorted(new_units.items()):
+        try:current=read_file(units_fd,name,0o644)
+        except FileNotFoundError:
+            if name in old_units:raise HostBundleError('Existing unit is missing') from None
+            pending.append(name);continue
+        if current==target:continue
+        if name not in old_units or current!=old_units[name][1]:
+            raise HostBundleError('Existing unit differs from verified release')
+        pending.append(name)
+    return tuple(pending)
+
+
 def read_pinned_cli(host_fd, pinned):
     """Read the existing CLI only when it matches trusted pinned metadata.
 
