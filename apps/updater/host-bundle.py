@@ -19,10 +19,46 @@ MAX_MODULES = 128
 MAX_CLI = 64 * 1024 * 1024
 OPERATION = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
 DIGEST = re.compile(r'^sha256:[a-f0-9]{64}$')
+STAGE = re.compile(r'^servus-install-[a-f0-9]{32}$')
 
 
 class HostBundleError(Exception):
     pass
+
+
+def completed_update(db, operation_id, staging_parent, policy_path, active_env, image_reference):
+    """Bind a host candidate to one completed, verified active panel update.
+
+    The caller must trust the journal and paths, hold the updater and install
+    locks, and independently verify the live approved policy and generation.
+    """
+    if (not isinstance(operation_id, str) or not OPERATION.fullmatch(operation_id) or
+        any(not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path
+            for path in (staging_parent, policy_path, active_env)) or
+        not isinstance(image_reference, str) or not re.fullmatch(r'ghcr\.io/raxon/servus@sha256:[a-f0-9]{64}', image_reference)):
+        raise HostBundleError('Invalid completed update input')
+    row = db.execute("SELECT o.digest,o.config_digest,o.attempt_id,o.attempt_nonce,p.preparation_id,p.staging_path "
+        "FROM operations o JOIN preparations p ON p.operation_id=o.id "
+        "JOIN update_transactions t ON t.operation_id=o.id JOIN apply_requests r ON r.operation_id=o.id "
+        "JOIN policy_approvals a ON a.operation_id=o.id WHERE o.id=? AND o.status='verified' "
+        "AND p.status='completed' AND t.phase='completed' AND r.state='completed' AND a.state='active' "
+        "AND a.policy_path=? AND a.source_env_path=? AND o.digest=t.root_digest AND o.digest=a.root_digest "
+        "AND o.config_digest=a.image_config_digest AND o.attempt_id=p.attempt_id AND o.attempt_id=t.attempt_id "
+        "AND o.attempt_id=a.attempt_id AND o.attempt_nonce=p.attempt_nonce AND o.attempt_nonce=t.attempt_nonce "
+        "AND o.attempt_nonce=a.attempt_nonce AND p.preparation_id=t.preparation_id AND p.preparation_id=a.preparation_id",
+        (operation_id, policy_path, active_env)).fetchone()
+    if not row:
+        raise HostBundleError('Completed update is unavailable')
+    digest, config_digest, attempt, nonce, preparation, stage = row
+    if (not isinstance(digest, str) or not DIGEST.fullmatch(digest) or image_reference != 'ghcr.io/raxon/servus@' + digest or
+        not isinstance(config_digest, str) or not DIGEST.fullmatch(config_digest) or
+        not isinstance(attempt, str) or not OPERATION.fullmatch(attempt) or
+        not isinstance(preparation, str) or not OPERATION.fullmatch(preparation) or
+        not isinstance(nonce, str) or not re.fullmatch(r'[a-f0-9]{64}', nonce) or
+        not isinstance(stage, str) or not os.path.isabs(stage) or os.path.normpath(stage) != stage or
+        os.path.dirname(stage) != staging_parent or not STAGE.fullmatch(os.path.basename(stage))):
+        raise HostBundleError('Completed update identity differs')
+    return digest, stage
 
 
 def _directory(parent, name, device):

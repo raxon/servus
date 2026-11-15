@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -11,6 +12,49 @@ ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('host_bundle', ROOT / 'apps/updater/host-bundle.py')
 bundle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bundle)
+
+
+class CompletedUpdateTest(unittest.TestCase):
+    def setUp(self):
+        self.db=sqlite3.connect(':memory:')
+        self.db.executescript('''
+        CREATE TABLE operations(id TEXT,status TEXT,digest TEXT,config_digest TEXT,attempt_id TEXT,attempt_nonce TEXT);
+        CREATE TABLE preparations(operation_id TEXT,status TEXT,attempt_id TEXT,attempt_nonce TEXT,preparation_id TEXT,staging_path TEXT);
+        CREATE TABLE update_transactions(operation_id TEXT,phase TEXT,root_digest TEXT,attempt_id TEXT,attempt_nonce TEXT,preparation_id TEXT);
+        CREATE TABLE apply_requests(operation_id TEXT,state TEXT);
+        CREATE TABLE policy_approvals(operation_id TEXT,state TEXT,root_digest TEXT,image_config_digest TEXT,attempt_id TEXT,attempt_nonce TEXT,preparation_id TEXT,policy_path TEXT,source_env_path TEXT);
+        ''')
+        self.op='11111111-1111-4111-8111-111111111111';self.attempt='22222222-2222-4222-8222-222222222222'
+        self.prep='33333333-3333-4333-8333-333333333333';self.nonce='d'*64
+        self.digest='sha256:'+'a'*64;self.config='sha256:'+'b'*64
+        self.stage='/root/staging/servus-install-'+'c'*32;self.image='ghcr.io/raxon/servus@'+self.digest
+        self.db.execute('INSERT INTO operations VALUES(?,?,?,?,?,?)',(self.op,'verified',self.digest,self.config,self.attempt,self.nonce))
+        self.db.execute('INSERT INTO preparations VALUES(?,?,?,?,?,?)',(self.op,'completed',self.attempt,self.nonce,self.prep,self.stage))
+        self.db.execute('INSERT INTO update_transactions VALUES(?,?,?,?,?,?)',(self.op,'completed',self.digest,self.attempt,self.nonce,self.prep))
+        self.db.execute('INSERT INTO apply_requests VALUES(?,?)',(self.op,'completed'))
+        self.db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?,?,?,?,?,?)',(self.op,'active',self.digest,self.config,self.attempt,self.nonce,self.prep,'/root/policy','/root/env'))
+
+    def tearDown(self):self.db.close()
+
+    def check(self):
+        return bundle.completed_update(self.db,self.op,'/root/staging','/root/policy','/root/env',self.image)
+
+    def test_binds_completed_operation_and_verified_stage(self):
+        self.assertEqual(self.check(),(self.digest,self.stage))
+
+    def test_rejects_incomplete_changed_and_untrusted_attempts(self):
+        for table,column,value in (('operations','status','verification_failed'),('preparations','status','prepared'),
+                                   ('update_transactions','phase','recovery_required'),('apply_requests','state','requested'),
+                                   ('policy_approvals','state','candidate'),('preparations','attempt_nonce','e'*64),
+                                   ('policy_approvals','image_config_digest','sha256:'+'f'*64),
+                                   ('preparations','staging_path','/root/elsewhere/servus-install-'+'c'*32)):
+            with self.subTest(table=table,column=column):
+                self.db.execute('SAVEPOINT test')
+                self.db.execute('UPDATE '+table+' SET '+column+'=?',(value,))
+                with self.assertRaises(bundle.HostBundleError):self.check()
+                self.db.execute('ROLLBACK TO test');self.db.execute('RELEASE test')
+        with self.assertRaises(bundle.HostBundleError):
+            bundle.completed_update(self.db,self.op,'/root/staging','/root/policy','/root/env','ghcr.io/raxon/servus@sha256:'+'f'*64)
 
 
 @unittest.skipUnless(os.geteuid() == 0 and Path('/proc/self/fd').exists(), 'Requires Linux root')
