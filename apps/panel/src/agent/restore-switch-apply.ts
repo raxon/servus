@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { RestoreJournal } from './restore-journal.js';
 import type { SecretVault } from '../shared/secrets.js';
 import { readRestoreSwitchIntent, type RestoreSwitchPlan } from './restore-switch-intent.js';
+import { inspectRestoreSourceAttachments, verifyRestoreSourceVolume } from './restore-source-volume.js';
 
 /** Apply a recorded switch. Completion stays fenced until volume binding and recovery are committed. */
 export async function applyRestoreSwitch(options:{docker:Docker;journal:RestoreJournal;vault:SecretVault;serviceId:string;operationId:string;verifyTarget:(plan:RestoreSwitchPlan)=>Promise<void>}):Promise<void> {
@@ -21,11 +22,8 @@ export async function applyRestoreSwitch(options:{docker:Docker;journal:RestoreJ
     if(current.ID!==inspection.serviceDockerId||current.Version?.Index!==inspection.serviceVersion||node!==inspection.nodeId||!isDeepStrictEqual(current.Spec,plan.previousSpec))throw new Error('Original database service changed before the switch.');
     const source=await options.docker.getContainer(inspection.sourceContainerId).inspect();
     if(!source.State.Running||source.Id!==inspection.sourceContainerId||source.Image!==inspection.imageId||source.Config.Labels?.['panel.owner']!=='self-hosted-panel'||source.Config.Labels?.['panel.service']!==options.serviceId||source.Config.Labels?.['com.docker.swarm.service.name']!==name||source.Mounts.length!==1||!source.Mounts.some(m=>m.Type==='volume'&&m.Name===inspection.sourceVolume&&m.Destination===dataPath&&m.RW))throw new Error('Original database container changed before the switch.');
-    const sourceVolume=await options.docker.getVolume(inspection.sourceVolume).inspect();
-    if(sourceVolume.Name!==inspection.sourceVolume||sourceVolume.Driver!=='local'||sourceVolume.Labels?.['panel.owner']!=='self-hosted-panel'||sourceVolume.Labels?.['panel.service']!==options.serviceId)throw new Error('Original database volume cannot be verified.');
-    if(record.kind==='postgres'&&plan.previousSpec.Labels?.['panel.postgres-auth']&&sourceVolume.Labels?.['panel.volume-reservation']!==plan.previousSpec.Labels['panel.volume-reservation'])throw new Error('Original database volume reservation changed.');
-    const attached=await options.docker.listContainers({all:true,filters:{volume:[inspection.sourceVolume]}});
-    if(attached.length!==1||attached[0]?.Id!==inspection.sourceContainerId)throw new Error('Original database volume attachments changed.');
+    await verifyRestoreSourceVolume({docker:options.docker,journal:options.journal,serviceId:options.serviceId,kind:record.kind as 'postgres'|'mariadb',volumeName:inspection.sourceVolume,spec:plan.previousSpec});
+    await inspectRestoreSourceAttachments({docker:options.docker,serviceId:options.serviceId,volumeName:inspection.sourceVolume,dataPath,expectedRunningId:inspection.sourceContainerId});
     return current;
   };
   const assertCandidate=(info:Awaited<ReturnType<typeof candidate.inspect>>)=>{

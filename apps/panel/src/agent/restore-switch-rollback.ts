@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { RestoreJournal } from './restore-journal.js';
 import type { SecretVault } from '../shared/secrets.js';
 import { readRestoreSwitchIntent, type RestoreSwitchPlan } from './restore-switch-intent.js';
+import { verifyRestoreSourceVolume } from './restore-source-volume.js';
 
 /** Restore the saved source service and keep the operation fenced for cleanup. */
 export async function rollbackRestoreSwitch(options:{docker:Docker;journal:RestoreJournal;vault:SecretVault;serviceId:string;operationId:string;verifySource:(plan:RestoreSwitchPlan)=>Promise<void>}):Promise<void> {
@@ -11,12 +12,9 @@ export async function rollbackRestoreSwitch(options:{docker:Docker;journal:Resto
   const currentStage=stage();
   if(!currentStage)throw new Error('Restore switch stage is unavailable.');
   if(currentStage!=='rolling_back'&&currentStage!=='rolled_back')options.journal.advanceSwitchStage(options.operationId,currentStage,'rolling_back');
-  const source=await options.docker.getVolume(inspection.sourceVolume).inspect();
-  if(source.Name!==inspection.sourceVolume||source.Driver!=='local'||source.Labels?.['panel.owner']!=='self-hosted-panel'||source.Labels?.['panel.service']!==options.serviceId)throw new Error('Original database volume cannot be verified.');
-  if(plan.previousSpec.Labels?.['panel.postgres-auth']){
-    const reservation=plan.previousSpec.Labels['panel.volume-reservation'];
-    if(!reservation||source.Labels?.['panel.volume-reservation']!==reservation)throw new Error('Original database volume reservation changed.');
-  }
+  const kind=options.journal.get(options.operationId)?.kind;
+  if(kind!=='postgres'&&kind!=='mariadb')throw new Error('Unsupported restore database.');
+  await verifyRestoreSourceVolume({docker:options.docker,journal:options.journal,serviceId:options.serviceId,kind,volumeName:inspection.sourceVolume,spec:plan.previousSpec});
   const node=(await options.docker.info()).Swarm?.NodeID;
   const current=await service.inspect();
   if(node!==inspection.nodeId||current.ID!==inspection.serviceDockerId||!Number.isSafeInteger(current.Version?.Index)||current.Version.Index<inspection.serviceVersion||(!isDeepStrictEqual(current.Spec,plan.previousSpec)&&!isDeepStrictEqual(current.Spec,plan.targetSpec)))throw new Error('Database service cannot be safely rolled back.');

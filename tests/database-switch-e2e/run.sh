@@ -17,8 +17,14 @@ cleanup() {
   for container in $(docker ps -aq --filter "label=com.docker.swarm.service.name=$service"); do
     if [[ $(docker inspect --format '{{ index .Config.Labels "panel.service" }}' "$container" 2>/dev/null || true) == "$service_id" ]]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
   done
+  for container in $(docker ps -aq --filter "label=panel.restore.service=$service_id" --filter label=panel.restore.purpose=candidate); do
+    if [[ $(docker inspect --format '{{ index .Config.Labels "panel.restore.service" }}' "$container" 2>/dev/null || true) == "$service_id" ]]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+  done
   if [[ $(docker inspect --format '{{ index .Config.Labels "panel.restore.operation" }}' "$candidate" 2>/dev/null || true) == "$id" ]]; then docker rm -f "$candidate" >/dev/null; fi
   if [[ $(docker volume inspect --format '{{ index .Labels "panel.restore.operation" }}' "$candidate" 2>/dev/null || true) == "$id" ]]; then docker volume rm "$candidate" >/dev/null; fi
+  for volume in $(docker volume ls -q --filter "label=panel.restore.service=$service_id" --filter label=panel.restore.purpose=candidate); do
+    if [[ $(docker volume inspect --format '{{ index .Labels "panel.restore.service" }}' "$volume" 2>/dev/null || true) == "$service_id" ]]; then docker volume rm "$volume" >/dev/null; fi
+  done
   if [[ $(docker volume inspect --format '{{ index .Labels "servus.test" }}' "$source_volume" 2>/dev/null || true) == "$id" ]]; then docker volume rm "$source_volume" >/dev/null; fi
   for secret in $(docker secret ls -q --filter "label=panel.service=$service_id"); do docker secret rm "$secret" >/dev/null; done
   if [[ -s "$root/project" ]]; then

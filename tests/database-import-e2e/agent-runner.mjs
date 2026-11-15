@@ -1,6 +1,6 @@
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import Docker from '/app/node_modules/dockerode/lib/docker.js';
 import Database from '/app/node_modules/better-sqlite3/lib/index.js';
@@ -31,7 +31,8 @@ if (kind === 'mariadb') {
   writeFileSync(join(directory,serviceId),store.vault.put(password),{mode:0o600});
 }
 const docker = new Docker({socketPath:'/var/run/docker.sock'});
-const runtime = {status:async()=>({online:true}),inspectService:async()=>({state:'running'}),apply:async()=>{throw new Error('Unexpected mutation');},consoleContainer:async()=>docker.getContainer(process.env.SERVUS_IMPORT_SOURCE_ID)};
+let sourceContainerId=process.env.SERVUS_IMPORT_SOURCE_ID;
+const runtime = {status:async()=>({online:true}),inspectService:async()=>({state:'running'}),apply:async()=>{throw new Error('Unexpected mutation');},consoleContainer:async()=>docker.getContainer(sourceContainerId)};
 const token = 'fixture-agent-token';
 const agent = await createAgent({dataDir,token,socketPath:join(dataDir,'socket'),dockerSocket:'/var/run/docker.sock',ingressPort:18080,ingressImage:'unused'},runtime);
 const headers = {authorization:`Bearer ${token}`};
@@ -82,6 +83,22 @@ try {
       await actual.apply(service,'deploy',randomUUID());await verifyTarget(switchPlan);
       const current=await docker.getService(`panel-app-${serviceId}`).inspect();
       if(current.Spec.TaskTemplate.ContainerSpec.Mounts[0]?.Source!==switchPlan.inspection.candidateVolume||current.Spec.Labels?.['panel.restore.operation']!==operationId)throw new Error('Database lifecycle did not retain the restored volume');
+      const active=await docker.listContainers({all:true,filters:{volume:[switchPlan.inspection.candidateVolume]}});
+      const running=active.filter(item=>item.State==='running');if(running.length!==1)throw new Error('Restored source container is ambiguous');sourceContainerId=running[0].Id;
+      const secondId=randomBytes(16).toString('hex'),secondPath=`/services/${serviceId}/database-restore/${secondId}`;
+      const secondUpload=await agent.inject({method:'POST',url:`/services/${serviceId}/database-restore/upload?operationId=${secondId}&kind=${kind}`,headers:{...headers,'content-type':'application/octet-stream'},payload:readFileSync('/fixture-data')});
+      if(secondUpload.statusCode!==200)throw new Error(`Second upload failed: ${secondUpload.statusCode}`);
+      const secondPrepared=await agent.inject({method:'POST',url:`${secondPath}/prepare`,headers,payload:{}});
+      if(secondPrepared.statusCode!==200)throw new Error(`Second preparation failed: ${secondPrepared.statusCode} ${JSON.stringify(secondPrepared.json())}`);
+      const secondInspection=await agent.inject({method:'GET',url:`${secondPath}/switch-inspection`,headers});
+      if(secondInspection.statusCode!==200||secondInspection.json().sourceVolume!==switchPlan.inspection.candidateVolume)throw new Error(`Second restore source was not verified: ${secondInspection.statusCode} ${JSON.stringify(secondInspection.json())}`);
+      const secondOptions={...options,operationId:secondId};
+      await prepareRestoreSwitchIntent(secondOptions);
+      await applyRestoreSwitch({...secondOptions,verifyTarget});
+      const verifySecondSource=async plan=>verifyTarget({...plan,inspection:{...plan.inspection,candidateVolume:plan.inspection.sourceVolume}});
+      await rollbackRestoreSwitch({...secondOptions,verifySource:verifySecondSource});
+      const secondFinished=await finalizeRestoreRollback({...secondOptions,dataDir,verifySource:verifySecondSource});
+      if(secondFinished.phase!=='cancelled'||journal.volumeBinding(serviceId)?.operation_id!==operationId)throw new Error('Second restore did not preserve the first binding');
     }
   } else {
     for (let attempt=0;attempt<2;attempt++) {

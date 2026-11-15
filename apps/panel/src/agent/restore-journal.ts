@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { validateRestoreBinding } from './restore-binding.js';
 
 export type RestorePhase = 'uploading' | 'reserved' | 'discarding' | 'discarding_candidate' | 'importing' | 'prepared' | 'switching' | 'needs_review' | 'completed' | 'cancelled';
 export type RestoreRecord = { id: string; service_id: string; kind: 'postgres' | 'mariadb' | 'redis'; archive_sha256: string; phase: RestorePhase; updated_at: string };
@@ -115,6 +116,7 @@ export class RestoreJournal {
   }
   retainedVolume(id:string):RetainedRestoreVolume|undefined { return this.db.prepare('SELECT * FROM restore_retained_volumes WHERE operation_id=?').get(id) as RetainedRestoreVolume|undefined; }
   volumeBinding(serviceId:string):RestoreVolumeBinding|undefined { return this.db.prepare('SELECT * FROM restore_volume_bindings WHERE service_id=?').get(serviceId) as RestoreVolumeBinding|undefined; }
+  validatedVolumeBinding(serviceId:string,kind:'postgres'|'mariadb'):RestoreVolumeBinding|undefined { return validateRestoreBinding(this.db,serviceId,kind); }
   completeSwitch(id:string,serviceId:string,sourceVolume:string):RestoreRecord {
     if(!idPattern.test(id)||!servicePattern.test(serviceId))throw new Error('Invalid restore switch identity.');
     return this.db.transaction(()=>{

@@ -13,8 +13,8 @@ function fixture(kind:'postgres'|'mariadb'='postgres') {
   const volumes:Record<string,unknown>={[sourceVolume]:{Name:sourceVolume,Driver:'local',Labels:{'panel.owner':'self-hosted-panel','panel.service':serviceId,'panel.volume-reservation':reservation}},[candidateVolume]:{Name:candidateVolume,Driver:'local',Labels:candidateLabels}};
   const attachments:Record<string,{Id:string}[]>={[sourceVolume]:[{Id:sourceId}],[candidateVolume]:[{Id:candidateId}]};
   const docker={getService:vi.fn(()=>({inspect:async()=>service})),info:async()=>({Swarm:{NodeID:nodeId}}),getVolume:(name:string)=>({inspect:async()=>volumes[name]}),getContainer:(name:string)=>({inspect:async()=>name===candidateVolume?candidate:source}),listContainers:async(opts:{filters:{volume:string[]}})=>attachments[opts.filters.volume[0]!],getImage:()=>({inspect:async()=>({Id:imageId})})};
-  const journal={get:vi.fn(()=>({id:operationId,service_id:serviceId,kind,phase:'prepared'}))};
-  return {options:{docker:docker as never,journal:journal as never,serviceId,operationId},docker,journal,service,source,candidate,attachments,sourceVolume,candidateVolume,sourceId,candidateId,imageId,nodeId};
+  const journal={get:vi.fn(()=>({id:operationId,service_id:serviceId,kind,phase:'prepared'})),validatedVolumeBinding:vi.fn(()=>undefined)};
+  return {options:{docker:docker as never,journal:journal as never,serviceId,operationId},docker,journal,service,source,candidate,attachments,volumes,sourceVolume,candidateVolume,sourceId,candidateId,imageId,nodeId};
 }
 
 for(const kind of ['postgres','mariadb'] as const)it(`inspects exact ${kind} resources without modifying them`,async()=>{
@@ -41,4 +41,24 @@ it('rejects a service changed during inspection',async()=>{
   const f=fixture();let calls=0;
   f.docker.getService.mockReturnValue({inspect:async()=>{calls++;return calls===1?f.service:{...f.service,Version:{Index:13}};}});
   await expect(inspectRestoreSwitch(f.options)).rejects.toThrow('changed during inspection');
+});
+
+it('uses the previously restored volume as the source of a later restore',async()=>{
+  const f=fixture(),previousId='f'.repeat(32),previousVolume=`panel-restore-${previousId}`;
+  f.journal.validatedVolumeBinding.mockReturnValue({service_id:f.options.serviceId,operation_id:previousId,volume_name:previousVolume,kind:'postgres'} as never);
+  f.service.Spec.Labels['panel.restore.operation']=previousId;f.service.Spec.TaskTemplate.ContainerSpec.Mounts[0]!.Source=previousVolume;
+  f.source.Mounts[0]!.Name=previousVolume;f.attachments[previousVolume]=[{Id:f.sourceId}];
+  f.volumes[previousVolume]={Name:previousVolume,Driver:'local',Labels:{'panel.restore.operation':previousId,'panel.restore.service':f.options.serviceId,'panel.restore.purpose':'candidate'}};
+  expect((await inspectRestoreSwitch(f.options)).sourceVolume).toBe(previousVolume);
+  f.service.Spec.Labels['panel.restore.operation']='wrong';
+  await expect(inspectRestoreSwitch(f.options)).rejects.toThrow('ownership');
+});
+
+it('accepts stopped historical tasks but rejects foreign volume attachments',async()=>{
+  const f=fixture(),staleId='f'.repeat(64),stale={...structuredClone(f.source),Id:staleId,State:{Running:false}};
+  f.attachments[f.sourceVolume]!.push({Id:staleId});
+  f.docker.getContainer=(name:string)=>({inspect:async()=>name===f.candidateVolume?f.candidate:name===staleId?stale:f.source});
+  expect((await inspectRestoreSwitch(f.options)).sourceContainerId).toBe(f.sourceId);
+  stale.Config.Labels['panel.service']=randomUUID();
+  await expect(inspectRestoreSwitch(f.options)).rejects.toThrow('attachments');
 });
