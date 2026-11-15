@@ -278,6 +278,28 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
             self.assertEqual(calls,['mask','stop','exchange','restore','authorize_start','start','ready','complete'])
         finally:fcntl.flock(self.sl,fcntl.LOCK_EX|fcntl.LOCK_NB)
 
+    def test_activation_waits_for_transient_install_lock_contention(self):
+        self.db.execute('CREATE TABLE host_recovery_snapshots(operation_id TEXT,image_digest TEXT,status TEXT)')
+        self.db.execute("INSERT INTO host_recovery_snapshots VALUES(?,?,'prepared')",(self.op,self.digest))
+        unit_mask=SimpleNamespace(mask_units=mock.Mock(),stop_masked_units=mock.Mock(),restore_from_journal=mock.Mock())
+        host_switch=SimpleNamespace(exchange_prepared=mock.Mock(),start_restored=mock.Mock(),
+            assert_supervisor_ready=mock.Mock(),complete_exchange=mock.Mock(),HostSwitchError=switch.HostSwitchError)
+        real=fcntl.flock;attempts=[]
+        def flock(fd,operation):
+            if fd==self.il and operation==(fcntl.LOCK_EX|fcntl.LOCK_NB):
+                attempts.append(1)
+                if len(attempts)<3:raise BlockingIOError('temporarily busy')
+            return real(fd,operation)
+        try:
+            with mock.patch.object(coordinator,'authorize_same_boot_start'),mock.patch.object(coordinator.fcntl,'flock',side_effect=flock),mock.patch.object(coordinator.time,'sleep'):
+                coordinator.activate_prepared(self.db,self.op,self.digest,{}, {},self.modules,self.cli,self.pin,
+                    state_fd=self.s,install_fd=self.i,units_fd=self.a,active_parent=self.a,candidate_parent=self.c,
+                    host_lock=self.hl,service_lock=self.sl,install_lock=self.il,supervisor=supervisor,unit_mask=unit_mask,
+                    host_switch=host_switch,bundle=bundle,exchange=exchange,fence=lambda:None,authorize=lambda:None,
+                    supervisor_socket='/control/socket',timeout=5)
+            self.assertEqual(len(attempts),3);host_switch.complete_exchange.assert_called_once()
+        finally:fcntl.flock(self.sl,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
     def test_activation_leaves_masks_for_recovery_if_exchange_fails(self):
         self.db.execute('CREATE TABLE host_recovery_snapshots(operation_id TEXT,image_digest TEXT,status TEXT)')
         self.db.execute("INSERT INTO host_recovery_snapshots VALUES(?,?,'prepared')",(self.op,self.digest))

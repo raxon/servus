@@ -463,8 +463,14 @@ def activate_prepared(db, operation_id, image_digest, originals, initial_states,
             if time.monotonic()>=deadline: raise HostPreparationError('Host readiness requires recovery') from None
             time.sleep(min(0.5,max(0,deadline-time.monotonic())))
         else: break
-    try: fcntl.flock(install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    except BlockingIOError as error: raise HostPreparationError('Installation lock requires recovery') from error
+    while True:
+        _same_lock(supervisor,state_fd,'host.lock',host_lock)
+        try:
+            fcntl.flock(install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            break
+        except BlockingIOError as error:
+            if time.monotonic()>=deadline:raise HostPreparationError('Installation lock requires recovery') from error
+            time.sleep(min(0.5,max(0,deadline-time.monotonic())))
     host_switch.complete_exchange(db,operation_id,state_fd=state_fd,install_fd=install_fd,host_lock=host_lock,
         install_lock=install_lock,active_parent=active_parent,candidate_parent=candidate_parent,supervisor=supervisor,
         coordinator=coordinator,bundle=bundle,exchange=exchange,unit_mask=unit_mask,units_fd=units_fd,
