@@ -13,7 +13,6 @@ import { rollbackRestoreSwitch } from '/app/dist/agent/restore-switch-rollback.j
 import { finalizeRestoreRollback } from '/app/dist/agent/restore-rollback-finalize.js';
 import { DockerRuntime } from '/app/dist/agent/runtime.js';
 import { verifyRestoreDatabase } from '/app/dist/agent/restore-switch-verify.js';
-import { finalizeRestoreSwitch } from '/app/dist/agent/restore-switch-finalize.js';
 
 const dataDir = mkdtempSync('/tmp/restore-agent-e2e-'), store = new Store(dataDir);
 const serviceId = process.env.SERVUS_IMPORT_SERVICE_ID || '11111111-1111-4111-8111-111111111111', kind = process.env.SERVUS_IMPORT_KIND;
@@ -39,7 +38,7 @@ const token = 'fixture-agent-token';
 const agent = await createAgent({dataDir,token,socketPath:join(dataDir,'socket'),dockerSocket:'/var/run/docker.sock',ingressPort:18080,ingressImage:'unused'},runtime);
 const headers = {authorization:`Bearer ${token}`};
 const path = `/services/${serviceId}/database-restore/${operationId}`;
-let switchDb, switchPlan, switchOptions, bindingCompleted=false;
+let switchDb, switchPlan, switchOptions, recordedInspection, bindingCompleted=false;
 try {
   const upload = await agent.inject({method:'POST',url:`/services/${serviceId}/database-restore/upload?operationId=${operationId}&kind=${kind}`,headers:{...headers,'content-type':'application/octet-stream'},payload:readFileSync('/fixture-data')});
   if (upload.statusCode !== 200 || upload.json().phase !== 'reserved') throw new Error(`Upload failed: ${upload.statusCode}`);
@@ -50,6 +49,7 @@ try {
   if (process.env.SERVUS_SWITCH_INSPECT === '1') {
     const inspection = await agent.inject({method:'GET',url:`${path}/switch-inspection`,headers});
     if (inspection.statusCode !== 200 || inspection.json().sourceContainerId !== process.env.SERVUS_IMPORT_SOURCE_ID || inspection.json().sourceVolume !== `panel-data-${serviceId}-database` || inspection.json().candidateVolume !== `panel-restore-${operationId}`) throw new Error(`Switch inspection failed: ${inspection.statusCode} ${JSON.stringify(inspection.json())}`);
+    recordedInspection=inspection.json();
   }
   const query = kind === 'postgres'
     ? 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"'
@@ -58,7 +58,10 @@ try {
   if (process.env.SERVUS_SWITCH_APPLY === '1') {
     switchDb=new Database(join(dataDir,'agent.sqlite'));const journal=new RestoreJournal(switchDb,()=>false);
     const options={docker,journal,vault:store.vault,serviceId,operationId};switchOptions=options;
-    await prepareRestoreSwitchIntent(options);switchPlan=readRestoreSwitchIntent(options);
+    if(process.env.SERVUS_SWITCH_BINDING==='1'){
+      const original=await docker.getService(`panel-app-${serviceId}`).inspect();
+      switchPlan={inspection:recordedInspection,previousSpec:original.Spec};
+    } else {await prepareRestoreSwitchIntent(options);switchPlan=readRestoreSwitchIntent(options);}
     const verifyData=async plan=>{
       for(let attempt=0;attempt<90;attempt++) {
         const containers=await docker.listContainers({all:true,filters:{volume:[plan.inspection.candidateVolume]}});
@@ -73,10 +76,12 @@ try {
       throw new Error('Switched database did not become ready');
     };
     const verifyTarget=async plan=>{await verifyRestoreDatabase({docker,plan,side:'target',kind});await verifyData(plan);};
-    await applyRestoreSwitch({...options,verifyTarget});
-    if(journal.switchIntent(operationId)?.stage!=='applied'||!journal.hasUnresolved(serviceId))throw new Error('Switch is not durably fenced');
     if(process.env.SERVUS_SWITCH_BINDING==='1'){
-      await finalizeRestoreSwitch({...options,dataDir,verifyTarget});bindingCompleted=true;
+      const commit=await agent.inject({method:'POST',url:`${path}/commit`,headers,payload:{}});
+      if(commit.statusCode!==200||commit.json().phase!=='completed'||commit.json().rolledBack)throw new Error(`Agent commit failed: ${commit.statusCode} ${JSON.stringify(commit.json())}`);
+      const repeat=await agent.inject({method:'POST',url:`${path}/commit`,headers,payload:{}});
+      if(repeat.statusCode!==200||repeat.json().phase!=='completed')throw new Error('Agent commit was not repeatable');
+      bindingCompleted=true;
       const actual=new DockerRuntime('/var/run/docker.sock',18080,'unused',dataDir);
       actual.ensureInfrastructure=async()=>{};
       actual.pull=async()=>switchPlan.previousSpec.TaskTemplate.ContainerSpec.Image;
@@ -102,6 +107,9 @@ try {
       await rollbackRestoreSwitch({...secondOptions,verifySource:verifySecondSource});
       const secondFinished=await finalizeRestoreRollback({...secondOptions,dataDir,verifySource:verifySecondSource});
       if(secondFinished.phase!=='cancelled'||journal.volumeBinding(serviceId)?.operation_id!==operationId)throw new Error('Second restore did not preserve the first binding');
+    } else {
+      await applyRestoreSwitch({...options,verifyTarget});
+      if(journal.switchIntent(operationId)?.stage!=='applied'||!journal.hasUnresolved(serviceId))throw new Error('Switch is not durably fenced');
     }
   } else {
     for (let attempt=0;attempt<2;attempt++) {
@@ -129,7 +137,7 @@ try {
       const service=docker.getService(`panel-app-${serviceId}`),current=await service.inspect();
       if(current.Spec.Labels?.['panel.owner']!=='self-hosted-panel'||current.Spec.Labels?.['panel.service']!==serviceId)throw new Error('Fixture service ownership changed');
       await service.update({...switchPlan.previousSpec,version:current.Version.Index});await verifySource(switchPlan);
-    } else {
+    } else if(switchOptions.journal.get(operationId)?.phase==='switching') {
       await rollbackRestoreSwitch({...switchOptions,verifySource});
       if(switchOptions.journal.switchIntent(operationId)?.stage!=='rolled_back')throw new Error('Rollback was not recorded');
       await rollbackRestoreSwitch({...switchOptions,verifySource});

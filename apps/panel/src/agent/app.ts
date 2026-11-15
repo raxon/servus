@@ -22,6 +22,7 @@ import { createRestoreCandidate } from './restore-candidate.js';
 import { importDatabaseCandidate } from './database-import.js';
 import { readRestoreArchive } from './restore-archive.js';
 import { inspectRestoreSwitch } from './restore-switch-inspect.js';
+import { commitPreparedRestore, RestoreCommitUncertainError } from './restore-commit.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -149,7 +150,8 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
     const record = restores.get(req.params.operationId);
     if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
-    return {operationId:record.id,phase:record.phase,kind:record.kind};
+    const stage=record.phase==='switching'?restores.switchIntent(record.id)?.stage:undefined;
+    return {operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{})};
   });
   app.post<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/cancel', async (req,reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
@@ -168,9 +170,10 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
     const record = restores.get(req.params.operationId);
     if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
-    if (record.phase !== 'reserved' || !['postgres','mariadb'].includes(record.kind)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be prepared now.'}});
+    if (record.phase !== 'reserved' || !['postgres','mariadb'].includes(record.kind) || cancellingRestores.has(record.id)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be prepared now.'}});
     const release = maintenance?.admit();
     if (maintenance && !release) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    cancellingRestores.add(record.id);
     try {
       if (!runtime.consoleContainer) throw new Error('Database restore is unavailable.');
       const kind = record.kind as 'postgres'|'mariadb';
@@ -182,7 +185,18 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
           return {containerId:candidate.containerId,dockerSocket:config.dockerSocket,database:source.database,user:source.user,input:()=>readRestoreArchive({dataDir:config.dataDir,operationId:record.id,key:vault.restoreArchiveKey(record.id)})};
         }});
       return {operationId:result.id,phase:result.phase};
-    } finally { release?.(); }
+    } finally { cancellingRestores.delete(record.id);release?.(); }
+  });
+  app.post<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/commit', async (req,reply) => {
+    if(!z.string().uuid().safeParse(req.params.id).success||!/^[a-f0-9]{32}$/.test(req.params.operationId)||!z.object({}).strict().safeParse(req.body??{}).success)return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore request.'}});
+    const record=restores.get(req.params.operationId);
+    if(!record||record.service_id!==req.params.id)return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
+    if(!['prepared','switching','completed','cancelled'].includes(record.phase)||cancellingRestores.has(record.id))return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be committed now.'}});
+    const release=maintenance?.admit();
+    if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    cancellingRestores.add(record.id);
+    try{return await commitPreparedRestore({docker:new Docker({socketPath:config.dockerSocket}),journal:restores,vault,dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId});}
+    finally{cancellingRestores.delete(record.id);release?.();}
   });
   app.get<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/switch-inspection', async (req,reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
@@ -300,6 +314,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     } finally { release?.(); }
   });
   app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof RestoreCommitUncertainError) return reply.code(503).send({error:{code:'RESTORE_UNCERTAIN',message:'Database restore requires recovery before further changes.'}});
     if (isUncertainRuntimeError(error)) return reply.code(503).send({ error: { code: 'OPERATION_UNCERTAIN', message: 'Docker connection interrupted. Reconcile the same operation before making another change.' } });
     return reply.code(422).send({ error: { code: 'RUNTIME_FAILED', message: vault.redact(message(error)) } });
   });

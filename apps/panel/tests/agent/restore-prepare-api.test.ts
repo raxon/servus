@@ -5,12 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 
-const mocks=vi.hoisted(()=>({allocate:vi.fn(),importCandidate:vi.fn()}));
+const mocks=vi.hoisted(()=>({allocate:vi.fn(),importCandidate:vi.fn(),commit:vi.fn()}));
 vi.mock('../../src/agent/restore-candidate.js',()=>({createRestoreCandidate:mocks.allocate}));
 vi.mock('../../src/agent/database-import.js',()=>({importDatabaseCandidate:mocks.importCandidate}));
+vi.mock('../../src/agent/restore-commit.js',()=>({commitPreparedRestore:mocks.commit,RestoreCommitUncertainError:class extends Error{}}));
 import { createAgent } from '../../src/agent/app.js';
 import { createApp } from '../../src/server/app.js';
 import { Store } from '../../src/server/store.js';
+import { RestoreCommitUncertainError } from '../../src/agent/restore-commit.js';
 
 const cleanup:(()=>Promise<void>)[]=[];
 afterEach(async()=>{for(const remove of cleanup.splice(0).reverse())await remove();vi.resetAllMocks();});
@@ -53,4 +55,24 @@ it('fences failed candidate allocation for review',async()=>{
   const f=await fixture(); mocks.allocate.mockRejectedValue(new Error('synthetic failure'));
   expect((await f.agent.inject({method:'POST',url:`${f.path}/prepare`,headers:f.auth,payload:{}})).statusCode).toBe(422);
   expect((await f.agent.inject({method:'GET',url:f.path,headers:f.auth})).json().phase).toBe('needs_review');
+});
+
+it('requires authentication and serializes commit and cancellation for the same operation',async()=>{
+  const f=await fixture();mocks.allocate.mockResolvedValue({containerId:'d'.repeat(64),volumeName:`panel-restore-${f.operationId}`});mocks.importCandidate.mockResolvedValue(undefined);
+  expect((await f.agent.inject({method:'POST',url:`${f.path}/prepare`,headers:f.auth,payload:{}})).statusCode).toBe(200);
+  expect((await f.agent.inject({method:'POST',url:`${f.path}/commit`,payload:{}})).statusCode).toBe(401);
+  let entered!:()=>void,finish!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;}),blocked=new Promise<void>(resolve=>{finish=resolve;});
+  mocks.commit.mockImplementation(async()=>{entered();await blocked;return {operationId:f.operationId,phase:'completed',rolledBack:false};});
+  const pending=f.agent.inject({method:'POST',url:`${f.path}/commit`,headers:f.auth,payload:{}});await started;
+  expect((await f.agent.inject({method:'POST',url:`${f.path}/cancel`,headers:f.auth,payload:{}})).statusCode).toBe(409);
+  expect((await f.agent.inject({method:'POST',url:`${f.path}/commit`,headers:f.auth,payload:{}})).statusCode).toBe(409);
+  finish();expect((await pending).json()).toEqual({operationId:f.operationId,phase:'completed',rolledBack:false});
+});
+
+it('reports an uncertain commit without leaking underlying details',async()=>{
+  const f=await fixture();mocks.allocate.mockResolvedValue({containerId:'d'.repeat(64),volumeName:`panel-restore-${f.operationId}`});mocks.importCandidate.mockResolvedValue(undefined);
+  await f.agent.inject({method:'POST',url:`${f.path}/prepare`,headers:f.auth,payload:{}});
+  mocks.commit.mockRejectedValue(new RestoreCommitUncertainError('private detail'));
+  const response=await f.agent.inject({method:'POST',url:`${f.path}/commit`,headers:f.auth,payload:{}});
+  expect(response.statusCode).toBe(503);expect(response.json().error.code).toBe('RESTORE_UNCERTAIN');expect(response.body).not.toContain('private detail');
 });
