@@ -1,7 +1,7 @@
 import type Docker from 'dockerode';
 import type { RestoreJournal } from './restore-journal.js';
 
-export type RestoreSwitchInspection = {serviceId:string;operationId:string;serviceVersion:number;sourceContainerId:string;sourceVolume:string;candidateContainerId:string;candidateVolume:string;imageId:string;nodeId:string};
+export type RestoreSwitchInspection = {serviceId:string;operationId:string;serviceDockerId:string;serviceVersion:number;sourceContainerId:string;sourceVolume:string;candidateContainerId:string;candidateVolume:string;imageId:string;nodeId:string};
 
 /** Inspect the exact source and isolated candidate before attempting a switch. */
 export async function inspectRestoreSwitch(options:{docker:Docker;journal:RestoreJournal;serviceId:string;operationId:string}):Promise<RestoreSwitchInspection> {
@@ -11,7 +11,7 @@ export async function inspectRestoreSwitch(options:{docker:Docker;journal:Restor
   const dataPath=record.kind==='postgres'?'/var/lib/postgresql/data':'/var/lib/mysql';
   const service=await options.docker.getService(serviceName).inspect(),spec=service.Spec,labels=spec.Labels ?? {},task=spec.TaskTemplate,containerSpec=task?.ContainerSpec;
   const version=service.Version?.Index, info=await options.docker.info(),nodeId=info.Swarm?.NodeID;
-  if(!Number.isSafeInteger(version)||!nodeId||labels['panel.owner']!=='self-hosted-panel'||labels['panel.service']!==record.service_id||labels['panel.kind']!==record.kind||spec.Name!==serviceName||spec.Mode?.Replicated?.Replicas!==1||spec.UpdateConfig?.Order!=='stop-first'||task?.Placement?.Constraints?.length!==1||task.Placement.Constraints[0]!==`node.id==${nodeId}`)throw new Error('Database service configuration cannot be safely switched.');
+  if(!service.ID||!Number.isSafeInteger(version)||!nodeId||labels['panel.owner']!=='self-hosted-panel'||labels['panel.service']!==record.service_id||labels['panel.kind']!==record.kind||spec.Name!==serviceName||spec.Mode?.Replicated?.Replicas!==1||spec.UpdateConfig?.Order!=='stop-first'||task?.Placement?.Constraints?.length!==1||task.Placement.Constraints[0]!==`node.id==${nodeId}`)throw new Error('Database service configuration cannot be safely switched.');
   const mounts=containerSpec?.Mounts;
   if(!containerSpec?.Image||!mounts||mounts.length!==1||mounts[0]?.Type!=='volume'||mounts[0].Source!==sourceVolume||mounts[0].Target!==dataPath||mounts[0].ReadOnly)throw new Error('Database source volume cannot be verified.');
   const sourceVol=await options.docker.getVolume(sourceVolume).inspect();
@@ -36,5 +36,5 @@ export async function inspectRestoreSwitch(options:{docker:Docker;journal:Restor
   if(!/^sha256:[a-f0-9]{64}$/.test(image.Id)||source.Image!==image.Id||candidate.Image!==image.Id)throw new Error('Database image identity does not match.');
   const current=await options.docker.getService(serviceName).inspect();
   if(current.ID!==service.ID||current.Version?.Index!==version||options.journal.get(record.id)?.phase!=='prepared')throw new Error('Database configuration changed during inspection.');
-  return {serviceId:record.service_id,operationId:record.id,serviceVersion:version!,sourceContainerId:source.Id,sourceVolume,candidateContainerId:candidate.Id,candidateVolume,imageId:image.Id,nodeId};
+  return {serviceId:record.service_id,operationId:record.id,serviceDockerId:service.ID,serviceVersion:version!,sourceContainerId:source.Id,sourceVolume,candidateContainerId:candidate.Id,candidateVolume,imageId:image.Id,nodeId};
 }

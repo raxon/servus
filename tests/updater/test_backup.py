@@ -105,6 +105,14 @@ class RestoreJournalSchemaTest(unittest.TestCase):
                         ('a'*32,UUID,'postgres','b'*64,phase,'2026-11-15T00:00:00.000Z'))
                     with self.assertRaisesRegex(backup.CaptureError,'Unresolved database restore'): backup._agent_schema(db)
 
+    def test_switch_intents_must_be_empty_for_backup(self):
+        with sqlite3.connect(':memory:') as db:
+            for table, columns in backup.AGENT_SWITCH_SCHEMA.items():
+                db.execute('CREATE TABLE ' + table + ' (' + ','.join(column + ' TEXT' for column in columns) + ')')
+            backup._agent_schema(db)
+            db.execute('INSERT INTO restore_switch_intents(id,service_id,service_version,sealed_plan,created_at) VALUES(?,?,?,?,?)',('a'*32,UUID,'1','encrypted','2026-11-15T00:00:00.000Z'))
+            with self.assertRaisesRegex(backup.CaptureError,'Unresolved database restore'): backup._agent_schema(db)
+
 
 class OperationHistoryTest(unittest.TestCase):
     def setUp(self):

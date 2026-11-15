@@ -18,7 +18,7 @@ function fixture(kind:'postgres'|'mariadb'='postgres') {
 }
 
 for(const kind of ['postgres','mariadb'] as const)it(`inspects exact ${kind} resources without modifying them`,async()=>{
-  const f=fixture(kind);expect(await inspectRestoreSwitch(f.options)).toEqual({serviceId:f.options.serviceId,operationId:f.options.operationId,serviceVersion:12,sourceContainerId:f.sourceId,sourceVolume:f.sourceVolume,candidateContainerId:f.candidateId,candidateVolume:f.candidateVolume,imageId:f.imageId,nodeId:f.nodeId});
+  const f=fixture(kind);expect(await inspectRestoreSwitch(f.options)).toEqual({serviceId:f.options.serviceId,operationId:f.options.operationId,serviceDockerId:'service123',serviceVersion:12,sourceContainerId:f.sourceId,sourceVolume:f.sourceVolume,candidateContainerId:f.candidateId,candidateVolume:f.candidateVolume,imageId:f.imageId,nodeId:f.nodeId});
 });
 
 it('rejects unowned, shared or mismatched volumes and candidates',async()=>{

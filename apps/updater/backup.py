@@ -66,6 +66,7 @@ PANEL_SCHEMA = {
 }
 AGENT_SCHEMA = {'operations': {'id','request_hash','state','response','updated_at','previous_spec','previous_recorded','target_spec','operation_stage','previous_error','service_id'}}
 AGENT_RESTORE_SCHEMA = {**AGENT_SCHEMA, 'restore_operations': {'id','service_id','kind','archive_sha256','phase','updated_at'}}
+AGENT_SWITCH_SCHEMA = {**AGENT_RESTORE_SCHEMA, 'restore_switch_intents': {'id','service_id','service_version','sealed_plan','created_at'}}
 
 class CaptureError(Exception): pass
 
@@ -359,7 +360,9 @@ def _schema(db,expected,version):
 
 def _agent_schema(db):
     has_restore = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_operations'").fetchone())
-    _schema(db, AGENT_RESTORE_SCHEMA if has_restore else AGENT_SCHEMA, 0)
+    has_switch = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_switch_intents'").fetchone())
+    if has_switch and not has_restore: raise CaptureError('Unsupported database schema')
+    _schema(db, AGENT_SWITCH_SCHEMA if has_switch else AGENT_RESTORE_SCHEMA if has_restore else AGENT_SCHEMA, 0)
     if not has_restore: return
     for ident, service, kind, digest, phase, updated in db.execute('SELECT id,service_id,kind,archive_sha256,phase,updated_at FROM restore_operations'):
         if phase not in ('completed', 'cancelled'):
@@ -369,6 +372,7 @@ def _agent_schema(db):
             kind not in ('postgres','mariadb','redis') or not isinstance(digest,str) or not re.fullmatch(r'[a-f0-9]{64}',digest) or
             not isinstance(updated,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',updated)):
             raise CaptureError('Database restore journal is invalid')
+    if has_switch and db.execute('SELECT 1 FROM restore_switch_intents LIMIT 1').fetchone(): raise CaptureError('Unresolved database restore requires recovery')
 
 def _config_references(config, refs, service_id, owners, purposes=None, git_requirements=None):
     if not isinstance(config,dict): raise CaptureError('Service configuration is invalid')
