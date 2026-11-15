@@ -43,9 +43,9 @@ def _masked_units(execute):
                 raise HostFenceError('Systemd unit state is invalid')
             properties[key] = value
         if (set(properties) != {'LoadState', 'ActiveState', 'ControlGroup', 'UnitFileState'} or
-            properties['LoadState'] != 'masked' or properties['UnitFileState'] != 'masked-runtime' or
+            properties['LoadState'] != 'masked' or properties['UnitFileState'] not in ('masked', 'masked-runtime') or
             properties['ActiveState'] != 'inactive' or properties['ControlGroup']):
-            raise HostFenceError('A host unit is not stopped and runtime-masked')
+            raise HostFenceError('A host unit is not stopped and masked')
 
 
 def _transient_cgroups(root):

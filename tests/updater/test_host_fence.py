@@ -28,6 +28,8 @@ class HostFenceTest(unittest.TestCase):
     def test_requires_all_masked_inactive_units_and_rechecks(self):
         self.check();self.quiet.ensure_host_namespaces.assert_called_once()
         self.quiet.ensure_no_open_data.assert_called_once_with('/usr/local/libexec/servus')
+        self.states[fence.UNITS[0]]='LoadState=masked\nActiveState=inactive\nControlGroup=\nUnitFileState=masked\n'
+        self.check()
         for change in ('LoadState=loaded','ActiveState=active','ControlGroup=/system.slice/example','UnitFileState=enabled'):
             with self.subTest(change=change):
                 self.states[fence.UNITS[0]]='LoadState=masked\nActiveState=inactive\nControlGroup=\nUnitFileState=masked-runtime\n'

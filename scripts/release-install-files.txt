@@ -14,6 +14,7 @@
 100644 apps/updater/host-exchange.py
 100644 apps/updater/host-fence.py
 100644 apps/updater/host-switch.py
+100644 apps/updater/host-unit-mask.py
 100644 apps/updater/initial-generation.py
 100644 apps/updater/install-gh.py
 100644 apps/updater/install-host.py
