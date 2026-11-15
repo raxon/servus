@@ -46,7 +46,7 @@ export async function importDatabaseCandidate(options: {
     const info = await inspect(['inspect', options.containerId]) as { Id?: string; Config?: { Labels?: Record<string,string>; Env?: string[] }; HostConfig?: { NetworkMode?: string; Privileged?: boolean; PidMode?: string; IpcMode?: string; CapAdd?: string[] | null; Tmpfs?: Record<string,string> | null }; State?: { Running?: boolean }; Mounts?: { Type?: string; Name?: string; Destination?: string; RW?: boolean }[] } | undefined;
     if (info?.Id !== options.containerId || info?.Config?.Labels?.['panel.restore.operation'] !== options.operationId ||
       info?.HostConfig?.NetworkMode !== 'none' || info.HostConfig.Privileged !== false || info.HostConfig.PidMode === 'host' || info.HostConfig.IpcMode === 'host' ||
-      (info.HostConfig.CapAdd?.length ?? 0) > 0 || Object.keys(info.HostConfig.Tmpfs ?? {}).length > 0 || info?.State?.Running !== true) throw new Error('Candidate isolation not verified.');
+      (info.HostConfig.CapAdd?.length ?? 0) > 0 || info?.State?.Running !== true) throw new Error('Candidate isolation not verified.');
     const variables = new Map((info.Config?.Env ?? []).map(value => { const at = value.indexOf('='); return [value.slice(0, at), value.slice(at + 1)]; }));
     const prefix = options.kind === 'postgres' ? 'POSTGRES' : 'MARIADB';
     if (variables.get(`${prefix}_DB`) !== options.database && options.kind === 'postgres') throw new Error('Candidate database identity mismatch.');
@@ -55,8 +55,8 @@ export async function importDatabaseCandidate(options: {
     const dataPath = options.kind === 'postgres' ? '/var/lib/postgresql/data' : '/var/lib/mysql';
     const volumeName = `panel-restore-${options.operationId}`;
     const mounts = info.Mounts;
-    if (!Array.isArray(mounts) || mounts.length !== 2 || !mounts.some(mount => mount.Type === 'volume' && mount.Name === volumeName && mount.Destination === dataPath && mount.RW === true) ||
-      !mounts.some(mount => mount.Type === 'bind' && mount.Destination === '/run/secrets/panel-db-password' && mount.RW === false)) throw new Error('Candidate mounts not verified.');
+    const tmpfs = info.HostConfig.Tmpfs ?? {}, ephemeral = Object.keys(tmpfs).length === 1 && tmpfs['/run/secrets'] === 'rw,noexec,nosuid,nodev,size=1m,mode=0700';
+    if (!Array.isArray(mounts) || !ephemeral || mounts.length !== 1 || !mounts.some(mount => mount.Type === 'volume' && mount.Name === volumeName && mount.Destination === dataPath && mount.RW === true)) throw new Error('Candidate mounts not verified.');
     const volume = await inspect(['volume', 'inspect', volumeName]) as { Name?: string; Labels?: Record<string,string> } | undefined;
     if (volume?.Name !== volumeName || volume.Labels?.['panel.restore.operation'] !== options.operationId || volume.Labels?.['panel.restore.purpose'] !== 'candidate') throw new Error('Candidate volume not verified.');
   } catch (error) { throw new DatabaseImportError('Database import candidate is not isolated.', false, { cause: error }); }

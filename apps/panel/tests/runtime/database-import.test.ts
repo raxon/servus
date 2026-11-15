@@ -12,9 +12,8 @@ afterEach(() => { vi.unstubAllEnvs(); for (const path of cleanup.splice(0)) rmSy
 function fixture(options: { network?: string; privileged?: boolean; label?: string; volumeLabel?: string; dataVolume?: string; exec?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'servus-import-test-')); cleanup.push(dir);
   const info = JSON.stringify([{ Id: containerId, Config: { Labels: { 'panel.restore.operation': options.label ?? operationId }, Env: ['POSTGRES_DB=fixture', 'POSTGRES_USER=fixture'] },
-    HostConfig: { NetworkMode: options.network ?? 'none', Privileged: options.privileged ?? false }, State: { Running: true },
-    Mounts: [{ Type: 'volume', Name: options.dataVolume ?? `panel-restore-${operationId}`, Destination: '/var/lib/postgresql/data', RW: true },
-      { Type: 'bind', Destination: '/run/secrets/panel-db-password', RW: false }] }]);
+    HostConfig: { NetworkMode: options.network ?? 'none', Privileged: options.privileged ?? false, Tmpfs: { '/run/secrets':'rw,noexec,nosuid,nodev,size=1m,mode=0700' } }, State: { Running: true },
+    Mounts: [{ Type: 'volume', Name: options.dataVolume ?? `panel-restore-${operationId}`, Destination: '/var/lib/postgresql/data', RW: true }] }]);
   const volume = JSON.stringify([{ Name: `panel-restore-${operationId}`, Labels: { 'panel.restore.operation': options.volumeLabel ?? operationId, 'panel.restore.purpose': 'candidate' } }]);
   const docker = join(dir, 'docker');
   writeFileSync(docker, `#!/bin/sh\ncase "$3" in\ninspect) printf '%s' '${info}' ;;\nvolume) printf '%s' '${volume}' ;;\nexec) ${options.exec ?? 'cat > "$SERVUS_INPUT"'} ;;\n*) exit 3 ;;\nesac\n`);

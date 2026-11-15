@@ -31,6 +31,21 @@ it('records intent before import and refuses a concurrent preparation', async ()
   expect(importCandidate).toHaveBeenCalledOnce(); finish(); expect((await running).phase).toBe('prepared');
 });
 
+it('records intent before allocating the isolated candidate', async () => {
+  const { journal, operationId, serviceId, target } = fixture();
+  const allocateTarget = vi.fn(async () => { expect(journal.get(operationId)?.phase).toBe('importing'); return target; });
+  const importCandidate = vi.fn(async () => {});
+  expect((await prepareRestoreCandidate({ journal, operationId, serviceId, allocateTarget, importCandidate })).phase).toBe('prepared');
+  expect(allocateTarget).toHaveBeenCalledOnce(); expect(importCandidate).toHaveBeenCalledOnce();
+});
+
+it('fences a failed candidate allocation for review', async () => {
+  const { journal, operationId, serviceId } = fixture(), importCandidate = vi.fn(async () => {});
+  const allocateTarget = vi.fn(async () => { throw new Error('synthetic allocation failure'); });
+  await expect(prepareRestoreCandidate({ journal, operationId, serviceId, allocateTarget, importCandidate })).rejects.toThrow('synthetic allocation failure');
+  expect(journal.get(operationId)?.phase).toBe('needs_review'); expect(importCandidate).not.toHaveBeenCalled();
+});
+
 it('keeps a failed or interrupted candidate fenced for review', async () => {
   const { journal, operationId, serviceId, target } = fixture('mariadb'), importCandidate = vi.fn(async () => { throw new Error('synthetic import failure'); });
   await expect(prepareRestoreCandidate({ journal, operationId, serviceId, target, importCandidate })).rejects.toThrow('synthetic import failure');
