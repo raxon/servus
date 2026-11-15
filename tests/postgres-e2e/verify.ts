@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import Database from 'better-sqlite3';
+import { request as httpRequest } from 'node:http';
+import { RestoreJournal } from '../../apps/panel/src/agent/restore-journal.js';
 
 // The caller owns and later deletes this dedicated, disposable Colima profile.
 const profile = process.env.SERVUS_PG_E2E_PROFILE;
@@ -83,6 +85,16 @@ async function downloadExport(serviceId:string) {
   assert.equal((await fetch(`${origin}${path}`,{headers:{cookie:`${cookie}; ${ticket}`}})).status,404);
   return data;
 }
+async function agentStatus(path:string, method='GET', body?:unknown, upgrade=false):Promise<number> {
+  const token=readFileSync(join(data,'agent-token'),'utf8').trim(), payload=body===undefined?undefined:JSON.stringify(body);
+  return new Promise((resolveStatus,reject)=>{
+    const req=httpRequest({socketPath:join(data,'agent.sock'),path,method,headers:{authorization:`Bearer ${token}`,
+      ...(payload?{'content-type':'application/json','content-length':Buffer.byteLength(payload)}:{}),
+      ...(upgrade?{connection:'Upgrade',upgrade:'websocket','sec-websocket-version':'13','sec-websocket-key':'dGhlIHNhbXBsZSBub25jZQ=='}:{})}},res=>{res.resume();resolveStatus(res.statusCode??0);});
+    req.on('upgrade',(_response,socket)=>{socket.destroy();resolveStatus(101);});
+    req.on('error',reject);req.setTimeout(10_000,()=>req.destroy(new Error('Agent request timed out')));req.end(payload);
+  });
+}
 
 try {
   const contextInfo = JSON.parse(cli(['context', 'inspect', context]))[0];
@@ -133,6 +145,16 @@ try {
     assert.equal(recovered.state, 'succeeded'); assert(recovered.target_spec);
   } finally { journal.close(); }
   console.log('PASS saved target recovered after SIGKILL of the real agent');
+  const restoreDb = new Database(join(data,'agent.sqlite'));
+  const restoreJournal = new RestoreJournal(restoreDb,()=>false), restoreId = randomBytes(16).toString('hex');
+  restoreJournal.reserve({id:restoreId,serviceId,kind:'postgres',archiveSha256:randomBytes(32).toString('hex')});
+  await terminate(agent,'SIGKILL');agent=launch('agent',port,ingress);
+  await waitUntil(async()=>{checkChild(agent,'agent');try{return await agentStatus('/runtime')===200?true:undefined;}catch{return undefined;}},'agent restart');
+  assert.equal(await agentStatus(`/services/${serviceId}/database-export`,'POST',{kind:'postgres',database:'app',user:'app'}),409);
+  assert.equal(await agentStatus(`/services/${serviceId}/console`,'GET',undefined,true),409);
+  assert.equal(await agentStatus('/services/apply','POST',{operationId:randomUUID(),type:'restart',service:created.service}),409);
+  restoreJournal.advance(restoreId,'reserved','cancelled');restoreDb.close();
+  console.log('PASS durable restore fence after SIGKILL of the real agent');
   const serviceName = `panel-app-${serviceId}`;
   async function runningContainer(targetId=serviceId) {
     return waitUntil(async () => {

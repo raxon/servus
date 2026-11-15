@@ -12,6 +12,7 @@ import { DockerRuntime, message, isUncertainRuntimeError, type RecoveryContext }
 import type { Service } from '../shared/types.js';
 import { consoleExecStopped, type AgentMaintenanceGate } from './maintenance.js';
 import { DatabaseExportUncertainError, exportDatabase } from './database-export.js';
+import { RestoreJournal } from './restore-journal.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -63,9 +64,11 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       if (row[column] && !row[column].startsWith('enc:v1:')) journal.prepare(`UPDATE operations SET ${column}=? WHERE id=?`).run(sealSpec(JSON.parse(row[column])),row.id);
     }
   }
-  maintenance?.bindJournal(() => Boolean(journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get()));
   const active = new Map<string, Promise<unknown>>();
   const locks = new Set<string>();
+  const consoles = new Map<string, number>(), uncertainConsoles = new Set<string>();
+  const restores = new RestoreJournal(journal, serviceId => locks.has(serviceId) || (consoles.get(serviceId) ?? 0) > 0 || uncertainConsoles.has(serviceId));
+  maintenance?.bindJournal(() => restores.hasUnresolved() || Boolean(journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get()));
   app.addHook('onRequest', async (req, reply) => {
     const value = req.headers.authorization?.replace(/^Bearer /, '') || '';
     const left = createHash('sha256').update(value).digest();
@@ -92,7 +95,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     const finish=()=>{if(finished)return;finished=true;artifact?.close();if(held)locks.delete(req.params.id);release?.();};
     try{
       const unresolved=journal.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(req.params.id);
-      if(unresolved||locks.has(req.params.id))return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'Another operation is changing this service.'}});
+      if(unresolved||restores.hasUnresolved(req.params.id)||locks.has(req.params.id))return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'Another operation is changing this service.'}});
       locks.add(req.params.id);held=true;
       if(!runtime.consoleContainer)throw new Error('Database export is unavailable.');
       const container=await runtime.consoleContainer(req.params.id);
@@ -113,12 +116,15 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if(!z.string().uuid().safeParse(req.params.id).success||!['/bin/sh','/bin/bash'].includes(req.query.shell||'/bin/sh')||(req.query.containerId&&!/^[a-f0-9]{12,64}$/.test(req.query.containerId)))return reply.code(400).send({error:{code:'INVALID_CONSOLE',message:'Invalid console target.'}});
     const release=maintenance?.admit();
     if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    if(restores.hasUnresolved(req.params.id)){release?.();return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'Another operation is changing this service.'}});}
     try { await runtime.consoleContainer!(req.params.id,req.query.containerId); }
     catch { return reply.code(404).send({error:{code:'CONTAINER_NOT_FOUND',message:'No permitted running container is available.'}}); }
     finally { release?.(); }
   }}, (socket,req)=>{
     const release=maintenance?.admit();
     if(maintenance&&!release){socket.close(1012,'Agent is draining');return;}
+    if(restores.hasUnresolved(req.params.id)){release?.();socket.close(1013,'Service is busy');return;}
+    consoles.set(req.params.id,(consoles.get(req.params.id)??0)+1);
     let closed=false, started=false, startUncertain=false, containerId='', exec: Docker.Exec|undefined, stream:Duplex|undefined;
     let endSession: () => void = () => {};
     const sessionEnd = new Promise<void>(resolve => { endSession = resolve; });
@@ -149,8 +155,11 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     socket.on('close',()=>{closed=true;clearTimeout(idle);if(stream&&!stream.destroyed){stream.write('\u0003exit\n');stream.end();setTimeout(()=>stream?.destroy(),250).unref();}endSession();});
     socket.on('error',()=>{closed=true;clearTimeout(idle);stream?.destroy();endSession();});
     void Promise.allSettled([ready,sessionEnd]).then(async()=>{
-      if(maintenance&&started&&(!exec||!await consoleExecStopped(exec,containerId)))maintenance.markUncertain();
-    }).catch(()=>maintenance?.markUncertain()).finally(()=>{unregister?.();release?.();});
+      if(startUncertain||(started&&(!exec||!await consoleExecStopped(exec,containerId)))) {uncertainConsoles.add(req.params.id);maintenance?.markUncertain();}
+    }).catch(()=>{uncertainConsoles.add(req.params.id);maintenance?.markUncertain();}).finally(()=>{
+      const remaining=(consoles.get(req.params.id)??1)-1;if(remaining)consoles.set(req.params.id,remaining);else consoles.delete(req.params.id);
+      unregister?.();release?.();
+    });
   });
   app.get<{Params:{id:string}}>('/operations/:id', (req, reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success) return reply.code(400).send({ error: { code: 'INVALID_ID', message: 'Invalid operation identity.' } });
@@ -172,10 +181,14 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (previous?.state === 'succeeded') return JSON.parse(previous.response!);
     if (previous?.state === 'failed') return reply.code(422).send(JSON.parse(previous.response!));
     if (active.has(body.operationId)) return active.get(body.operationId);
-    const unresolved = journal.prepare("SELECT id FROM operations WHERE service_id=? AND state='running' AND id!=? LIMIT 1").get(body.service.id, body.operationId);
-    if (unresolved || locks.has(body.service.id)) return reply.code(409).send({ error: { code: 'SERVICE_BUSY', message: 'Another operation is changing this service.' } });
+    const acquired = journal.transaction(() => {
+      const unresolved = journal.prepare("SELECT id FROM operations WHERE service_id=? AND state='running' AND id!=? LIMIT 1").get(body.service.id, body.operationId);
+      if (unresolved || restores.hasUnresolved(body.service.id) || locks.has(body.service.id)) return false;
+      journal.prepare("INSERT INTO operations(id,request_hash,state,updated_at,service_id) VALUES(?,?,'running',?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,service_id=excluded.service_id").run(body.operationId, hash, new Date().toISOString(), body.service.id);
+      return true;
+    }).immediate();
+    if (!acquired) return reply.code(409).send({ error: { code: 'SERVICE_BUSY', message: 'Another operation is changing this service.' } });
     locks.add(body.service.id);
-    journal.prepare("INSERT INTO operations(id,request_hash,state,updated_at,service_id) VALUES(?,?,'running',?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,service_id=excluded.service_id").run(body.operationId, hash, new Date().toISOString(), body.service.id);
     const recovery: RecoveryContext = {
       previousRecorded: previous?.previous_recorded === 1,
       previousSpec: previous?.previous_spec ? openSpec(previous.previous_spec) : null,
