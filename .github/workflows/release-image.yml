@@ -78,6 +78,21 @@ jobs:
           EXPECTED_REVISION: ${{ steps.release.outputs.commit }}
           EXPECTED_VERSION: ${{ steps.release.outputs.tag }}
         run: bash "$RUNNER_TEMP/servus-release-context/scripts/verify-image.sh" "$IMAGE_ID"
+      - name: Test private Git builds in the release image
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          fixture_dir="/tmp/servus-private-git-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+          mkdir -m 700 "$fixture_dir"
+          trap 'python3 -c '\''import re,shutil,sys; p=sys.argv[1]; assert re.fullmatch(r"/tmp/servus-private-git-[a-f0-9]{32}",p); shutil.rmtree(p)'\'' "$fixture_dir"' EXIT
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$fixture_dir/key.pem" -out "$fixture_dir/cert.pem" -days 1 -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1 >/dev/null 2>&1
+          docker run --rm --network host --user "$(id -u):$(stat -c '%g' /var/run/docker.sock)" \
+            --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+            --mount "type=bind,src=$fixture_dir,dst=$fixture_dir" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/tests/integration/private-git-docker.mjs,dst=/fixture.mjs,readonly" \
+            -e "SERVUS_FIXTURE_DIR=$fixture_dir" -e "HOME=$fixture_dir" --entrypoint node "$IMAGE_ID" /fixture.mjs
       - name: Test supervisor entrypoints in the built image
         env:
           IMAGE_ID: ${{ steps.build.outputs.image_id }}
