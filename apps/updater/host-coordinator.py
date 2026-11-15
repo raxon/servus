@@ -136,7 +136,7 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
     def verify():
         _same_lock(supervisor,state_fd,'host.lock',host_lock)
         row=db.execute('SELECT image_digest,status FROM host_stops WHERE operation_id=?',(operation_id,)).fetchone()
-        if not row or row[0]!=image_digest or row[1] not in ('stopping','stopped','restarting'):
+        if not row or row[0]!=image_digest or row[1] not in ('stopping','stopped','starting','restarting'):
             raise HostPreparationError('Updater stop is not eligible for recovery')
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_switches'").fetchone():
             switched=db.execute('SELECT image_digest,phase FROM host_switches WHERE operation_id=?',(operation_id,)).fetchone()
@@ -190,7 +190,7 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
             if snapshot and (snapshot[0]!=image_digest or snapshot[1] not in ('intent','prepared','recovery_required','abandoned')):
                 raise HostPreparationError('Recovery snapshot is not eligible for abandonment')
             db.execute("UPDATE host_recovery_snapshots SET status='abandoned' WHERE operation_id=? AND image_digest=? AND status IN ('intent','prepared','recovery_required')",(operation_id,image_digest))
-        if db.execute("UPDATE host_stops SET status='restarting' WHERE operation_id=? AND image_digest=? AND status IN ('stopping','stopped','restarting')",(operation_id,image_digest)).rowcount!=1:
+        if db.execute("UPDATE host_stops SET status='restarting' WHERE operation_id=? AND image_digest=? AND status IN ('stopping','stopped','starting','restarting')",(operation_id,image_digest)).rowcount!=1:
             raise HostPreparationError('Updater restart journal changed')
         db.execute('COMMIT')
     except BaseException:
