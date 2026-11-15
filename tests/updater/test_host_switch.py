@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'apps/updater'))
@@ -19,7 +20,7 @@ import supervisor
 def load(name):
     spec=importlib.util.spec_from_file_location(name.replace('-','_'),ROOT/'apps/updater'/name)
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
-bundle=load('host-bundle.py');coordinator=load('host-coordinator.py');exchange=load('host-exchange.py');switch=load('host-switch.py')
+bundle=load('host-bundle.py');coordinator=load('host-coordinator.py');exchange=load('host-exchange.py');switch=load('host-switch.py');daemon=load('supervisor-daemon.py')
 
 
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
@@ -174,6 +175,35 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
             os.chmod(path,0o666)
             with self.assertRaises(switch.HostSwitchError):switch.assert_supervisor_ready(str(path),self.op,supervisor=supervisor,bundle=bundle)
         finally:server.close()
+
+    def test_completion_queries_real_supervisor_protocol_with_install_lock_held(self):
+        self.apply()
+        self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
+        self.db.execute('INSERT INTO host_unit_masks VALUES(?,?,?)',(self.op,self.digest,'restored'))
+        directory=self.root/'control';directory.mkdir(mode=0o750);path=directory/'command.sock'
+        server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);server.bind(str(path));os.chmod(path,0o600);server.listen()
+        pairs=[socket.socketpair() for _ in supervisor.ROLES];policy=object();identities=object()
+        hub=SimpleNamespace(used=False,policy=policy,identities=identities,
+                            connections=dict(zip(supervisor.ROLES,[pair[0] for pair in pairs])))
+        failures=[]
+        def serve():
+            try:
+                for _ in range(2):
+                    daemon.handle_command(server,hub,str(self.install),'/gate','/journal','/policy',str(self.state/'journal.sqlite'),'/env')
+            except BaseException as error:failures.append(error)
+        thread=threading.Thread(target=serve);thread.start()
+        args=self.args();args.pop('fence');args.pop('service_lock')
+        args.update(host_lock=self.hl,unit_mask=mock.Mock(unsafe=True),units_fd=self.a,supervisor_socket=str(path))
+        try:
+            with mock.patch.object(daemon,'load_approved_policy',return_value=policy), \
+                 mock.patch.object(supervisor,'inspect_servus',return_value=identities), \
+                 mock.patch.object(supervisor,'MaintenanceSupervisor',side_effect=AssertionError('must not reacquire install lock')):
+                switch.complete_exchange(self.db,self.op,**args)
+            thread.join(5);self.assertFalse(thread.is_alive());self.assertEqual(failures,[])
+            self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('completed',))
+        finally:
+            server.close()
+            for first,second in pairs:first.close();second.close()
 
     def test_complete_requires_restored_units_and_healthy_services(self):
         self.apply()
