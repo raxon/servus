@@ -5,6 +5,7 @@ import argparse
 import errno
 import fcntl
 import grp
+import hashlib
 import importlib.util
 import json
 import os
@@ -27,6 +28,8 @@ MAX_REQUEST = 4096
 EXECUTOR = pathlib.Path('/usr/local/libexec/servus/verification-executor.py')
 PREPARATION_FENCE = pathlib.Path('/usr/local/libexec/servus/preparation-fence.py')
 DISCOVERY_EXECUTOR = pathlib.Path('/usr/local/libexec/servus/discover-release.py')
+DNS_JOURNAL_BACKUP = pathlib.Path('/usr/local/libexec/servus/backup.py')
+DNS_JOURNAL_BACKUP_SHA256 = 'a5f67f984cd5fe2a9f29208858d47beb108697fc9e235f8c9b365e30ee2f3752'
 FENCE_MODULE = pathlib.Path('/usr/local/libexec/servus/verification-fence.py')
 FENCE_ROOT = pathlib.Path('/run/servus-updater/fences')
 NSS_CONFIG = pathlib.Path('/etc/nsswitch.conf')
@@ -1096,10 +1099,39 @@ class DiscoveryWorker:
             self.process = None
 
 
+def dns_journal_backup_supported():
+    """Only advertise the exact reviewed snapshot reader installed on this host.
+
+    This is an observation, not a lease across host replacement. A later host
+    without the table support still fails closed when validating a snapshot.
+    """
+    fd = None
+    try:
+        trusted_root_file(DNS_JOURNAL_BACKUP)
+        fd = os.open(DNS_JOURNAL_BACKUP, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        info = os.fstat(fd); named = DNS_JOURNAL_BACKUP.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_nlink != 1 or
+            (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino) or info.st_size > 1048576): return False
+        with os.fdopen(fd, 'rb', closefd=False) as stream: data=stream.read(1048577)
+        after=os.fstat(fd); named_after=DNS_JOURNAL_BACKUP.lstat()
+        if (len(data)!=info.st_size or len(data)>1048576 or
+            (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)!=
+            (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns) or
+            (after.st_dev,after.st_ino)!=(named_after.st_dev,named_after.st_ino)):
+            return False
+        return hashlib.sha256(data).hexdigest()==DNS_JOURNAL_BACKUP_SHA256
+    except (OSError, RuntimeError):
+        return False
+    finally:
+        if fd is not None: os.close(fd)
+
+
 def process(journal, request, *, allow_apply=False, discovery=None):
     if not isinstance(request, dict) or request.get('version') != 1 or type(request.get('version')) is not int:
         raise ProtocolError('invalid_request')
     action = request.get('action')
+    if action == 'backup_schema' and set(request) == {'version', 'action'}:
+        return {'backupFileDnsJournalVersion': 1 if allow_apply and dns_journal_backup_supported() else 0}
     if action == 'discover' and set(request) == {'version', 'action', 'current'}:
         if discovery is None: raise ProtocolError('unavailable')
         return discovery.request(request['current'])

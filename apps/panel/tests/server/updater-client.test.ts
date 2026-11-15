@@ -2,7 +2,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { submitUpdate, updateStatus, retryUpdate, prepareUpdate, applyUpdate, applyStatus, discoverUpdate, UpdaterClientError, type UpdateSubmission } from '../../src/server/updater-client.js';
+import { submitUpdate, updateStatus, retryUpdate, prepareUpdate, applyUpdate, applyStatus, discoverUpdate, updaterBackupFileSchema, UpdaterClientError, type UpdateSubmission } from '../../src/server/updater-client.js';
 
 const input: UpdateSubmission = { operationId: '12345678-1234-4123-8123-123456789abc', commit: 'a'.repeat(40), digest: `sha256:${'b'.repeat(64)}`, tag: 'v1.2.3' };
 const operation = { ...input, status: 'accepted', createdAt: '2026-11-14 10:00:00' };
@@ -35,6 +35,21 @@ async function failure(promise: Promise<unknown>, code: string, certainty: strin
 }
 
 describe('updater Unix socket client', () => {
+  it('accepts only a strict DNS journal compatibility observation',async()=>{
+    for(const version of [0,1]){
+      const endpoint=await fixture((socket,request)=>{
+        expect(JSON.parse(request)).toEqual({version:1,action:'backup_schema'});
+        socket.end(JSON.stringify({ok:true,operation:{backupFileDnsJournalVersion:version}})+'\n');
+      });
+      await expect(updaterBackupFileSchema(endpoint)).resolves.toEqual({backupFileDnsJournalVersion:version});
+    }
+    for(const operation of [{backupFileDnsJournalVersion:2},{backupFileDnsJournalVersion:true},{backupFileDnsJournalVersion:1,extra:true},{}]){
+      const endpoint=await fixture(socket=>socket.end(JSON.stringify({ok:true,operation})+'\n'));
+      await failure(updaterBackupFileSchema(endpoint),'invalid_response','uncertain');
+    }
+    const old=await fixture(socket=>socket.end(JSON.stringify({ok:false,error:'invalid_request'})+'\n'));
+    await failure(updaterBackupFileSchema(old),'invalid_request','definitive');
+  });
   it('accepts only a correctly shaped discovery result for the requested version', async () => {
     const options = await fixture((socket, request) => {
       expect(JSON.parse(request)).toEqual({version: 1, action: 'discover', current: 'v1.0.0'});
