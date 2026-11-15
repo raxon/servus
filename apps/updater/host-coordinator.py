@@ -110,7 +110,7 @@ def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_l
 
 def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_fd, install_fd, units_fd,
                             host_lock, supervisor, unit_mask, bundle, ready, run=subprocess.run,
-                            host_switch=None, exchange=None, active_parent=None, candidate_parent=None, readiness_timeout=60):
+                            host_switch=None, exchange=None, active_parent=None, candidate_parent=None, readiness_timeout=60, prepare_only=False):
     """Recover a journaled stop before exchange or after verified rollback.
 
     The caller holds the host operation lock, supplies independently verified
@@ -121,7 +121,7 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         db.in_transaction or db.isolation_level is not None or db.execute('PRAGMA synchronous').fetchone()[0] < 2 or
         not isinstance(operation_id,str) or not bundle.OPERATION.fullmatch(operation_id) or
         not isinstance(image_digest,str) or not bundle.DIGEST.fullmatch(image_digest) or not callable(ready) or
-        type(readiness_timeout) not in (int,float) or not 0 <= readiness_timeout <= 300):
+        type(readiness_timeout) not in (int,float) or not 0 <= readiness_timeout <= 300 or type(prepare_only) is not bool):
         raise HostPreparationError('Invalid updater recovery context')
     _same_lock(supervisor, state_fd, 'host.lock', host_lock)
     fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600)
@@ -196,6 +196,8 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
     except BaseException:
         if db.in_transaction:db.execute('ROLLBACK')
         raise
+    if prepare_only:
+        return
     try:
         for command in (['/usr/bin/systemctl','start','servus-updater-socket.service'],
                         ['/usr/bin/systemctl','start','servus-supervisor.service'],

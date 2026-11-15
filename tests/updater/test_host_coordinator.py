@@ -139,6 +139,24 @@ class HostCoordinatorTest(unittest.TestCase):
         finally:
             fcntl.flock(self.service_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);fcntl.flock(self.install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);os.close(state_fd);os.close(install_fd)
 
+    def test_recovery_can_prepare_boot_without_starting_services(self):
+        names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
+        states={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
+        unit_mask=SimpleNamespace(UNITS=names,UnitMaskError=RuntimeError,_directory=mock.Mock(),_metadata=mock.Mock(),_read=mock.Mock(),capture_service_states=mock.Mock(return_value=states))
+        self.db.execute('CREATE TABLE host_stops(operation_id TEXT PRIMARY KEY,image_digest TEXT,status TEXT)')
+        self.db.execute("INSERT INTO host_stops VALUES(?,?,'stopped')",(self.fixture.op,self.fixture.digest))
+        state_fd=os.open(self.state,os.O_RDONLY|os.O_DIRECTORY);install_fd=os.open(self.install,os.O_RDONLY|os.O_DIRECTORY)
+        fcntl.flock(self.install_lock,fcntl.LOCK_UN);run=mock.Mock();ready=mock.Mock()
+        try:
+            coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,{name:b'unit' for name in names},
+                state_fd=state_fd,install_fd=install_fd,units_fd=install_fd,host_lock=self.host_lock,supervisor=supervisor,
+                unit_mask=unit_mask,bundle=bundle,ready=ready,run=run,prepare_only=True)
+            self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('restarting',))
+            self.assertEqual([call.args[0][1] for call in run.call_args_list],['daemon-reload','reset-failed'])
+            ready.assert_not_called()
+        finally:
+            fcntl.flock(self.install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);os.close(state_fd);os.close(install_fd)
+
     def test_recovery_keeps_intent_if_control_plane_is_unavailable(self):
         names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
         states={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
