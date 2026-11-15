@@ -12,12 +12,14 @@ import { compileConfiguration, decodeDockerLogs } from '../../src/agent/configur
 import { createAgent } from '../../src/agent/app.js';
 import { validateRepository } from '../../src/agent/build.js';
 import { ingressStatus } from '../../src/agent/observability.js';
+import { RestoreJournal } from '../../src/agent/restore-journal.js';
 import type { Service } from '../../src/shared/types.js';
 
 const cleanup: (() => unknown | Promise<unknown>)[]=[];
 afterEach(async()=>{for(const fn of cleanup.splice(0).reverse())await fn();vi.unstubAllEnvs();});
 function fixture() {
   const dataDir=mkdtempSync(join(tmpdir(),'panel-config-'));cleanup.push(()=>rmSync(dataDir,{recursive:true,force:true}));
+  new Database(join(dataDir,'agent.sqlite')).close();
   const runtime=new DockerRuntime('/unused',18080,'unused',dataDir),client=runtime.docker as any,vault=new SecretVault(dataDir);
   const service:Service={id:randomUUID(),projectId:randomUUID(),name:'web',image:'nginx:alpine',hostname:'app.localhost',port:80,replicas:1,revision:1,deployedRevision:null,state:'pending',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),lastError:null};
   const metadata=new Database(join(dataDir,'panel.sqlite'));metadata.exec('CREATE TABLE service_secret_refs(reference TEXT PRIMARY KEY,service_id TEXT NOT NULL,purpose TEXT NOT NULL); PRAGMA user_version=5');cleanup.push(()=>metadata.close());
@@ -40,6 +42,35 @@ function fixture() {
 }
 
 describe('service configuration and protected storage',()=>{
+  it.each(['postgres','mariadb'] as const)('keeps the committed %s restore volume on restart and redeploy',async kind=>{
+    const f=fixture(),ref=f.putSecret('synthetic-password','database');
+    Object.assign(f.service,{kind,...(kind==='postgres'?{image:'postgres:17-alpine'}:{}),database:{database:'app',user:'app',passwordSecretRef:ref},domains:[]});
+    await f.runtime.apply(f.service,'deploy',randomUUID());
+    const operation='a'.repeat(32),volumeName=`panel-restore-${operation}`,oldVolume=`panel-data-${f.service.id}-database`,timestamp=new Date().toISOString();
+    const journalDb=new Database(join(f.dataDir,'agent.sqlite'));cleanup.push(()=>journalDb.close());
+    journalDb.exec('CREATE TABLE operations(id TEXT PRIMARY KEY,service_id TEXT,state TEXT)');new RestoreJournal(journalDb,()=>false);
+    journalDb.prepare("INSERT INTO restore_operations VALUES(?,?,? ,?,'completed',?)").run(operation,f.service.id,kind,'b'.repeat(64),timestamp);
+    journalDb.prepare("INSERT INTO restore_retained_volumes VALUES(?,?,?,'pre_restore_source',?)").run(operation,f.service.id,oldVolume,timestamp);
+    journalDb.prepare('INSERT INTO restore_volume_bindings VALUES(?,?,?,?,?)').run(f.service.id,operation,volumeName,kind,timestamp);
+    f.volumes.set(volumeName,{Name:volumeName,Driver:'local',Labels:{'panel.restore.operation':operation,'panel.restore.service':f.service.id,'panel.restore.purpose':'candidate'}});
+    const previous=f.current();previous.Labels['panel.restore.operation']=operation;previous.TaskTemplate.ContainerSpec.Mounts[0].Source=volumeName;
+    f.service.deployedRevision=1;f.service.revision=2;
+    await f.runtime.apply(f.service,'restart',randomUUID());
+    expect(f.current().TaskTemplate.ContainerSpec.Mounts[0].Source).toBe(volumeName);
+    await f.runtime.apply(f.service,'deploy',randomUUID());
+    expect(f.current().TaskTemplate.ContainerSpec.Mounts[0].Source).toBe(volumeName);
+    expect(f.current().Labels['panel.restore.operation']).toBe(operation);
+    expect(f.volumes.has(oldVolume)).toBe(true);
+    f.volumes.get(volumeName).Labels['panel.restore.service']=randomUUID();
+    await expect(f.runtime.apply(f.service,'restart',randomUUID())).rejects.toThrow('ownership cannot be verified');
+    f.volumes.get(volumeName).Labels['panel.restore.service']=f.service.id;
+    journalDb.prepare('UPDATE restore_retained_volumes SET volume_name=? WHERE operation_id=?').run('invalid-source',operation);
+    await expect(f.runtime.apply(f.service,'restart',randomUUID())).rejects.toThrow('binding is invalid');
+    journalDb.prepare('UPDATE restore_retained_volumes SET volume_name=? WHERE operation_id=?').run(oldVolume,operation);
+    journalDb.prepare('DELETE FROM restore_volume_bindings WHERE service_id=?').run(f.service.id);
+    await expect(f.runtime.apply(f.service,'restart',randomUUID())).rejects.toThrow('binding is unavailable');
+  });
+
   it('migrates the owned ingress policy so clean exits restart after a daemon reboot',async()=>{
     const f=fixture(),update=vi.fn(async()=>{});
     f.client.info=async()=>({Swarm:{ControlAvailable:true,LocalNodeState:'active'}});

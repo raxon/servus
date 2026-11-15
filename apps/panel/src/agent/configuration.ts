@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep, join } from 'node:path';
 import { SecretVault } from '../shared/secrets.js';
 import type { Service } from '../shared/types.js';
+import type { RestoreVolumeBinding } from './restore-journal.js';
 
 const helperImage = 'alpine:3.21';
 export const databaseKinds = new Set(['postgres', 'redis', 'mariadb']);
@@ -13,7 +14,7 @@ export const databasePaths = { postgres: '/var/lib/postgresql/data', mariadb: '/
 export const postgresScramVersion = 'scram-v1';
 const postgresHba = 'local all all scram-sha-256\nhost all all 0.0.0.0/0 scram-sha-256\nhost all all ::/0 scram-sha-256\n';
 
-export async function compileConfiguration(docker: Docker, service: Service, vault: SecretVault, dataDir: string, options: { postgresScram?: boolean; freshPostgres?: boolean } = {}): Promise<{
+export async function compileConfiguration(docker: Docker, service: Service, vault: SecretVault, dataDir: string, options: { postgresScram?: boolean; freshPostgres?: boolean; restoreBinding?:RestoreVolumeBinding } = {}): Promise<{
   mounts: Docker.MountSettings[]; environment: string[]; secrets: NonNullable<Docker.ContainerSpec['Secrets']>; command?: string[]; args?: string[]; postgresReservation?: string;
 }> {
   if (stateful(service) && service.replicas !== 1) throw new Error('Writable storage and databases require a single replica.');
@@ -21,6 +22,7 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
   const environment = (service.environment || []).map(item => `${item.name}=${item.secretRef ? vault.getServiceSecret(item.secretRef,service.id,'environment') : item.value || ''}`);
   const secrets: NonNullable<Docker.ContainerSpec['Secrets']> = [];
   const configured = service.mounts || [];
+  if(options.restoreBinding&&(options.freshPostgres||options.restoreBinding.service_id!==service.id||options.restoreBinding.kind!==service.kind||configured.some(mount=>mount.target===databasePaths[options.restoreBinding!.kind])))throw new Error('Restored database volume configuration cannot be changed.');
   if(options.freshPostgres && (!options.postgresScram || service.kind!=='postgres' || configured.length || service.environment?.some(item=>item.name==='PGDATA')))throw new Error('A new protected PostgreSQL service requires its default data volume and data path.');
   for (const mount of configured) {
     if (mount.type === 'volume') {
@@ -51,8 +53,8 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
     const passwordId = await swarmSecret(docker, passwordName, password, service.id);
     secrets.push({ SecretID: passwordId, SecretName: passwordName, File: { Name: 'panel-db-password', UID: '0', GID: '0', Mode: 0o444 } });
     if (!configured.some(mount => mount.target === databasePaths[kind])) {
-      const name = `panel-data-${service.id}-database`;
-      const result = await volume(docker, name, service.id, options.freshPostgres === true);
+      const name = options.restoreBinding?.volume_name ?? `panel-data-${service.id}-database`;
+      const result = options.restoreBinding ? await verifyRestoredVolume(docker,options.restoreBinding) : await volume(docker, name, service.id, options.freshPostgres === true);
       if(options.freshPostgres) { if(typeof result!=='string')throw new Error('Missing PostgreSQL volume reservation.'); postgresReservation=result; }
       mounts.push({ Type: 'volume', Source: name, Target: databasePaths[kind] });
     }
@@ -85,6 +87,13 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
     if (kind === 'redis') { command = ['/bin/sh']; args = ['-c', 'exec docker-entrypoint.sh redis-server --appendonly yes --requirepass "$(cat /run/secrets/panel-db-password)"']; }
   }
   return { mounts, environment, secrets, command, args, postgresReservation };
+}
+
+export async function verifyRestoredVolume(docker:Docker,binding:RestoreVolumeBinding):Promise<false> {
+  if(!/^[a-f0-9]{32}$/.test(binding.operation_id)||binding.volume_name!==`panel-restore-${binding.operation_id}`)throw new Error('Restored database volume binding is invalid.');
+  const volume=await docker.getVolume(binding.volume_name).inspect();
+  if(volume.Name!==binding.volume_name||volume.Driver!=='local'||volume.Labels?.['panel.restore.operation']!==binding.operation_id||volume.Labels?.['panel.restore.service']!==binding.service_id||volume.Labels?.['panel.restore.purpose']!=='candidate')throw new Error('Restored database volume ownership cannot be verified.');
+  return false;
 }
 
 async function volume(docker: Docker, name: string, serviceId: string, requireFresh = false): Promise<boolean | string> {

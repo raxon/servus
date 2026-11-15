@@ -4,7 +4,9 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { SecretVault } from '../shared/secrets.js';
 import { buildSource } from './build.js';
-import { compileConfiguration, databaseKind, stateful, decodeDockerLogs, postgresScramVersion } from './configuration.js';
+import { compileConfiguration, databaseKind, stateful, decodeDockerLogs, postgresScramVersion, verifyRestoredVolume } from './configuration.js';
+import { readRestoreBinding } from './restore-binding.js';
+import type { RestoreVolumeBinding } from './restore-journal.js';
 import { serviceContainers, serviceMetrics, ownedContainer, outputBuffer, execOutput, ingressStatus } from './observability.js';
 import type { Service, RuntimeStatus, ServiceLogs, ContainerInfo, ServiceMetrics } from '../shared/types.js';
 import type { ApplyResult } from './client.js';
@@ -110,12 +112,13 @@ export class DockerRuntime {
     return details.RepoDigests?.[0] || image;
   }
 
-  private async verifyProtectedPostgresVolume(serviceId: string, spec: Docker.ServiceSpec | null | undefined): Promise<void> {
+  private async verifyProtectedPostgresVolume(serviceId: string, spec: Docker.ServiceSpec | null | undefined, binding?:RestoreVolumeBinding): Promise<void> {
     if(!spec || spec.Labels?.['panel.postgres-auth']!==postgresScramVersion)return;
     const reservation=spec.Labels['panel.volume-reservation'];
     const mounts=containerSpec(spec)?.Mounts??[];
-    const expected=`panel-data-${serviceId}-database`;
+    const expected=binding?.volume_name??`panel-data-${serviceId}-database`;
     if(!reservation || !/^[a-f0-9]{64}$/.test(reservation) || mounts.length!==1 || mounts[0]?.Type!=='volume' || mounts[0]?.Source!==expected || mounts[0]?.Target!=='/var/lib/postgresql/data' || mounts[0]?.ReadOnly)throw new Error('The protected PostgreSQL volume configuration cannot be verified.');
+    if(binding){if(spec.Labels?.['panel.restore.operation']!==binding.operation_id)throw new Error('The restored PostgreSQL volume binding does not match.');await verifyRestoredVolume(this.docker,binding);return;}
     let inspected;
     try {inspected=await this.docker.getVolume(expected).inspect();}
     catch {throw new Error('The protected PostgreSQL data volume is unavailable.');}
@@ -124,9 +127,21 @@ export class DockerRuntime {
 
   async apply(service: Service, type: string, operationId: string, recovery?: RecoveryContext): Promise<ApplyResult> {
     const name = `panel-app-${service.id}`;
+    const binding=service.kind==='postgres'||service.kind==='mariadb'?readRestoreBinding(this.dataDir,service.id,service.kind):undefined;
+    const verifyBinding=async (...specs:(Docker.ServiceSpec|null|undefined)[])=>{
+      if(service.kind!=='postgres'&&service.kind!=='mariadb')return;
+      for(const spec of specs){
+        if(!spec)continue;
+        if(!binding){if(spec.Labels?.['panel.restore.operation'])throw new Error('Restored database volume binding is unavailable.');continue;}
+        const mounts=containerSpec(spec)?.Mounts??[],target=binding.kind==='postgres'?'/var/lib/postgresql/data':'/var/lib/mysql';
+        if(spec.Labels?.['panel.restore.operation']!==binding.operation_id||mounts.length!==1||mounts[0]?.Type!=='volume'||mounts[0].Source!==binding.volume_name||mounts[0].Target!==target||mounts[0].ReadOnly)throw new Error('Restored database service does not match its committed volume.');
+      }
+      if(binding)await verifyRestoredVolume(this.docker,binding);
+    };
     if (type === 'destroy') {
       const existing = await this.inspect(name);
       const previousSpec = recovery?.previousRecorded ? recovery.previousSpec : existing?.Spec ?? null;
+      await verifyBinding(existing?.Spec,previousSpec,recovery?.targetSpec);
       if([existing?.Spec,previousSpec,recovery?.targetSpec].some(spec=>spec?.Labels?.['panel.postgres-auth']===postgresScramVersion))assertSafePostgresDataPath(service,existing?.Spec,previousSpec,recovery?.targetSpec);
       if (existing) {
         if (existing.Spec.Labels?.['panel.owner'] !== OWNER) throw new Error('Service ownership check failed.');
@@ -140,13 +155,15 @@ export class DockerRuntime {
     await this.ensureInfrastructure();
     const messages: string[] = [];
     const existing = await this.inspect(name);
+    if(binding&&!existing)throw new Error('The restored database service is missing; recover its saved configuration before continuing.');
     if (existing && existing.Spec.Labels?.['panel.owner'] !== OWNER) throw new Error('Service ownership check failed.');
     if (!existing && type !== 'deploy') throw new Error('No deployed service exists. Deploy the saved configuration before starting or restarting it.');
     const previousSpec = recovery?.previousRecorded ? recovery.previousSpec : existing?.Spec ?? null;
+    await verifyBinding(existing?.Spec,previousSpec,recovery?.targetSpec);
     if([existing?.Spec,previousSpec,recovery?.targetSpec].some(spec=>spec?.Labels?.['panel.postgres-auth']===postgresScramVersion))assertSafePostgresDataPath(service,existing?.Spec,previousSpec,recovery?.targetSpec);
     if (!recovery?.previousRecorded) recovery?.recordPrevious(previousSpec ? structuredClone(previousSpec) : null);
     if (recovery?.stage === 'rolling_back') {
-      await this.verifyProtectedPostgresVolume(service.id, previousSpec);
+      await this.verifyProtectedPostgresVolume(service.id, previousSpec,binding);
       await this.restore(name, previousSpec, operationId);
       throw new Error(`Deployment failed; recovered the previous runtime configuration. ${recovery.previousError || 'Interrupted rollback.'}`);
     }
@@ -180,10 +197,11 @@ export class DockerRuntime {
         if(service.kind==='postgres' && previousPostgresAuth!==undefined && previousPostgresAuth!==postgresScramVersion)throw new Error('Unsupported PostgreSQL authentication policy. Update the agent before redeploying.');
         const freshPostgres=service.kind==='postgres' && !previousSpec && service.deployedRevision===null;
         const postgresScram=service.kind==='postgres' && (previousPostgresAuth===postgresScramVersion || freshPostgres);
-        const configuration = await compileConfiguration(this.docker, service, this.vault, this.dataDir, {postgresScram,freshPostgres});
+        const configuration = await compileConfiguration(this.docker, service, this.vault, this.dataDir, {postgresScram,freshPostgres,restoreBinding:binding});
         const key = service.id.replaceAll('-', '');
         const labels: Record<string, string> = { 'panel.owner': OWNER, 'panel.project': service.projectId, 'panel.service': service.id,
           'panel.revision': String(service.revision), 'panel.operation': operationId, 'panel.replicas': String(service.replicas), 'panel.kind': service.kind || 'app' };
+        if(binding)labels['panel.restore.operation']=binding.operation_id;
         if(postgresScram)labels['panel.image-reference']=service.image;
         if (sourceCommit) labels['panel.sourceCommit'] = sourceCommit;
         if (postgresScram) {
@@ -231,6 +249,8 @@ export class DockerRuntime {
       recovery?.recordTarget(structuredClone(spec));
     }
 
+    await verifyBinding(spec);
+
     if(type==='deploy'&&service.kind==='postgres'&&[spec,previousSpec,existing?.Spec].some(item=>item?.Labels?.['panel.postgres-auth']===postgresScramVersion)) {
       assertPostgresImageReference(service,spec);
       if(previousSpec)assertPostgresImageReference(service,previousSpec);
@@ -242,7 +262,7 @@ export class DockerRuntime {
     if(type!=='stop' && service.kind==='postgres' && spec.Labels?.['panel.postgres-auth']===postgresScramVersion) {
       const reservation=spec.Labels['panel.volume-reservation'];
       for(const prior of [previousSpec,existing?.Spec])if(prior?.Labels?.['panel.postgres-auth']===postgresScramVersion && prior.Labels['panel.volume-reservation']!==reservation)throw new Error('PostgreSQL volume reservation changed.');
-      await this.verifyProtectedPostgresVolume(service.id, spec);
+      await this.verifyProtectedPostgresVolume(service.id, spec,binding);
     }
     try {
       if (existing?.Spec.Labels?.['panel.operation'] === operationId) messages.push('Recovered a previously applied operation; inspecting its target tasks.');
@@ -258,7 +278,7 @@ export class DockerRuntime {
       if (isUncertainRuntimeError(error)) throw error;
       const failure = message(error);
       recovery?.beginRollback(failure);
-      try { await this.verifyProtectedPostgresVolume(service.id, previousSpec); await this.restore(name, previousSpec, operationId); }
+      try { await this.verifyProtectedPostgresVolume(service.id, previousSpec,binding); await this.restore(name, previousSpec, operationId); }
       catch (rollbackError) {
         if (isUncertainRuntimeError(rollbackError)) throw rollbackError;
         throw new Error(`Operation failed: ${failure}. Recovery also failed: ${message(rollbackError)}`);

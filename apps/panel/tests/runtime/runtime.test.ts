@@ -28,6 +28,7 @@ function task(target: Docker.ServiceSpec, state = 'running') {
 }
 function harness(initial: Docker.ServiceSpec | null) {
   const dataDir=mkdtempSync(join(tmpdir(),'panel-runtime-'));cleanup.push(()=>rmSync(dataDir,{recursive:true,force:true}));
+  new Database(join(dataDir,'agent.sqlite')).close();
   const runtime = new DockerRuntime('/never-connect', 18080, 'unused', dataDir);
   let current = initial ? structuredClone(initial) : null;
   let updateState: string | undefined;
