@@ -133,7 +133,7 @@ class HostCoordinatorTest(unittest.TestCase):
             run=mock.Mock()
             fcntl.flock(self.service_lock,fcntl.LOCK_UN)
             coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=run,**args)
-            self.assertEqual([call.args[0] for call in run.call_args_list],[['/usr/bin/systemctl','daemon-reload'],['/usr/bin/systemctl','start','servus-updater-socket.service'],['/usr/bin/systemctl','start','servus-supervisor.service'],['/usr/bin/systemctl','start','servus-updater.service']])
+            self.assertEqual([call.args[0] for call in run.call_args_list],[['/usr/bin/systemctl','daemon-reload'],['/usr/bin/systemctl','reset-failed','servus-updater-socket.service','servus-supervisor.service','servus-updater.service'],['/usr/bin/systemctl','start','servus-updater-socket.service'],['/usr/bin/systemctl','start','servus-supervisor.service'],['/usr/bin/systemctl','start','servus-updater.service']])
             self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('completed',))
             self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('abandoned',))
         finally:

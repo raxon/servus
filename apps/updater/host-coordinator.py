@@ -187,7 +187,8 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         if db.in_transaction:db.execute('ROLLBACK')
         raise
     try:
-        for command in (['/usr/bin/systemctl','start','servus-updater-socket.service'],
+        for command in (['/usr/bin/systemctl','reset-failed','servus-updater-socket.service','servus-supervisor.service','servus-updater.service'],
+                        ['/usr/bin/systemctl','start','servus-updater-socket.service'],
                         ['/usr/bin/systemctl','start','servus-supervisor.service'],
                         ['/usr/bin/systemctl','start','servus-updater.service']):
             _same_lock(supervisor,state_fd,'host.lock',host_lock)
