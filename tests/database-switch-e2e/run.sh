@@ -3,6 +3,7 @@ set -euo pipefail
 : "${SERVUS_IMPORT_IMAGE:?Set SERVUS_IMPORT_IMAGE to a test image containing Node and Docker CLI}"
 id=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 kind=${SERVUS_SWITCH_KIND:-postgres}
+binding_test=${SERVUS_SWITCH_BINDING:-0}
 [[ $kind == postgres || $kind == mariadb ]]
 service_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
 root="/tmp/servus-db-switch-$id"
@@ -12,11 +13,19 @@ candidate="panel-restore-$id"
 created_swarm=0
 mkdir -m 700 "$root"
 cleanup() {
-  if [[ $(docker service inspect --format '{{ index .Spec.Labels "servus.test" }}' "$service" 2>/dev/null || true) == "$id" ]]; then docker service rm "$service" >/dev/null; fi
-  for container in $(docker ps -aq --filter "label=servus.test=$id"); do docker rm -f "$container" >/dev/null 2>&1 || true; done
+  if [[ $(docker service inspect --format '{{ index .Spec.Labels "panel.service" }}' "$service" 2>/dev/null || true) == "$service_id" && $(docker service inspect --format '{{ index .Spec.Labels "panel.owner" }}' "$service" 2>/dev/null || true) == self-hosted-panel ]]; then docker service rm "$service" >/dev/null; fi
+  for container in $(docker ps -aq --filter "label=com.docker.swarm.service.name=$service"); do
+    if [[ $(docker inspect --format '{{ index .Config.Labels "panel.service" }}' "$container" 2>/dev/null || true) == "$service_id" ]]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+  done
   if [[ $(docker inspect --format '{{ index .Config.Labels "panel.restore.operation" }}' "$candidate" 2>/dev/null || true) == "$id" ]]; then docker rm -f "$candidate" >/dev/null; fi
   if [[ $(docker volume inspect --format '{{ index .Labels "panel.restore.operation" }}' "$candidate" 2>/dev/null || true) == "$id" ]]; then docker volume rm "$candidate" >/dev/null; fi
   if [[ $(docker volume inspect --format '{{ index .Labels "servus.test" }}' "$source_volume" 2>/dev/null || true) == "$id" ]]; then docker volume rm "$source_volume" >/dev/null; fi
+  for secret in $(docker secret ls -q --filter "label=panel.service=$service_id"); do docker secret rm "$secret" >/dev/null; done
+  if [[ -s "$root/project" ]]; then
+    project_id=$(cat "$root/project"); [[ $project_id =~ ^[a-f0-9-]{36}$ ]]
+    network="panel-project-$project_id"
+    if [[ $(docker network inspect --format '{{ index .Labels "panel.project" }}' "$network" 2>/dev/null || true) == "$project_id" ]]; then docker network rm "$network" >/dev/null; fi
+  fi
   if [[ $created_swarm == 1 ]]; then docker swarm leave --force >/dev/null; fi
   python3 -c 'import re,shutil,sys; p=sys.argv[1]; assert re.fullmatch(r"/tmp/servus-db-switch-[a-f0-9]{32}",p); shutil.rmtree(p)' "$root"
 }
@@ -25,6 +34,7 @@ if [[ $(docker info --format '{{.Swarm.LocalNodeState}}') != active ]]; then doc
 node_id=$(docker info --format '{{.Swarm.NodeID}}')
 password=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
 printf '%s' "$password" > "$root/password"; chmod 600 "$root/password"
+touch "$root/project"; chmod 600 "$root/project"
 docker volume create --label "servus.test=$id" --label panel.owner=self-hosted-panel --label "panel.service=$service_id" "$source_volume" >/dev/null
 if [[ $kind == postgres ]]; then
   image=postgres:17-alpine; data_path=/var/lib/postgresql/data
@@ -61,8 +71,8 @@ runner=$(cd "$(dirname "$0")/../database-import-e2e" && pwd)/agent-runner.mjs
 mounts=()
 if [[ -n ${SERVUS_IMPORT_DIST:-} ]]; then mounts+=(--mount "type=bind,src=$SERVUS_IMPORT_DIST,dst=/app/dist,readonly"); fi
 docker run --rm --network none --user 0 --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock "${mounts[@]}" \
-  --mount "type=bind,src=$root/dump,dst=/fixture-data,readonly" --mount "type=bind,src=$root/password,dst=/fixture-password,readonly" --mount "type=bind,src=$runner,dst=/fixture-agent-runner.mjs,readonly" \
-  -e PATH=/usr/bin:/bin -e "SERVUS_IMPORT_SOURCE_ID=$source_id" -e "SERVUS_IMPORT_SERVICE_ID=$service_id" -e "SERVUS_IMPORT_OPERATION=$id" -e "SERVUS_IMPORT_KIND=$kind" -e SERVUS_SWITCH_INSPECT=1 -e SERVUS_SWITCH_APPLY=1 \
+  --mount "type=bind,src=$root/dump,dst=/fixture-data,readonly" --mount "type=bind,src=$root/password,dst=/fixture-password,readonly" --mount "type=bind,src=$root/project,dst=/fixture-project" --mount "type=bind,src=$runner,dst=/fixture-agent-runner.mjs,readonly" \
+  -e PATH=/usr/bin:/bin -e "SERVUS_IMPORT_SOURCE_ID=$source_id" -e "SERVUS_IMPORT_SERVICE_ID=$service_id" -e "SERVUS_IMPORT_OPERATION=$id" -e "SERVUS_IMPORT_KIND=$kind" -e "SERVUS_SWITCH_BINDING=$binding_test" -e SERVUS_SWITCH_INSPECT=1 -e SERVUS_SWITCH_APPLY=1 \
   --entrypoint /usr/local/bin/node "$SERVUS_IMPORT_IMAGE" /fixture-agent-runner.mjs
 source_id=$(docker ps -q --no-trunc --filter "label=com.docker.swarm.service.name=$service" --filter "volume=$source_volume" | head -1)
 [[ -n $source_id ]]
@@ -76,10 +86,10 @@ fi
 [[ $source_result == expected-marker,source-after-backup ]]
 ! docker inspect "$candidate" >/dev/null 2>&1
 for container in $(docker ps -aq --filter "volume=$candidate"); do
-  [[ $(docker inspect --format '{{ index .Config.Labels "servus.test" }}' "$container") == "$id" ]]
+  [[ $(docker inspect --format '{{ index .Config.Labels "panel.service" }}' "$container") == "$service_id" ]]
   [[ $(docker inspect --format '{{.State.Running}}' "$container") == false ]]
   docker rm "$container" >/dev/null
 done
 [[ $(docker volume inspect --format '{{ index .Labels "panel.restore.operation" }}' "$candidate") == "$id" ]]
 docker volume rm "$candidate" >/dev/null
-printf 'PASS %s Swarm switch, target verification and fixture rollback\n' "$kind"
+printf 'PASS %s Swarm switch, target verification and fixture rollback (binding=%s)\n' "$kind" "$binding_test"

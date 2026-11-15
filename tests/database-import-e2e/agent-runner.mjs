@@ -11,11 +11,13 @@ import { prepareRestoreSwitchIntent, readRestoreSwitchIntent } from '/app/dist/a
 import { applyRestoreSwitch } from '/app/dist/agent/restore-switch-apply.js';
 import { rollbackRestoreSwitch } from '/app/dist/agent/restore-switch-rollback.js';
 import { finalizeRestoreRollback } from '/app/dist/agent/restore-rollback-finalize.js';
+import { DockerRuntime } from '/app/dist/agent/runtime.js';
 
 const dataDir = mkdtempSync('/tmp/restore-agent-e2e-'), store = new Store(dataDir);
 const serviceId = process.env.SERVUS_IMPORT_SERVICE_ID || '11111111-1111-4111-8111-111111111111', kind = process.env.SERVUS_IMPORT_KIND;
 const operationId = process.env.SERVUS_IMPORT_OPERATION, password = readFileSync('/fixture-password','utf8');
 const actor = store.setup('fixture@example.test','fixture-hash'), project = store.createProject('restore-fixture');
+if(process.env.SERVUS_SWITCH_BINDING==='1')writeFileSync('/fixture-project',project.id);
 const now = new Date().toISOString(), actionId = randomUUID(), jobId = randomUUID();
 store.db.prepare(`INSERT INTO services(id,project_id,name,image,port,hostname,replicas,revision,deployed_revision,state,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,1,1,1,'running',NULL,?,?)`)
   .run(serviceId,project.id,'fixture','fixture:latest',kind === 'postgres' ? 5432 : 3306,'fixture.internal',now,now);
@@ -34,7 +36,7 @@ const token = 'fixture-agent-token';
 const agent = await createAgent({dataDir,token,socketPath:join(dataDir,'socket'),dockerSocket:'/var/run/docker.sock',ingressPort:18080,ingressImage:'unused'},runtime);
 const headers = {authorization:`Bearer ${token}`};
 const path = `/services/${serviceId}/database-restore/${operationId}`;
-let switchDb, switchPlan, switchOptions;
+let switchDb, switchPlan, switchOptions, bindingCompleted=false;
 try {
   const upload = await agent.inject({method:'POST',url:`/services/${serviceId}/database-restore/upload?operationId=${operationId}&kind=${kind}`,headers:{...headers,'content-type':'application/octet-stream'},payload:readFileSync('/fixture-data')});
   if (upload.statusCode !== 200 || upload.json().phase !== 'reserved') throw new Error(`Upload failed: ${upload.statusCode}`);
@@ -60,7 +62,7 @@ try {
         for(const item of containers) {
           const info=await docker.getContainer(item.Id).inspect();
           if(!info.State.Running||info.Config.Labels?.['com.docker.swarm.service.name']!==`panel-app-${serviceId}`)continue;
-          const sourceQuery=kind==='postgres'?'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"':'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"';
+          const sourceQuery=kind==='postgres'?'PGPASSWORD="${POSTGRES_PASSWORD:-$(cat /run/secrets/panel-db-password)}" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"':'MYSQL_PWD="${MARIADB_PASSWORD:-$(cat /run/secrets/panel-db-password)}" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"';
           try {if(execFileSync('docker',['exec',item.Id,'sh','-c',sourceQuery],{encoding:'utf8',stdio:['ignore','pipe','ignore'],env:{...process.env,PATH:`${process.env.PATH}:/usr/local/bin`}}).trim()==='expected-marker')return;}catch{}
         }
         await new Promise(resolve=>setTimeout(resolve,1000));
@@ -69,6 +71,18 @@ try {
     };
     await applyRestoreSwitch({...options,verifyTarget});
     if(journal.switchIntent(operationId)?.stage!=='applied'||!journal.hasUnresolved(serviceId))throw new Error('Switch is not durably fenced');
+    if(process.env.SERVUS_SWITCH_BINDING==='1'){
+      journal.completeSwitch(operationId,serviceId,switchPlan.inspection.sourceVolume);bindingCompleted=true;
+      const actual=new DockerRuntime('/var/run/docker.sock',18080,'unused',dataDir);
+      actual.ensureInfrastructure=async()=>{};
+      actual.pull=async()=>switchPlan.previousSpec.TaskTemplate.ContainerSpec.Image;
+      actual.verifyService=async()=>verifyTarget(switchPlan);
+      const service={...snapshot,name:'fixture',image:kind==='postgres'?'postgres:17-alpine':'mariadb:11.4',hostname:'fixture.internal',port:kind==='postgres'?5432:3306,replicas:1,revision:1,deployedRevision:1,state:'running',createdAt:now,updatedAt:now,lastError:null,domains:[]};
+      await actual.apply(service,'restart',randomUUID());await verifyTarget(switchPlan);
+      await actual.apply(service,'deploy',randomUUID());await verifyTarget(switchPlan);
+      const current=await docker.getService(`panel-app-${serviceId}`).inspect();
+      if(current.Spec.TaskTemplate.ContainerSpec.Mounts[0]?.Source!==switchPlan.inspection.candidateVolume||current.Spec.Labels?.['panel.restore.operation']!==operationId)throw new Error('Database lifecycle did not retain the restored volume');
+    }
   } else {
     for (let attempt=0;attempt<2;attempt++) {
       const cancelled = await agent.inject({method:'POST',url:`${path}/cancel`,headers,payload:{}});
@@ -90,13 +104,19 @@ try {
       }
       throw new Error('Original database did not become ready');
     };
-    await rollbackRestoreSwitch({...switchOptions,verifySource});
-    if(switchOptions.journal.switchIntent(operationId)?.stage!=='rolled_back')throw new Error('Rollback was not recorded');
-    await rollbackRestoreSwitch({...switchOptions,verifySource});
-    const finished=await finalizeRestoreRollback({...switchOptions,dataDir,verifySource});
-    if(finished.phase!=='cancelled'||switchOptions.journal.hasUnresolved(serviceId)||switchOptions.journal.retainedVolume(operationId)?.volume_name!==switchPlan.inspection.candidateVolume)throw new Error('Rollback retention was not recorded');
-    await docker.getVolume(switchPlan.inspection.candidateVolume).inspect();
-    await finalizeRestoreRollback({...switchOptions,dataDir,verifySource});
+    if(bindingCompleted){
+      const service=docker.getService(`panel-app-${serviceId}`),current=await service.inspect();
+      if(current.Spec.Labels?.['panel.owner']!=='self-hosted-panel'||current.Spec.Labels?.['panel.service']!==serviceId)throw new Error('Fixture service ownership changed');
+      await service.update({...switchPlan.previousSpec,version:current.Version.Index});await verifySource(switchPlan);
+    } else {
+      await rollbackRestoreSwitch({...switchOptions,verifySource});
+      if(switchOptions.journal.switchIntent(operationId)?.stage!=='rolled_back')throw new Error('Rollback was not recorded');
+      await rollbackRestoreSwitch({...switchOptions,verifySource});
+      const finished=await finalizeRestoreRollback({...switchOptions,dataDir,verifySource});
+      if(finished.phase!=='cancelled'||switchOptions.journal.hasUnresolved(serviceId)||switchOptions.journal.retainedVolume(operationId)?.volume_name!==switchPlan.inspection.candidateVolume)throw new Error('Rollback retention was not recorded');
+      await docker.getVolume(switchPlan.inspection.candidateVolume).inspect();
+      await finalizeRestoreRollback({...switchOptions,dataDir,verifySource});
+    }
   }
   switchDb?.close();await agent.close(); store.close(); rmSync(dataDir,{recursive:true,force:true});
 }

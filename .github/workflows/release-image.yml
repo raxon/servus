@@ -106,7 +106,9 @@ jobs:
           IMAGE_ID: ${{ steps.build.outputs.image_id }}
         run: |
           for kind in postgres mariadb; do
-            SERVUS_SWITCH_KIND="$kind" SERVUS_IMPORT_IMAGE="$IMAGE_ID" bash tests/database-switch-e2e/run.sh
+            for binding in 0 1; do
+              SERVUS_SWITCH_KIND="$kind" SERVUS_SWITCH_BINDING="$binding" SERVUS_IMPORT_IMAGE="$IMAGE_ID" bash tests/database-switch-e2e/run.sh
+            done
           done
       - name: Test supervisor entrypoints in the built image
         env:
