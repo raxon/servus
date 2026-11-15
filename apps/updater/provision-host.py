@@ -112,12 +112,13 @@ def prepare(config_dir, state_dir):
     try:
         parent = directory(parent_path)
         state = child_directory(parent, state_name)
-        for name in ('staging', 'maintenance', 'backups', 'policies', 'docker-config'):
+        for name in ('staging', 'maintenance', 'backups', 'policies', 'docker-config', 'host-generations'):
             fd = child_directory(state, name)
             try:
                 if name == 'docker-config' and os.listdir(fd):
                     raise ProvisionError('Docker configuration must be empty')
             finally: os.close(fd)
+        publish_once(state, 'host.lock', b'')
         values = {'SERVUS_UPDATER_STATE_DIR': state_dir, 'SERVUS_UPDATER_SOCKET_DIR': '/run/servus-updater/control',
                   'SERVUS_COMPONENT_UID': '1000', 'SERVUS_UPDATER_SOCKET_GID': '1000',
                   'SERVUS_SUPERVISOR_COMMAND_SOCKET': config_dir + '/supervisor-control/command'}

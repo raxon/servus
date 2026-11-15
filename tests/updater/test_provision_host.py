@@ -134,10 +134,13 @@ class HostProvisioningTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(path.stat().st_mode),0o600)
         self.assertIn('SERVUS_UPDATER_SOCKET_DIR=/run/servus-updater/control\n',contents)
         self.assertIn('SERVUS_COMPONENT_UID=1000\n',contents)
-        for name in ('staging','maintenance','backups','policies','docker-config'):
+        for name in ('staging','maintenance','backups','policies','docker-config','host-generations'):
             value=(self.state/name).stat()
             self.assertEqual((value.st_uid,value.st_gid,stat.S_IMODE(value.st_mode)),(0,0,0o700))
+        lock=self.state/'host.lock'; lock_inode=lock.stat().st_ino
+        self.assertEqual((lock.stat().st_uid,lock.stat().st_gid,stat.S_IMODE(lock.stat().st_mode),lock.read_bytes()),(0,0,0o600,b''))
         self.prepare()
+        self.assertEqual(lock.stat().st_ino,lock_inode)
         self.assertEqual(path.stat().st_ino,inode);self.assertEqual(path.read_text(),contents)
 
     def test_existing_configuration_is_not_overwritten(self):
@@ -151,6 +154,13 @@ class HostProvisioningTest(unittest.TestCase):
         path.unlink();path.mkdir(mode=0o777);path.chmod(0o777)
         with self.assertRaises(module.ProvisionError): self.prepare()
         self.assertEqual(stat.S_IMODE(path.stat().st_mode),0o777)
+
+    def test_untrusted_host_lock_and_generation_directory_are_rejected(self):
+        self.prepare();lock=self.state/'host.lock';lock.unlink();lock.symlink_to(self.config/'updater.env')
+        with self.assertRaises(OSError):self.prepare()
+        lock.unlink();lock.touch(mode=0o600)
+        generations=self.state/'host-generations';generations.rmdir();generations.symlink_to(self.config)
+        with self.assertRaises(OSError):self.prepare()
 
     def test_external_docker_configuration_is_never_adopted(self):
         self.prepare(); item=self.state/'docker-config/config.json';item.write_text('{}')
