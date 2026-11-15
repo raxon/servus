@@ -46,11 +46,23 @@ run_import() {
     module=/fixture-import.ts; journal_module=/fixture-journal.ts; preparation_module=/fixture-preparation.ts; candidate_module=/fixture-candidate.ts; archive_module=/fixture-archive.ts; secrets_module=/app/dist/shared/fixture-secrets.ts
     mounts+=(--mount "type=bind,src=$SERVUS_IMPORT_SOURCE,dst=$module,readonly" --mount "type=bind,src=$(dirname "$SERVUS_IMPORT_SOURCE")/restore-journal.ts,dst=$journal_module,readonly" --mount "type=bind,src=$(dirname "$SERVUS_IMPORT_SOURCE")/restore-preparation.ts,dst=$preparation_module,readonly" --mount "type=bind,src=$(dirname "$SERVUS_IMPORT_SOURCE")/restore-candidate.ts,dst=$candidate_module,readonly" --mount "type=bind,src=$(dirname "$SERVUS_IMPORT_SOURCE")/restore-archive.ts,dst=$archive_module,readonly" --mount "type=bind,src=${SERVUS_IMPORT_SECRETS_SOURCE:-$(dirname "$SERVUS_IMPORT_SOURCE")/../shared/secrets.ts},dst=$secrets_module,readonly")
   fi
+  if [[ -n ${SERVUS_IMPORT_DIST:-} ]]; then mounts+=(--mount "type=bind,src=$SERVUS_IMPORT_DIST,dst=/app/dist,readonly"); fi
   docker run --rm --network none --user 0 --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
     "${mounts[@]}" \
     --mount "type=bind,src=$dump,dst=/fixture-data,readonly" --mount "type=bind,src=$root/password,dst=/fixture-password,readonly" --mount "type=bind,src=$runner,dst=/fixture-runner.mjs,readonly" \
     -e PATH=/usr/bin:/bin -e "SERVUS_IMPORT_EXISTING=$target" -e "SERVUS_IMPORT_SOURCE_ID=$source_id" -e "SERVUS_IMPORT_OPERATION=$id" -e "SERVUS_IMPORT_KIND=$kind" -e "SERVUS_IMPORT_MODULE=$module" -e "SERVUS_IMPORT_JOURNAL=$journal_module" -e "SERVUS_IMPORT_PREPARATION=$preparation_module" -e "SERVUS_IMPORT_CANDIDATE=$candidate_module" -e "SERVUS_IMPORT_ARCHIVE=$archive_module" -e "SERVUS_IMPORT_SECRETS=$secrets_module" -e "SERVUS_IMPORT_SHA256=$digest" -e "SERVUS_IMPORT_TAMPER=$tamper" \
     --entrypoint /usr/local/bin/node "$SERVUS_IMPORT_IMAGE" /fixture-runner.mjs
+}
+run_agent_import() {
+  local kind=$1 dump=$2 source_id runner
+  source_id=$(docker inspect --format '{{.Id}}' "$source_name")
+  runner=$(cd "$(dirname "$0")" && pwd)/agent-runner.mjs
+  local -a mounts=()
+  if [[ -n ${SERVUS_IMPORT_DIST:-} ]]; then mounts+=(--mount "type=bind,src=$SERVUS_IMPORT_DIST,dst=/app/dist,readonly"); fi
+  docker run --rm --network none --user 0 --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock "${mounts[@]}" \
+    --mount "type=bind,src=$dump,dst=/fixture-data,readonly" --mount "type=bind,src=$root/password,dst=/fixture-password,readonly" --mount "type=bind,src=$runner,dst=/fixture-agent-runner.mjs,readonly" \
+    -e PATH=/usr/bin:/bin -e "SERVUS_IMPORT_SOURCE_ID=$source_id" -e "SERVUS_IMPORT_OPERATION=$id" -e "SERVUS_IMPORT_KIND=$kind" \
+    --entrypoint /usr/local/bin/node "$SERVUS_IMPORT_IMAGE" /fixture-agent-runner.mjs
 }
 reject_import() {
   local status=0
@@ -93,6 +105,17 @@ for kind in postgres mariadb; do
   [[ $result == expected-marker && $source_result == expected-marker ]]
   reject_import "$kind" "$root/dump" "$(sha256sum "$root/dump" | cut -d' ' -f1)" 0 1
   printf 'PASS %s isolated import and nonempty-target rejection\n' "$kind"
+  docker rm -f -v "$candidate_name" >/dev/null; docker volume rm "$volume" >/dev/null
+  run_agent_import "$kind" "$root/dump"
+  if [[ $kind == postgres ]]; then
+    result=$(docker exec "$candidate_name" sh -c 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"')
+    source_result=$(docker exec "$source_name" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"')
+  else
+    result=$(docker exec "$candidate_name" sh -c 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"')
+    source_result=$(docker exec "$source_name" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"')
+  fi
+  [[ $result == expected-marker && $source_result == expected-marker ]]
+  printf 'PASS %s agent upload and isolated preparation\n' "$kind"
   docker rm -f -v "$source_name" "$candidate_name" >/dev/null
   docker volume rm "$volume" >/dev/null
 done
