@@ -323,7 +323,7 @@ def cleanup_stopped_legacy_upload(operation_id, restore_id, service_id, lease, s
     record={'version':1,'operationId':operation_id,'restoreId':restore_id,'serviceId':service_id,'state':'intent'}
     supervisor._atomic_file(lease._owner.journal,marker,json.dumps(record,separators=(',',':')).encode('ascii')+b'\n',0o600)
     lease.assert_locked(operation_id,'stopped_unverified')
-    raw=supervisor._docker('run','--rm','--name','servus-recovery-'+operation_id,'--user','1000:1000',
+    raw=supervisor._docker('run','--rm','--name','servus-recovery-'+operation_id,'--label','servus.recovery='+operation_id,'--user','1000:1000',
         '--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges',
         '--pids-limit','64','--memory','256m','--tmpfs','/tmp:rw,noexec,nosuid,nodev,size=32m',
         '--mount','type=bind,src='+data_dir+',dst=/data','--entrypoint','node',hub.policy.image_id,
