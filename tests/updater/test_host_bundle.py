@@ -84,6 +84,24 @@ class HostBundleTest(unittest.TestCase):
     def collect(self):
         return bundle.collect(self.fd, self.manifest, ('core.py', 'runner.py'))
 
+    def test_collects_only_manifest_verified_systemd_units(self):
+        directory=self.root/'deployment'/'systemd';directory.mkdir(parents=True,mode=0o755)
+        (self.root/'deployment').chmod(0o755)
+        name='servus-updater.service';content=b'[Service]\nType=simple\n'
+        path=directory/name;path.write_bytes(content);path.chmod(0o644)
+        self.manifest['deployment/systemd/'+name]=(0o644,len(content),hashlib.sha256(content).hexdigest())
+        self.assertEqual(bundle.collect_units(self.fd,self.manifest,(name,)),{name:(0o644,content)})
+        path.write_bytes(b'[Service]\nType=oneshot\n')
+        with self.assertRaises(bundle.HostBundleError):bundle.collect_units(self.fd,self.manifest,(name,))
+        path.unlink();path.symlink_to('/etc/passwd')
+        with self.assertRaises(OSError):bundle.collect_units(self.fd,self.manifest,(name,))
+
+    def test_rejects_missing_unsafe_and_duplicate_unit_names(self):
+        for required in (('../escape.service',),('servus-updater.service','servus-updater.service'),
+                         ('other.service',),('servus-updater.service',)):
+            with self.subTest(required=required),self.assertRaises(bundle.HostBundleError):
+                bundle.collect_units(self.fd,self.manifest,required)
+
     def test_collects_exact_bytes_and_future_signed_modules(self):
         self.add('future.py', b'future', 0o644)
         self.assertEqual(self.collect(), {'core.py': (0o644, b'core'), 'future.py': (0o644, b'future'),

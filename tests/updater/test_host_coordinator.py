@@ -52,7 +52,12 @@ class HostCoordinatorTest(unittest.TestCase):
         self.daemon=SimpleNamespace(resolve_active_policy=mock.Mock(return_value=('/root/policy','/root/accepted',self.policy)))
         self.extractor=SimpleNamespace(MANIFEST_LIMIT=262144,_manifest_files=mock.Mock(return_value=self.manifest))
         self.backup=SimpleNamespace(_read=lambda fd,limit:os.read(fd,limit+1))
-        self.install_host=SimpleNamespace(MODULES=('install-gh.py','core.py'))
+        self.install_host=SimpleNamespace(MODULES=('install-gh.py','core.py'),UNITS=('servus-updater.service',))
+        unit_dir=self.stage/'deployment'/'systemd';unit_dir.mkdir(parents=True,mode=0o755)
+        (self.stage/'deployment').chmod(0o755)
+        unit=b'[Service]\nType=simple\n';unit_path=unit_dir/'servus-updater.service'
+        unit_path.write_bytes(unit);unit_path.chmod(0o644)
+        self.manifest['deployment/systemd/servus-updater.service']=(0o644,len(unit),hashlib.sha256(unit).hexdigest())
         self.install_gh=SimpleNamespace(PINNED={'amd64':self.pin,'arm64':self.pin})
 
     def tearDown(self):
@@ -186,6 +191,12 @@ class HostCoordinatorTest(unittest.TestCase):
         self.assertEqual(name,'runtime-'+self.fixture.op)
         self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('prepared',))
         self.assertEqual((self.candidates/name/'bin'/'gh').read_bytes(),self.cli)
+
+    def test_rejects_modified_systemd_unit_before_staging(self):
+        (self.stage/'deployment'/'systemd'/'servus-updater.service').write_bytes(b'changed')
+        with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}),self.assertRaises(bundle.HostBundleError):
+            self.prepare()
+        self.assertFalse(list(self.candidates.iterdir()))
 
     def test_preparation_can_return_authenticated_activation_material(self):
         with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}):

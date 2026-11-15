@@ -452,6 +452,7 @@ def prepare_completed(db, operation_id, *, state_dir, install_dir, gate_dir,
         finally: os.close(fd)
         manifest = extractor._manifest_files(raw)
         modules = bundle.collect(staging, manifest, install_host.MODULES)
+        bundle.collect_units(staging, manifest, install_host.UNITS)
         arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(platform.machine())
         if arch not in install_gh.PINNED:
             raise HostPreparationError('Host architecture is unsupported')

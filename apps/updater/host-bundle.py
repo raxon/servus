@@ -13,6 +13,7 @@ import re
 import stat
 
 NAME = re.compile(r'^[a-z0-9][a-z0-9-]{0,63}\.py$')
+UNIT_NAME = re.compile(r'^servus-[a-z0-9][a-z0-9-]{0,63}\.(?:service|timer)$')
 MAX_MODULE = 4 * 1024 * 1024
 MAX_TOTAL = 16 * 1024 * 1024
 MAX_MODULES = 128
@@ -158,6 +159,35 @@ def collect(stage_fd, manifest, required):
             os.close(updater)
         if apps is not None:
             os.close(apps)
+
+
+def collect_units(stage_fd, manifest, required):
+    """Read signed systemd units without installing or executing them."""
+    info=os.fstat(stage_fd)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or
+        stat.S_IMODE(info.st_mode)!=0o700 or not isinstance(manifest,dict) or
+        not isinstance(required,(tuple,list)) or not 1<=len(required)<=MAX_MODULES or
+        any(not isinstance(name,str) or not UNIT_NAME.fullmatch(name) for name in required) or
+        len(set(required))!=len(required)):
+        raise HostBundleError('Invalid systemd unit bundle input')
+    prefix='deployment/systemd/'
+    selected={name:manifest.get(prefix+name) for name in required}
+    if any(not isinstance(value,tuple) or len(value)!=3 or value[0]!=0o644 for value in selected.values()):
+        raise HostBundleError('Incomplete or invalid systemd unit bundle')
+    deployment=units=None
+    try:
+        deployment=_directory(stage_fd,'deployment',info.st_dev)
+        units=_directory(deployment,'systemd',info.st_dev)
+        result={};total=0
+        for name,expected in sorted(selected.items()):
+            mode,content=_read_module(units,name,expected,info.st_dev,allowed_modes=(0o644,))
+            total+=len(content)
+            if total>MAX_TOTAL:raise HostBundleError('Systemd unit bundle is too large')
+            result[name]=(mode,content)
+        return result
+    finally:
+        if units is not None:os.close(units)
+        if deployment is not None:os.close(deployment)
 
 
 def read_pinned_cli(host_fd, pinned):
