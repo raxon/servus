@@ -132,7 +132,7 @@ class ArchiveTest(unittest.TestCase):
                 item, data = entries[-1]
                 data = transform(data); item.size = len(data); entries[-1] = (item, data)
             return mutate
-        for transform in (lambda data:data.replace(b'"minimumUpdaterAbi":1', b'"minimumUpdaterAbi":2'),
+        for transform in (lambda data:data.replace(b'"minimumUpdaterAbi":1', b'"minimumUpdaterAbi":3'),
                           lambda data:data.replace(b'"schema":1', b'"schema":1,"schema":1'),
                           lambda data:data.replace(b'"sha256":"', b'"sha256":"f', 1)):
             with self.subTest(transform=transform), self.assertRaises(extractor.ExtractionError):
@@ -170,8 +170,11 @@ class ArchiveTest(unittest.TestCase):
                 raw = json.dumps(document, separators=(',', ':')).encode()
                 item.size = len(raw); entries[-1] = (item, raw)
             return mutate
+        with mock.patch.object(extractor, 'UPDATER_ABI', 1):
+            with self.assertRaises(extractor.ExtractionError): extractor._read_archive(make_archive(set_abi(2)))
         with mock.patch.object(extractor, 'UPDATER_ABI', 2):
             self.assertIn('manifest.json', extractor._read_archive(make_archive(set_abi(1))))
+            self.assertIn('manifest.json', extractor._read_archive(make_archive(set_abi(2))))
             for abi in (0, 3, True, None, '1'):
                 with self.subTest(abi=abi), self.assertRaises(extractor.ExtractionError):
                     extractor._read_archive(make_archive(set_abi(abi)))
