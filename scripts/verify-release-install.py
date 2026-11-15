@@ -36,7 +36,12 @@ def expected_files(commit):
     records = [{'path': name, 'type': 'file', 'mode': mode, 'size': len(content),
                 'sha256': hashlib.sha256(content).hexdigest()}
                for name, (mode, content) in sorted(expected.items())]
-    document = {'schema': 1, 'minimumUpdaterAbi': 1, 'files': records}
+    abi_entry = subprocess.run(['git', 'ls-tree', '--name-only', commit, '--', 'scripts/release-updater-abi.txt'],
+                               check=True, capture_output=True, text=True).stdout.strip()
+    abi = subprocess.check_output(['git', 'show', commit + ':scripts/release-updater-abi.txt'], text=True).strip() if abi_entry else '1'
+    if abi not in ('1', '2'):
+        raise ValueError('Invalid minimum updater ABI')
+    document = {'schema': 1, 'minimumUpdaterAbi': int(abi), 'files': records}
     expected['manifest.json'] = (0o644, (json.dumps(document, separators=(',', ':'), sort_keys=True) + '\n').encode())
     return expected
 

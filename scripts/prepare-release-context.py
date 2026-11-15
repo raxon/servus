@@ -60,7 +60,11 @@ def run():
         raise ValueError('Install manifest is empty')
     if sum(item['size'] for item in records) > 16 * 1024 * 1024:
         raise ValueError('Install files exceed size limit')
-    document = {'schema': 1, 'minimumUpdaterAbi': 1, 'files': sorted(records, key=lambda item: item['path'])}
+    abi_file = output / 'scripts/release-updater-abi.txt'
+    abi = abi_file.read_text(encoding='ascii').strip() if abi_file.exists() else '1'
+    if abi not in ('1', '2'):
+        raise ValueError('Invalid minimum updater ABI')
+    document = {'schema': 1, 'minimumUpdaterAbi': int(abi), 'files': sorted(records, key=lambda item: item['path'])}
     (assets / 'manifest.json').write_text(json.dumps(document, separators=(',', ':'), sort_keys=True) + '\n', encoding='utf-8')
     os.chmod(assets / 'manifest.json', 0o644)
     dockerfile = (output / 'Dockerfile').read_bytes()

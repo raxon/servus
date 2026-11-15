@@ -2,6 +2,7 @@ import importlib.util
 import configparser
 import shlex
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -100,6 +101,23 @@ class ReleaseArtifactTest(unittest.TestCase):
             self.assertFalse((context / 'untracked-secret').exists())
             self.assertIn('COPY --chown=0:0 .servus-install/ /opt/servus/install/', (context / 'Dockerfile.release').read_text())
             self.assertNotEqual(subprocess.run(['python3', str(PREPARE), '--revision', 'HEAD', '--output', str(Path(directory) / 'bad')], cwd=repo, capture_output=True).returncode, 0)
+
+            (repo / 'scripts/release-updater-abi.txt').write_text('2\n')
+            subprocess.run(['git', 'add', 'scripts/release-updater-abi.txt'], cwd=repo, check=True)
+            subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'require ABI 2'], cwd=repo, check=True)
+            next_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+            (repo / 'scripts/release-updater-abi.txt').write_text('1\n')
+            next_context = Path(directory) / 'context-abi2'
+            subprocess.run(['python3', str(PREPARE), '--revision', next_commit, '--output', str(next_context)], cwd=repo, check=True)
+            self.assertEqual(json.loads((next_context / '.servus-install/manifest.json').read_text())['minimumUpdaterAbi'], 2)
+            previous = os.getcwd()
+            try:
+                os.chdir(repo)
+                expected = verify.expected_files(next_commit)
+                self.assertEqual(json.loads(expected['manifest.json'][1])['minimumUpdaterAbi'], 2)
+                self.assertEqual(json.loads(verify.expected_files(commit)['manifest.json'][1])['minimumUpdaterAbi'], 1)
+            finally:
+                os.chdir(previous)
 
     @unittest.skipUnless(os.environ.get('SERVUS_RELEASE_DOCKER_TEST') == '1', 'Docker integration is opt-in')
     def test_actual_image_install_files(self):
