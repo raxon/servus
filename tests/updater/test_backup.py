@@ -105,7 +105,11 @@ class RestoreJournalSchemaTest(unittest.TestCase):
             backup._agent_schema(db)
             db.execute("UPDATE restore_upload_locks SET lock_id='bad'")
             with self.assertRaisesRegex(backup.CaptureError,'Upload lock journal is invalid'): backup._agent_schema(db)
+            db.execute("UPDATE restore_upload_locks SET lock_id=?",('c'*32,))
+            db.execute('DELETE FROM restore_operations')
+            with self.assertRaisesRegex(backup.CaptureError,'Upload lock journal is invalid'): backup._agent_schema(db)
             db.execute('DELETE FROM restore_upload_locks')
+            db.execute('INSERT INTO restore_operations(id,service_id,kind,archive_sha256,phase,updated_at) VALUES(?,?,?,?,?,?)',(ident,UUID,'postgres','b'*64,'cancelled',now))
             db.execute('INSERT INTO restore_review_phases(operation_id,phase) VALUES(?,?)',(ident,'importing'))
             with self.assertRaises(backup.CaptureError): backup._agent_schema(db)
 
@@ -636,7 +640,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
 
     def test_legacy_agent_without_restore_table_is_supported(self):
         for table in ('restore_switch_intents','restore_retained_volumes','restore_volume_bindings','restore_upload_locks','restore_review_phases','restore_operations'):
-            self.agent.execute(f'DROP TABLE {table}')
+            self.agent.execute(f'DROP TABLE IF EXISTS {table}')
         self.agent.commit();self.fix_permissions();self.capture()
         with sqlite3.connect(self.dst/'agent.sqlite') as restored:
             self.assertIsNone(restored.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='restore_operations'").fetchone())

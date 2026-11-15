@@ -112,6 +112,12 @@ try {
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
     await page.screenshot({path:`/tmp/servus-restore-review-${viewport.width}.png`});
     await dialog.getByRole('button',{name:'Close dialog'}).click();
+    operation={operationId:'b'.repeat(32),kind:'postgres',phase:'needs_review'};
+    await page.reload();
+    await section.getByRole('button',{name:'Restore',exact:true}).click();
+    await dialog.getByRole('alert').getByText('The restore state could not be verified.').waitFor();
+    await dialog.getByText(operation.operationId).waitFor();
+    await dialog.getByRole('button',{name:'Close dialog'}).click();
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
     if(viewport.width===1440)await page.screenshot({path:'/tmp/servus-database-export-ui.png'});
     await page.close();
