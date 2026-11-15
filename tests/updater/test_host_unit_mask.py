@@ -48,6 +48,31 @@ class HostUnitMaskTest(unittest.TestCase):
         for name in mask.UNITS:self.assertEqual(os.readlink(self.units/name),'/dev/null')
         self.restore();self.assertEqual(self.phase(),'restored');self.assert_originals()
 
+    def test_masked_stop_checks_locks_and_fences_consumers(self):
+        self.apply();run=mock.Mock();fence=mock.Mock(return_value=None)
+        mask.stop_masked_units(self.base.db,self.base.op,self.base.digest,host_lock=self.base.hl,fence=fence,run=run,**self.args())
+        self.assertEqual([call.args[0] for call in run.call_args_list],[
+            ['/usr/bin/systemctl','daemon-reload'],['/usr/bin/systemctl','stop','servus-updater.service'],
+            ['/usr/bin/systemctl','stop','servus-supervisor.service'],['/usr/bin/systemctl','stop','servus-updater-socket.service'],
+            ['/usr/bin/systemctl','stop','servus-updater-bootstrap.service']])
+        fence.assert_called_once_with();self.assertEqual(self.phase(),'masked')
+        fence.side_effect=RuntimeError('still running')
+        with self.assertRaises(RuntimeError):
+            mask.stop_masked_units(self.base.db,self.base.op,self.base.digest,host_lock=self.base.hl,fence=fence,run=run,**self.args())
+        self.assertEqual(self.phase(),'masked')
+
+    def test_masked_stop_rejects_incomplete_mask_or_lost_host_lock(self):
+        self.apply();run=mock.Mock();fence=mock.Mock(return_value=None)
+        fcntl.flock(self.base.hl,fcntl.LOCK_UN)
+        try:
+            with self.assertRaises(fixtures.supervisor.SupervisorError):
+                mask.stop_masked_units(self.base.db,self.base.op,self.base.digest,host_lock=self.base.hl,fence=fence,run=run,**self.args())
+        finally:fcntl.flock(self.base.hl,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        (self.units/mask.UNITS[0]).unlink();(self.units/mask.UNITS[0]).write_bytes(self.originals[mask.UNITS[0]])
+        with self.assertRaises(mask.UnitMaskError):
+            mask.stop_masked_units(self.base.db,self.base.op,self.base.digest,host_lock=self.base.hl,fence=fence,run=run,**self.args())
+        self.assertFalse(run.called)
+
     def test_recovery_loads_verified_originals_from_journal(self):
         self.apply()
         self.assertEqual(mask.load_verified_backup(self.base.db,self.base.op,self.base.digest,self.base.s),(self.originals,self.states))

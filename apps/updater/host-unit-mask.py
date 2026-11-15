@@ -299,6 +299,39 @@ def mask_units(db, operation_id, image_digest, originals, *, state, install, uni
         raise UnitMaskError('Unit mask journal changed')
 
 
+
+def stop_masked_units(db, operation_id, image_digest, *, state, install, units, host_lock,
+                      service_lock, install_lock, supervisor, coordinator, fence, run=subprocess.run):
+    """Stop durably masked host units before the caller exchanges runtime files.
+
+    The fence independently verifies systemd, cgroups, namespaces and open files.
+    Repeating the stop after an interruption is safe; journal state remains masked.
+    """
+    if not callable(fence): raise UnitMaskError('A host process fence is required')
+    def guard():
+        _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
+        coordinator._same_lock(supervisor, state, 'host.lock', host_lock)
+        _directory(state, 0o700); _directory(install, 0o700); _directory(units, 0o755)
+        row=db.execute('SELECT image_digest,phase FROM host_unit_masks WHERE operation_id=?',(operation_id,)).fetchone()
+        if row != (image_digest,'masked') or not all(_masked(units,name) for name in UNITS):
+            raise UnitMaskError('Host unit masks are incomplete')
+        load_verified_backup(db,operation_id,image_digest,state)
+    guard()
+    try:
+        for command in (['/usr/bin/systemctl','daemon-reload'],
+                        ['/usr/bin/systemctl','stop','servus-updater.service'],
+                        ['/usr/bin/systemctl','stop','servus-supervisor.service'],
+                        ['/usr/bin/systemctl','stop','servus-updater-socket.service'],
+                        ['/usr/bin/systemctl','stop','servus-updater-bootstrap.service']):
+            guard()
+            run(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,cwd='/',
+                env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'},timeout=60,check=True)
+    except (OSError,subprocess.SubprocessError) as error:
+        raise UnitMaskError('Host service stop requires recovery') from error
+    guard()
+    if fence() is not None: raise UnitMaskError('Host process fence returned an invalid result')
+    guard()
+
 def restore_units(db, operation_id, image_digest, originals, service_states, *, state, install, units,
                   service_lock, install_lock, supervisor, coordinator):
     """Restore only verified backups and exact masks, including partial masking."""
