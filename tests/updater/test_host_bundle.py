@@ -89,6 +89,42 @@ class HostBundleTest(unittest.TestCase):
         with mock.patch.object(bundle, 'MAX_TOTAL', 3):
             with self.assertRaises(bundle.HostBundleError): self.collect()
 
+    def test_reads_only_the_pinned_cli_from_a_trusted_host_directory(self):
+        host=self.root/'host';host.mkdir(mode=0o755);binary=host/'bin';binary.mkdir(mode=0o755)
+        path=binary/'gh';path.write_bytes(b'trusted cli');path.chmod(0o755)
+        pin=('a'*64,hashlib.sha256(b'trusted cli').hexdigest(),len(b'trusted cli'))
+        fd=os.open(host,os.O_RDONLY|os.O_DIRECTORY)
+        try:
+            self.assertEqual(bundle.read_pinned_cli(fd,pin),b'trusted cli')
+            path.write_bytes(b'changed cli')
+            with self.assertRaises(bundle.HostBundleError):bundle.read_pinned_cli(fd,pin)
+            path.write_bytes(b'trusted cli');(binary/'other').touch()
+            with self.assertRaises(bundle.HostBundleError):bundle.read_pinned_cli(fd,pin)
+            (binary/'other').unlink();path.unlink();path.symlink_to('/bin/true')
+            with self.assertRaises(OSError):bundle.read_pinned_cli(fd,pin)
+        finally:os.close(fd)
+
+    def test_rejects_invalid_cli_pin_before_opening_binary(self):
+        host=self.root/'host';host.mkdir(mode=0o755);fd=os.open(host,os.O_RDONLY|os.O_DIRECTORY)
+        try:
+            for pin in (('a'*64,'b'*64,0),('a'*64,'b'*64,True),('x'*64,'b'*64,10),('a'*64,'b'*64,bundle.MAX_CLI+1)):
+                with self.subTest(pin=pin),self.assertRaises(bundle.HostBundleError):bundle.read_pinned_cli(fd,pin)
+        finally:os.close(fd)
+
+    def test_cli_compatibility_uses_only_static_candidate_metadata(self):
+        spec=importlib.util.spec_from_file_location('install_gh',ROOT/'apps/updater/install-gh.py')
+        installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
+        source=(ROOT/'apps/updater/install-gh.py').read_bytes()
+        modules={'install-gh.py':(0o644,source)};pin=installer.PINNED['amd64']
+        bundle.check_cli_compatibility(modules,'amd64',pin)
+        bundle.check_cli_compatibility(modules,'arm64',installer.PINNED['arm64'])
+        with self.assertRaises(bundle.HostBundleError):bundle.check_cli_compatibility(modules,'amd64',('a'*64,'b'*64,1))
+        modified=source+b'\nPINNED["amd64"] = ("a", "b", 1)\n'
+        with self.assertRaises(bundle.HostBundleError):bundle.check_cli_compatibility({'install-gh.py':(0o644,modified)},'amd64',pin)
+        duplicate=source+b'\nPINNED = {}\n'
+        with self.assertRaises(bundle.HostBundleError):bundle.check_cli_compatibility({'install-gh.py':(0o644,duplicate)},'amd64',pin)
+        with self.assertRaises(bundle.HostBundleError):bundle.check_cli_compatibility({},'amd64',pin)
+
     def test_stages_generation_with_completion_record_and_never_overwrites(self):
         operation='12345678-1234-4234-8234-123456789abc'
         digest='sha256:'+'a'*64
@@ -129,6 +165,35 @@ class HostBundleTest(unittest.TestCase):
         (path/'core.py').write_bytes(b'core')
         (path/'unexpected').touch()
         with self.assertRaises(bundle.HostBundleError):bundle.verify_generation(self.fd,operation,digest,modules)
+
+    def test_runtime_tree_contains_pinned_cli_and_readable_modules(self):
+        operation='12345678-1234-4234-8234-123456789abc';digest='sha256:'+'a'*64
+        modules=self.collect();cli=b'trusted cli';pin=('a'*64,hashlib.sha256(cli).hexdigest(),len(cli))
+        name=bundle.stage_runtime_tree(self.fd,operation,digest,modules,cli,pin);path=self.root/name
+        self.assertEqual(path.stat().st_mode & 0o777,0o755)
+        self.assertEqual((path/'bin').stat().st_mode & 0o777,0o755)
+        self.assertEqual((path/'bin'/'gh').stat().st_mode & 0o777,0o755)
+        self.assertEqual((path/'bin'/'gh').read_bytes(),cli)
+        self.assertEqual(bundle.verify_runtime_tree(self.fd,operation,digest,modules,cli,pin),name)
+        with self.assertRaises(FileExistsError):bundle.stage_runtime_tree(self.fd,operation,digest,modules,cli,pin)
+        (path/'bin'/'gh').write_bytes(b'other bytes')
+        with self.assertRaises(bundle.HostBundleError):bundle.verify_runtime_tree(self.fd,operation,digest,modules,cli,pin)
+
+    def test_runtime_tree_rejects_wrong_pin_and_extra_files(self):
+        operation='12345678-1234-4234-8234-123456789abc';digest='sha256:'+'a'*64
+        modules=self.collect();cli=b'trusted cli';pin=('a'*64,hashlib.sha256(cli).hexdigest(),len(cli))
+        with self.assertRaises(bundle.HostBundleError):bundle.stage_runtime_tree(self.fd,operation,digest,modules,b'wrong',pin)
+        self.assertFalse((self.root/('runtime-'+operation)).exists())
+        name=bundle.stage_runtime_tree(self.fd,operation,digest,modules,cli,pin);(self.root/name/'unexpected').touch()
+        with self.assertRaises(bundle.HostBundleError):bundle.verify_runtime_tree(self.fd,operation,digest,modules,cli,pin)
+
+    def test_runtime_tree_interruption_never_publishes_completion_marker(self):
+        operation='12345678-1234-4234-8234-123456789abc';digest='sha256:'+'a'*64
+        modules=self.collect();cli=b'trusted cli';pin=('a'*64,hashlib.sha256(cli).hexdigest(),len(cli))
+        with mock.patch.object(bundle.os,'write',side_effect=OSError('disk failure')):
+            with self.assertRaises(OSError):bundle.stage_runtime_tree(self.fd,operation,digest,modules,cli,pin)
+        self.assertFalse((self.root/('runtime-'+operation)/'complete.json').exists())
+        with self.assertRaises(bundle.HostBundleError):bundle.verify_runtime_tree(self.fd,operation,digest,modules,cli,pin)
 
 
 if __name__ == '__main__': unittest.main()
