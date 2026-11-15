@@ -36,7 +36,11 @@ async function fixture(){
 
 it('prepares the staged archive against the confirmed source and service-owned credentials',async()=>{
   const f=await fixture();
-  mocks.allocate.mockImplementation(async opts=>{expect(opts.journal.get(f.operationId).phase).toBe('importing');return {containerId:'d'.repeat(64),volumeName:`panel-restore-${f.operationId}`};});
+  mocks.allocate.mockImplementation(async opts=>{
+    expect(opts.journal.get(f.operationId).phase).toBe('importing');
+    expect((await f.agent.inject({method:'GET',url:f.path,headers:f.auth})).json()).toEqual({operationId:f.operationId,phase:'importing',kind:'postgres'});
+    return {containerId:'d'.repeat(64),volumeName:`panel-restore-${f.operationId}`};
+  });
   mocks.importCandidate.mockImplementation(async opts=>{const chunks:Buffer[]=[];for await(const chunk of opts.input() as Readable)chunks.push(Buffer.from(chunk));expect(Buffer.concat(chunks).toString()).toBe('archive');});
   const response=await f.agent.inject({method:'POST',url:`${f.path}/prepare`,headers:f.auth,payload:{}});
   expect(response.statusCode).toBe(200);expect(response.json()).toEqual({operationId:f.operationId,phase:'prepared'});

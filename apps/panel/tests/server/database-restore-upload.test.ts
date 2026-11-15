@@ -90,6 +90,22 @@ it('reports an unverifiable legacy upload to authorized clients',async()=>{
   } finally {db.close();}
 });
 
+it('reports preparation that is no longer owned by this agent process',async()=>{
+  const {app,store,headers,service,operationId,path}=await fixture();
+  const db=new Database(join(store.dataDir,'agent.sqlite'));
+  try {
+    const journal=new RestoreJournal(db,()=>false);
+    journal.reserve({id:operationId,serviceId:service.id,kind:'postgres',archiveSha256:'a'.repeat(64)});
+    journal.advance(operationId,'reserved','importing');
+    const expected={operationId,kind:'postgres',phase:'importing',recoveryReason:'preparation_unverified'};
+    const response=await app.inject({url:`/api/v1/services/${service.id}/database-restore`,headers});
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({operation:expected});
+    expect((await app.inject({url:path,headers})).json()).toEqual(expected);
+    expect((await app.inject({method:'POST',url:`${path}/cancel`,headers,payload:{}})).statusCode).toBe(409);
+  } finally {db.close();}
+});
+
 it('requires write access and explicit confirmation before starting restore actions',async()=>{
   const requestAgent=vi.fn(async(path:string)=>({operationId:path.split('/').at(-2),phase:path.endsWith('/prepare')?'prepared':'completed',...(path.endsWith('/commit')?{rolledBack:false}:{})}));
   const {app,store,headers,project,service,operationId,path}=await fixture(requestAgent as never);

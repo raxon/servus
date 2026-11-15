@@ -10,7 +10,7 @@ type RestoreOperation = {
   phase: "uploading" | "reserved" | "discarding" | "discarding_candidate" | "importing" | "prepared" | "switching" | "needs_review" | "completed" | "cancelled";
   kind: "postgres" | "mariadb" | "redis";
   reviewPhase?: "uploading" | "reserved" | "discarding" | "importing" | "prepared" | "switching";
-  recoveryReason?: "legacy_upload_unverified";
+  recoveryReason?: "legacy_upload_unverified" | "preparation_unverified";
   rolledBack?: true;
 };
 
@@ -100,7 +100,12 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
           <FeatureLoading label="Uploading export" />
           <button className="button" type="button" disabled={cancelUpload.isPending} onClick={() => cancelUpload.mutate(operation!.operationId)}>{cancelUpload.isPending ? <FeatureLoading label="Cancelling" /> : "Cancel upload"}</button>
         </>}
-        {phase && ["importing", "discarding"].includes(phase) && <FeatureLoading label="Restore in progress" />}
+        {phase === "importing" && operation?.recoveryReason === "preparation_unverified" && <div role="alert">
+          <p>Preparation may have been interrupted. The temporary database and its import cannot yet be verified as stopped.</p>
+          <p>The service remains locked for changes. Ask an administrator to review this restore.</p>
+          <p>Restore ID: <code>{operation.operationId}</code></p>
+        </div>}
+        {(phase === "discarding" || (phase === "importing" && operation?.recoveryReason !== "preparation_unverified")) && <FeatureLoading label="Restore in progress" />}
         {phase === "discarding_candidate" && <>
           <p role="status">The temporary database is being removed. If cleanup was interrupted, try again.</p>
           <button className="button" type="button" disabled={busy} onClick={() => action.mutate({type:"cancel",operationId:operation!.operationId})}>Finish cleanup</button>
