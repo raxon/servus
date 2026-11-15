@@ -21,6 +21,7 @@ import { prepareRestoreCandidate } from './restore-preparation.js';
 import { createRestoreCandidate } from './restore-candidate.js';
 import { importDatabaseCandidate } from './database-import.js';
 import { readRestoreArchive } from './restore-archive.js';
+import { inspectRestoreSwitch } from './restore-switch-inspect.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -182,6 +183,12 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
         }});
       return {operationId:result.id,phase:result.phase};
     } finally { release?.(); }
+  });
+  app.get<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/switch-inspection', async (req,reply) => {
+    if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
+    const record=restores.get(req.params.operationId);
+    if (!record || record.service_id!==req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
+    return inspectRestoreSwitch({docker:new Docker({socketPath:config.dockerSocket}),journal:restores,serviceId:req.params.id,operationId:req.params.operationId});
   });
   app.get<{Params:{id:string};Querystring:{containerId?:string;shell?:string}}>('/services/:id/console', {websocket:true,preValidation:async(req,reply)=>{
     if(!z.string().uuid().safeParse(req.params.id).success||!['/bin/sh','/bin/bash'].includes(req.query.shell||'/bin/sh')||(req.query.containerId&&!/^[a-f0-9]{12,64}$/.test(req.query.containerId)))return reply.code(400).send({error:{code:'INVALID_CONSOLE',message:'Invalid console target.'}});
