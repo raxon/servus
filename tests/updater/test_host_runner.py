@@ -31,7 +31,7 @@ class HostRunnerTest(unittest.TestCase):
         self.op='12345678-1234-4234-8234-123456789abc';self.digest='sha256:'+'a'*64;self.policy=SimpleNamespace(image_reference='image')
         self.daemon=SimpleNamespace(resolve_active_policy=mock.Mock(return_value=('/policy','/accepted',self.policy)))
         self.bundle=SimpleNamespace(OPERATION=bundle.OPERATION,completed_update=mock.Mock(return_value=(self.digest,'/stage')))
-        self.coordinator=SimpleNamespace(stop_updater=mock.Mock(),prepare_completed=mock.Mock(),activate_prepared=mock.Mock())
+        self.coordinator=SimpleNamespace(stop_updater=mock.Mock(),prepare_completed=mock.Mock(),prepare_recovery_snapshot=mock.Mock(),activate_prepared=mock.Mock())
         self.coordinator.stop_updater.side_effect=lambda *a,**k:(os.open(Path(self.paths['state'])/'service.lock',os.O_RDONLY),{'state':'fixture'})
         self.coordinator.prepare_completed.return_value=('runtime-'+self.op,self.digest,{'core.py':(0o644,b'core')},b'cli',('pin',))
         self.unit=SimpleNamespace(UNITS=('unit-a','unit-b'))
@@ -46,7 +46,7 @@ class HostRunnerTest(unittest.TestCase):
         with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}):
             runner.activate(self.op,modules=self.modules,paths=self.paths)
         self.coordinator.stop_updater.assert_called_once();self.coordinator.prepare_completed.assert_called_once()
-        self.coordinator.activate_prepared.assert_called_once()
+        self.coordinator.prepare_recovery_snapshot.assert_called_once();self.coordinator.activate_prepared.assert_called_once()
         fd=os.open(Path(self.paths['state'])/'host.lock',os.O_RDONLY)
         try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         finally:os.close(fd)

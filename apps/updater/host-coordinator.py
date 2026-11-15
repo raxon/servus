@@ -6,6 +6,7 @@ The root caller must supply trusted host modules and hold both installation
 and updater locks for the complete operation.
 """
 import fcntl
+import hashlib
 import os
 import pathlib
 import platform
@@ -180,6 +181,11 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         verify()
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_preparations'").fetchone():
             db.execute("UPDATE host_preparations SET status='abandoned' WHERE operation_id=? AND image_digest=? AND status IN ('intent','prepared','recovery_required')",(operation_id,image_digest))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_recovery_snapshots'").fetchone():
+            snapshot=db.execute('SELECT image_digest,status FROM host_recovery_snapshots WHERE operation_id=?',(operation_id,)).fetchone()
+            if snapshot and (snapshot[0]!=image_digest or snapshot[1] not in ('intent','prepared','recovery_required','abandoned')):
+                raise HostPreparationError('Recovery snapshot is not eligible for abandonment')
+            db.execute("UPDATE host_recovery_snapshots SET status='abandoned' WHERE operation_id=? AND image_digest=? AND status IN ('intent','prepared','recovery_required')",(operation_id,image_digest))
         if db.execute("UPDATE host_stops SET status='restarting' WHERE operation_id=? AND image_digest=? AND status IN ('stopping','stopped','restarting')",(operation_id,image_digest)).rowcount!=1:
             raise HostPreparationError('Updater restart journal changed')
         db.execute('COMMIT')
@@ -210,6 +216,56 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         raise
 
 
+
+
+def prepare_recovery_snapshot(db, operation_id, image_digest, *, state_fd, install_fd, active_fd,
+                              candidate_parent, host_lock, service_lock, install_lock,
+                              supervisor, bundle, install_host):
+    """Save the trusted current host modules outside the exchanged runtime."""
+    if (sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or db.in_transaction or
+        db.isolation_level is not None or db.execute('PRAGMA synchronous').fetchone()[0]<2 or
+        not isinstance(operation_id,str) or not bundle.OPERATION.fullmatch(operation_id) or
+        not isinstance(image_digest,str) or not bundle.DIGEST.fullmatch(image_digest)):
+        raise HostPreparationError('Invalid recovery snapshot context')
+    def guard():
+        _same_lock(supervisor,state_fd,'host.lock',host_lock)
+        _same_lock(supervisor,state_fd,'service.lock',service_lock)
+        _same_lock(supervisor,install_fd,'install.lock',install_lock)
+        fd=supervisor._open_root_file(state_fd,'journal.sqlite',0o600)
+        try:
+            named=os.stat(db.execute('PRAGMA database_list').fetchone()[2],follow_symlinks=False);opened=os.fstat(fd)
+            if (named.st_dev,named.st_ino)!=(opened.st_dev,opened.st_ino):raise HostPreparationError('The journal identity differs')
+        finally:os.close(fd)
+    guard()
+    if db.execute("SELECT 1 FROM host_preparations p JOIN host_stops s ON s.operation_id=p.operation_id AND s.image_digest=p.image_digest WHERE p.operation_id=? AND p.image_digest=? AND p.status='prepared' AND s.status='stopped'",(operation_id,image_digest)).fetchone() is None:
+        raise HostPreparationError('Host preparation is not ready')
+    names=install_host.MODULES
+    modules={name:((0o755 if name=='servus-updater.py' else 0o644),
+                   install_host.read_file(active_fd,name,0o755 if name=='servus-updater.py' else 0o644)) for name in names}
+    _,_,metadata=bundle._generation_metadata(candidate_parent,operation_id,image_digest,modules)
+    metadata_digest=hashlib.sha256(metadata).hexdigest()
+    guard();db.execute('BEGIN IMMEDIATE')
+    try:
+        db.execute("CREATE TABLE IF NOT EXISTS host_recovery_snapshots(operation_id TEXT PRIMARY KEY,image_digest TEXT NOT NULL,metadata_size INTEGER NOT NULL,metadata_digest TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('intent','prepared','recovery_required','completed','abandoned'))) ")
+        db.execute("INSERT INTO host_recovery_snapshots VALUES(?,?,?,?,'intent')",(operation_id,image_digest,len(metadata),metadata_digest))
+        db.execute('COMMIT')
+    except BaseException:
+        if db.in_transaction:db.execute('ROLLBACK')
+        raise
+    try:
+        name=bundle.stage_generation(candidate_parent,operation_id,image_digest,modules)
+        guard()
+        for item,(mode,content) in modules.items():
+            if install_host.read_file(active_fd,item,mode)!=content:raise HostPreparationError('Active host modules changed')
+        if bundle.load_generation(candidate_parent,operation_id,image_digest,len(metadata),metadata_digest,names)!=modules:
+            raise HostPreparationError('Recovery snapshot changed')
+        if db.execute("UPDATE host_recovery_snapshots SET status='prepared' WHERE operation_id=? AND image_digest=? AND status='intent'",(operation_id,image_digest)).rowcount!=1:
+            raise HostPreparationError('Recovery snapshot journal changed')
+        return name
+    except BaseException:
+        try:db.execute("UPDATE host_recovery_snapshots SET status='recovery_required' WHERE operation_id=? AND status='intent'",(operation_id,))
+        except BaseException:pass
+        raise
 
 def recover_exchange(db, operation_id, image_digest, *, state_fd, install_fd, units_fd, active_parent,
                      candidate_parent, host_lock, service_lock, install_lock, supervisor, unit_mask,
@@ -291,6 +347,8 @@ def activate_prepared(db, operation_id, image_digest, originals, initial_states,
     _same_lock(supervisor,state_fd,'service.lock',service_lock)
     _same_lock(supervisor,install_fd,'install.lock',install_lock)
     if authorize() is not None: raise HostPreparationError('Update authorization failed')
+    if db.execute("SELECT 1 FROM host_recovery_snapshots WHERE operation_id=? AND image_digest=? AND status='prepared'",(operation_id,image_digest)).fetchone() is None:
+        raise HostPreparationError('Recovery snapshot is not prepared')
     coordinator=SimpleNamespace(_same_lock=_same_lock)
     unit_args=dict(state=state_fd,install=install_fd,units=units_fd,service_lock=service_lock,
                    install_lock=install_lock,supervisor=supervisor,coordinator=coordinator)

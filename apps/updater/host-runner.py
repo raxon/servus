@@ -33,12 +33,13 @@ def activate(operation_id, *, modules, paths=PATHS):
     if (sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or
         not isinstance(operation_id,str) or not bundle.OPERATION.fullmatch(operation_id)):
         raise HostRunnerError('Invalid host activation request')
-    state=install=units=active=candidates=host_lock=install_lock=service_lock=db=None
+    state=install=units=active=runtime=candidates=host_lock=install_lock=service_lock=db=None
     try:
         state=supervisor._trusted_directory(paths['state'],0o700)
         install=supervisor._trusted_directory(paths['install'],0o700)
         units=supervisor._trusted_directory(paths['units'],0o755)
         active=supervisor._trusted_directory(paths['parent'],0o755)
+        runtime=supervisor._trusted_directory(paths['active'],0o755)
         candidates=supervisor._trusted_directory(paths['candidates'],0o700)
         host_lock=supervisor._open_root_file(state,'host.lock',0o600)
         install_lock=supervisor._open_root_file(install,'install.lock',0o600)
@@ -62,6 +63,9 @@ def activate(operation_id, *, modules, paths=PATHS):
             supervisor=supervisor,daemon=daemon,extractor=modules['extractor'],backup=modules['backup'],bundle=bundle,
             install_host=modules['install_host'],install_gh=modules['install_gh'],include_material=True)
         if generation!='runtime-'+operation_id or prepared_digest!=digest:raise HostRunnerError('Prepared release differs')
+        coordinator.prepare_recovery_snapshot(db,operation_id,digest,state_fd=state,install_fd=install,active_fd=runtime,
+            candidate_parent=candidates,host_lock=host_lock,service_lock=service_lock,install_lock=install_lock,
+            supervisor=supervisor,bundle=bundle,install_host=modules['install_host'])
         def fence():modules['fence'].assert_fenced(paths['active'],modules['quiescence'])
         coordinator.activate_prepared(db,operation_id,digest,originals,initial,contents,cli,pin,state_fd=state,install_fd=install,
             units_fd=units,active_parent=active,candidate_parent=candidates,host_lock=host_lock,service_lock=service_lock,
@@ -69,7 +73,7 @@ def activate(operation_id, *, modules, paths=PATHS):
             exchange=modules['exchange'],fence=fence,authorize=authorize,supervisor_socket=paths['socket'])
     finally:
         if db is not None:db.close()
-        for fd in (service_lock,install_lock,host_lock,candidates,active,units,install,state):
+        for fd in (service_lock,install_lock,host_lock,candidates,runtime,active,units,install,state):
             if fd is not None:os.close(fd)
 
 

@@ -203,6 +203,25 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
             for name,data in originals.items():self.assertEqual((unit_dir/name).read_bytes(),data)
         finally:os.close(units_fd)
 
+    def test_recovery_snapshot_is_bound_to_journal_and_retains_trusted_bytes(self):
+        active=self.active/'servus';(active/'core.py').write_bytes(b'old host')
+        active_fd=os.open(active,os.O_RDONLY|os.O_DIRECTORY)
+        self.db.execute('CREATE TABLE host_stops(operation_id TEXT PRIMARY KEY,image_digest TEXT,status TEXT)')
+        self.db.execute("INSERT INTO host_stops VALUES(?,?,'stopped')",(self.op,self.digest))
+        def read(parent,name,mode):
+            fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+            try:return os.read(fd,1024)
+            finally:os.close(fd)
+        installer=SimpleNamespace(MODULES=('core.py',),read_file=read)
+        try:
+            name=coordinator.prepare_recovery_snapshot(self.db,self.op,self.digest,state_fd=self.s,install_fd=self.i,
+                active_fd=active_fd,candidate_parent=self.c,host_lock=self.hl,service_lock=self.sl,install_lock=self.il,
+                supervisor=supervisor,bundle=bundle,install_host=installer)
+            row=self.db.execute('SELECT metadata_size,metadata_digest,status FROM host_recovery_snapshots').fetchone()
+            self.assertEqual(name,'host-'+self.op);self.assertEqual(row[2],'prepared')
+            self.assertEqual(bundle.load_generation(self.c,self.op,self.digest,row[0],row[1],installer.MODULES),{'core.py':(0o644,b'old host')})
+        finally:os.close(active_fd)
+
     def test_same_boot_start_requires_restored_units_and_exchanged_runtime(self):
         unit_dir=self.root/'units';unit_dir.mkdir(mode=0o755);units_fd=os.open(unit_dir,os.O_RDONLY|os.O_DIRECTORY)
         originals={name:('unit:'+name).encode() for name in unit_mask_module.UNITS}
@@ -230,6 +249,8 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
         finally:os.close(units_fd)
 
     def test_activation_orders_handoff_and_reacquires_install_lock(self):
+        self.db.execute('CREATE TABLE host_recovery_snapshots(operation_id TEXT,image_digest TEXT,status TEXT)')
+        self.db.execute("INSERT INTO host_recovery_snapshots VALUES(?,?,'prepared')",(self.op,self.digest))
         calls=[]
         def record(name):
             def call(*args,**kwargs):calls.append(name)
@@ -255,6 +276,8 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
         finally:fcntl.flock(self.sl,fcntl.LOCK_EX|fcntl.LOCK_NB)
 
     def test_activation_leaves_masks_for_recovery_if_exchange_fails(self):
+        self.db.execute('CREATE TABLE host_recovery_snapshots(operation_id TEXT,image_digest TEXT,status TEXT)')
+        self.db.execute("INSERT INTO host_recovery_snapshots VALUES(?,?,'prepared')",(self.op,self.digest))
         calls=[]
         def mark(name):
             def call(*args,**kwargs):calls.append(name)

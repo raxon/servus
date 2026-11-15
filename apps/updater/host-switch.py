@@ -257,6 +257,9 @@ def complete_exchange(db, operation_id, *, state_fd, install_fd, host_lock, inst
             raise HostSwitchError('Host preparation journal changed')
         if db.execute("SELECT 1 FROM host_unit_masks WHERE operation_id=? AND image_digest=? AND phase='restored'", (operation_id, switch[0])).fetchone() is None:
             raise HostSwitchError('Host unit recovery journal changed')
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_recovery_snapshots'").fetchone():
+            if db.execute("UPDATE host_recovery_snapshots SET status='completed' WHERE operation_id=? AND image_digest=? AND status='prepared'",(operation_id,switch[0])).rowcount!=1:
+                raise HostSwitchError('Host recovery snapshot journal changed')
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_stops'").fetchone():
             if db.execute("UPDATE host_stops SET status='completed' WHERE operation_id=? AND image_digest=? AND status='starting'", (operation_id, switch[0])).rowcount != 1:
                 raise HostSwitchError('Updater stop journal changed')
