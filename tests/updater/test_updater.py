@@ -76,9 +76,13 @@ class JournalContractTest(unittest.TestCase):
     def test_unfinished_host_exchange_blocks_new_update_work(self):
         journal = self.module.Journal(self.state)
         try:
+            journal.db.execute("CREATE TABLE host_stops(operation_id TEXT, status TEXT)")
             journal.db.execute("CREATE TABLE host_preparations(operation_id TEXT, status TEXT)")
             journal.db.execute("CREATE TABLE host_switches(operation_id TEXT, phase TEXT)")
             journal.db.execute("CREATE TABLE host_unit_masks(operation_id TEXT, phase TEXT)")
+            journal.db.execute("INSERT INTO host_stops VALUES(?, 'stopping')", (UUID,))
+            with self.assertRaises(self.module.ProtocolError):self.module.process(journal, REQUEST)
+            journal.db.execute("UPDATE host_stops SET status='completed'")
             journal.db.execute("INSERT INTO host_preparations VALUES(?, 'prepared')", (UUID,))
             with self.assertRaises(self.module.ProtocolError) as error:
                 self.module.process(journal, REQUEST)

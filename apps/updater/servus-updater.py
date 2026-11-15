@@ -169,6 +169,7 @@ class Journal:
     def host_update_pending(self):
         """Block new update work while a host runtime exchange needs recovery."""
         checks = (
+            ('host_stops', "status != 'completed'"),
             ('host_preparations', "status != 'completed'"),
             ('host_switches', "phase NOT IN ('completed','rolled_back')"),
             ('host_unit_masks', "phase != 'restored'"),

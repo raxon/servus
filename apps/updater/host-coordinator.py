@@ -5,10 +5,12 @@ This module does not activate a generation, stop services or authorize itself.
 The root caller must supply trusted host modules and hold both installation
 and updater locks for the complete operation.
 """
+import fcntl
 import os
 import pathlib
 import platform
 import stat
+import subprocess
 import sys
 
 
@@ -40,6 +42,66 @@ def _no_pending(db):
     if any(db.execute(query).fetchone() for query in checks):
         raise HostPreparationError('Another update requires completion or recovery')
 
+
+
+def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_lock, install_lock,
+                 supervisor, unit_mask, bundle, authorize, run=subprocess.run):
+    """Journal and stop the updater before taking its service lock.
+
+    The caller holds host and installation locks and authorizes the completed
+    signed update. The returned service lock remains held by the caller.
+    """
+    if (sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or
+        db.in_transaction or db.isolation_level is not None or db.execute('PRAGMA synchronous').fetchone()[0] < 2 or
+        not isinstance(operation_id, str) or not bundle.OPERATION.fullmatch(operation_id) or
+        not isinstance(image_digest, str) or not bundle.DIGEST.fullmatch(image_digest) or not callable(authorize)):
+        raise HostPreparationError('Invalid updater stop context')
+    _same_lock(supervisor, state_fd, 'host.lock', host_lock)
+    _same_lock(supervisor, install_fd, 'install.lock', install_lock)
+    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600)
+    try:
+        named = os.stat(db.execute('PRAGMA database_list').fetchone()[2], follow_symlinks=False)
+        opened = os.fstat(fd)
+        if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+            raise HostPreparationError('The journal identity differs')
+    finally: os.close(fd)
+    states = unit_mask.capture_service_states()
+    if any(states[name] != 'active' for name in unit_mask.UNITS[:-1]):
+        raise HostPreparationError('Host services are not ready for update')
+    if authorize() is not None: raise HostPreparationError('Update authorization failed')
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        _no_pending(db)
+        db.execute("CREATE TABLE IF NOT EXISTS host_stops (operation_id TEXT PRIMARY KEY,image_digest TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('stopping','stopped','completed','recovery_required'))) ")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_stop ON host_stops ((1)) WHERE status != 'completed'")
+        db.execute("INSERT INTO host_stops VALUES(?,?,'stopping')", (operation_id,image_digest))
+        db.execute('COMMIT')
+    except BaseException:
+        if db.in_transaction: db.execute('ROLLBACK')
+        raise
+    _same_lock(supervisor, state_fd, 'host.lock', host_lock)
+    _same_lock(supervisor, install_fd, 'install.lock', install_lock)
+    if authorize() is not None: raise HostPreparationError('Update authorization failed')
+    try:
+        run(['/usr/bin/systemctl','stop','servus-updater.service'], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd='/',
+            env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'},timeout=60,check=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise HostPreparationError('Updater stop requires recovery') from error
+    lock = supervisor._open_root_file(state_fd, 'service.lock', 0o600)
+    try:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error: raise HostPreparationError('Updater service lock remains held') from error
+        expected = dict(states);expected['servus-updater.service'] = 'inactive'
+        if unit_mask.capture_service_states() != expected: raise HostPreparationError('Host service states changed during stop')
+        _same_lock(supervisor, state_fd, 'host.lock', host_lock)
+        _same_lock(supervisor, install_fd, 'install.lock', install_lock)
+        if db.execute("UPDATE host_stops SET status='stopped' WHERE operation_id=? AND image_digest=? AND status='stopping'", (operation_id,image_digest)).rowcount != 1:
+            raise HostPreparationError('Updater stop journal changed')
+        return lock, states
+    except BaseException:
+        os.close(lock)
+        raise
 
 def prepare_completed(db, operation_id, *, state_dir, install_dir, gate_dir,
                       candidate_parent, host_dir, active_env, service_lock, install_lock,

@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -40,9 +41,9 @@ class HostCoordinatorTest(unittest.TestCase):
         (self.stage/'manifest.json').write_bytes(b'fixture');(self.stage/'manifest.json').chmod(0o644)
         (self.host/'bin').mkdir(mode=0o755);(self.host/'bin'/'gh').write_bytes(self.cli);(self.host/'bin'/'gh').chmod(0o755)
         (self.gate/'state').write_bytes(b'servus-lifecycle-v1 normal\n');(self.gate/'state').chmod(0o644)
-        for path in (self.state/'service.lock',self.install/'install.lock'):path.touch(mode=0o600)
-        self.service_lock=os.open(self.state/'service.lock',os.O_RDONLY);self.install_lock=os.open(self.install/'install.lock',os.O_RDONLY)
-        for fd in (self.service_lock,self.install_lock):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        for path in (self.state/'service.lock',self.state/'host.lock',self.install/'install.lock'):path.touch(mode=0o600)
+        self.service_lock=os.open(self.state/'service.lock',os.O_RDONLY);self.host_lock=os.open(self.state/'host.lock',os.O_RDONLY);self.install_lock=os.open(self.install/'install.lock',os.O_RDONLY)
+        for fd in (self.service_lock,self.host_lock,self.install_lock):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         target=sqlite3.connect(self.state/'journal.sqlite');self.fixture.db.backup(target);target.close();(self.state/'journal.sqlite').chmod(0o600)
         self.db=sqlite3.connect(self.state/'journal.sqlite',isolation_level=None)
         self.db.execute('UPDATE preparations SET staging_path=?',(str(self.stage),))
@@ -55,13 +56,45 @@ class HostCoordinatorTest(unittest.TestCase):
         self.install_gh=SimpleNamespace(PINNED={'amd64':self.pin,'arm64':self.pin})
 
     def tearDown(self):
-        self.db.close();os.close(self.service_lock);os.close(self.install_lock);self.temp.cleanup();self.fixture.tearDown()
+        self.db.close();os.close(self.service_lock);os.close(self.host_lock);os.close(self.install_lock);self.temp.cleanup();self.fixture.tearDown()
 
     def prepare(self):
         return coordinator.prepare_completed(self.db,self.fixture.op,state_dir=str(self.state),install_dir=str(self.install),
             gate_dir=str(self.gate),candidate_parent=str(self.candidates),host_dir=str(self.host),active_env='/root/env',
             service_lock=self.service_lock,install_lock=self.install_lock,supervisor=supervisor,daemon=self.daemon,
             extractor=self.extractor,backup=self.backup,bundle=bundle,install_host=self.install_host,install_gh=self.install_gh)
+
+    def test_stop_updater_journals_before_systemctl_and_acquires_service_lock(self):
+        names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
+        before={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
+        after={**before,'servus-updater.service':'inactive'}
+        unit_mask=SimpleNamespace(UNITS=names,capture_service_states=mock.Mock(side_effect=[before,after]))
+        def stop(command,**kwargs):
+            self.assertEqual(command,['/usr/bin/systemctl','stop','servus-updater.service'])
+            self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('stopping',))
+        state_fd=os.open(self.state,os.O_RDONLY|os.O_DIRECTORY);install_fd=os.open(self.install,os.O_RDONLY|os.O_DIRECTORY)
+        fcntl.flock(self.service_lock,fcntl.LOCK_UN)
+        try:
+            held,states=coordinator.stop_updater(self.db,self.fixture.op,self.fixture.digest,state_fd=state_fd,
+                install_fd=install_fd,host_lock=self.host_lock,install_lock=self.install_lock,
+                supervisor=supervisor,unit_mask=unit_mask,bundle=bundle,authorize=lambda:None,run=stop)
+            try:self.assertEqual(states,before);self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('stopped',))
+            finally:os.close(held)
+        finally:
+            fcntl.flock(self.service_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);os.close(state_fd);os.close(install_fd)
+
+    def test_failed_stop_leaves_recovery_intent(self):
+        names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
+        states={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
+        unit_mask=SimpleNamespace(UNITS=names,capture_service_states=mock.Mock(return_value=states))
+        state_fd=os.open(self.state,os.O_RDONLY|os.O_DIRECTORY);install_fd=os.open(self.install,os.O_RDONLY|os.O_DIRECTORY)
+        try:
+            with self.assertRaises(coordinator.HostPreparationError):
+                coordinator.stop_updater(self.db,self.fixture.op,self.fixture.digest,state_fd=state_fd,install_fd=install_fd,
+                    host_lock=self.host_lock,install_lock=self.install_lock,supervisor=supervisor,unit_mask=unit_mask,bundle=bundle,
+                    authorize=lambda:None,run=mock.Mock(side_effect=subprocess.CalledProcessError(1,'systemctl')))
+            self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('stopping',))
+        finally:os.close(state_fd);os.close(install_fd)
 
     def test_prepares_verified_generation_and_records_completion(self):
         with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}):name=self.prepare()

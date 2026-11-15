@@ -233,6 +233,8 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
 
     def test_complete_requires_restored_units_and_healthy_services(self):
         self.apply()
+        self.db.execute('CREATE TABLE host_stops(operation_id TEXT PRIMARY KEY,image_digest TEXT,status TEXT)')
+        self.db.execute("INSERT INTO host_stops VALUES(?,?,'stopped')",(self.op,self.digest))
         self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
         self.db.execute('INSERT INTO host_unit_masks VALUES(?,?,?)',(self.op,self.digest,'masked'))
         args=self.args();args.pop('fence');args.pop('service_lock');args.update(host_lock=self.hl,unit_mask=mock.Mock(unsafe=True), units_fd=self.a,supervisor_socket='/control/socket');ready=mock.Mock(return_value=None)
@@ -247,6 +249,7 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
         self.assertEqual(self.observe(),'exchanged')
         self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('completed',))
         self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('completed',))
+        self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('completed',))
 
     def test_completion_uses_host_lock_while_updater_owns_service_lock(self):
         self.apply()
