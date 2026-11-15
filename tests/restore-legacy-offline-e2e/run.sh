@@ -16,4 +16,5 @@ active_mounts=()
 if [[ -n ${SERVUS_LOCK_DIST:-} ]]; then active_mounts+=(--mount "type=bind,src=$SERVUS_LOCK_DIST,dst=/app/dist,readonly"); fi
 docker run --rm --name "$name" --label "servus.test=$fixture_id" --user "$run_user" --network none --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,size=32m --mount "type=bind,src=$root,dst=/fixture" \
+  --mount "type=bind,src=$root,dst=/data" \
   --mount "type=bind,src=$runner,dst=/fixture-runner.mjs,readonly" "${active_mounts[@]}" --entrypoint node "$SERVUS_LOCK_IMAGE" /fixture-runner.mjs
