@@ -1368,7 +1368,7 @@ function ServicePage() {
           <ServiceMetricsPanel service={service} />
           <div className="service-overview-grid">
             {database ? (
-              <DatabaseConnection service={service} />
+              <DatabaseConnection service={service} admin={user.role === "admin"} />
             ) : (
               <section className="surface details-card">
                 <div className="card-heading">

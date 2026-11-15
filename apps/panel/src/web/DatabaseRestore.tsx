@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Upload } from "lucide-react";
 import type { Service } from "../shared/types.js";
-import { api } from "./api.js";
+import { api, RequestError } from "./api.js";
 import { FeatureError, FeatureLoading, FeatureModal } from "./feature-ui.js";
 
 type RestoreOperation = {
@@ -14,18 +14,20 @@ type RestoreOperation = {
   rolledBack?: true;
 };
 
-export function DatabaseRestore({ service }: { service: Service }) {
+type RecoveryOperation = {status:"requested" | "dispatching" | "awaiting_completion" | "completed" | "recovery_required"};
+
+export function DatabaseRestore({ service, admin }: { service: Service; admin: boolean }) {
   const [open, setOpen] = useState(false);
   return <>
     <div className="detail-row">
       <span>Restore database</span>
       <button className="button button-small" type="button" onClick={() => setOpen(true)}><Upload size={15} /> Restore</button>
     </div>
-    {open && <RestoreDialog service={service} onClose={() => setOpen(false)} />}
+    {open && <RestoreDialog service={service} admin={admin} onClose={() => setOpen(false)} />}
   </>;
 }
 
-function RestoreDialog({ service, onClose }: { service: Service; onClose: () => void }) {
+function RestoreDialog({ service, admin, onClose }: { service: Service; admin: boolean; onClose: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [confirmed, setConfirmed] = useState(false);
   const [uploadInProgress, setUploadInProgress] = useState(false);
@@ -61,13 +63,34 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
   });
   const operation = status.data?.operation;
   const phase = operation?.phase;
-  const readyForFile = !operation || phase === "completed" || phase === "cancelled";
+  const recoveryKey=["legacy-recovery",service.id,operation?.operationId];
+  const recovery=useQuery({
+    queryKey:recoveryKey,
+    enabled:admin && !!operation,
+    queryFn:async()=>{
+      try{
+        const result=await api<{operation:RecoveryOperation}>(`${base}/${operation!.operationId}/legacy-recovery`,{csrf:true});
+        if(result.operation.status==="completed")void client.invalidateQueries({queryKey:key});
+        return result;
+      }
+      catch(error){if(error instanceof RequestError && error.status===404)return {operation:null};throw error;}
+    },
+    retry:false,
+    refetchInterval:query=>query.state.data?.operation && query.state.data.operation.status!=="completed" ? 3000 : false,
+  });
+  const recover=useMutation({
+    mutationFn:(operationId:string)=>api<{operation:RecoveryOperation}>(`${base}/${operationId}/legacy-recovery`,{method:"POST",body:{}}),
+    onSettled:()=>{void client.invalidateQueries({queryKey:recoveryKey});void client.invalidateQueries({queryKey:key});},
+  });
+  const recoveryPhase=recovery.data?.operation?.status;
+  const recoveryPending=!!recoveryPhase && recoveryPhase!=="completed";
+  const readyForFile = (!operation || phase === "completed" || phase === "cancelled") && !recoveryPending;
   const busy = action.isPending || status.isFetching || !!status.error;
   const extension = service.kind === "postgres" ? ".dump" : ".sql";
   const fileValid = !!file && file.size > 0 && file.size <= 2 * 1024 ** 3;
   return <FeatureModal title="Restore database" description={`Restore a ${extension} export to this ${service.kind === "postgres" ? "PostgreSQL" : "MariaDB"} database.`} onClose={onClose}>
     <div className="restore-dialog">
-      <FeatureError error={status.error ?? cancelUpload.error ?? (cancelUpload.isSuccess && phase === "cancelled" ? null : action.error)} />
+      <FeatureError error={status.error ?? cancelUpload.error ?? recover.error ?? (cancelUpload.isSuccess && phase === "cancelled" ? null : action.error)} />
       {status.isPending ? <FeatureLoading label="Checking restore status" /> : status.data && !status.error ? <>
         {phase === "completed" && <p role="status">The database was restored.</p>}
         {phase === "cancelled" && <p role="status">{operation?.rolledBack ? "The restore was rolled back. The previous database is running." : "The restore was cancelled."}</p>}
@@ -93,9 +116,13 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
         {(phase === "reserved" || phase === "prepared") && <button className="button" type="button" disabled={busy} onClick={() => action.mutate({type:"cancel",operationId:operation!.operationId})}>Cancel restore</button>}
         {phase === "uploading" && operation?.recoveryReason === "legacy_upload_unverified" && <div role="alert">
           <p>This older upload has no recorded process lock, so its writer cannot be verified as stopped.</p>
-          <p>The service remains locked for changes. Ask an administrator to review this restore.</p>
+          <p>The service remains locked for changes. {admin ? "Recovery briefly restarts the panel." : "Ask an administrator to review this restore."}</p>
           <p>Restore ID: <code>{operation.operationId}</code></p>
+          {admin && recovery.isPending && <FeatureLoading label="Checking recovery" />}
+          {admin && recovery.error && <><p>Recovery status is unavailable. Check the status before trying again.</p><button className="button" type="button" onClick={()=>void recovery.refetch()}>Check recovery status</button></>}
+          {admin && recovery.data?.operation===null && <button className="button" type="button" disabled={recover.isPending || recovery.isFetching} onClick={()=>recover.mutate(operation.operationId)}>{recover.isPending ? <FeatureLoading label="Starting recovery" /> : "Recover interrupted upload"}</button>}
         </div>}
+        {recoveryPending && <div role="status"><p>{recoveryPhase === "recovery_required" ? "Recovery needs administrator review. The panel may be temporarily unavailable." : "Recovery is in progress. The panel may be temporarily unavailable."}</p><button className="button" type="button" onClick={()=>{void recovery.refetch();void status.refetch();}}>Check recovery status</button></div>}
         {phase === "uploading" && operation?.recoveryReason !== "legacy_upload_unverified" && <>
           <FeatureLoading label="Uploading export" />
           <button className="button" type="button" disabled={cancelUpload.isPending} onClick={() => cancelUpload.mutate(operation!.operationId)}>{cancelUpload.isPending ? <FeatureLoading label="Cancelling" /> : "Cancel upload"}</button>

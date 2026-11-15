@@ -939,7 +939,7 @@ export function ServiceMetricsPanel({ service }: { service: Service }) {
   );
 }
 
-export function DatabaseConnection({ service }: { service: Service }) {
+export function DatabaseConnection({ service, admin }: { service: Service; admin: boolean }) {
   const [visible, setVisible] = useState(false);
   const [revealed, setRevealed] = useState<ConnectionInfo | null>(null);
   const connection = useQuery({
@@ -1065,7 +1065,7 @@ export function DatabaseConnection({ service }: { service: Service }) {
             </button>
           </div>
           <p className="feature-helper">Exports up to 2 GiB of database data. Application files are not included.</p>
-          {(service.kind === "postgres" || service.kind === "mariadb") && <DatabaseRestore service={service} />}
+          {(service.kind === "postgres" || service.kind === "mariadb") && <DatabaseRestore service={service} admin={admin} />}
         </>
       ) : null}
     </section>

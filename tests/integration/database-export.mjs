@@ -33,10 +33,14 @@ try {
   browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});
   for(const viewport of [{width:1440,height:900},{width:768,height:900},{width:375,height:850}]){
     const page=await browser.newPage({viewport,acceptDownloads:true});
-    let operation=null,commits=0,uploads=0,badUpload=false,finishSlowUpload;
+    let operation=null,recovery=null,recoveryRequests=0,commits=0,uploads=0,badUpload=false,finishSlowUpload;
     await page.route(`**/api/v1/services/${service.id}/database-restore**`,async route=>{
       const request=route.request(),path=new URL(request.url()).pathname;
       assert(request.headers()['x-csrf-token']);
+      if(path.endsWith('/legacy-recovery')){
+        if(request.method()==='GET')return recovery?route.fulfill({json:{operation:recovery}}):route.fulfill({status:404,json:{error:{code:'NOT_FOUND',message:'Not found'}}});
+        recoveryRequests++;recovery={status:'requested'};return route.fulfill({json:{operation:recovery}});
+      }
       if(request.method()==='GET')return route.fulfill({json:{operation}});
       const operationId=path.split('/').at(-2);
       if(path.endsWith('/upload')){
@@ -124,6 +128,15 @@ try {
     await dialog.getByRole('alert').getByText('This older upload has no recorded process lock, so its writer cannot be verified as stopped.').waitFor();
     await dialog.getByText(operation.operationId).waitFor();
     assert.equal(await dialog.getByRole('button',{name:'Cancel upload'}).count(),0);
+    await dialog.getByRole('button',{name:'Recover interrupted upload'}).click();
+    await dialog.getByText('Recovery is in progress.',{exact:false}).waitFor();
+    assert.equal(recoveryRequests,1);
+    assert.equal(await dialog.getByRole('button',{name:'Recover interrupted upload'}).count(),0);
+    operation={...operation,phase:'cancelled'};delete operation.recoveryReason;
+    recovery={status:'completed'};
+    await dialog.getByRole('button',{name:'Check recovery status'}).click();
+    await dialog.getByText('The restore was cancelled.').waitFor();
+    await dialog.getByLabel('Export file').waitFor();
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
     await dialog.getByRole('button',{name:'Close dialog'}).click();
     operation={operationId:'d'.repeat(32),kind:'postgres',phase:'importing',recoveryReason:'preparation_unverified'};
