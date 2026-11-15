@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -87,6 +88,47 @@ class HostBundleTest(unittest.TestCase):
     def test_rejects_oversized_bundle(self):
         with mock.patch.object(bundle, 'MAX_TOTAL', 3):
             with self.assertRaises(bundle.HostBundleError): self.collect()
+
+    def test_stages_generation_with_completion_record_and_never_overwrites(self):
+        operation='12345678-1234-4234-8234-123456789abc'
+        digest='sha256:'+'a'*64
+        name=bundle.stage_generation(self.fd,operation,digest,self.collect())
+        path=self.root/name
+        metadata=json.loads((path/'complete.json').read_bytes())
+        self.assertEqual(metadata['operationId'],operation)
+        self.assertEqual(metadata['imageDigest'],digest)
+        self.assertEqual((path/'core.py').read_bytes(),b'core')
+        self.assertEqual((path/'runner.py').stat().st_mode & 0o777,0o755)
+        self.assertEqual((path/'complete.json').stat().st_mode & 0o777,0o600)
+        with self.assertRaises(FileExistsError):bundle.stage_generation(self.fd,operation,digest,self.collect())
+        self.assertEqual((path/'core.py').read_bytes(),b'core')
+
+    def test_failed_write_leaves_no_completion_record(self):
+        operation='12345678-1234-4234-8234-123456789abc'
+        with mock.patch.object(bundle.os,'write',side_effect=OSError('disk failure')):
+            with self.assertRaises(OSError):bundle.stage_generation(self.fd,operation,'sha256:'+'a'*64,self.collect())
+        path=self.root/('host-'+operation)
+        self.assertTrue(path.is_dir())
+        self.assertFalse((path/'complete.json').exists())
+
+    def test_invalid_generation_never_creates_directory(self):
+        operation='12345678-1234-4234-8234-123456789abc'
+        for bad in ({'../evil.py':(0o644,b'x')},{'core.py':(0o777,b'x')},{'core.py':(0o644,'not bytes')}):
+            with self.subTest(bad=bad),self.assertRaises(bundle.HostBundleError):
+                bundle.stage_generation(self.fd,operation,'sha256:'+'a'*64,bad)
+        self.assertFalse((self.root/('host-'+operation)).exists())
+
+    def test_generation_recheck_rejects_tampering_and_mismatched_release(self):
+        operation='12345678-1234-4234-8234-123456789abc';digest='sha256:'+'a'*64
+        modules=self.collect();name=bundle.stage_generation(self.fd,operation,digest,modules);path=self.root/name
+        self.assertEqual(bundle.verify_generation(self.fd,operation,digest,modules),name)
+        with self.assertRaises(bundle.HostBundleError):
+            bundle.verify_generation(self.fd,operation,'sha256:'+'b'*64,modules)
+        (path/'core.py').write_bytes(b'evil')
+        with self.assertRaises(bundle.HostBundleError):bundle.verify_generation(self.fd,operation,digest,modules)
+        (path/'core.py').write_bytes(b'core')
+        (path/'unexpected').touch()
+        with self.assertRaises(bundle.HostBundleError):bundle.verify_generation(self.fd,operation,digest,modules)
 
 
 if __name__ == '__main__': unittest.main()

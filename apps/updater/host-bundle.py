@@ -6,6 +6,7 @@ The root coordinator must bind the supplied manifest and directory to the
 verified image and the active update journal before using the returned bytes.
 """
 import hashlib
+import json
 import os
 import re
 import stat
@@ -14,6 +15,8 @@ NAME = re.compile(r'^[a-z0-9][a-z0-9-]{0,63}\.py$')
 MAX_MODULE = 4 * 1024 * 1024
 MAX_TOTAL = 16 * 1024 * 1024
 MAX_MODULES = 128
+OPERATION = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+DIGEST = re.compile(r'^sha256:[a-f0-9]{64}$')
 
 
 class HostBundleError(Exception):
@@ -35,9 +38,9 @@ def _directory(parent, name, device):
         raise
 
 
-def _read_module(directory, name, expected, device):
+def _read_module(directory, name, expected, device, *, allowed_modes=(0o644, 0o755)):
     mode, size, digest = expected
-    if (type(mode) is not int or mode not in (0o644, 0o755) or type(size) is not int or
+    if (type(mode) is not int or mode not in allowed_modes or type(size) is not int or
         not 0 <= size <= MAX_MODULE or not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest)):
         raise HostBundleError('Invalid module manifest')
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
@@ -102,3 +105,94 @@ def collect(stage_fd, manifest, required):
             os.close(updater)
         if apps is not None:
             os.close(apps)
+
+
+def _generation_metadata(parent_fd, operation_id, image_digest, modules):
+    parent = os.fstat(parent_fd)
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_gid != 0 or
+        stat.S_IMODE(parent.st_mode) != 0o700 or not isinstance(operation_id, str) or
+        not OPERATION.fullmatch(operation_id) or not isinstance(image_digest, str) or
+        not DIGEST.fullmatch(image_digest) or not isinstance(modules, dict) or
+        not 1 <= len(modules) <= MAX_MODULES):
+        raise HostBundleError('Invalid generation input')
+    total = 0
+    records = []
+    if any(not isinstance(name, str) for name in modules):
+        raise HostBundleError('Invalid generation module')
+    for name, value in sorted(modules.items()):
+        if (not isinstance(name, str) or not NAME.fullmatch(name) or not isinstance(value, tuple) or
+            len(value) != 2 or type(value[0]) is not int or value[0] not in (0o644, 0o755) or
+            not isinstance(value[1], bytes) or len(value[1]) > MAX_MODULE):
+            raise HostBundleError('Invalid generation module')
+        mode, content = value
+        total += len(content)
+        if total > MAX_TOTAL:
+            raise HostBundleError('Host bundle is too large')
+        records.append({'name': name, 'mode': mode, 'size': len(content), 'sha256': hashlib.sha256(content).hexdigest()})
+    return parent, records, (json.dumps({'schema': 1, 'operationId': operation_id, 'imageDigest': image_digest,
+                                        'modules': records}, sort_keys=True, separators=(',', ':')) + '\n').encode()
+
+
+def verify_generation(parent_fd, operation_id, image_digest, modules):
+    """Recheck a candidate against bytes from the authenticated release."""
+    parent, records, content = _generation_metadata(parent_fd, operation_id, image_digest, modules)
+    name = 'host-' + operation_id
+    directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    try:
+        info = os.fstat(directory)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o700 or
+            info.st_dev != parent.st_dev or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino) or
+            set(os.listdir(directory)) != {record['name'] for record in records} | {'complete.json'}):
+            raise HostBundleError('Invalid generation directory')
+        metadata = _read_module(directory, 'complete.json', (0o600, len(content), hashlib.sha256(content).hexdigest()), info.st_dev, allowed_modes=(0o600,))
+        if metadata[1] != content:
+            raise HostBundleError('Generation metadata differs')
+        for record in records:
+            expected = (record['mode'], record['size'], record['sha256'])
+            if _read_module(directory, record['name'], expected, info.st_dev)[1] != modules[record['name']][1]:
+                raise HostBundleError('Generation module differs')
+        return name
+    finally:
+        os.close(directory)
+
+
+def stage_generation(parent_fd, operation_id, image_digest, modules):
+    """Write a candidate; the caller must separately authorize activation.
+
+    A crash may leave an incomplete directory. The completion record is written
+    last, and an existing generation is never replaced or silently repaired.
+    """
+    parent, records, content = _generation_metadata(parent_fd, operation_id, image_digest, modules)
+    name = 'host-' + operation_id
+    os.mkdir(name, 0o700, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+    directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    try:
+        info = os.fstat(directory)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o700 or
+            info.st_dev != parent.st_dev or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+            raise HostBundleError('Unsafe generation directory')
+        def write_file(filename, mode, content):
+            fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=directory)
+            try:
+                os.fchmod(fd, mode)
+                view = memoryview(content)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise HostBundleError('Generation write failed')
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        for record in records:
+            write_file(record['name'], record['mode'], modules[record['name']][1])
+        os.fsync(directory)
+        write_file('complete.json', 0o600, content)
+        os.fsync(directory)
+        os.fsync(parent_fd)
+    finally:
+        os.close(directory)
+    return verify_generation(parent_fd, operation_id, image_digest, modules)
