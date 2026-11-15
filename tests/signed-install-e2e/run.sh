@@ -7,6 +7,8 @@ for tool in colima docker openssl python3 git; do
   command -v "$tool" >/dev/null || { printf 'Missing tool: %s\n' "$tool" >&2; exit 1; }
 done
 [ "$(uname -m)" = arm64 ] || { printf 'This fixture requires an arm64 host.\n' >&2; exit 1; }
+version=${SERVUS_TEST_VERSION:-$(git show HEAD:package.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')}
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'Invalid test release version.\n' >&2; exit 1; }
 profile="servus-signed-e2e-$(openssl rand -hex 8)"
 context="colima-$profile"
 temp_dir=$(mktemp -d /tmp/servus-signed-e2e.XXXXXXXX)
@@ -47,16 +49,17 @@ fi
 address=$(guest sh -c "hostname -I | awk '{print \$1}'")
 [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'VM has no usable IPv4 address.\n' >&2; exit 1; }
 guest sudo bash /run/servus-signed-fixture/install.sh --swarm-advertise-addr "$address" --ingress-port 18080
-for unit in servus-supervisor.service servus-updater.service servus-updater-socket.service; do
+for unit in servus-supervisor.service servus-updater.service servus-updater-socket.service servus-host-update.timer; do
   guest sudo systemctl is-active --quiet "$unit"
   guest sudo systemctl is-enabled --quiet "$unit"
 done
-guest sudo /usr/bin/python3 -I - <<'PY'
-import json, time, urllib.request
+guest sudo /usr/bin/python3 -I - "$version" <<'PY'
+import json, sys, time, urllib.request
+version=sys.argv[1]
 base='http://127.0.0.1:4180'
 with urllib.request.urlopen(base+'/api/v1/health',timeout=10) as response:
     health=json.load(response)
-assert health.get('status')=='ok' and health.get('version')=='0.1.6', health
+assert health.get('status')=='ok' and health.get('version')==version, health
 request=urllib.request.Request(base+'/api/v1/setup',data=json.dumps({'email':'signed-e2e@example.test','password':'signed-e2e-passphrase'}).encode(),headers={'Content-Type':'application/json','Origin':base})
 with urllib.request.urlopen(request,timeout=20) as response:
     cookie=response.headers.get('Set-Cookie')
@@ -75,7 +78,7 @@ while True:
     if discovery.get('status') != 'checking': break
     assert time.monotonic() < deadline, discovery
     time.sleep(2)
-assert discovery.get('current')=='v0.1.6' and discovery.get('status') in ('no_newer_version','ahead'), discovery
+assert discovery.get('current')=='v'+version and discovery.get('status') in ('no_newer_version','ahead'), discovery
 print('PASS signed first installation, account setup, session and update discovery',flush=True)
 PY
 printf 'PASS real supervised first installation on disposable systemd VM\n'
