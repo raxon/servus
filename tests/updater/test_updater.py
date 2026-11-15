@@ -82,6 +82,8 @@ class JournalContractTest(unittest.TestCase):
             journal.db.execute("CREATE TABLE host_unit_masks(operation_id TEXT, phase TEXT)")
             journal.db.execute("INSERT INTO host_stops VALUES(?, 'stopping')", (UUID,))
             with self.assertRaises(self.module.ProtocolError):self.module.process(journal, REQUEST)
+            journal.db.execute("UPDATE host_stops SET status='restarting'")
+            with self.assertRaises(self.module.ProtocolError):self.module.process(journal, REQUEST)
             journal.db.execute("UPDATE host_stops SET status='completed'")
             journal.db.execute("INSERT INTO host_preparations VALUES(?, 'prepared')", (UUID,))
             with self.assertRaises(self.module.ProtocolError) as error:

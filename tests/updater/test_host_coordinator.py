@@ -152,7 +152,11 @@ class HostCoordinatorTest(unittest.TestCase):
                 coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,{name:b'unit' for name in names},
                     state_fd=state_fd,install_fd=install_fd,units_fd=install_fd,host_lock=self.host_lock,supervisor=supervisor,
                     unit_mask=unit_mask,bundle=bundle,ready=mock.Mock(side_effect=RuntimeError('unavailable')),run=mock.Mock())
-            self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('stopped',))
+            self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('restarting',))
+            coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,{name:b'unit' for name in names},
+                state_fd=state_fd,install_fd=install_fd,units_fd=install_fd,host_lock=self.host_lock,supervisor=supervisor,
+                unit_mask=unit_mask,bundle=bundle,ready=lambda:None,run=mock.Mock())
+            self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('completed',))
         finally:
             fcntl.flock(self.install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);os.close(state_fd);os.close(install_fd)
 

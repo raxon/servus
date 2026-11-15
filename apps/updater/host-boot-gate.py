@@ -41,7 +41,7 @@ def assert_safe(state_dir):
                 try:
                     if db.execute('PRAGMA user_version').fetchone()[0]!=8 or not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'").fetchone():
                         raise BootGateError('Unsupported updater journal')
-                    checks=(('host_stops',"status IS NULL OR status != 'completed'"),
+                    checks=(('host_stops',"status IS NULL OR status NOT IN ('completed','restarting')"),
                             ('host_preparations',"status IS NULL OR status NOT IN ('completed','abandoned')"),
                             ('host_switches',"phase IS NULL OR phase NOT IN ('completed','rolled_back')"),
                             ('host_unit_masks',"phase IS NULL OR phase != 'restored'"))

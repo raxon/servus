@@ -27,6 +27,13 @@ class HostBootGateTest(unittest.TestCase):
             self.db.execute('CREATE TABLE '+table+'('+column+' TEXT)');self.db.execute('INSERT INTO '+table+' VALUES(?)',(value,))
         self.db.commit();self.check()
 
+    def test_restart_phase_allows_services_only_after_other_work_is_terminal(self):
+        self.db.execute('CREATE TABLE host_stops(status TEXT)');self.db.execute("INSERT INTO host_stops VALUES('restarting')")
+        self.db.execute('CREATE TABLE host_preparations(status TEXT)');self.db.execute("INSERT INTO host_preparations VALUES('recovery_required')")
+        self.db.commit()
+        with self.assertRaises(gate.BootGateError):self.check()
+        self.db.execute("UPDATE host_preparations SET status='abandoned'");self.db.commit();self.check()
+
     def test_pending_unknown_or_null_state_blocks_startup(self):
         for table,column,value in (('host_stops','status','stopped'),('host_preparations','status','prepared'),
                                    ('host_switches','phase','exchanged'),('host_unit_masks','phase','restoring')):

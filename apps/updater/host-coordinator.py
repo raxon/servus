@@ -74,7 +74,7 @@ def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_l
     db.execute('BEGIN IMMEDIATE')
     try:
         _no_pending(db)
-        db.execute("CREATE TABLE IF NOT EXISTS host_stops (operation_id TEXT PRIMARY KEY,image_digest TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('stopping','stopped','completed','recovery_required'))) ")
+        db.execute("CREATE TABLE IF NOT EXISTS host_stops (operation_id TEXT PRIMARY KEY,image_digest TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('stopping','stopped','restarting','completed','recovery_required'))) ")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_stop ON host_stops ((1)) WHERE status != 'completed'")
         db.execute("INSERT INTO host_stops VALUES(?,?,'stopping')", (operation_id,image_digest))
         db.execute('COMMIT')
@@ -133,7 +133,7 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
     def verify():
         _same_lock(supervisor,state_fd,'host.lock',host_lock)
         row=db.execute('SELECT image_digest,status FROM host_stops WHERE operation_id=?',(operation_id,)).fetchone()
-        if not row or row[0]!=image_digest or row[1] not in ('stopping','stopped'):
+        if not row or row[0]!=image_digest or row[1] not in ('stopping','stopped','restarting'):
             raise HostPreparationError('Updater stop is not eligible for recovery')
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_switches'").fetchone():
             switched=db.execute('SELECT image_digest,phase FROM host_switches WHERE operation_id=?',(operation_id,)).fetchone()
@@ -148,7 +148,7 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
                 raise HostPreparationError('Host unit restoration is incomplete')
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_preparations'").fetchone():
             preparation=db.execute('SELECT image_digest,status FROM host_preparations WHERE operation_id=?',(operation_id,)).fetchone()
-            if preparation and (preparation[0]!=image_digest or preparation[1] not in ('intent','prepared','recovery_required')):
+            if preparation and (preparation[0]!=image_digest or preparation[1] not in (('abandoned',) if row[1]=='restarting' else ('intent','prepared','recovery_required'))):
                 raise HostPreparationError('Host preparation is not eligible for recovery')
         for name in unit_mask.UNITS: unit_mask._read(units_fd,name,0o644,originals[name])
     verify()
@@ -174,6 +174,17 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         finally:os.close(fd)
     if states['servus-updater-bootstrap.service'] != 'inactive':
         raise HostPreparationError('Bootstrap service is active during recovery')
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        verify()
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_preparations'").fetchone():
+            db.execute("UPDATE host_preparations SET status='abandoned' WHERE operation_id=? AND image_digest=? AND status IN ('intent','prepared','recovery_required')",(operation_id,image_digest))
+        if db.execute("UPDATE host_stops SET status='restarting' WHERE operation_id=? AND image_digest=? AND status IN ('stopping','stopped','restarting')",(operation_id,image_digest)).rowcount!=1:
+            raise HostPreparationError('Updater restart journal changed')
+        db.execute('COMMIT')
+    except BaseException:
+        if db.in_transaction:db.execute('ROLLBACK')
+        raise
     try:
         for command in (['/usr/bin/systemctl','start','servus-updater-socket.service'],
                         ['/usr/bin/systemctl','start','servus-supervisor.service'],
@@ -189,9 +200,7 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
     db.execute('BEGIN IMMEDIATE')
     try:
         verify()
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_preparations'").fetchone():
-            db.execute("UPDATE host_preparations SET status='abandoned' WHERE operation_id=? AND image_digest=? AND status IN ('intent','prepared','recovery_required')",(operation_id,image_digest))
-        if db.execute("UPDATE host_stops SET status='completed' WHERE operation_id=? AND image_digest=? AND status IN ('stopping','stopped')",(operation_id,image_digest)).rowcount!=1:
+        if db.execute("UPDATE host_stops SET status='completed' WHERE operation_id=? AND image_digest=? AND status='restarting'",(operation_id,image_digest)).rowcount!=1:
             raise HostPreparationError('Updater stop journal changed')
         db.execute('COMMIT')
     except BaseException:
