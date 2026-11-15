@@ -12,6 +12,8 @@ import platform
 import stat
 import subprocess
 import sys
+import time
+from types import SimpleNamespace
 
 
 class HostPreparationError(Exception):
@@ -191,9 +193,56 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         if db.in_transaction:db.execute('ROLLBACK')
         raise
 
+
+def activate_prepared(db, operation_id, image_digest, originals, initial_states, modules, cli, pin, *,
+                      state_fd, install_fd, units_fd, active_parent, candidate_parent, host_lock, service_lock,
+                      install_lock, supervisor, unit_mask, host_switch, bundle, exchange, fence, authorize,
+                      supervisor_socket, run=subprocess.run, timeout=60):
+    """Activate a verified host candidate using the already acquired locks.
+
+    A trusted caller must hold host, service and installation locks and supply
+    bytes re-read from the authenticated release. The host lock remains held.
+    On failure the journal and masks are retained for explicit recovery.
+    """
+    if not callable(authorize) or not callable(fence) or not 1 <= timeout <= 300:
+        raise HostPreparationError('Invalid host activation context')
+    _same_lock(supervisor,state_fd,'host.lock',host_lock)
+    _same_lock(supervisor,state_fd,'service.lock',service_lock)
+    _same_lock(supervisor,install_fd,'install.lock',install_lock)
+    if authorize() is not None: raise HostPreparationError('Update authorization failed')
+    coordinator=SimpleNamespace(_same_lock=_same_lock)
+    unit_args=dict(state=state_fd,install=install_fd,units=units_fd,service_lock=service_lock,
+                   install_lock=install_lock,supervisor=supervisor,coordinator=coordinator)
+    unit_mask.mask_units(db,operation_id,image_digest,originals,initial_states=initial_states,host_lock=host_lock,**unit_args)
+    unit_mask.stop_masked_units(db,operation_id,image_digest,host_lock=host_lock,fence=fence,run=run,**unit_args)
+    if authorize() is not None: raise HostPreparationError('Update authorization failed')
+    host_switch.exchange_prepared(db,operation_id,image_digest,modules,cli,pin,state_fd=state_fd,install_fd=install_fd,
+        service_lock=service_lock,install_lock=install_lock,active_parent=active_parent,candidate_parent=candidate_parent,
+        supervisor=supervisor,coordinator=coordinator,bundle=bundle,exchange=exchange,fence=fence)
+    unit_mask.restore_from_journal(db,operation_id,image_digest,**unit_args)
+    fcntl.flock(service_lock,fcntl.LOCK_UN)
+    fcntl.flock(install_lock,fcntl.LOCK_UN)
+    host_switch.start_restored(db,operation_id,state_fd=state_fd,install_fd=install_fd,host_lock=host_lock,
+        active_parent=active_parent,candidate_parent=candidate_parent,units_fd=units_fd,supervisor=supervisor,
+        coordinator=coordinator,bundle=bundle,exchange=exchange,unit_mask=unit_mask,run=run)
+    deadline=time.monotonic()+timeout
+    while True:
+        _same_lock(supervisor,state_fd,'host.lock',host_lock)
+        try: host_switch.assert_supervisor_ready(supervisor_socket,operation_id,supervisor=supervisor,bundle=bundle)
+        except (host_switch.HostSwitchError,OSError):
+            if time.monotonic()>=deadline: raise HostPreparationError('Host readiness requires recovery') from None
+            time.sleep(min(0.5,max(0,deadline-time.monotonic())))
+        else: break
+    try: fcntl.flock(install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError as error: raise HostPreparationError('Installation lock requires recovery') from error
+    host_switch.complete_exchange(db,operation_id,state_fd=state_fd,install_fd=install_fd,host_lock=host_lock,
+        install_lock=install_lock,active_parent=active_parent,candidate_parent=candidate_parent,supervisor=supervisor,
+        coordinator=coordinator,bundle=bundle,exchange=exchange,unit_mask=unit_mask,units_fd=units_fd,
+        supervisor_socket=supervisor_socket)
+
 def prepare_completed(db, operation_id, *, state_dir, install_dir, gate_dir,
                       candidate_parent, host_dir, active_env, service_lock, install_lock,
-                      supervisor, daemon, extractor, backup, bundle, install_host, install_gh):
+                      supervisor, daemon, extractor, backup, bundle, install_host, install_gh, include_material=False):
     """Stage a candidate and record durable intent before writing its files."""
     if sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated:
         raise HostPreparationError('An isolated Linux root coordinator is required')
@@ -284,7 +333,7 @@ def prepare_completed(db, operation_id, *, state_dir, install_dir, gate_dir,
         if db.execute("UPDATE host_preparations SET status='prepared' WHERE operation_id=? AND image_digest=? AND generation=? AND status='intent'",
                       (operation_id, digest, generation)).rowcount != 1:
             raise HostPreparationError('Host preparation journal changed')
-        return generation
+        return (generation, digest, modules, cli, pin) if include_material else generation
     except BaseException:
         if inserted:
             try: db.execute("UPDATE host_preparations SET status='recovery_required' WHERE operation_id=? AND status='intent'", (operation_id,))

@@ -58,11 +58,11 @@ class HostCoordinatorTest(unittest.TestCase):
     def tearDown(self):
         self.db.close();os.close(self.service_lock);os.close(self.host_lock);os.close(self.install_lock);self.temp.cleanup();self.fixture.tearDown()
 
-    def prepare(self):
+    def prepare(self, include_material=False):
         return coordinator.prepare_completed(self.db,self.fixture.op,state_dir=str(self.state),install_dir=str(self.install),
             gate_dir=str(self.gate),candidate_parent=str(self.candidates),host_dir=str(self.host),active_env='/root/env',
             service_lock=self.service_lock,install_lock=self.install_lock,supervisor=supervisor,daemon=self.daemon,
-            extractor=self.extractor,backup=self.backup,bundle=bundle,install_host=self.install_host,install_gh=self.install_gh)
+            extractor=self.extractor,backup=self.backup,bundle=bundle,install_host=self.install_host,install_gh=self.install_gh,include_material=include_material)
 
     def test_stop_updater_journals_before_systemctl_and_acquires_service_lock(self):
         names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
@@ -155,6 +155,12 @@ class HostCoordinatorTest(unittest.TestCase):
         self.assertEqual(name,'runtime-'+self.fixture.op)
         self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('prepared',))
         self.assertEqual((self.candidates/name/'bin'/'gh').read_bytes(),self.cli)
+
+    def test_preparation_can_return_authenticated_activation_material(self):
+        with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}):
+            generation,digest,modules,cli,pin=self.prepare(include_material=True)
+        self.assertEqual(generation,'runtime-'+self.fixture.op);self.assertEqual(digest,self.fixture.digest)
+        self.assertEqual(modules['core.py'],(0o644,b'core'));self.assertEqual(cli,self.cli);self.assertEqual(pin,self.pin)
 
     def test_rejects_pending_update_without_creating_candidate(self):
         self.db.execute("INSERT INTO apply_requests VALUES('pending','requested')")

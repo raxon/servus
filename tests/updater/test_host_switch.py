@@ -176,6 +176,45 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
             with self.assertRaises(switch.HostSwitchError):switch.assert_supervisor_ready(str(path),self.op,supervisor=supervisor,bundle=bundle)
         finally:server.close()
 
+    def test_activation_orders_handoff_and_reacquires_install_lock(self):
+        calls=[]
+        def record(name):
+            def call(*args,**kwargs):calls.append(name)
+            return call
+        def start(*args,**kwargs):
+            calls.append('start')
+            with self.assertRaises(supervisor.SupervisorError):supervisor._assert_exclusive_flock(self.sl)
+            with self.assertRaises(supervisor.SupervisorError):supervisor._assert_exclusive_flock(self.il)
+            supervisor._assert_exclusive_flock(self.hl)
+        def complete(*args,**kwargs):
+            calls.append('complete');supervisor._assert_exclusive_flock(self.il)
+        unit_mask=SimpleNamespace(mask_units=record('mask'),stop_masked_units=record('stop'),restore_from_journal=record('restore'))
+        host_switch=SimpleNamespace(exchange_prepared=record('exchange'),start_restored=start,
+            assert_supervisor_ready=record('ready'),complete_exchange=complete,HostSwitchError=switch.HostSwitchError)
+        try:
+            coordinator.activate_prepared(self.db,self.op,self.digest,{}, {},self.modules,self.cli,self.pin,
+                state_fd=self.s,install_fd=self.i,units_fd=self.a,active_parent=self.a,candidate_parent=self.c,
+                host_lock=self.hl,service_lock=self.sl,install_lock=self.il,supervisor=supervisor,unit_mask=unit_mask,
+                host_switch=host_switch,bundle=bundle,exchange=exchange,fence=lambda:None,authorize=lambda:None,
+                supervisor_socket='/control/socket')
+            self.assertEqual(calls,['mask','stop','exchange','restore','start','ready','complete'])
+        finally:fcntl.flock(self.sl,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
+    def test_activation_leaves_masks_for_recovery_if_exchange_fails(self):
+        calls=[]
+        def mark(name):
+            def call(*args,**kwargs):calls.append(name)
+            return call
+        unit_mask=SimpleNamespace(mask_units=mark('mask'),stop_masked_units=mark('stop'),restore_from_journal=mark('restore'))
+        host_switch=SimpleNamespace(exchange_prepared=mock.Mock(side_effect=RuntimeError('fixture')))
+        with self.assertRaises(RuntimeError):
+            coordinator.activate_prepared(self.db,self.op,self.digest,{}, {},self.modules,self.cli,self.pin,
+                state_fd=self.s,install_fd=self.i,units_fd=self.a,active_parent=self.a,candidate_parent=self.c,
+                host_lock=self.hl,service_lock=self.sl,install_lock=self.il,supervisor=supervisor,unit_mask=unit_mask,
+                host_switch=host_switch,bundle=bundle,exchange=exchange,fence=lambda:None,authorize=lambda:None,
+                supervisor_socket='/control/socket')
+        self.assertEqual(calls,['mask','stop']);supervisor._assert_exclusive_flock(self.il)
+
     def test_restart_requires_released_locks_and_restores_only_active_services(self):
         self.apply()
         self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
