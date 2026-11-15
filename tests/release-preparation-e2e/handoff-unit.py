@@ -70,6 +70,8 @@ try:
     assert not (install/handoff.MARKER).exists()
     for name in ('servus-supervisor.service','servus-updater.service'):
         subprocess.run(['/usr/bin/systemctl','is-active','--quiet',name],check=True,timeout=10)
+    for action in ('is-active','is-enabled'):
+        subprocess.run(['/usr/bin/systemctl',action,'--quiet','servus-host-update.timer'],check=True,timeout=10)
     print('PASS real systemd starts services after installation lock is released',flush=True)
 finally:
     journal.close()

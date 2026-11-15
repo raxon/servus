@@ -70,6 +70,8 @@ guest sudo install -d -m 755 /usr/local/libexec/servus
 guest sudo install -d -m 700 /etc/servus
 guest sudo tee /usr/local/libexec/servus/provision-host.py < "$temp_dir/head/apps/updater/provision-host.py" > /dev/null
 guest sudo chmod 644 /usr/local/libexec/servus/provision-host.py
+guest sudo tee /usr/local/libexec/servus/servus-updater.py < "$temp_dir/tag/apps/updater/servus-updater.py" > /dev/null
+guest sudo chmod 755 /usr/local/libexec/servus/servus-updater.py
 guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/provision-host.py
 guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/provision-host.py
 guest sudo test -f /etc/servus/updater.env
@@ -99,6 +101,7 @@ guest sudo /usr/bin/python3 -I /usr/local/libexec/servus/install-gh.py
 guest sudo mv /usr/bin/gh /usr/bin/gh-legacy-fixture
 guest sudo /usr/local/libexec/servus/bin/gh --version
 guest sudo /usr/bin/python3 -I -B /run/servus-release-fixture/flow.py "$release_mode"
+guest sudo /usr/bin/python3 -I -B -c 'import importlib.util,pathlib; s=importlib.util.spec_from_file_location("updater", "/usr/local/libexec/servus/servus-updater.py"); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); j=m.Journal(pathlib.Path("/var/lib/servus-updater")); j.close()'
 guest sudo tee /usr/local/libexec/servus/provision-socket.py < "$temp_dir/head/apps/updater/provision-socket.py" > /dev/null
 guest sudo chmod 644 /usr/local/libexec/servus/provision-socket.py
 for unit in servus-updater-socket.service servus-updater-bootstrap.service; do
