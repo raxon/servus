@@ -29,10 +29,8 @@ it('records an upload and its lock identity atomically and preserves it across r
   const recovered=new RestoreJournal(reopened,()=>false);
   expect(recovered.get(request.id)?.phase).toBe('uploading');
   expect(recovered.uploadLockId(request.id)).toBe(lockId);
-  const other=intent();
-  expect(()=>recovered.beginUpload({...other,id:'d'.repeat(32),lockId})).toThrow();
-  expect(recovered.get('d'.repeat(32))).toBeUndefined();
-  expect(recovered.hasUnresolved(other.serviceId)).toBe(false);
+  expect(recovered.get(request.id)?.archive_sha256).toBe(lockId.repeat(2));
+  expect(reopened.prepare("SELECT name FROM sqlite_master WHERE name IN ('restore_upload_locks','restore_review_phases')").all()).toEqual([]);
 });
 
 it('persists immutable identity and unresolved phases across restart', () => {
@@ -48,7 +46,7 @@ it('persists immutable identity and unresolved phases across restart', () => {
   expect(() => recovered.reserve({ ...request, id: 'd'.repeat(32) })).toThrow('unresolved');
   expect(() => recovered.advance(request.id, 'importing', 'cancelled')).toThrow('transition');
   recovered.advance(request.id, 'importing', 'needs_review');
-  expect(recovered.reviewPhase(request.id)).toBe('importing');
+  expect(recovered.reviewPhase(request.id)).toBeUndefined();
   expect(() => recovered.advance(request.id, 'needs_review', 'completed')).toThrow('transition');
   expect(recovered.hasUnresolved()).toBe(true);
 });

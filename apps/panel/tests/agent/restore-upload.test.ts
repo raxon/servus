@@ -35,7 +35,7 @@ it('holds a uniquely named process lock before publishing its journal fence', as
   });
   const result = await uploadRestoreArchive({ ...base, input: () => Readable.from(['archive']) });
   expect(result.record.phase).toBe('reserved');
-  expect(base.journal.uploadLockId(base.operationId)).toMatch(/^[a-f0-9]{32}$/);
+  expect(base.journal.uploadLockId(base.operationId)).toBeUndefined();
 });
 
 it('leaves no journal entry when the process lock cannot be created', async () => {

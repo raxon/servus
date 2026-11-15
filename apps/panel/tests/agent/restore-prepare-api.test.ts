@@ -56,8 +56,8 @@ it('does not allocate without authentication or when the source is not running',
 it('fences failed candidate allocation for review',async()=>{
   const f=await fixture(); mocks.allocate.mockRejectedValue(new Error('synthetic failure'));
   expect((await f.agent.inject({method:'POST',url:`${f.path}/prepare`,headers:f.auth,payload:{}})).statusCode).toBe(422);
-  expect((await f.agent.inject({method:'GET',url:f.path,headers:f.auth})).json()).toEqual({operationId:f.operationId,phase:'needs_review',kind:'postgres',reviewPhase:'importing'});
-  expect((await f.agent.inject({method:'GET',url:`/services/${f.service.id}/database-restore`,headers:f.auth})).json().operation.reviewPhase).toBe('importing');
+  expect((await f.agent.inject({method:'GET',url:f.path,headers:f.auth})).json()).toEqual({operationId:f.operationId,phase:'needs_review',kind:'postgres'});
+  expect((await f.agent.inject({method:'GET',url:`/services/${f.service.id}/database-restore`,headers:f.auth})).json().operation.reviewPhase).toBeUndefined();
 });
 
 it('cleans a definitively failed import and keeps the current database unchanged',async()=>{

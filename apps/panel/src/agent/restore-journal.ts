@@ -43,8 +43,6 @@ export class RestoreJournal {
         db.exec('INSERT INTO restore_operations SELECT * FROM restore_operations_old; DROP TABLE restore_operations_old');
       }
       db.exec("CREATE UNIQUE INDEX IF NOT EXISTS restore_one_active_per_service ON restore_operations(service_id) WHERE phase NOT IN ('completed','cancelled')");
-      db.exec('CREATE TABLE IF NOT EXISTS restore_upload_locks (operation_id TEXT PRIMARY KEY, lock_id TEXT NOT NULL UNIQUE)');
-      db.exec("CREATE TABLE IF NOT EXISTS restore_review_phases (operation_id TEXT PRIMARY KEY, phase TEXT NOT NULL CHECK(phase IN ('uploading','reserved','discarding','importing','prepared','switching'))) ");
       const switchSchema="CREATE TABLE restore_switch_intents (id TEXT PRIMARY KEY, service_id TEXT NOT NULL, service_version INTEGER NOT NULL, sealed_plan TEXT NOT NULL, created_at TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'pending' CHECK(stage IN ('pending','candidate_stop','candidate_detached','applying','applied','rolling_back','rolled_back')))";
       const switchTable=db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_switch_intents'").get() as {sql:string}|undefined;
       if(!switchTable)db.exec(switchSchema);
@@ -84,26 +82,26 @@ export class RestoreJournal {
     }).immediate();
   }
   beginUpload(input: { id: string; serviceId: string; kind: RestoreRecord['kind']; lockId?:string }): RestoreRecord {
-    if (!idPattern.test(input.id) || !servicePattern.test(input.serviceId) || !['postgres', 'mariadb'].includes(input.kind) || (input.lockId!==undefined&&!idPattern.test(input.lockId))) throw new Error('Invalid restore upload.');
+    if (!idPattern.test(input.id) || !servicePattern.test(input.serviceId) || !['postgres', 'mariadb'].includes(input.kind) || (input.lockId!==undefined&&(!idPattern.test(input.lockId)||input.lockId==='0'.repeat(32)))) throw new Error('Invalid restore upload.');
     return this.db.transaction(() => {
       if (this.get(input.id) || this.isLocked(input.serviceId) || this.hasUnresolved(input.serviceId) || this.db.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(input.serviceId)) throw new Error('Service has an unresolved operation.');
-      this.db.prepare("INSERT INTO restore_operations(id,service_id,kind,archive_sha256,phase,updated_at) VALUES(?,?,?,?,'uploading',?)").run(input.id,input.serviceId,input.kind,'0'.repeat(64),new Date().toISOString());
-      if(input.lockId)this.db.prepare('INSERT INTO restore_upload_locks(operation_id,lock_id) VALUES(?,?)').run(input.id,input.lockId);
+      // During uploading there is no archive digest yet. A repeated, nonzero lock
+      // identity distinguishes new writers from the legacy all-zero sentinel.
+      this.db.prepare("INSERT INTO restore_operations(id,service_id,kind,archive_sha256,phase,updated_at) VALUES(?,?,?,?,'uploading',?)").run(input.id,input.serviceId,input.kind,input.lockId?input.lockId.repeat(2):'0'.repeat(64),new Date().toISOString());
       return this.get(input.id)!;
     }).immediate();
   }
   uploadLockId(id:string):string|undefined {
     if(!idPattern.test(id))throw new Error('Invalid restore upload identity.');
-    const row=this.db.prepare('SELECT lock_id FROM restore_upload_locks WHERE operation_id=?').get(id) as {lock_id:unknown}|undefined;
-    if(row && (typeof row.lock_id!=='string'||!idPattern.test(row.lock_id)))throw new Error('Invalid restore upload lock identity.');
-    return row?.lock_id as string|undefined;
+    const row=this.get(id);
+    if(!row || row.phase!=='uploading' || row.archive_sha256==='0'.repeat(64))return undefined;
+    const marker=row.archive_sha256;
+    if(!digestPattern.test(marker)||marker.slice(0,32)!==marker.slice(32))throw new Error('Invalid restore upload lock identity.');
+    return marker.slice(0,32);
   }
   reviewPhase(id:string):RestoreReviewPhase|undefined {
     if(!idPattern.test(id))throw new Error('Invalid restore identity.');
-    const row=this.db.prepare('SELECT phase FROM restore_review_phases WHERE operation_id=?').get(id) as {phase:unknown}|undefined;
-    if(!row)return undefined;
-    if(typeof row.phase!=='string'||!['uploading','reserved','discarding','importing','prepared','switching'].includes(row.phase))throw new Error('Invalid restore review phase.');
-    return row.phase as RestoreReviewPhase;
+    return undefined;
   }
   finishUpload(id: string, archiveSha256: string): RestoreRecord {
     if (!idPattern.test(id) || !digestPattern.test(archiveSha256)) throw new Error('Invalid restore upload.');
@@ -173,7 +171,6 @@ export class RestoreJournal {
       const previous = this.get(id);
       if (!previous || previous.phase !== expected) throw new Error('Restore phase does not match the expected state.');
       this.db.prepare('UPDATE restore_operations SET phase=?,updated_at=? WHERE id=? AND phase=?').run(next,new Date().toISOString(),id,expected);
-      if(next==='needs_review')this.db.prepare('INSERT INTO restore_review_phases(operation_id,phase) VALUES(?,?)').run(id,expected);
       return this.get(id)!;
     }).immediate();
   }

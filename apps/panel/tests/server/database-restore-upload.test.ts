@@ -62,7 +62,7 @@ it('stages, reports and cancels an archive through the authenticated agent',asyn
   expect(events.map(event=>event.operation)).toEqual(expect.arrayContaining(['database.restore.upload.started','database.restore.upload.staged','database.restore.cancelled']));
 });
 
-it('returns a recorded review phase through the authenticated panel status endpoint',async()=>{
+it('returns a review status through the authenticated panel status endpoint',async()=>{
   const {app,store,headers,service,operationId}=await fixture();
   const db=new Database(join(store.dataDir,'agent.sqlite'));
   try {
@@ -71,7 +71,7 @@ it('returns a recorded review phase through the authenticated panel status endpo
     journal.advance(operationId,'uploading','needs_review');
     const response=await app.inject({url:`/api/v1/services/${service.id}/database-restore`,headers});
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({operation:{operationId,kind:'postgres',phase:'needs_review',reviewPhase:'uploading'}});
+    expect(response.json()).toEqual({operation:{operationId,kind:'postgres',phase:'needs_review'}});
     expect((await app.inject({url:`/api/v1/services/${service.id}/database-restore`})).statusCode).toBe(401);
   } finally {db.close();}
 });

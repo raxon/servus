@@ -100,8 +100,7 @@ it('keeps an interrupted upload fenced if its recorded lock identity is malforme
   const {app,dataDir,serviceId,operationId}=await fixture();
   const db=new Database(join(dataDir,'agent.sqlite'));
   try {
-    db.prepare('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)').run(operationId,serviceId,'postgres','0'.repeat(64),'uploading',new Date().toISOString());
-    db.prepare('INSERT INTO restore_upload_locks(operation_id,lock_id) VALUES(?,?)').run(operationId,'../invalid');
+    db.prepare('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)').run(operationId,serviceId,'postgres','a'.repeat(32)+'b'.repeat(32),'uploading',new Date().toISOString());
     const response=await app.inject({method:'POST',url:`/services/${serviceId}/database-restore/${operationId}/cancel`,headers:{authorization:'Bearer fixture-token'}});
     expect(response.statusCode).toBe(409);
     expect((db.prepare('SELECT phase FROM restore_operations WHERE id=?').get(operationId) as {phase:string}).phase).toBe('uploading');
