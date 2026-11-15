@@ -4,14 +4,18 @@ import os
 import signal
 import sqlite3
 import subprocess
+import sys
 import time
 
 if os.geteuid()!=0 or not os.uname().nodename.startswith('colima-servus-legacy-e2e-'):
     raise SystemExit('A disposable legacy fixture VM is required')
 path='/var/lib/servus-updater/journal.sqlite'
+if len(sys.argv)!=2 or not all(part.isdecimal() for part in sys.argv[1].split('.')) or len(sys.argv[1].split('.'))!=3:
+    raise SystemExit('A valid recovery version is required')
+target='v'+sys.argv[1]
 with sqlite3.connect(path) as db:
     old=db.execute("SELECT o.id FROM operations o JOIN policy_approvals a ON a.operation_id=o.id WHERE o.tag='v0.1.14' AND a.state='superseded'").fetchall()
-    active=db.execute("SELECT o.id,p.staging_path FROM operations o JOIN policy_approvals a ON a.operation_id=o.id JOIN preparations p ON p.operation_id=o.id WHERE o.tag='v0.1.19' AND a.state='active'").fetchall()
+    active=db.execute("SELECT o.id,p.staging_path FROM operations o JOIN policy_approvals a ON a.operation_id=o.id JOIN preparations p ON p.operation_id=o.id WHERE o.tag=? AND a.state='active'",(target,)).fetchall()
 assert len(old)==1 and len(active)==1,(old,active)
 operation,stage=active[0]
 entry=os.path.join(stage,'apps/updater/host-adoption.py')

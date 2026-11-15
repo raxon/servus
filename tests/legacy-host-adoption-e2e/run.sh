@@ -67,16 +67,18 @@ guest sudo chmod 644 /usr/local/libexec/servus/discover-release.py
 node tests/signed-update-e2e/browser.mjs "http://127.0.0.1:$port" 0.1.13 0.1.14 "$base"
 old_tag=v0.1.14
 if [ "${SERVUS_TEST_INTERRUPTED_ADOPTION:-0}" = 1 ]; then
-  recovery_commit=$(git rev-parse 'v0.1.19^{commit}')
+  recovery=${SERVUS_TEST_RECOVERY_VERSION:-0.1.19}
+  [[ $recovery =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'Invalid recovery version.\n' >&2; exit 1; }
+  recovery_commit=$(git rev-parse "v${recovery}^{commit}")
   cp "$temp_dir/discovery-original.py" "$temp_dir/discovery-recovery.py"
-  python3 tests/legacy-host-adoption-e2e/pin-discovery.py "$temp_dir/discovery-recovery.py" v0.1.19 "$recovery_commit"
+  python3 tests/legacy-host-adoption-e2e/pin-discovery.py "$temp_dir/discovery-recovery.py" "v$recovery" "$recovery_commit"
   guest sudo tee /usr/local/libexec/servus/discover-release.py < "$temp_dir/discovery-recovery.py" >/dev/null
   guest sudo chmod 644 /usr/local/libexec/servus/discover-release.py
   guest sudo tee /run/servus-legacy-fixture/upgrade.py < tests/legacy-host-adoption-e2e/upgrade.py >/dev/null
-  guest sudo /usr/bin/python3 -I -B /run/servus-legacy-fixture/upgrade.py 0.1.19 "$port"
+  guest sudo /usr/bin/python3 -I -B /run/servus-legacy-fixture/upgrade.py "$recovery" "$port"
   guest sudo tee /run/servus-legacy-fixture/interrupt.py < tests/legacy-host-adoption-e2e/interrupt.py >/dev/null
-  guest sudo /usr/bin/python3 -I -B /run/servus-legacy-fixture/interrupt.py
-  old_tag=v0.1.19
+  guest sudo /usr/bin/python3 -I -B /run/servus-legacy-fixture/interrupt.py "$recovery"
+  old_tag=v$recovery
 fi
 cp "$temp_dir/discovery-original.py" "$temp_dir/discovery-target.py"
 python3 tests/legacy-host-adoption-e2e/pin-discovery.py "$temp_dir/discovery-target.py" "v$target" "$target_commit"
