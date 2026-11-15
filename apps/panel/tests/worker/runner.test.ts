@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -136,16 +136,19 @@ describe('worker drain',()=>{
     expect(await worker.once()).toBe(false);
   });
   it('retains the lease and retries an uncertain outcome while draining',async()=>{
-    const {store,action}=fixture();
-    const waiting=deferred<void>(),resume=deferred<void>();let calls=0;
-    const worker=new Worker(store,100,{apply:async()=>{if(++calls===1)throw new AgentRequestError('Timeout','uncertain');return success;},wait:async()=>{waiting.resolve();await resume.promise;}});
-    const running=worker.once();await waiting.promise;
-    const draining=worker.drain(1000);
-    await delay(150);
-    expect(store.claimNextJob('another-worker',100)).toBeNull();
-    resume.resolve();await running;
-    expect(await draining).toEqual({status:'drained'});
-    expect(calls).toBe(2);expect(store.getAction(action.id)!.status).toBe('succeeded');
+    vi.useFakeTimers();
+    try {
+      const {store,action}=fixture();
+      const waiting=deferred<void>(),resume=deferred<void>();let calls=0;
+      const worker=new Worker(store,100,{apply:async()=>{if(++calls===1)throw new AgentRequestError('Timeout','uncertain');return success;},wait:async()=>{waiting.resolve();await resume.promise;}});
+      const running=worker.once();await waiting.promise;
+      const draining=worker.drain(1000);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(store.claimNextJob('another-worker',100)).toBeNull();
+      resume.resolve();await running;
+      expect(await draining).toEqual({status:'drained'});
+      expect(calls).toBe(2);expect(store.getAction(action.id)!.status).toBe('succeeded');
+    } finally { vi.useRealTimers(); }
   });
   it('does not report drained after a lease is lost',async()=>{
     const {store,action}=fixture();
