@@ -21,12 +21,12 @@ function isRecord(value: unknown, expected: CloudflareDns01Record): boolean {
   return ['id','type','name','content','comment'].every(key=>Object.hasOwn(record,key)) && record.id === expected.recordId && record.type === 'TXT' && record.name === expected.name && (record.content === expected.value || record.content === `"${expected.value}"`) && record.comment === owner(expected.operationId);
 }
 
-/** A zone-scoped API token is held only in memory. Callers must never log it. */
+/** Callers supply a zone-scoped API token and must never log it. The token's permissions are not inferred from its format. */
 export class CloudflareDns01Provider implements Dns01Provider<CloudflareDns01Record> {
   private readonly zone: string;
   readonly #token: string;
   constructor(private readonly zoneId: string, zoneName: string, token: string, private readonly transport: Fetch = fetch) {
-    if (typeof zoneId !== 'string' || !dns01IdPattern.test(zoneId) || typeof token !== 'string' || !tokenPattern.test(token) || typeof transport !== 'function') throw new Dns01ProviderError('invalid_input');
+    if (typeof zoneId !== 'string' || !dns01IdPattern.test(zoneId) || typeof token !== 'string' || !tokenPattern.test(token) || token.startsWith('cfk_') || typeof transport !== 'function') throw new Dns01ProviderError('invalid_input');
     this.zone = canonicalDnsName(zoneName);
     this.#token = token;
   }

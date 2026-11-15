@@ -67,6 +67,7 @@ describe('Cloudflare DNS-01 adapter', () => {
   it('fails closed for tampered handles and unsafe credentials without sending a request',async()=>{
     const fetcher=vi.fn<typeof fetch>();
     expect(()=>new CloudflareDns01Provider(zoneId,'example.com','bad\r\ntoken',fetcher)).toThrow(Dns01ProviderError);
+    expect(()=>new CloudflareDns01Provider(zoneId,'example.com','cfk_global_fixture_key',fetcher)).toThrow(Dns01ProviderError);
     const provider=new CloudflareDns01Provider(zoneId,'example.com',token,fetcher);
     expect(JSON.stringify(provider)).not.toContain(token);
     expect(inspect(provider)).not.toContain(token);
