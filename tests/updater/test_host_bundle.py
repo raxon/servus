@@ -42,6 +42,20 @@ class CompletedUpdateTest(unittest.TestCase):
     def test_binds_completed_operation_and_verified_stage(self):
         self.assertEqual(self.check(),(self.digest,self.stage))
 
+    def test_historical_baseline_requires_completed_superseded_release(self):
+        with self.assertRaises(bundle.HostBundleError):
+            bundle.historical_completed_update(self.db,self.op,'/root/staging','/root/env')
+        self.db.execute("UPDATE policy_approvals SET state='superseded'")
+        self.assertEqual(bundle.historical_completed_update(self.db,self.op,'/root/staging','/root/env'),(self.digest,self.stage))
+        for table,column,value in (('operations','status','verification_failed'),('update_transactions','phase','recovery_required'),
+                                   ('preparations','attempt_nonce','e'*64),('policy_approvals','source_env_path','/root/other')):
+            with self.subTest(table=table,column=column):
+                self.db.execute('SAVEPOINT historical')
+                self.db.execute('UPDATE '+table+' SET '+column+'=?',(value,))
+                with self.assertRaises(bundle.HostBundleError):
+                    bundle.historical_completed_update(self.db,self.op,'/root/staging','/root/env')
+                self.db.execute('ROLLBACK TO historical');self.db.execute('RELEASE historical')
+
     def test_rejects_incomplete_changed_and_untrusted_attempts(self):
         for table,column,value in (('operations','status','verification_failed'),('preparations','status','prepared'),
                                    ('update_transactions','phase','recovery_required'),('apply_requests','state','requested'),

@@ -198,6 +198,43 @@ class HostCoordinatorTest(unittest.TestCase):
             self.prepare()
         self.assertFalse(list(self.candidates.iterdir()))
 
+    def test_unit_adoption_rechecks_signed_releases_locks_and_recovery_guards(self):
+        names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
+        guards=('host-boot-gate.py','host-bundle.py','host-coordinator.py','host-exchange.py','host-fence.py',
+                'host-recovery.py','host-runner.py','host-switch.py','host-unit-mask.py','install-host.py')
+        modules={name:(0o644,b'verified') for name in guards}
+        states={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
+        unit_mask=SimpleNamespace(UNITS=names,capture_service_states=mock.Mock(return_value=states))
+        installer=SimpleNamespace(MODULES=guards,UNITS=names,read_file=mock.Mock(return_value=b'verified'))
+        units=self.root/'units';units.mkdir(mode=0o755)
+        state_fd=os.open(self.state,os.O_RDONLY|os.O_DIRECTORY);install_fd=os.open(self.install,os.O_RDONLY|os.O_DIRECTORY)
+        host_fd=os.open(self.host,os.O_RDONLY|os.O_DIRECTORY);units_fd=os.open(units,os.O_RDONLY|os.O_DIRECTORY)
+        previous='12345678-1234-4234-8234-123456789abc'
+        def run():
+            return coordinator.adopt_verified_units(self.db,previous,self.fixture.op,state_dir=str(self.state),active_env='/root/env',
+                state_fd=state_fd,install_fd=install_fd,host_fd=host_fd,units_fd=units_fd,host_lock=self.host_lock,
+                install_lock=self.install_lock,supervisor=supervisor,daemon=self.daemon,extractor=self.extractor,
+                backup=self.backup,bundle=bundle,install_host=installer,unit_mask=unit_mask)
+        try:
+            def apply(*_args,**kwargs):kwargs['authorize']()
+            with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}), \
+                 mock.patch.object(bundle,'historical_completed_update',return_value=(self.fixture.digest,str(self.stage))), \
+                 mock.patch.object(bundle,'collect_units',return_value={name:(0o644,b'unit') for name in names}), \
+                 mock.patch.object(bundle,'collect',return_value=modules), \
+                 mock.patch.object(bundle,'apply_unit_adoption',side_effect=apply) as publish:
+                run();publish.assert_called_once()
+                installer.read_file.return_value=b'modified'
+                with self.assertRaises(coordinator.HostPreparationError):run()
+                self.assertEqual(publish.call_count,1)
+                installer.read_file.return_value=b'verified'
+                def changed_during_publish(*_args,**kwargs):
+                    self.daemon.resolve_active_policy.return_value=('/changed','/root/accepted',self.policy)
+                    kwargs['authorize']()
+                publish.side_effect=changed_during_publish
+                with self.assertRaises(coordinator.HostPreparationError):run()
+        finally:
+            for fd in (state_fd,install_fd,host_fd,units_fd):os.close(fd)
+
     def test_preparation_can_return_authenticated_activation_material(self):
         with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}):
             generation,digest,modules,cli,pin=self.prepare(include_material=True)

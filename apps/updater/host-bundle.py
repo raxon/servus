@@ -64,6 +64,39 @@ def completed_update(db, operation_id, staging_parent, policy_path, active_env, 
     return digest, stage
 
 
+def historical_completed_update(db, operation_id, staging_parent, active_env):
+    """Bind an earlier signed release to its completed, superseded journal entry.
+
+    The caller must trust the journal, protect the staging directory, and hold
+    the installation lock while using this historical baseline.
+    """
+    if (not isinstance(operation_id,str) or not OPERATION.fullmatch(operation_id) or
+        any(not isinstance(path,str) or not os.path.isabs(path) or os.path.normpath(path)!=path
+            for path in (staging_parent,active_env))):
+        raise HostBundleError('Invalid historical update input')
+    row=db.execute("SELECT o.digest,o.config_digest,o.attempt_id,o.attempt_nonce,p.preparation_id,p.staging_path "
+        "FROM operations o JOIN preparations p ON p.operation_id=o.id "
+        "JOIN update_transactions t ON t.operation_id=o.id JOIN apply_requests r ON r.operation_id=o.id "
+        "JOIN policy_approvals a ON a.operation_id=o.id WHERE o.id=? AND o.status='verified' "
+        "AND p.status='completed' AND t.phase='completed' AND r.state='completed' AND a.state='superseded' "
+        "AND a.source_env_path=? AND o.digest=t.root_digest AND o.digest=a.root_digest "
+        "AND o.config_digest=a.image_config_digest AND o.attempt_id=p.attempt_id AND o.attempt_id=t.attempt_id "
+        "AND o.attempt_id=a.attempt_id AND o.attempt_nonce=p.attempt_nonce AND o.attempt_nonce=t.attempt_nonce "
+        "AND o.attempt_nonce=a.attempt_nonce AND p.preparation_id=t.preparation_id AND p.preparation_id=a.preparation_id",
+        (operation_id,active_env)).fetchone()
+    if not row:raise HostBundleError('Historical update is unavailable')
+    digest,config_digest,attempt,nonce,preparation,stage=row
+    if (not isinstance(digest,str) or not DIGEST.fullmatch(digest) or
+        not isinstance(config_digest,str) or not DIGEST.fullmatch(config_digest) or
+        not isinstance(attempt,str) or not OPERATION.fullmatch(attempt) or
+        not isinstance(preparation,str) or not OPERATION.fullmatch(preparation) or
+        not isinstance(nonce,str) or not re.fullmatch(r'[a-f0-9]{64}',nonce) or
+        not isinstance(stage,str) or not os.path.isabs(stage) or os.path.normpath(stage)!=stage or
+        os.path.dirname(stage)!=staging_parent or not STAGE.fullmatch(os.path.basename(stage))):
+        raise HostBundleError('Historical update identity differs')
+    return digest,stage
+
+
 def _directory(parent, name, device):
     fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
     try:

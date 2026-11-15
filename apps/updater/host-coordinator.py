@@ -48,6 +48,78 @@ def _no_pending(db):
 
 
 
+def adopt_verified_units(db, old_operation, active_operation, *, state_dir, active_env,
+                         state_fd, install_fd, host_fd, units_fd, host_lock, install_lock,
+                         supervisor, daemon, extractor, backup, bundle, install_host, unit_mask):
+    """Publish signed boot-gated units after the caller provisions recovery guards.
+
+    This phase does not reload systemd or stop services. The caller must retain
+    the old release, enable recovery, and activate the host runtime separately.
+    """
+    if (sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or db.in_transaction or
+        db.isolation_level is not None or old_operation==active_operation or
+        not bundle.OPERATION.fullmatch(old_operation or '') or not bundle.OPERATION.fullmatch(active_operation or '')):
+        raise HostPreparationError('Invalid host adoption context')
+    journal_path=os.path.join(state_dir,'journal.sqlite')
+    staging_parent=os.path.join(state_dir,'staging')
+    def load_stage(path, required_units, *, need_modules=False):
+        stage=supervisor._trusted_directory(path,0o700)
+        try:
+            fd=supervisor._open_root_file(stage,'manifest.json',0o644)
+            try:
+                before=os.fstat(fd);raw=backup._read(fd,extractor.MANIFEST_LIMIT);after=os.fstat(fd)
+                named=os.stat('manifest.json',dir_fd=stage,follow_symlinks=False)
+                identity=lambda item:(item.st_dev,item.st_ino,item.st_size,item.st_mtime_ns,item.st_ctime_ns)
+                if identity(before)!=identity(after) or (before.st_dev,before.st_ino)!=(named.st_dev,named.st_ino):
+                    raise HostPreparationError('Release manifest changed')
+            finally:os.close(fd)
+            manifest=extractor._manifest_files(raw)
+            units=bundle.collect_units(stage,manifest,required_units)
+            modules=bundle.collect(stage,manifest,install_host.MODULES) if need_modules else None
+            return units,modules
+        finally:os.close(stage)
+    def guard():
+        _same_lock(supervisor,state_fd,'host.lock',host_lock)
+        _same_lock(supervisor,install_fd,'install.lock',install_lock)
+        fd=supervisor._open_root_file(state_fd,'journal.sqlite',0o600)
+        try:
+            actual=os.fstat(fd);named=os.stat(db.execute('PRAGMA database_list').fetchone()[2],follow_symlinks=False)
+            if (actual.st_dev,actual.st_ino)!=(named.st_dev,named.st_ino):raise HostPreparationError('Journal identity differs')
+        finally:os.close(fd)
+        _no_pending(db)
+        for table,column,finished in (('host_stops','status',('completed',)),('host_preparations','status',('completed','abandoned')),
+                                      ('host_switches','phase',('completed','rolled_back')),('host_unit_masks','phase',('restored',))):
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
+                marks=','.join('?' for _ in finished)
+                if db.execute('SELECT 1 FROM '+table+' WHERE '+column+' IS NULL OR '+column+' NOT IN ('+marks+') LIMIT 1',finished).fetchone():
+                    raise HostPreparationError('Host update requires recovery')
+        if daemon.resolve_active_policy(journal_path,active_env)!=(policy_path,accepted_env,policy) or supervisor.inspect_servus(policy)!=identities:
+            raise HostPreparationError('Active host identity changed')
+        if bundle.completed_update(db,active_operation,staging_parent,policy_path,active_env,policy.image_reference)!=(active_digest,active_stage):
+            raise HostPreparationError('Active release changed')
+        if bundle.historical_completed_update(db,old_operation,staging_parent,active_env)!=(old_digest,old_stage):
+            raise HostPreparationError('Historical release changed')
+        states=unit_mask.capture_service_states()
+        if any(states[name]!='active' for name in unit_mask.UNITS[:-1]) or states[unit_mask.UNITS[-1]]!='inactive':
+            raise HostPreparationError('Host services are not ready')
+        for name in guards:
+            mode,content=modules[name]
+            if install_host.read_file(host_fd,name,mode)!=content:raise HostPreparationError('Host recovery guard differs')
+    _same_lock(supervisor,state_fd,'host.lock',host_lock);_same_lock(supervisor,install_fd,'install.lock',install_lock)
+    _no_pending(db)
+    policy_path,accepted_env,policy=daemon.resolve_active_policy(journal_path,active_env)
+    identities=supervisor.inspect_servus(policy)
+    active_digest,active_stage=bundle.completed_update(db,active_operation,staging_parent,policy_path,active_env,policy.image_reference)
+    old_digest,old_stage=bundle.historical_completed_update(db,old_operation,staging_parent,active_env)
+    old_units,_=load_stage(old_stage,unit_mask.UNITS)
+    new_units,modules=load_stage(active_stage,install_host.UNITS,need_modules=True)
+    guards=('host-boot-gate.py','host-bundle.py','host-coordinator.py','host-exchange.py','host-fence.py',
+            'host-recovery.py','host-runner.py','host-switch.py','host-unit-mask.py','install-host.py')
+    if not set(guards).issubset(modules):raise HostPreparationError('Host recovery guards are missing')
+    guard()
+    bundle.apply_unit_adoption(units_fd,old_units,new_units,read_file=install_host.read_file,authorize=guard)
+
+
 def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_lock, install_lock,
                  supervisor, unit_mask, bundle, authorize, run=subprocess.run):
     """Journal and stop the updater before taking its service lock.
