@@ -9,6 +9,7 @@
 100644 apps/updater/discover-release.py
 100644 apps/updater/extract-install.py
 100644 apps/updater/guarded-verifier.py
+100644 apps/updater/host-boot-gate.py
 100644 apps/updater/host-bundle.py
 100644 apps/updater/host-coordinator.py
 100644 apps/updater/host-exchange.py
