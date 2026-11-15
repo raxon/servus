@@ -113,6 +113,15 @@ class LegacyCleanupCoordinatorTest(unittest.TestCase):
         with self.assertRaises(OSError):self.lease.record_legacy_start()
         self.assertEqual(self.marker()['state'],'cleaned');self.assertEqual(self.lease._state,'stopped_unverified')
 
+    def test_scoped_start_keeps_new_work_blocked(self):
+        self.lease._owner.gate=self.directory
+        self.lease._owner.gate_lock=os.open(Path(self.tmp.name)/'lock',os.O_CREAT|os.O_RDWR,0o600)
+        try:
+            self.lease._state='starting'
+            self.lease.release_for_start()
+            self.assertEqual((Path(self.tmp.name)/'state').read_bytes(),b'servus-lifecycle-v1 recovering\n')
+        finally:os.close(self.lease._owner.gate_lock)
+
     def start_fixture(self):
         hub=self.lease._hub;hub.policy.healthchecks={'api':{},'worker':None,'agent':{}}
         binding=(*self.lease._policy_binding,hub.policy)

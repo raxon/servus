@@ -22,7 +22,7 @@ class LegacyFinalizeTest(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(dir='/root',prefix='servus-legacy-finalize-');root=Path(self.temp.name)
         (root/'journal').mkdir(mode=0o700);(root/'gate').mkdir(mode=0o755);self.journal_path=str(root/'journal')
         self.journal=os.open(root/'journal',os.O_RDONLY|os.O_DIRECTORY);self.gate=os.open(root/'gate',os.O_RDONLY|os.O_DIRECTORY)
-        supervisor._atomic_file(self.gate,'state',b'servus-lifecycle-v1 normal\n',0o644)
+        supervisor._atomic_file(self.gate,'state',b'servus-lifecycle-v1 recovering\n',0o644)
         self.operation=SimpleNamespace(journal=self.journal,gate=self.gate);self.op=str(uuid.uuid4());self.restore='a'*32;self.service=str(uuid.uuid4())
         self.hub=mock.create_autospec(supervisor.DrainHub,instance=True);self.hub.used=False
         self.hub.connections={role:mock.Mock() for role in supervisor.ROLES}
@@ -44,9 +44,14 @@ class LegacyFinalizeTest(unittest.TestCase):
         try:os.stat(name,dir_fd=self.journal,follow_symlinks=False);return True
         except FileNotFoundError:return False
     def finalize(self):return daemon.finalize_legacy_recovery(self.hub,self.operation,'/root/policy','/root/journal','/root/env')
+    def gate_state(self):
+        fd=supervisor._open_root_file(self.gate,'state',0o644)
+        try:return os.read(fd,64)
+        finally:os.close(fd)
 
     def test_finishes_only_after_matching_healthy_authenticated_roles(self):
         self.assertTrue(self.finalize())
+        self.assertEqual(self.gate_state(),b'servus-lifecycle-v1 normal\n')
         self.assertFalse(self.exists('maintenance.json'));self.assertFalse(self.exists('legacy-upload-recovery.json'))
         fd=supervisor._open_root_file(self.journal,'legacy-upload-validated-'+self.op+'.json',0o600)
         try:self.assertEqual(json.loads(os.read(fd,4097))['state'],'validated')
@@ -89,6 +94,7 @@ class LegacyFinalizeTest(unittest.TestCase):
         self.marker['policyBinding'][1]='sha256:'+'f'*64;self.write('legacy-upload-recovery.json',self.marker)
         with self.assertRaises(supervisor.SupervisorError):self.finalize()
         self.assertTrue(self.exists('maintenance.json'));self.assertTrue(self.exists('legacy-upload-recovery.json'))
+        self.assertEqual(self.gate_state(),b'servus-lifecycle-v1 recovering\n')
 
     def test_health_drift_after_history_write_keeps_active_markers(self):
         def records(unhealthy):
@@ -97,6 +103,12 @@ class LegacyFinalizeTest(unittest.TestCase):
             with self.assertRaises(supervisor.SupervisorError):self.finalize()
         self.assertTrue(self.exists('maintenance.json'));self.assertTrue(self.exists('legacy-upload-recovery.json'))
         self.assertTrue(self.exists('legacy-upload-validated-'+self.op+'.json'))
+        self.assertEqual(self.gate_state(),b'servus-lifecycle-v1 recovering\n')
+
+    def test_open_gate_without_receipt_never_finalizes(self):
+        supervisor._atomic_file(self.gate,'state',b'servus-lifecycle-v1 normal\n',0o644)
+        with self.assertRaises(supervisor.SupervisorError):self.finalize()
+        self.assertTrue(self.exists('maintenance.json'))
 
     def test_status_requires_matching_history_and_no_active_recovery(self):
         status=lambda:daemon.legacy_recovery_status(self.journal_path,self.op,self.restore,self.service)

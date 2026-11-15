@@ -3,6 +3,7 @@ export type UncertaintySource = 'handler' | 'request_aborted' | 'response_closed
 
 // This is an in-process barrier only. A coordinator must also exclude other writers.
 export class MaintenanceGate {
+  constructor(private readonly allowWork:()=>boolean = () => true) {}
   private draining = false;
   private readonly uncertainty = new Set<UncertaintySource>();
   private active = 0;
@@ -12,7 +13,7 @@ export class MaintenanceGate {
   get isDraining() { return this.draining; }
 
   admit(): (() => void) | undefined {
-    if (this.draining) return undefined;
+    if (this.draining || !this.allowWork()) return undefined;
     return this.beginWork();
   }
 

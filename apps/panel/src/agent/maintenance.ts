@@ -26,6 +26,7 @@ export async function consoleExecStopped(exec: Docker.Exec, containerId: string,
 
 // This barrier covers one agent process only. A coordinator must exclude other writers.
 export class AgentMaintenanceGate {
+  constructor(private readonly allowWork:()=>boolean = () => true) {}
   private draining = false;
   private uncertain = false;
   private active = 0;
@@ -40,7 +41,7 @@ export class AgentMaintenanceGate {
   }
 
   admit(): (() => void) | undefined {
-    if (this.draining) return undefined;
+    if (this.draining || !this.allowWork()) return undefined;
     this.active++;
     let done = false;
     return () => {

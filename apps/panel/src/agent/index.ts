@@ -3,9 +3,10 @@ import { createAgent } from './app.js';
 import { agentConfig } from './config.js';
 import { AgentMaintenanceGate } from './maintenance.js';
 import { startSupervisorControl, supervisorConfig } from '../shared/supervisor-entrypoint.js';
+import { lifecycleAllowsWork } from '../shared/lifecycle-gate.js';
 
 const controlConfig = supervisorConfig(process.env);
-const maintenance = controlConfig ? new AgentMaintenanceGate() : undefined;
+const maintenance = controlConfig ? new AgentMaintenanceGate(lifecycleAllowsWork) : undefined;
 const config = agentConfig();
 if (existsSync(config.socketPath)) {
   const { connect } = await import('node:net');

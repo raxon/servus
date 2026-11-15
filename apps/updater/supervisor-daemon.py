@@ -419,7 +419,8 @@ def finalize_legacy_recovery(hub, operation, policy_path, approval_journal, acce
         raise supervisor.SupervisorError('Legacy recovery policy changed')
     state_fd=supervisor._open_root_file(operation.gate,'state',0o644)
     try:
-        if os.read(state_fd,64)!=b'servus-lifecycle-v1 normal\n':raise supervisor.SupervisorError('Legacy recovery gate is not open')
+        gate_state=os.read(state_fd,64)
+        if gate_state not in (b'servus-lifecycle-v1 recovering\n',b'servus-lifecycle-v1 normal\n'):raise supervisor.SupervisorError('Legacy recovery gate is invalid')
     finally:os.close(state_fd)
     def verify_health():
         try:
@@ -455,7 +456,7 @@ def finalize_legacy_recovery(hub, operation, policy_path, approval_journal, acce
     history={**marker,'state':'validated'}
     try:fd=supervisor._open_root_file(operation.journal,history_name,0o600)
     except FileNotFoundError:
-        if maintenance_info is None:raise supervisor.SupervisorError('Legacy recovery history is unavailable')
+        if maintenance_info is None or gate_state!=b'servus-lifecycle-v1 recovering\n':raise supervisor.SupervisorError('Legacy recovery history is unavailable')
         supervisor._atomic_file(operation.journal,history_name,json.dumps(history,separators=(',',':')).encode('ascii')+b'\n',0o600)
     else:
         try:
@@ -467,6 +468,10 @@ def finalize_legacy_recovery(hub, operation, policy_path, approval_journal, acce
     if (supervisor.inspect_servus(hub.policy)!=hub.identities or select.select(list(hub.connections.values()),[],[],0)[0] or
         approved_policy_binding(hub,policy_path,approval_journal,accepted_env)!=binding):
         raise supervisor.SupervisorError('Legacy recovery identity changed')
+    # The receipt is durable and the health and identity checks have passed.
+    # Keep the recovering barrier closed on every earlier failure.
+    if gate_state==b'servus-lifecycle-v1 recovering\n':
+        supervisor._atomic_file(operation.gate,'state',b'servus-lifecycle-v1 normal\n',0o644)
     if maintenance_info is not None:
         named=os.stat('maintenance.json',dir_fd=operation.journal,follow_symlinks=False)
         if (named.st_dev,named.st_ino)!=(maintenance_info.st_dev,maintenance_info.st_ino):raise supervisor.SupervisorError('Maintenance marker changed')

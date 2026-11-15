@@ -948,6 +948,7 @@ class DrainLease:
     def release_for_start(self):
         """Open the gate only after a durable starting marker has been recorded."""
         self.assert_locked(self._operation_id, 'starting')
-        _atomic_file(self._owner.gate, 'state', b'servus-lifecycle-v1 normal\n', 0o644)
+        state=b'servus-lifecycle-v1 recovering\n' if self._legacy_upload_id is not None else b'servus-lifecycle-v1 normal\n'
+        _atomic_file(self._owner.gate, 'state', state, 0o644)
         fcntl.flock(self._owner.gate_lock, fcntl.LOCK_UN)
         self._settled = True

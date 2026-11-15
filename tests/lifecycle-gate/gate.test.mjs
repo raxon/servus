@@ -38,6 +38,8 @@ test('lifecycle gate excludes unsafe starts and holds its lock across exec', asy
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, 'STARTED');
     assert.notEqual(attempt(false).status, 0, 'A writable gate mount must fail');
+    root("printf 'servus-lifecycle-v1 recovering\\n' > /run/servus-lifecycle/state");
+    assert.equal(attempt().status, 0, 'Recovering must permit the guarded component to start');
 
     for (const alteration of [
       'rm /run/servus-lifecycle/state',

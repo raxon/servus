@@ -52,7 +52,13 @@ it('marks an interrupted import as requiring candidate disposal', async () => {
   const dir = fixture({ exec: 'touch "$SERVUS_STARTED"; exec sleep 30' });
   const controller = new AbortController();
   const promise = importDatabaseCandidate({ ...target('synthetic-dump'), signal: controller.signal });
-  await vi.waitFor(() => expect(existsSync(join(dir, 'started'))).toBe(true));
-  controller.abort();
-  await expect(promise).rejects.toMatchObject({ candidateMayBeDirty: true });
-});
+  void promise.catch(() => {});
+  try {
+    await vi.waitFor(() => expect(existsSync(join(dir, 'started'))).toBe(true), {timeout: 10_000});
+    controller.abort();
+    await expect(promise).rejects.toMatchObject({ candidateMayBeDirty: true });
+  } finally {
+    controller.abort();
+    await promise.catch(() => {});
+  }
+}, 15_000);

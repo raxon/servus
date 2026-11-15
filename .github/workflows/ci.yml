@@ -133,6 +133,13 @@ jobs:
       - name: Build workspace
         if: matrix.suite == 'browser'
         run: npm run build
+      - name: Verify recovery barrier on Linux
+        if: matrix.suite == 'browser'
+        run: |
+          docker run --rm --user 0:0 --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=16m \
+            --mount "type=bind,source=$PWD/apps/panel/dist/shared/lifecycle-gate.js,target=/fixture/gate.mjs,readonly" \
+            --mount "type=bind,source=$PWD/tests/lifecycle-gate/recovery-barrier.mjs,target=/fixture/test.mjs,readonly" \
+            --entrypoint node node:24-bookworm-slim /fixture/test.mjs /fixture/gate.mjs
       - name: Test session isolation in Chromium
         if: matrix.suite == 'browser'
         run: |

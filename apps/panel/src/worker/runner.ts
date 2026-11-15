@@ -5,6 +5,7 @@ import { AgentRequestError, agentRequest, applyService, type ApplyResult } from 
 import type { ActionType, Service, ServiceState } from '../shared/types.js';
 
 export interface WorkerOptions {
+  allowWork?: () => boolean;
   apply?: (operationId: string, service: Service, type: ActionType) => Promise<ApplyResult>;
   readState?: (serviceId: string) => Promise<{state:ServiceState;deployedRevision?:number}>;
   wait?: (milliseconds: number) => Promise<void>;
@@ -23,6 +24,7 @@ export class Worker {
   private readonly readState;
   private readonly wait;
   private readonly retryDelayMs;
+  private readonly allowWork;
   private draining = false;
   private active: Promise<boolean> | undefined;
   private readonly uncertainActions = new Set<string>();
@@ -32,6 +34,7 @@ export class Worker {
     this.readState = options.readState ?? ((serviceId: string) => agentRequest<{state:ServiceState;deployedRevision?:number}>(`/services/${serviceId}/state`));
     this.wait = options.wait ?? delay;
     this.retryDelayMs = options.retryDelayMs ?? 1000;
+    this.allowWork = options.allowWork ?? (() => true);
   }
 
   once(): Promise<boolean> {
@@ -61,7 +64,7 @@ export class Worker {
   }
 
   private async processOne(): Promise<boolean> {
-    if(this.stopping || this.draining) return false;
+    if(this.stopping || this.draining || !this.allowWork()) return false;
     let job: ReturnType<Store['claimNextJob']>;
     try { job = this.store.claimNextJob(this.id,this.leaseMs); }
     catch(error) { this.claimUncertain=true; throw error; }

@@ -4,9 +4,10 @@ import { runtimeStatus } from '../agent/client.js';
 import { loadTrustedProxySecret } from './proxy-address.js';
 import { MaintenanceGate } from './maintenance.js';
 import { startSupervisorControl, supervisorConfig } from '../shared/supervisor-entrypoint.js';
+import { lifecycleAllowsWork } from '../shared/lifecycle-gate.js';
 
 const controlConfig = supervisorConfig(process.env);
-const maintenance = controlConfig ? new MaintenanceGate() : undefined;
+const maintenance = controlConfig ? new MaintenanceGate(lifecycleAllowsWork) : undefined;
 const dataDir = resolve(process.env.PANEL_DATA_DIR ?? '.data');
 const app = await createApp({
   dataDir,

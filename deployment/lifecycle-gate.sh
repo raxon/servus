@@ -33,6 +33,7 @@ check_lock_identity
 # The shared lock stays on fd 9 across exec. A coordinator must hold the
 # exclusive lock before resetting the state to normal after maintenance.
 [ -f "$state" ] && [ ! -L "$state" ] && [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$state" 2>/dev/null)" = '0:0:644:1' ] || fail
-printf 'servus-lifecycle-v1 normal\n' | /usr/bin/cmp -s - "$state" || fail
+printf 'servus-lifecycle-v1 normal\n' | /usr/bin/cmp -s - "$state" ||
+  printf 'servus-lifecycle-v1 recovering\n' | /usr/bin/cmp -s - "$state" || fail
 [ "$#" -gt 0 ] || fail
 exec /usr/local/bin/node "$@"
