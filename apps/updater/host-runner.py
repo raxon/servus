@@ -78,6 +78,48 @@ def activate(operation_id, *, modules, paths=PATHS):
             if fd is not None:os.close(fd)
 
 
+def pending_activation(db, policy_path, active_env, image_reference, staging_parent, *, bundle):
+    """Select only the completed update backing the currently active policy."""
+    rows=db.execute("SELECT a.operation_id FROM policy_approvals a "
+        "JOIN update_transactions t ON t.operation_id=a.operation_id "
+        "JOIN apply_requests r ON r.operation_id=a.operation_id "
+        "WHERE a.state='active' AND a.policy_path=? AND a.source_env_path=? "
+        "AND t.phase='completed' AND r.state='completed'",(policy_path,active_env)).fetchall()
+    if len(rows)>1:raise HostRunnerError('Active update is ambiguous')
+    if not rows:return None
+    operation_id=rows[0][0]
+    bundle.completed_update(db,operation_id,staging_parent,policy_path,active_env,image_reference)
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_stops'").fetchone():
+        if db.execute("SELECT 1 FROM host_stops WHERE status!='completed' OR status IS NULL LIMIT 1").fetchone():
+            raise HostRunnerError('Host update requires recovery')
+        previous=db.execute('SELECT status FROM host_stops WHERE operation_id=?',(operation_id,)).fetchone()
+        if previous:
+            if previous[0]=='completed':return None
+            raise HostRunnerError('Host update requires recovery')
+    return operation_id
+
+
+def activate_current(*, modules, paths=PATHS):
+    """Activate the current completed release once; activation rechecks trust."""
+    supervisor=modules['supervisor'];daemon=modules['daemon']
+    state=supervisor._trusted_directory(paths['state'],0o700)
+    try:
+        fd=supervisor._open_root_file(state,'journal.sqlite',0o600)
+        try:
+            named=os.stat(paths['state']+'/journal.sqlite',follow_symlinks=False);opened=os.fstat(fd)
+            if (named.st_dev,named.st_ino)!=(opened.st_dev,opened.st_ino):raise HostRunnerError('Journal identity differs')
+        finally:os.close(fd)
+        dbpath=paths['state']+'/journal.sqlite'
+        policy_path,_,policy=daemon.resolve_active_policy(dbpath,paths['active_env'])
+        db=sqlite3.connect(dbpath,isolation_level=None,timeout=5)
+        try:
+            operation_id=pending_activation(db,policy_path,paths['active_env'],policy.image_reference,
+                paths['state']+'/staging',bundle=modules['bundle'])
+        finally:db.close()
+    finally:os.close(state)
+    if operation_id is not None:activate(operation_id,modules=modules,paths=paths)
+
+
 def load_modules():
     """Load only protected root-owned installed modules before the exchange."""
     directory=PATHS['active']
@@ -184,12 +226,13 @@ def recover_pending(*, modules, paths=PATHS, prepare_only):
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('operation_id',nargs='?')
-    choice=parser.add_mutually_exclusive_group();choice.add_argument('--recover-prepare',action='store_true');choice.add_argument('--recover-finish',action='store_true')
+    choice=parser.add_mutually_exclusive_group();choice.add_argument('--recover-prepare',action='store_true');choice.add_argument('--recover-finish',action='store_true');choice.add_argument('--activate-current',action='store_true')
     args=parser.parse_args()
     if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated:raise HostRunnerError('Isolated root is required')
-    if bool(args.operation_id)==bool(args.recover_prepare or args.recover_finish):parser.error('Select an operation or one recovery mode')
+    if bool(args.operation_id)==bool(args.recover_prepare or args.recover_finish or args.activate_current):parser.error('Select an operation or one mode')
     sys.path.insert(0,PATHS['active']);modules=load_modules()
     if args.operation_id:activate(args.operation_id,modules=modules)
+    elif args.activate_current:activate_current(modules=modules)
     else:recover_pending(modules=modules,prepare_only=args.recover_prepare)
 
 

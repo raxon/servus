@@ -20,6 +20,63 @@ def load(name):
 runner=load('host-runner.py');bundle=load('host-bundle.py')
 
 
+class PendingActivationTest(unittest.TestCase):
+    def setUp(self):
+        self.db=sqlite3.connect(':memory:')
+        self.db.executescript('''
+            CREATE TABLE policy_approvals(operation_id TEXT, state TEXT, policy_path TEXT, source_env_path TEXT);
+            CREATE TABLE update_transactions(operation_id TEXT, phase TEXT);
+            CREATE TABLE apply_requests(operation_id TEXT, state TEXT);
+        ''')
+        self.operation='12345678-1234-4234-8234-123456789abc'
+        self.bundle=SimpleNamespace(completed_update=mock.Mock())
+
+    def tearDown(self):self.db.close()
+
+    def add_update(self,operation=None,*,policy='/policy',env='/env',approval='active',phase='completed',request='completed'):
+        operation=operation or self.operation
+        self.db.execute('INSERT INTO policy_approvals VALUES(?,?,?,?)',(operation,approval,policy,env))
+        self.db.execute('INSERT INTO update_transactions VALUES(?,?)',(operation,phase))
+        self.db.execute('INSERT INTO apply_requests VALUES(?,?)',(operation,request))
+
+    def select(self):
+        return runner.pending_activation(self.db,'/policy','/env','image','/stage',bundle=self.bundle)
+
+    def test_selects_only_completed_active_policy_and_verifies_release(self):
+        self.add_update()
+        self.assertEqual(self.select(),self.operation)
+        self.bundle.completed_update.assert_called_once_with(self.db,self.operation,'/stage','/policy','/env','image')
+
+    def test_ignores_incomplete_or_inactive_updates(self):
+        self.add_update(phase='starting')
+        self.assertIsNone(self.select())
+        self.db.execute("UPDATE update_transactions SET phase='completed'")
+        self.db.execute("UPDATE policy_approvals SET state='superseded'")
+        self.assertIsNone(self.select())
+        self.bundle.completed_update.assert_not_called()
+
+    def test_refuses_ambiguous_and_unverified_releases(self):
+        self.add_update();self.add_update('12345678-1234-4234-8234-123456789abd')
+        with self.assertRaises(runner.HostRunnerError):self.select()
+        self.db.execute('DELETE FROM policy_approvals WHERE operation_id!=?',(self.operation,))
+        self.bundle.completed_update.side_effect=RuntimeError('unverified')
+        with self.assertRaises(RuntimeError):self.select()
+
+    def test_does_not_retry_completed_or_interrupted_host_operation(self):
+        self.add_update()
+        self.db.execute('CREATE TABLE host_stops(operation_id TEXT,status TEXT)')
+        self.db.execute("INSERT INTO host_stops VALUES(?,'completed')",(self.operation,))
+        self.assertIsNone(self.select())
+        self.db.execute("INSERT INTO host_stops VALUES('another','stopped')")
+        with self.assertRaises(runner.HostRunnerError):self.select()
+        self.db.execute("DELETE FROM host_stops WHERE operation_id='another'")
+        self.db.execute("UPDATE host_stops SET status='stopped'")
+        with self.assertRaises(runner.HostRunnerError):self.select()
+        self.db.execute('DELETE FROM host_stops')
+        self.db.execute("INSERT INTO host_stops VALUES('another','stopped')")
+        with self.assertRaises(runner.HostRunnerError):self.select()
+
+
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
 class HostRunnerTest(unittest.TestCase):
     def setUp(self):
@@ -112,6 +169,17 @@ class HostRunnerTest(unittest.TestCase):
         with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}),self.assertRaises(RuntimeError):
             runner.activate(self.op,modules=self.modules,paths=self.paths)
         self.coordinator.stop_updater.assert_not_called()
+
+    def test_activate_current_delegates_only_selected_operation(self):
+        with mock.patch.object(runner,'pending_activation',return_value=self.op) as select, \
+             mock.patch.object(runner,'activate') as activate:
+            runner.activate_current(modules=self.modules,paths=self.paths)
+        select.assert_called_once()
+        activate.assert_called_once_with(self.op,modules=self.modules,paths=self.paths)
+        with mock.patch.object(runner,'pending_activation',return_value=None), \
+             mock.patch.object(runner,'activate') as activate:
+            runner.activate_current(modules=self.modules,paths=self.paths)
+        activate.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()
