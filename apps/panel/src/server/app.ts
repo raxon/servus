@@ -181,6 +181,27 @@ export async function createApp(options: AppOptions) {
     return auth.user;
   }
   registerUpdates(app,{administrator,socketPath:options.updaterSocketPath,applyEnabled:options.updaterApplyEnabled,currentVersion:options.updaterCurrentVersion ?? BUILD_INFO.version});
+  app.get(`${prefix}/integrations/github`,async req=>{
+    administrator(req);
+    const connection=store.vault.githubConnection();
+    return connection ? {connected:true,username:connection.username} : {connected:false};
+  });
+  app.put(`${prefix}/integrations/github`,async req=>{
+    const actor=administrator(req,true);
+    const input=z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/)}).strict().parse(req.body);
+    store.vault.setGithubConnection(input.username,input.token);
+    store.recordAudit(actor.id,'integration.github.set','github');
+    return {connected:true,username:input.username};
+  });
+  app.delete(`${prefix}/integrations/github`,async req=>{
+    const actor=administrator(req,true);
+    store.vault.deleteGithubConnection();
+    store.recordAudit(actor.id,'integration.github.delete','github');
+    return {connected:false};
+  });
+  function approveSharedGithub(user:User, configuration:{source?: import('../shared/types.js').SourceConfig}) {
+    if (configuration.source?.type === 'git' && configuration.source.sharedGithub && user.role !== 'admin') throw new AppError('FORBIDDEN','Only administrators can configure the shared GitHub connection',403);
+  }
   app.get(`${prefix}/users`,async req=>{
     administrator(req);
     return {users:store.db.prepare('SELECT id,email,role,created_at AS createdAt FROM users ORDER BY email').all()};
@@ -224,14 +245,22 @@ export async function createApp(options: AppOptions) {
     const key=z.string().min(1).max(128).parse(req.headers['idempotency-key']);
     const input=normalizeServiceInput(req.body);
     approveBindMounts(user,input);
+    approveSharedGithub(user,input);
     const result=store.createService(req.params.id,input,user.id,key);
     return reply.code(202).send(result);
   });
   app.get<{Params:{id:string}}>(`${prefix}/services/:id`, async req => serviceAccess(req,req.params.id).service);
   app.patch<{Params:{id:string}}>(`${prefix}/services/:id`, async req => {
-    const {auth}=serviceAccess(req,req.params.id,true);
+    const {auth,service}=serviceAccess(req,req.params.id,true);
     const input=parseServicePatch(req.body);
     approveBindMounts(auth.user,input);
+    approveSharedGithub(auth.user,input);
+    if (input.source && auth.user.role !== 'admin' && service.source?.type === 'git' && service.source.sharedGithub) throw new AppError('FORBIDDEN','Only administrators can change a source using the shared GitHub connection',403);
+    if (input.source?.type === 'git' && input.source.credential?.secretRef) {
+      const previous = service.source?.type === 'git' ? service.source : undefined;
+      if (previous?.sharedGithub && !input.source.sharedGithub && input.source.credential.secretRef === previous.credential?.secretRef) throw new AppError('SECRET_REFERENCE','Enter a separate token when disconnecting the shared GitHub connection',403);
+      if (auth.user.role !== 'admin' && (!previous || previous.sharedGithub || input.source.credential.secretRef !== previous.credential?.secretRef)) throw new AppError('SECRET_REFERENCE','This Git credential is not available for reuse',403);
+    }
     return store.updateService(req.params.id,input,auth.user.id);
   });
   app.delete<{Params:{id:string}}>(`${prefix}/services/:id`,async(req,reply)=>{

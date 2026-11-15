@@ -316,7 +316,32 @@ export class Store {
       if (this.db.prepare("SELECT id FROM jobs WHERE service_id=? AND status IN ('queued','running')").get(serviceId)) throw new AppError('SERVICE_BUSY', 'Another operation is already queued or running for this service', 409);
       const action: Action = { id: randomUUID(), projectId: service.projectId, serviceId, type, status: 'queued', phase: 'queued', error: null, createdAt: now(), updatedAt: now(), finishedAt: null };
       this.db.prepare('INSERT INTO actions VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(action.id,action.projectId,serviceId,actorId,type,action.status,action.phase,null,action.createdAt,action.updatedAt,null);
-      this.db.prepare('INSERT INTO jobs (id,action_id,service_id,snapshot,status,created_at) VALUES (?,?,?,?,?,?)').run(randomUUID(),action.id,serviceId,JSON.stringify(service),'queued',now());
+      let snapshot = service;
+      // Pin the current shared credential to the queued job; later rotations must not change an existing snapshot.
+      if (type === 'deploy' && service.source?.type === 'git' && service.source.sharedGithub) {
+        const connection = this.vault.githubConnection();
+        if (!connection) throw new AppError('GITHUB_CONNECTION_REQUIRED','Configure the shared GitHub connection before deploying',409);
+        const repository = new URL(service.source.repository);
+        if (repository.protocol !== 'https:' || repository.host.toLowerCase() !== 'github.com') throw new AppError('GIT_SOURCE','The shared GitHub connection can only be used with github.com');
+        const currentRef = service.source.credential?.secretRef;
+        let matches = false;
+        if (currentRef) {
+          try {
+            this.requireOwnedSecret(serviceId,currentRef,'git');
+            const current: unknown = JSON.parse(this.vault.get(currentRef));
+            matches = !!current && typeof current === 'object' && 'kind' in current && current.kind === 'git-credential-v1' && 'serviceId' in current && current.serviceId === serviceId && 'repository' in current && current.repository === repository.href && 'username' in current && current.username === connection.username && 'token' in current && current.token === connection.token;
+          } catch { throw new AppError('SECRET_REFERENCE','The shared GitHub credential is unavailable',409); }
+        }
+        const reference = matches ? currentRef! : this.putServiceSecret(serviceId,JSON.stringify({kind:'git-credential-v1',serviceId,repository:repository.href,username:connection.username,token:connection.token}),'git');
+        snapshot = {...service, source:{...service.source,credential:{username:connection.username,secretRef:reference}}};
+        if (!matches) {
+          const row = this.db.prepare('SELECT config FROM services WHERE id=?').get(serviceId) as {config:string};
+          const config = JSON.parse(row.config) as import('../shared/types.js').ServiceConfiguration;
+          config.source = snapshot.source;
+          this.db.prepare('UPDATE services SET config=? WHERE id=?').run(JSON.stringify(config),serviceId);
+        }
+      }
+      this.db.prepare('INSERT INTO jobs (id,action_id,service_id,snapshot,status,created_at) VALUES (?,?,?,?,?,?)').run(randomUUID(),action.id,serviceId,JSON.stringify(snapshot),'queued',now());
       this.db.prepare('INSERT INTO idempotency VALUES (?,?,?,?)').run(actorId,key,requestHash,action.id);
       this.appendEvent(action.id,'info',`${type[0]!.toUpperCase()}${type.slice(1)} queued for configuration revision ${service.revision}`);
       return action;
@@ -411,6 +436,13 @@ export class Store {
   }
   private protectConfiguration(serviceId:string,input:Service):import('../shared/types.js').ServiceConfiguration {
     const config=configurationOf(input);
+    if(config.source?.type==='git' && config.source.sharedGithub && !config.source.credential) {
+      const connection=this.vault.githubConnection();
+      if(!connection)throw new AppError('GITHUB_CONNECTION_REQUIRED','Configure the shared GitHub connection first',409);
+      const repository=new URL(config.source.repository).href;
+      const record=JSON.stringify({kind:'git-credential-v1',serviceId,repository,username:connection.username,token:connection.token});
+      config.source={...config.source,repository,credential:{username:connection.username,secretRef:this.putServiceSecret(serviceId,record,'git')}};
+    }
     if(config.source?.type==='git'&&config.source.credential) {
       const source=config.source, credential=source.credential!, repository=new URL(source.repository).href;
       if(credential.token!==undefined) {

@@ -22,12 +22,15 @@ try {
   const page=await browser.newPage({viewport:{width:375,height:850}});page.setDefaultTimeout(10000);await page.goto(`${origin}/projects/${project.id}`);
   await page.getByLabel('Email address').fill('admin@example.test');await page.getByLabel('Password',{exact:true}).fill('testing-password');await page.getByRole('button',{name:'Sign in',exact:true}).click();
   await page.getByRole('button',{name:'New service'}).click();const dialog=page.getByRole('dialog');
-  await dialog.getByLabel('Service name').fill('private-app');await dialog.locator('select').first().selectOption('git');
-  await dialog.getByLabel('Repository URL').fill('https://github.com/example/private.git');await dialog.getByLabel('Private repository').check();
+  await dialog.getByLabel('Service name').fill('private-app');await dialog.getByText('Git',{exact:true}).click();
+  await dialog.getByLabel('Repository URL').fill('https://git.example.com/team/app.git');
+  await dialog.getByText('GitHub',{exact:true}).click();
+  await dialog.getByLabel('GitHub repository').fill('example/private.git');await dialog.getByLabel('Private repository').check();
   await dialog.getByLabel('Git username').fill('git-user');await dialog.getByLabel('Access token').fill('test-git-token');
   assert.equal(await dialog.getByLabel('Access token').getAttribute('type'),'password');
   const created=page.waitForResponse(response=>response.url().endsWith('/services')&&response.request().method()==='POST');
   await dialog.getByRole('button',{name:'Create & deploy'}).click();const response=await created;assert.equal(response.status(),202);const value=await response.json();
+  assert.equal(value.service.source.repository,'https://github.com/example/private.git');
   assert.equal(value.service.source.credential.username,'git-user');assert.equal(value.service.source.credential.token,undefined);assert.ok(value.service.source.credential.secretRef);
   await page.getByRole('tab',{name:'Source',exact:true}).click();await page.getByLabel('Access token').waitFor();assert.equal(await page.getByLabel('Access token').inputValue(),'');
   await page.getByLabel('Access token').fill('test-rotated-token');const saved=page.waitForResponse(response=>response.url().endsWith(`/services/${value.service.id}`)&&response.request().method()==='PATCH');
@@ -35,3 +38,5 @@ try {
   await page.waitForFunction(()=>document.documentElement.scrollWidth<=window.innerWidth);
   console.log('Private Git form created and rotated credentials on a disposable panel.');
 } finally {await browser?.close();server.kill('SIGTERM');await exited;await rm(directory,{recursive:true,force:true});}
+
+await import("./github-connection.mjs");

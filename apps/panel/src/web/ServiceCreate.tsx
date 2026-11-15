@@ -10,6 +10,8 @@ import type {
   SourceConfig,
 } from "../shared/types.js";
 import { api } from "./api.js";
+import { useGithubConnection } from "./GithubSettings.js";
+import { SourceChoiceFields, githubRepositoryUrl, type SourceChoice } from "./source-choice.js";
 import { notifyServiceQueued } from "./notifications.js";
 import { FeatureError, FeatureLoading, FeatureModal } from "./feature-ui.js";
 
@@ -52,21 +54,26 @@ const kinds: {
 
 export function CreateService({
   projectId,
+  admin,
   onClose,
 }: {
   projectId: string;
+  admin: boolean;
   onClose: () => void;
 }) {
   const client = useQueryClient();
   const navigate = useNavigate();
   const [kind, setKind] = useState<ServiceKind>("app");
-  const [sourceType, setSourceType] = useState<SourceConfig["type"]>("image");
+  const [sourceType, setSourceType] = useState<SourceChoice>("image");
   const [name, setName] = useState("");
   const [image, setImage] = useState("");
   const [hostname, setHostname] = useState("");
   const [port, setPort] = useState(80);
   const [repository, setRepository] = useState("");
+  const [githubRepository, setGithubRepository] = useState("");
   const [privateGit, setPrivateGit] = useState(false);
+  const [sharedGithub, setSharedGithub] = useState(false);
+  const github = useGithubConnection(admin);
   const [gitUsername, setGitUsername] = useState("");
   const [gitToken, setGitToken] = useState("");
   const [branch, setBranch] = useState("main");
@@ -78,8 +85,8 @@ export function CreateService({
   const mutation = useMutation({
     mutationFn: () => {
       const source: SourceConfig =
-        kind === "app" && sourceType === "git"
-          ? { type: "git", repository, branch, context, dockerfile, ...(privateGit ? { credential: { username: gitUsername, token: gitToken } } : {}) }
+        kind === "app" && sourceType !== "image"
+          ? { type: "git", repository: sourceType === "github" ? githubRepositoryUrl(githubRepository) : repository, branch, context, dockerfile, ...(sourceType === "github" && sharedGithub ? {sharedGithub: true} : privateGit ? { credential: { username: gitUsername, token: gitToken } } : {}) }
           : { type: "image" };
       const body: ServiceInput = {
         name,
@@ -175,20 +182,7 @@ export function CreateService({
             />
             <small>Use lowercase letters, numbers, and hyphens.</small>
           </label>
-          {kind === "app" ? (
-            <label>
-              Source
-              <select
-                value={sourceType}
-                onChange={(event) =>
-                  setSourceType(event.target.value as SourceConfig["type"])
-                }
-              >
-                <option value="image">Docker image</option>
-                <option value="git">Git repository</option>
-              </select>
-            </label>
-          ) : null}
+          {kind === "app" ? <SourceChoiceFields value={sourceType} onChange={setSourceType} /> : null}
           {sourceType === "image" ? (
             <label>
               Docker image
@@ -207,21 +201,21 @@ export function CreateService({
             </label>
           ) : (
             <>
-              <label>
+              {sourceType === "github" ? <label>
+                GitHub repository
+                <input name="github-repository" value={githubRepository} onChange={(event) => setGithubRepository(event.target.value)} pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" placeholder="organization/repository" autoCapitalize="none" spellCheck={false} required />
+                <small>Enter the owner and repository name, for example organization/app.</small>
+              </label> : <label>
                 Repository URL
-                <input
-                  type="url"
-                  value={repository}
-                  onChange={(event) => setRepository(event.target.value)}
-                  required
-                  placeholder="https://github.com/organization/application.git"
-                />
-              </label>
-              <label className="checkbox-label">
+                <input name="repository" type="url" value={repository} onChange={(event) => setRepository(event.target.value)} required placeholder="https://github.com/organization/application.git" />
+              </label>}
+              {sourceType === "github" && github.data?.connected ? <label className="checkbox-label"><input type="checkbox" checked={sharedGithub} onChange={event => setSharedGithub(event.target.checked)} /> Use shared GitHub connection ({github.data.username})</label> : null}
+              {sourceType === "github" && admin && github.isSuccess && !github.data.connected ? <small>To reuse a token across projects, add it in Settings under GitHub connection.</small> : null}
+              {!sharedGithub || sourceType !== "github" ? <label className="checkbox-label">
                 <input type="checkbox" checked={privateGit} onChange={(event) => setPrivateGit(event.target.checked)} />
                 Private repository
-              </label>
-              {privateGit ? <>
+              </label> : null}
+              {privateGit && (!sharedGithub || sourceType !== "github") ? <>
                 <label>Git username<input value={gitUsername} onChange={(event) => setGitUsername(event.target.value)} autoComplete="off" required /></label>
                 <label>Access token<input type="password" value={gitToken} onChange={(event) => setGitToken(event.target.value)} autoComplete="new-password" required /><small>The token is encrypted on this installation.</small></label>
               </> : null}

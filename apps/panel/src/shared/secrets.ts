@@ -1,9 +1,11 @@
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
 
 const referencePattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// A stable reserved reference keeps the instance connection in the existing encrypted backup inventory.
+const githubConnectionReference = '83b896d9-8e84-41ae-886c-d9026721459a';
 const pause = new Int32Array(new SharedArrayBuffer(4));
 
 /** Encrypts immutable secrets and runtime snapshots using a local installation key. */
@@ -70,6 +72,27 @@ export class SecretVault {
     return this.open(readFileSync(join(this.directory, reference), 'utf8'));
   }
 
+  githubConnection(): { username: string; token: string } | null {
+    if (!existsSync(join(this.directory, githubConnectionReference))) return null;
+    const value: unknown = JSON.parse(this.get(githubConnectionReference));
+    if (!value || typeof value !== 'object' || !('kind' in value) || value.kind !== 'github-connection-v1' || !('username' in value) || typeof value.username !== 'string' || !/^[^\x00-\x20\x7f:=]{1,256}$/.test(value.username) || !('token' in value) || typeof value.token !== 'string' || !/^[^\x00-\x20\x7f]{1,4096}$/.test(value.token)) throw new Error('Invalid GitHub connection.');
+    return { username: value.username, token: value.token };
+  }
+
+  setGithubConnection(username: string, token: string): void {
+    if (!/^[^\x00-\x20\x7f:=]{1,256}$/.test(username) || !/^[^\x00-\x20\x7f]{1,4096}$/.test(token)) throw new Error('Invalid GitHub connection.');
+    if (existsSync(join(this.directory, githubConnectionReference))) this.githubConnection();
+    const temporary = join(this.directory, `.pending-${randomUUID()}`);
+    try {
+      writeFileSync(temporary, this.seal(JSON.stringify({ kind: 'github-connection-v1', username, token })), { flag: 'wx', mode: 0o600 });
+      renameSync(temporary, join(this.directory, githubConnectionReference));
+    } finally { try { unlinkSync(temporary); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; } }
+  }
+
+  deleteGithubConnection(): void {
+    if (this.githubConnection()) unlinkSync(join(this.directory, githubConnectionReference));
+  }
+
   /** Read only references authorized for this service and use. */
   getServiceSecret(reference: string, serviceId: string, purpose: 'environment' | 'database' | 'git'): string {
     if (!referencePattern.test(reference) || !referencePattern.test(serviceId)) throw new Error('Invalid secret identity.');
@@ -99,7 +122,7 @@ export class SecretVault {
         const value = this.get(reference);
         try {
           const record: unknown = JSON.parse(value);
-          if (record && typeof record === 'object' && 'kind' in record && record.kind === 'git-credential-v1' && 'token' in record && typeof record.token === 'string' && 'username' in record && typeof record.username === 'string') return [value, record.token, Buffer.from(record.token).toString('base64'), Buffer.from(`${record.username}:${record.token}`).toString('base64')];
+          if (record && typeof record === 'object' && 'kind' in record && (record.kind === 'git-credential-v1' || record.kind === 'github-connection-v1') && 'token' in record && typeof record.token === 'string' && 'username' in record && typeof record.username === 'string') return [value, record.token, Buffer.from(record.token).toString('base64'), Buffer.from(`${record.username}:${record.token}`).toString('base64')];
         } catch { /* Ordinary secrets need not contain JSON. */ }
         return [value];
       }).filter(Boolean).sort((left, right) => right.length - left.length);

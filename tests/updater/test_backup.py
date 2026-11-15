@@ -588,6 +588,22 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         self.panel.commit();self.fix_permissions();manifest=self.capture()
         self.assertIn('secrets/'+reference,manifest['files']);self.assertNotIn('fixture-git-token',json.dumps(manifest))
 
+    def test_shared_github_connection_is_included_in_capture(self):
+        reference,config=self.add_git_credential()
+        config['source']['sharedGithub']=True
+        self.panel.execute('UPDATE services SET config=? WHERE id=?',(json.dumps(config),UUID));self.panel.commit()
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);s.vault.setGithubConnection('git-user','shared-fixture-token');s.close();"
+        subprocess.run([NODE,'--input-type=module','-e',script,str(self.src)],check=True,timeout=20)
+        self.fix_permissions();self.capture()
+        manifest=json.loads((self.dst/'manifest.json').read_text())
+        self.assertIn('secrets/'+reference,manifest['files'])
+        self.assertIn('secrets/83b896d9-8e84-41ae-886c-d9026721459a',manifest['files'])
+        self.assertNotIn('shared-fixture-token',json.dumps(manifest))
+        backup._validate_staging(self.destination_fd,self.node_fd)
+        restored=self.root/'restored-github';shutil.copytree(self.dst,restored)
+        check="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.vault.githubConnection()?.token!=='shared-fixture-token')process.exit(2);s.close();"
+        subprocess.run([NODE,'--input-type=module','-e',check,str(restored)],check=True,timeout=20)
+
     def test_git_metadata_rejects_mismatched_repository(self):
         self.add_git_credential(repository='https://github.com/other/repo.git')
         with self.assertRaisesRegex(backup.CaptureError,'Encryption verification failed'): self.capture()

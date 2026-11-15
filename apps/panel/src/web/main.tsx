@@ -70,6 +70,7 @@ import { api, errorMessage, RequestError, setCsrfToken } from "./api.js";
 import { CreateService } from "./ServiceCreate.js";
 import { AccountLinkSettings, CentralAccessSettings, CentralSignIn } from "./CentralAccess.js";
 import { LocalPasswordSettings } from "./LocalPassword.js";
+import { GithubSettings } from "./GithubSettings.js";
 import { UpdateSettings, useUpdateDiscovery } from "./UpdateSettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
@@ -709,6 +710,7 @@ function DashboardProject({ project }: { project: Project }) {
 }
 
 function ProjectPage() {
+  const { user } = useAuth();
   const { projectId } = useParams({ strict: false });
   const navigate = useNavigate();
   const projects = useProjects();
@@ -868,7 +870,7 @@ function ProjectPage() {
       <ErrorNotice error={actions.error} />
       {!actions.error ? <ActionsTable actions={actions.data ?? []} loading={actions.isPending} /> : null}
       {create && projectId ? (
-        <CreateService projectId={projectId} onClose={() => setCreate(false)} />
+        <CreateService projectId={projectId} admin={user.role === "admin"} onClose={() => setCreate(false)} />
       ) : null}
     </>
   );
@@ -1482,6 +1484,7 @@ function SettingsPage() {
         </section>
       </div>
       {user.role === "admin" ? <UpdateSettings /> : null}
+      {user.role === "admin" ? <GithubSettings /> : null}
       <LocalPasswordSettings />
       {user.role === "admin" ? <CentralAccessSettings /> : null}
       <AccountLinkSettings />

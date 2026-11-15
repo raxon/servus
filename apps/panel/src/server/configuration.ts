@@ -11,7 +11,7 @@ const targetSchema = z.string().min(2).max(255).refine(value=>value.startsWith('
 const kindSchema = z.enum(['app','postgres','redis','mariadb']);
 const sourceSchema = z.discriminatedUnion('type',[
   z.object({type:z.literal('image')}).strict(),
-  z.object({type:z.literal('git'),repository:z.string().url().max(1000),branch:z.string().min(1).max(200).regex(/^[^\s\x00-\x1f~^:?*\[\\]+$/),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),credential:z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),secretRef:z.string().uuid().optional()}).strict().refine(v=>Boolean(v.token)!==Boolean(v.secretRef)).optional()}).strict(),
+  z.object({type:z.literal('git'),repository:z.string().url().max(1000),branch:z.string().min(1).max(200).regex(/^[^\s\x00-\x1f~^:?*\[\\]+$/),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),sharedGithub:z.boolean().optional(),credential:z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),secretRef:z.string().uuid().optional()}).strict().refine(v=>Boolean(v.token)!==Boolean(v.secretRef)).optional()}).strict(),
 ]);
 const envSchema = z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32000).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).strict();
 const domainSchema = z.object({hostname:hostnameSchema,port:z.number().int().min(1).max(65535),primary:z.boolean().optional()}).strict();
@@ -66,6 +66,8 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
     if(!['https:','http:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw new AppError('GIT_SOURCE','Git URLs must not contain credentials, query strings or fragments');
     const allowed=(process.env.PANEL_GIT_HTTP_HOSTS??'').split(',').map(item=>item.trim()).filter(Boolean);
     if(url.protocol==='http:'&&!allowed.includes(url.hostname))throw new AppError('GIT_SOURCE','HTTP Git sources require an explicit local-test allowlist');
+    if(source.sharedGithub && (url.protocol!=='https:' || url.host.toLowerCase()!=='github.com'))throw new AppError('GIT_SOURCE','The shared GitHub connection can only be used with github.com');
+    if(source.sharedGithub && source.credential?.token)throw new AppError('GIT_SOURCE','Choose either the shared GitHub connection or a separate token');
     if(source.credential&&url.protocol!=='https:')throw new AppError('GIT_SOURCE','Private Git sources require HTTPS');
     if(!allowed.includes(url.hostname)&&(url.hostname==='localhost'||url.hostname.endsWith('.localhost')||url.hostname==='metadata.google.internal'||isIP(url.hostname)!==0))throw new AppError('GIT_SOURCE','Local or IP-based Git hosts require an explicit allowlist');
     for(const path of [source.context,source.dockerfile])if(path.startsWith('/')||path.split(/[\\/]/).includes('..')||path.includes('\0'))throw new AppError('GIT_PATH','Build paths must stay within the repository');
