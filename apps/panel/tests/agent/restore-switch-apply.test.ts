@@ -9,6 +9,7 @@ import { SecretVault } from '../../src/shared/secrets.js';
 import { applyRestoreSwitch } from '../../src/agent/restore-switch-apply.js';
 import { rollbackRestoreSwitch } from '../../src/agent/restore-switch-rollback.js';
 import { finalizeRestoreRollback } from '../../src/agent/restore-rollback-finalize.js';
+import { finalizeRestoreSwitch } from '../../src/agent/restore-switch-finalize.js';
 
 const cleanup:(()=>void)[]=[];
 afterEach(()=>{for(const remove of cleanup.splice(0).reverse())remove();});
@@ -111,4 +112,20 @@ it('does not release the fence when retention metadata cannot be written',async(
   f.db.exec("CREATE TRIGGER fail_retention BEFORE INSERT ON restore_retained_volumes BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END");
   await expect(finalizeRestoreRollback({...f.options,dataDir:f.dataDir,verifySource})).rejects.toThrow('synthetic failure');
   expect(f.journal.switchIntent(f.options.operationId)?.stage).toBe('rolled_back');expect(f.journal.hasUnresolved(f.options.serviceId)).toBe(true);
+});
+
+it('finalizes only after target verification and preserves the source volume',async()=>{
+  const f=fixture();await applyRestoreSwitch(f.options);
+  const result=await finalizeRestoreSwitch({...f.options,dataDir:f.dataDir});
+  expect(result.phase).toBe('completed');expect(f.journal.hasUnresolved(f.options.serviceId)).toBe(false);
+  expect(f.journal.volumeBinding(f.options.serviceId)?.volume_name).toBe(f.inspection.candidateVolume);
+  expect(f.journal.retainedVolume(f.options.operationId)).toMatchObject({volume_name:f.inspection.sourceVolume,reason:'pre_restore_source'});
+  expect((await finalizeRestoreSwitch({...f.options,dataDir:f.dataDir})).phase).toBe('completed');
+});
+
+it('keeps the switch fenced if target verification fails during finalization',async()=>{
+  const f=fixture();await applyRestoreSwitch(f.options);f.verifyTarget.mockRejectedValueOnce(new Error('database not ready'));
+  await expect(finalizeRestoreSwitch({...f.options,dataDir:f.dataDir})).rejects.toThrow('not ready');
+  expect(f.journal.switchIntent(f.options.operationId)?.stage).toBe('applied');
+  expect(f.journal.volumeBinding(f.options.serviceId)).toBeUndefined();expect(f.journal.hasUnresolved(f.options.serviceId)).toBe(true);
 });

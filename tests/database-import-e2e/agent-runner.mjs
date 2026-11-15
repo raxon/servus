@@ -12,6 +12,8 @@ import { applyRestoreSwitch } from '/app/dist/agent/restore-switch-apply.js';
 import { rollbackRestoreSwitch } from '/app/dist/agent/restore-switch-rollback.js';
 import { finalizeRestoreRollback } from '/app/dist/agent/restore-rollback-finalize.js';
 import { DockerRuntime } from '/app/dist/agent/runtime.js';
+import { verifyRestoreDatabase } from '/app/dist/agent/restore-switch-verify.js';
+import { finalizeRestoreSwitch } from '/app/dist/agent/restore-switch-finalize.js';
 
 const dataDir = mkdtempSync('/tmp/restore-agent-e2e-'), store = new Store(dataDir);
 const serviceId = process.env.SERVUS_IMPORT_SERVICE_ID || '11111111-1111-4111-8111-111111111111', kind = process.env.SERVUS_IMPORT_KIND;
@@ -57,7 +59,7 @@ try {
     switchDb=new Database(join(dataDir,'agent.sqlite'));const journal=new RestoreJournal(switchDb,()=>false);
     const options={docker,journal,vault:store.vault,serviceId,operationId};switchOptions=options;
     await prepareRestoreSwitchIntent(options);switchPlan=readRestoreSwitchIntent(options);
-    const verifyTarget=async plan=>{
+    const verifyData=async plan=>{
       for(let attempt=0;attempt<90;attempt++) {
         const containers=await docker.listContainers({all:true,filters:{volume:[plan.inspection.candidateVolume]}});
         for(const item of containers) {
@@ -70,17 +72,18 @@ try {
       }
       throw new Error('Switched database did not become ready');
     };
+    const verifyTarget=async plan=>{await verifyRestoreDatabase({docker,plan,side:'target',kind});await verifyData(plan);};
     await applyRestoreSwitch({...options,verifyTarget});
     if(journal.switchIntent(operationId)?.stage!=='applied'||!journal.hasUnresolved(serviceId))throw new Error('Switch is not durably fenced');
     if(process.env.SERVUS_SWITCH_BINDING==='1'){
-      journal.completeSwitch(operationId,serviceId,switchPlan.inspection.sourceVolume);bindingCompleted=true;
+      await finalizeRestoreSwitch({...options,dataDir,verifyTarget});bindingCompleted=true;
       const actual=new DockerRuntime('/var/run/docker.sock',18080,'unused',dataDir);
       actual.ensureInfrastructure=async()=>{};
       actual.pull=async()=>switchPlan.previousSpec.TaskTemplate.ContainerSpec.Image;
-      actual.verifyService=async()=>verifyTarget(switchPlan);
+      actual.verifyService=async()=>verifyData(switchPlan);
       const service={...snapshot,name:'fixture',image:kind==='postgres'?'postgres:17-alpine':'mariadb:11.4',hostname:'fixture.internal',port:kind==='postgres'?5432:3306,replicas:1,revision:1,deployedRevision:1,state:'running',createdAt:now,updatedAt:now,lastError:null,domains:[]};
-      await actual.apply(service,'restart',randomUUID());await verifyTarget(switchPlan);
-      await actual.apply(service,'deploy',randomUUID());await verifyTarget(switchPlan);
+      await actual.apply(service,'restart',randomUUID());await verifyData(switchPlan);
+      await actual.apply(service,'deploy',randomUUID());await verifyData(switchPlan);
       const current=await docker.getService(`panel-app-${serviceId}`).inspect();
       if(current.Spec.TaskTemplate.ContainerSpec.Mounts[0]?.Source!==switchPlan.inspection.candidateVolume||current.Spec.Labels?.['panel.restore.operation']!==operationId)throw new Error('Database lifecycle did not retain the restored volume');
       const active=await docker.listContainers({all:true,filters:{volume:[switchPlan.inspection.candidateVolume]}});
@@ -95,7 +98,7 @@ try {
       const secondOptions={...options,operationId:secondId};
       await prepareRestoreSwitchIntent(secondOptions);
       await applyRestoreSwitch({...secondOptions,verifyTarget});
-      const verifySecondSource=async plan=>verifyTarget({...plan,inspection:{...plan.inspection,candidateVolume:plan.inspection.sourceVolume}});
+      const verifySecondSource=async plan=>{await verifyRestoreDatabase({docker,plan,side:'source',kind});await verifyData({...plan,inspection:{...plan.inspection,candidateVolume:plan.inspection.sourceVolume}});};
       await rollbackRestoreSwitch({...secondOptions,verifySource:verifySecondSource});
       const secondFinished=await finalizeRestoreRollback({...secondOptions,dataDir,verifySource:verifySecondSource});
       if(secondFinished.phase!=='cancelled'||journal.volumeBinding(serviceId)?.operation_id!==operationId)throw new Error('Second restore did not preserve the first binding');
@@ -109,12 +112,13 @@ try {
 } finally {
   if(switchPlan){
     const verifySource=async plan=>{
+      if(!bindingCompleted)await verifyRestoreDatabase({docker,plan,side:'source',kind});
       for(let attempt=0;attempt<90;attempt++){
         const active=await docker.listContainers({all:true,filters:{volume:[plan.inspection.sourceVolume]}});
         for(const item of active){
           const info=await docker.getContainer(item.Id).inspect();
           if(!info.State.Running||info.Config.Labels?.['com.docker.swarm.service.name']!==`panel-app-${serviceId}`)continue;
-          const sourceQuery=kind==='postgres'?`PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT string_agg(value, ',' ORDER BY value) FROM items"`:`MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT GROUP_CONCAT(value ORDER BY value SEPARATOR ',') FROM items"`;
+          const sourceQuery=kind==='postgres'?`PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT string_agg(value, ',' ORDER BY value) FROM items"`:`MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT GROUP_CONCAT(value ORDER BY value SEPARATOR ',') FROM items"`;
           try{if(execFileSync('docker',['exec',item.Id,'sh','-c',sourceQuery],{encoding:'utf8',stdio:['ignore','pipe','ignore'],env:{...process.env,PATH:`${process.env.PATH}:/usr/local/bin`}}).trim()==='expected-marker,source-after-backup')return;}catch{}
         }
         await new Promise(resolve=>setTimeout(resolve,1000));

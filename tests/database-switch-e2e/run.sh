@@ -42,21 +42,27 @@ password=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
 printf '%s' "$password" > "$root/password"; chmod 600 "$root/password"
 touch "$root/project"; chmod 600 "$root/project"
 docker volume create --label "servus.test=$id" --label panel.owner=self-hosted-panel --label "panel.service=$service_id" "$source_volume" >/dev/null
+secret="servus-fixture-$id-password"
+docker secret create --label panel.owner=self-hosted-panel --label "panel.service=$service_id" "$secret" "$root/password" >/dev/null
+database_secrets=(--secret "source=$secret,target=panel-db-password,mode=0444")
 if [[ $kind == postgres ]]; then
   image=postgres:17-alpine; data_path=/var/lib/postgresql/data
-  database_env=(--env POSTGRES_DB=fixture --env POSTGRES_USER=fixture --env "POSTGRES_PASSWORD=$password")
+  database_env=(--env POSTGRES_DB=fixture --env POSTGRES_USER=fixture --env POSTGRES_PASSWORD_FILE=/run/secrets/panel-db-password)
 else
   image=mariadb:11.4; data_path=/var/lib/mysql
-  database_env=(--env MARIADB_DATABASE=fixture --env MARIADB_USER=fixture --env "MARIADB_PASSWORD=$password" --env "MARIADB_ROOT_PASSWORD=$password")
+  root_secret="servus-fixture-$id-root"
+  docker secret create --label panel.owner=self-hosted-panel --label "panel.service=$service_id" "$root_secret" "$root/password" >/dev/null
+  database_secrets+=(--secret "source=$root_secret,target=panel-db-root-password,mode=0444")
+  database_env=(--env MARIADB_DATABASE=fixture --env MARIADB_USER=fixture --env MARIADB_PASSWORD_FILE=/run/secrets/panel-db-password --env MARIADB_ROOT_PASSWORD_FILE=/run/secrets/panel-db-root-password)
 fi
 docker service create --quiet --name "$service" --no-resolve-image --replicas 1 --update-order stop-first --constraint "node.id==$node_id" \
   --label "servus.test=$id" --label panel.owner=self-hosted-panel --label "panel.service=$service_id" --label "panel.kind=$kind" \
   --container-label "servus.test=$id" --container-label panel.owner=self-hosted-panel --container-label "panel.service=$service_id" \
-  --mount "type=volume,source=$source_volume,target=$data_path" "${database_env[@]}" "$image" >/dev/null
+  --mount "type=volume,source=$source_volume,target=$data_path" "${database_env[@]}" "${database_secrets[@]}" "$image" >/dev/null
 source_id=''
 ready() {
   if [[ $kind == postgres ]]; then docker exec "$source_id" pg_isready -q -h 127.0.0.1 -U fixture -d fixture
-  else docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT 1"' >/dev/null 2>&1; fi
+  else docker exec "$source_id" sh -c 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT 1"' >/dev/null 2>&1; fi
 }
 for _ in $(seq 1 90); do
   source_id=$(docker ps -q --no-trunc --filter "label=com.docker.swarm.service.name=$service" | head -1)
@@ -65,13 +71,13 @@ for _ in $(seq 1 90); do
 done
 [[ -n $source_id ]] && ready
 if [[ $kind == postgres ]]; then
-  docker exec "$source_id" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -v ON_ERROR_STOP=1 -c "CREATE TABLE items (value text); INSERT INTO items VALUES ('\''expected-marker'\'');"' >/dev/null
-  docker exec "$source_id" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h 127.0.0.1 -U fixture --format=custom --no-owner --no-privileges fixture' > "$root/dump"
-  docker exec "$source_id" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -v ON_ERROR_STOP=1 -c "INSERT INTO items VALUES ('\''source-after-backup'\'');"' >/dev/null
+  docker exec "$source_id" sh -c 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -v ON_ERROR_STOP=1 -c "CREATE TABLE items (value text); INSERT INTO items VALUES ('\''expected-marker'\'');"' >/dev/null
+  docker exec "$source_id" sh -c 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" pg_dump -h 127.0.0.1 -U fixture --format=custom --no-owner --no-privileges fixture' > "$root/dump"
+  docker exec "$source_id" sh -c 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -v ON_ERROR_STOP=1 -c "INSERT INTO items VALUES ('\''source-after-backup'\'');"' >/dev/null
 else
-  docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -e "CREATE TABLE items (value text); INSERT INTO items VALUES ('\''expected-marker'\'');"'
-  docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb-dump -h 127.0.0.1 -u fixture --single-transaction --quick --skip-lock-tables --no-tablespaces fixture' > "$root/dump"
-  docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -e "INSERT INTO items VALUES ('\''source-after-backup'\'');"'
+  docker exec "$source_id" sh -c 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -e "CREATE TABLE items (value text); INSERT INTO items VALUES ('\''expected-marker'\'');"'
+  docker exec "$source_id" sh -c 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb-dump -h 127.0.0.1 -u fixture --single-transaction --quick --skip-lock-tables --no-tablespaces fixture' > "$root/dump"
+  docker exec "$source_id" sh -c 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -e "INSERT INTO items VALUES ('\''source-after-backup'\'');"'
 fi
 runner=$(cd "$(dirname "$0")/../database-import-e2e" && pwd)/agent-runner.mjs
 mounts=()
@@ -85,9 +91,9 @@ source_id=$(docker ps -q --no-trunc --filter "label=com.docker.swarm.service.nam
 for _ in $(seq 1 90); do if ready; then break; fi; sleep 1; done
 ready
 if [[ $kind == postgres ]]; then
-  source_result=$(docker exec "$source_id" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT string_agg(value, '\'','\'' ORDER BY value) FROM items"')
+  source_result=$(docker exec "$source_id" sh -c 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT string_agg(value, '\'','\'' ORDER BY value) FROM items"')
 else
-  source_result=$(docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT GROUP_CONCAT(value ORDER BY value SEPARATOR '\'','\'') FROM items"')
+  source_result=$(docker exec "$source_id" sh -c 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT GROUP_CONCAT(value ORDER BY value SEPARATOR '\'','\'') FROM items"')
 fi
 [[ $source_result == expected-marker,source-after-backup ]]
 ! docker inspect "$candidate" >/dev/null 2>&1
