@@ -11,6 +11,8 @@ if (process.platform !== 'linux' || process.getuid?.() !== 0 || !process.env.SER
 const require = createRequire('/app/package.json');
 const Database = require('better-sqlite3');
 const root = mkdtempSync('/srv/servus-entrypoint-fixture-'); chmodSync(root, 0o755);
+const lifecycleState='/run/servus-lifecycle/state';
+writeFileSync(lifecycleState,'servus-lifecycle-v1 normal\n',{mode:0o644});chmodSync(lifecycleState,0o644);
 const data = join(root, 'data');
 const token = randomBytes(32).toString('hex');
 const secretPath = join(root, 'secret'); writeFileSync(secretPath, token, { mode: 0o640 }); chownSync(secretPath, 0, 1000);
@@ -72,6 +74,10 @@ try {
   await pauseUntil(async () => { try { return (await fetch(`http://127.0.0.1:${apiPort}/health`)).ok; } catch { return false; } }, 'API startup');
   await pauseUntil(() => ['api','worker','agent'].every(role => channels.has(role)), 'all authenticated control channels');
   const origin=`http://127.0.0.1:${apiPort}`;
+  writeFileSync(lifecycleState,'servus-lifecycle-v1 recovering\n');
+  const blockedSetup=await fetch(`${origin}/api/v1/setup`,{method:'POST',headers:{origin,'content-type':'application/json'},body:JSON.stringify({email:'fixture@example.test',password:'fixture-password-123'})});
+  assert.equal(blockedSetup.status,503);
+  writeFileSync(lifecycleState,'servus-lifecycle-v1 normal\n');
   const setup=await fetch(`${origin}/api/v1/setup`,{method:'POST',headers:{origin,'content-type':'application/json'},body:JSON.stringify({email:'fixture@example.test',password:'fixture-password-123'})});
   assert.equal(setup.status,200);const cookie=setup.headers.get('set-cookie').split(';')[0];const csrf=(await setup.json()).csrfToken;
   const requestId = randomUUID(); const first = await drain('worker',requestId); assert.equal(first.status,'drained');

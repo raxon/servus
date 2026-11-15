@@ -126,6 +126,7 @@ jobs:
           docker run --rm --pull=never --network none --read-only --user root \
             --tmpfs /srv:rw,nosuid,nodev,size=128m \
             --tmpfs /tmp:rw,nosuid,nodev,size=32m \
+            --tmpfs /run/servus-lifecycle:rw,nosuid,nodev,size=1m,mode=755 \
             --mount "type=bind,source=$RUNNER_TEMP/servus-release-context/tests/integration/supervisor-entrypoint.mjs,target=/fixture.mjs,readonly" \
             --env SERVUS_SUPERVISOR_INTEGRATION_FIXTURE=1 \
             --entrypoint node "$IMAGE_ID" /fixture.mjs
