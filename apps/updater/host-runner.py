@@ -1,0 +1,120 @@
+#!/usr/bin/python3 -I
+"""Run a root-authorized host update for one completed signed release.
+
+This command is not installed as a service or called by the panel. The caller
+must arrange boot recovery before scheduling it unattended.
+"""
+import argparse
+import fcntl
+import importlib.util
+import os
+import sqlite3
+import stat
+import sys
+
+
+class HostRunnerError(Exception):
+    pass
+
+
+PATHS = {
+    'state': '/var/lib/servus-updater', 'install': '/opt/servus',
+    'gate': '/etc/servus/lifecycle', 'active': '/usr/local/libexec/servus',
+    'parent': '/usr/local/libexec', 'candidates': '/var/lib/servus-updater/host-generations',
+    'units': '/etc/systemd/system', 'active_env': '/etc/servus/servus.env',
+    'socket': '/etc/servus/supervisor-control/command',
+}
+
+
+def activate(operation_id, *, modules, paths=PATHS):
+    """Authorize the active release, then stage and activate its host runtime."""
+    supervisor=modules['supervisor'];daemon=modules['daemon'];bundle=modules['bundle']
+    coordinator=modules['coordinator'];unit_mask=modules['unit_mask'];switch=modules['switch']
+    if (sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or
+        not isinstance(operation_id,str) or not bundle.OPERATION.fullmatch(operation_id)):
+        raise HostRunnerError('Invalid host activation request')
+    state=install=units=active=candidates=host_lock=install_lock=service_lock=db=None
+    try:
+        state=supervisor._trusted_directory(paths['state'],0o700)
+        install=supervisor._trusted_directory(paths['install'],0o700)
+        units=supervisor._trusted_directory(paths['units'],0o755)
+        active=supervisor._trusted_directory(paths['parent'],0o755)
+        candidates=supervisor._trusted_directory(paths['candidates'],0o700)
+        host_lock=supervisor._open_root_file(state,'host.lock',0o600)
+        install_lock=supervisor._open_root_file(install,'install.lock',0o600)
+        for fd in (host_lock,install_lock):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        dbpath=paths['state']+'/journal.sqlite';fd=supervisor._open_root_file(state,'journal.sqlite',0o600);os.close(fd)
+        db=sqlite3.connect(dbpath,isolation_level=None,timeout=5)
+        policy_path,accepted_env,policy=daemon.resolve_active_policy(dbpath,paths['active_env'])
+        identities=supervisor.inspect_servus(policy)
+        digest,stage=bundle.completed_update(db,operation_id,paths['state']+'/staging',policy_path,paths['active_env'],policy.image_reference)
+        def authorize():
+            if (daemon.resolve_active_policy(dbpath,paths['active_env']) != (policy_path,accepted_env,policy) or
+                supervisor.inspect_servus(policy) != identities or
+                bundle.completed_update(db,operation_id,paths['state']+'/staging',policy_path,paths['active_env'],policy.image_reference)!=(digest,stage)):
+                raise HostRunnerError('Active update changed')
+        originals={name:modules['install_host'].read_file(units,name,0o644) for name in unit_mask.UNITS}
+        service_lock,initial=coordinator.stop_updater(db,operation_id,digest,state_fd=state,install_fd=install,
+            host_lock=host_lock,install_lock=install_lock,supervisor=supervisor,unit_mask=unit_mask,bundle=bundle,authorize=authorize)
+        generation,prepared_digest,contents,cli,pin=coordinator.prepare_completed(db,operation_id,
+            state_dir=paths['state'],install_dir=paths['install'],gate_dir=paths['gate'],candidate_parent=paths['candidates'],
+            host_dir=paths['active'],active_env=paths['active_env'],service_lock=service_lock,install_lock=install_lock,
+            supervisor=supervisor,daemon=daemon,extractor=modules['extractor'],backup=modules['backup'],bundle=bundle,
+            install_host=modules['install_host'],install_gh=modules['install_gh'],include_material=True)
+        if generation!='runtime-'+operation_id or prepared_digest!=digest:raise HostRunnerError('Prepared release differs')
+        def fence():modules['fence'].assert_fenced(paths['active'],modules['quiescence'])
+        coordinator.activate_prepared(db,operation_id,digest,originals,initial,contents,cli,pin,state_fd=state,install_fd=install,
+            units_fd=units,active_parent=active,candidate_parent=candidates,host_lock=host_lock,service_lock=service_lock,
+            install_lock=install_lock,supervisor=supervisor,unit_mask=unit_mask,host_switch=switch,bundle=bundle,
+            exchange=modules['exchange'],fence=fence,authorize=authorize,supervisor_socket=paths['socket'])
+    finally:
+        if db is not None:db.close()
+        for fd in (service_lock,install_lock,host_lock,candidates,active,units,install,state):
+            if fd is not None:os.close(fd)
+
+
+def load_modules():
+    """Load only protected root-owned installed modules before the exchange."""
+    directory=PATHS['active']
+    fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        for component in directory.split('/')[1:]:
+            child=os.open(component,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+            os.close(fd);fd=child
+            info=os.fstat(fd)
+            if info.st_uid!=0 or info.st_mode & 0o022:raise HostRunnerError('Host module path is unsafe')
+        info=os.fstat(fd)
+        if info.st_gid!=0 or stat.S_IMODE(info.st_mode)!=0o755:raise HostRunnerError('Host module directory is unsafe')
+        item=os.open('supervisor.py',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
+        try:
+            info=os.fstat(item);named=os.stat('supervisor.py',dir_fd=fd,follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or info.st_nlink!=1 or
+                stat.S_IMODE(info.st_mode)!=0o644 or (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino)):
+                raise HostRunnerError('Host supervisor module is unsafe')
+        finally:os.close(item)
+    finally:os.close(fd)
+    import supervisor
+    fd=supervisor._trusted_directory(directory,0o755)
+    try:
+        names={'daemon':'supervisor-daemon','bundle':'host-bundle','coordinator':'host-coordinator',
+               'unit_mask':'host-unit-mask','switch':'host-switch','exchange':'host-exchange',
+               'fence':'host-fence','quiescence':'quiescence','extractor':'extract-install',
+               'backup':'backup','install_host':'install-host','install_gh':'install-gh'}
+        result={'supervisor':supervisor}
+        for key,name in names.items():
+            item=supervisor._open_root_file(fd,name+'.py',0o644);os.close(item)
+            spec=importlib.util.spec_from_file_location('servus_host_'+name.replace('-','_'),directory+'/'+name+'.py')
+            if not spec or not spec.loader:raise HostRunnerError('Host module is unavailable')
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);result[key]=module
+        return result
+    finally:os.close(fd)
+
+
+def main():
+    parser=argparse.ArgumentParser();parser.add_argument('operation_id');args=parser.parse_args()
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated:raise HostRunnerError('Isolated root is required')
+    sys.path.insert(0,PATHS['active'])
+    activate(args.operation_id,modules=load_modules())
+
+
+if __name__=='__main__':main()

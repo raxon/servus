@@ -13,6 +13,7 @@
 100644 apps/updater/host-coordinator.py
 100644 apps/updater/host-exchange.py
 100644 apps/updater/host-fence.py
+100644 apps/updater/host-runner.py
 100644 apps/updater/host-switch.py
 100644 apps/updater/host-unit-mask.py
 100644 apps/updater/initial-generation.py
