@@ -94,6 +94,79 @@ def no_duplicate_keys(pairs):
     return result
 
 
+class LegacyRecoveryJournal:
+    """Durable at-most-once dispatch for host-mediated legacy upload recovery."""
+    def __init__(self,state_dir):
+        fd=private_file(state_dir,'legacy-recovery-requests.sqlite');os.close(fd)
+        self.db=sqlite3.connect(state_dir/'legacy-recovery-requests.sqlite',isolation_level=None,timeout=2)
+        self.db.execute('PRAGMA journal_mode=WAL');self.db.execute('PRAGMA synchronous=FULL');self.db.execute('PRAGMA busy_timeout=2000')
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            version=self.db.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (0,1):raise RuntimeError('Unsupported legacy recovery journal')
+            self.db.execute("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY,restore_id TEXT NOT NULL UNIQUE,service_id TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('requested','dispatching','awaiting_completion','completed','recovery_required')),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_legacy_recovery ON requests ((1)) WHERE state != 'completed'")
+            self.db.execute('PRAGMA user_version=1');self.db.execute('COMMIT')
+        except BaseException:
+            self.db.execute('ROLLBACK');self.db.close();raise
+        directory=os.open(state_dir,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:os.fsync(directory)
+        finally:os.close(directory)
+
+    def close(self):self.db.close()
+    def recover(self):
+        # An earlier daemon may still be executing after its client disappears.
+        self.db.execute("UPDATE requests SET state='recovery_required' WHERE state IN ('dispatching','awaiting_completion')")
+    def active(self):return bool(self.db.execute("SELECT 1 FROM requests WHERE state != 'completed' LIMIT 1").fetchone())
+    def status(self,operation_id):
+        if not valid_uuid(operation_id):raise ProtocolError('invalid_request')
+        row=self.db.execute('SELECT id,restore_id,service_id,state FROM requests WHERE id=?',(operation_id,)).fetchone()
+        if not row:raise ProtocolError('not_found')
+        return dict(zip(('operationId','restoreId','serviceId','status'),row))
+    def submit(self,operation_id,restore_id,service_id,update_journal):
+        if (not valid_uuid(operation_id) or not isinstance(restore_id,str) or not re.fullmatch(r'[a-f0-9]{32}',restore_id) or
+            not isinstance(service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service_id)):
+            raise ProtocolError('invalid_request')
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            old=self.db.execute('SELECT restore_id,service_id FROM requests WHERE id=?',(operation_id,)).fetchone()
+            if old:
+                if old!=(restore_id,service_id):raise ProtocolError('idempotency_conflict')
+                result=self.status(operation_id);self.db.execute('COMMIT');return result
+            if self.active() or self.db.execute('SELECT 1 FROM requests WHERE restore_id=?',(restore_id,)).fetchone():raise ProtocolError('operation_in_progress')
+            if (update_journal.host_update_pending() or
+                update_journal.db.execute("SELECT 1 FROM operations WHERE status IN ('accepted','verifying','recovery_required') LIMIT 1").fetchone() or
+                update_journal.db.execute("SELECT 1 FROM preparations WHERE status IN ('preparing','prepared','recovery_required') LIMIT 1").fetchone() or
+                update_journal.db.execute("SELECT 1 FROM update_transactions WHERE phase != 'completed' LIMIT 1").fetchone() or
+                update_journal.db.execute("SELECT 1 FROM apply_requests WHERE state != 'completed' LIMIT 1").fetchone()):
+                raise ProtocolError('operation_in_progress')
+            self.db.execute("INSERT INTO requests(id,restore_id,service_id,state) VALUES(?,?,?,'requested')",(operation_id,restore_id,service_id))
+            result=self.status(operation_id);self.db.execute('COMMIT');return result
+        except BaseException:
+            if self.db.in_transaction:self.db.execute('ROLLBACK')
+            raise
+    def claim(self):
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            row=self.db.execute("SELECT id,restore_id,service_id FROM requests WHERE state='requested'").fetchone()
+            if row and self.db.execute("UPDATE requests SET state='dispatching' WHERE id=? AND state='requested'",(row[0],)).rowcount!=1:raise RuntimeError('Recovery request changed')
+            self.db.execute('COMMIT');return row
+        except BaseException:
+            if self.db.in_transaction:self.db.execute('ROLLBACK')
+            raise
+    def finish_dispatch(self,operation_id,success):
+        if not valid_uuid(operation_id) or type(success) is not bool:raise ValueError('Invalid recovery dispatch result')
+        cursor=self.db.execute("UPDATE requests SET state=? WHERE id=? AND state='dispatching'",('awaiting_completion' if success else 'recovery_required',operation_id))
+        if cursor.rowcount!=1:raise RuntimeError('Recovery request changed')
+    def pending_confirmation(self):
+        return self.db.execute("SELECT id,restore_id,service_id,state FROM requests WHERE state IN ('awaiting_completion','recovery_required')").fetchone()
+    def confirm(self,operation_id,result):
+        if not valid_uuid(operation_id) or result not in ('completed','recovery_required','in_progress','unknown'):raise ValueError('Invalid recovery confirmation')
+        if result in ('completed','recovery_required'):
+            cursor=self.db.execute("UPDATE requests SET state=? WHERE id=? AND state IN ('awaiting_completion','recovery_required')",(result,operation_id))
+            if cursor.rowcount!=1:raise RuntimeError('Recovery request changed')
+
+
 class Journal:
     def __init__(self, state_dir):
         database = state_dir / 'journal.sqlite'
