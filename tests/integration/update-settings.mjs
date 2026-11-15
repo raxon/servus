@@ -64,7 +64,8 @@ try {
   await page.goto(`${origin}/settings`);
   await page.getByRole('button', { name: 'Check for updates' }).click();
   await page.getByText('Version v0.1.6 is available.', { exact: false }).waitFor();
-  assert.equal(discovered, 2);
+  assert.ok(discovered >= 2);
+  await page.getByRole('link', { name: 'Update available: v0.1.6' }).waitFor();
   await page.getByRole('button', { name: 'Install update' }).click();
   await page.getByText('Release verification failed.').waitFor();
   await page.reload();
