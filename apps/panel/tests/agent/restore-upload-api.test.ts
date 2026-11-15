@@ -1,11 +1,14 @@
 import { afterEach, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createRequire } from 'node:module';
 import { createAgent } from '../../src/agent/app.js';
 import { AgentMaintenanceGate } from '../../src/agent/maintenance.js';
 
@@ -79,3 +82,23 @@ it('does not release an interrupted upload without a live writer to reconcile',a
     expect((db.prepare('SELECT phase FROM restore_operations WHERE id=?').get(operationId) as {phase:string}).phase).toBe('uploading');
   }finally{db.close();}
 });
+
+it('recovers a killed writer but refuses while another process holds its upload lock',async()=>{
+  const {app,dataDir,serviceId,operationId}=await fixture();
+  const journalUrl=new URL('../../src/agent/restore-journal.ts',import.meta.url).href,uploadUrl=new URL('../../src/agent/restore-upload.ts',import.meta.url).href;
+  const sqlitePath=createRequire(import.meta.url).resolve('better-sqlite3');
+  const program=`const {default:Database}=await import(process.argv[1]);const {RestoreJournal}=await import(process.argv[2]);const {uploadRestoreArchive}=await import(process.argv[3]);const {PassThrough}=await import('node:stream');const db=new Database(process.argv[4]);const journal=new RestoreJournal(db,()=>false);const source=new PassThrough();void uploadRestoreArchive({journal,operationId:process.argv[5],serviceId:process.argv[6],kind:'postgres',dataDir:process.argv[7],key:Buffer.alloc(32),input:()=>source}).catch(()=>{});source.write('private fixture');process.stdout.write('ready\\n');setInterval(()=>{},1000);`;
+  const child=spawn(process.execPath,['--import','tsx','--input-type=module','-e',program,sqlitePath,journalUrl,uploadUrl,join(dataDir,'agent.sqlite'),operationId,serviceId,dataDir],{stdio:['ignore','pipe','pipe']});
+  const path=`/services/${serviceId}/database-restore/${operationId}`,auth={authorization:'Bearer fixture-token'};
+  try{
+    const ready=await Promise.race([once(child.stdout,'data'),once(child,'exit').then(()=>{throw new Error('Upload fixture exited early');}),delay(5000).then(()=>{throw new Error('Upload fixture timed out');})]);
+    expect(ready[0].toString()).toBe('ready\n');
+    expect((await app.inject({method:'POST',url:`${path}/cancel`,headers:auth})).statusCode).toBe(409);
+    expect((await app.inject({url:path,headers:auth})).json().phase).toBe('uploading');
+    const exited=once(child,'exit');child.kill('SIGKILL');await exited;
+    const cancelled=await app.inject({method:'POST',url:`${path}/cancel`,headers:auth});
+    expect(cancelled.statusCode).toBe(200);expect(cancelled.json()).toEqual({operationId,phase:'cancelled'});
+    expect(readdirSync(join(dataDir,'restore-archives'))).toEqual([]);
+    expect((await app.inject({url:path,headers:auth})).json().phase).toBe('cancelled');
+  }finally{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');}
+},10000);

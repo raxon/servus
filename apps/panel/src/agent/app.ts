@@ -13,6 +13,8 @@ import type { Service } from '../shared/types.js';
 import { consoleExecStopped, type AgentMaintenanceGate } from './maintenance.js';
 import { DatabaseExportUncertainError, exportDatabase } from './database-export.js';
 import { RestoreJournal } from './restore-journal.js';
+import { acquireRestoreUploadLock } from './restore-upload-lock.js';
+import { discardInterruptedRestoreArchive, readRestoreArchive } from './restore-archive.js';
 import { uploadRestoreArchive } from './restore-upload.js';
 import { cancelStagedRestore } from './restore-cancel.js';
 import { cancelPreparedRestore } from './restore-candidate-cancel.js';
@@ -20,7 +22,6 @@ import { loadRestoreSource } from './restore-source.js';
 import { prepareRestoreCandidate } from './restore-preparation.js';
 import { createRestoreCandidate } from './restore-candidate.js';
 import { DatabaseImportError, importDatabaseCandidate } from './database-import.js';
-import { readRestoreArchive } from './restore-archive.js';
 import { inspectRestoreSwitch } from './restore-switch-inspect.js';
 import { commitPreparedRestore, RestoreCommitUncertainError } from './restore-commit.js';
 
@@ -172,12 +173,24 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
     if (!['uploading','reserved','discarding','prepared','discarding_candidate','cancelled'].includes(record.phase) || cancellingRestores.has(record.id)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be cancelled now.'}});
     const upload=record.phase==='uploading'?activeUploads.get(record.id):undefined;
-    if(record.phase==='uploading'&&(!upload||upload.serviceId!==req.params.id))return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'The interrupted upload requires recovery.'}});
+    if(upload&&upload.serviceId!==req.params.id)return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be cancelled now.'}});
     const release = maintenance?.admit();
     if (maintenance && !release) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     cancellingRestores.add(record.id);
     try {
       if(upload){upload.controller.abort();await upload.done;}
+      else if(record.phase==='uploading'){
+        let unlock:()=>void;
+        try{unlock=acquireRestoreUploadLock(config.dataDir,record.id,false);}
+        catch{return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'The interrupted upload requires recovery.'}});}
+        try{
+          const current=restores.get(record.id);
+          if(!current||current.service_id!==req.params.id||current.phase!=='uploading')throw new RestoreCommitUncertainError('Restore upload state changed during recovery.');
+          discardInterruptedRestoreArchive(config.dataDir,record.id);
+          const result=restores.advance(record.id,'uploading','cancelled');
+          return {operationId:result.id,phase:result.phase};
+        }finally{unlock();}
+      }
       const current=restores.get(record.id);
       if(!current||current.service_id!==req.params.id||!['reserved','discarding','prepared','discarding_candidate','cancelled'].includes(current.phase))throw new RestoreCommitUncertainError('Restore upload cleanup requires recovery.');
       const result = ['prepared','discarding_candidate'].includes(current.phase)

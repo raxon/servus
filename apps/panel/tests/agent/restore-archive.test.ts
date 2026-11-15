@@ -6,13 +6,30 @@ import { tmpdir } from 'node:os';
 import { PassThrough, Readable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readRestoreArchive, stageRestoreArchive } from '../../src/agent/restore-archive.js';
+import { discardInterruptedRestoreArchive, readRestoreArchive, stageRestoreArchive } from '../../src/agent/restore-archive.js';
 import { SecretVault } from '../../src/shared/secrets.js';
 
 const cleanup: string[] = [];
 afterEach(() => { for (const dir of cleanup.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function fixture() { const dataDir = mkdtempSync(join(tmpdir(), 'restore-archive-test-')); cleanup.push(dataDir); return { dataDir, operationId: 'a'.repeat(32), key: randomBytes(32) }; }
 async function read(stream: Readable) { const chunks: Buffer[] = []; for await (const chunk of stream) chunks.push(Buffer.from(chunk)); return Buffer.concat(chunks); }
+
+it('removes both links after a crash during archive publication',async()=>{
+  const base=fixture();await stageRestoreArchive({...base,input:()=>Readable.from(['archive'])});
+  const dir=join(base.dataDir,'restore-archives'),published=join(dir,`${base.operationId}.enc`);
+  linkSync(published,join(dir,`.pending-${base.operationId}-${'b'.repeat(32)}`));
+  discardInterruptedRestoreArchive(base.dataDir,base.operationId);expect(readdirSync(dir)).toEqual([]);
+  discardInterruptedRestoreArchive(base.dataDir,base.operationId);
+});
+
+it('refuses to discard unexpected hard links or symbolic links',async()=>{
+  const base=fixture();await stageRestoreArchive({...base,input:()=>Readable.from(['archive'])});
+  const dir=join(base.dataDir,'restore-archives'),published=join(dir,`${base.operationId}.enc`),external=join(base.dataDir,'external');
+  linkSync(published,external);expect(()=>discardInterruptedRestoreArchive(base.dataDir,base.operationId)).toThrow('recovery');
+  rmSync(external);symlinkSync(published,join(dir,`.pending-${base.operationId}-${'b'.repeat(32)}`));
+  expect(()=>discardInterruptedRestoreArchive(base.dataDir,base.operationId)).toThrow('recovery');
+  expect(readFileSync(published).length).toBeGreaterThan(0);
+});
 
 it('derives stable, operation-specific archive keys without exposing the installation key', () => {
   const { dataDir, operationId } = fixture(), vault = new SecretVault(dataDir), key = vault.restoreArchiveKey(operationId);

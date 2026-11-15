@@ -56,6 +56,23 @@ export async function discardUnpublishedRestoreArchive(dataDir: string, operatio
   try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
 }
 
+/** Discard an interrupted publication while the operation's process lock is held. */
+export function discardInterruptedRestoreArchive(dataDir:string,operationId:string):void {
+  if(!idPattern.test(operationId))throw new Error('Invalid restore archive identity.');
+  const dir=archiveDirectory(dataDir),prefix=`.pending-${operationId}-`,pattern=new RegExp(`^\\.pending-${operationId}-[a-f0-9]{32}$`);
+  const pending=readdirSync(dir).filter(name=>name.startsWith(prefix));
+  if(pending.length>1||pending.some(name=>!pattern.test(name)))throw new Error('Restore archive requires recovery.');
+  const published=join(dir,`${operationId}.enc`),paths=[...pending.map(name=>join(dir,name)),published];
+  const found=paths.flatMap(path=>{try{return [{path,info:lstatSync(path)}];}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return [];throw error;}});
+  const uid=process.getuid?.();
+  if(found.some(({info})=>!info.isFile()||info.isSymbolicLink()||(uid!==undefined&&info.uid!==uid)||(info.mode&0o777)!==0o600))throw new Error('Restore archive requires recovery.');
+  if(found.length===2){if(found[0]!.info.dev!==found[1]!.info.dev||found[0]!.info.ino!==found[1]!.info.ino||found.some(({info})=>info.nlink!==2))throw new Error('Restore archive requires recovery.');}
+  else if(found.some(({info})=>info.nlink!==1))throw new Error('Restore archive requires recovery.');
+  for(const item of found)unlinkSync(item.path);
+  const fd=openSync(dir,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+  try{fsyncSync(fd);}finally{closeSync(fd);}
+}
+
 /** Persist an authenticated encrypted archive without replacing an existing operation. */
 export async function stageRestoreArchive(options: {
   dataDir: string; operationId: string; key: Buffer; input: () => Readable; signal?: AbortSignal; sizeLimit?: number;
