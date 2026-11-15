@@ -23,6 +23,8 @@ MAX_CLI = 64 * 1024 * 1024
 OPERATION = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
 DIGEST = re.compile(r'^sha256:[a-f0-9]{64}$')
 STAGE = re.compile(r'^servus-install-[a-f0-9]{32}$')
+ADOPTION_GUARDS = ('host-boot-gate.py','host-bundle.py','host-coordinator.py','host-exchange.py','host-fence.py',
+                   'host-recovery.py','host-runner.py','host-switch.py','host-unit-mask.py','install-host.py')
 
 
 class HostBundleError(Exception):
@@ -257,6 +259,60 @@ def inspect_unit_adoption(units_fd, old_units, new_units, *, read_file):
             raise HostBundleError('Existing unit differs from verified release')
         pending.append(name)
     return tuple(pending)
+
+
+def install_adoption_guards(host_fd, state_fd, old_modules, new_modules, *, read_file, publish, authorize):
+    """Install signed recovery guards without replacing running service modules.
+
+    The caller must hold the host and installation locks, bind both inventories
+    to verified journal entries, and recheck that binding in authorize().
+    """
+    if (sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or
+        not callable(read_file) or not callable(publish) or not callable(authorize) or
+        not isinstance(old_modules,dict) or not isinstance(new_modules,dict) or
+        not set(ADOPTION_GUARDS).issubset(new_modules) or 'install-host.py' not in old_modules):
+        raise HostBundleError('Invalid recovery guard adoption context')
+    for fd,mode in ((host_fd,0o755),(state_fd,0o700)):
+        info=os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or stat.S_IMODE(info.st_mode)!=mode:
+            raise HostBundleError('Unsafe recovery guard directory')
+    for inventory,names in ((old_modules,('install-host.py',)),(new_modules,ADOPTION_GUARDS)):
+        for name in names:
+            value=inventory[name]
+            if (not isinstance(value,tuple) or len(value)!=2 or value[0]!=0o644 or
+                not isinstance(value[1],bytes) or len(value[1])>MAX_MODULE):
+                raise HostBundleError('Invalid recovery guard inventory')
+    if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
+    old=old_modules['install-host.py'][1];new=new_modules['install-host.py'][1]
+    current=read_file(host_fd,'install-host.py',0o644)
+    if current not in (old,new):raise HostBundleError('Existing host installer differs')
+    for name in ADOPTION_GUARDS:
+        if name=='install-host.py':continue
+        try:current=read_file(host_fd,name,0o644)
+        except FileNotFoundError:continue
+        if current!=new_modules[name][1]:raise HostBundleError('Existing recovery guard differs')
+    if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
+    publish(state_fd,'adoption-old-install-host.py',old,0o600)
+    for name in ADOPTION_GUARDS:
+        if name=='install-host.py':continue
+        if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
+        publish(host_fd,name,new_modules[name][1],0o644)
+    if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
+    current=read_file(host_fd,'install-host.py',0o644)
+    if current==old and old!=new:
+        temporary='.servus-adopt-'+secrets.token_hex(16)
+        try:
+            _write_file(host_fd,temporary,0o644,new);os.fsync(host_fd)
+            if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
+            if read_file(host_fd,'install-host.py',0o644)!=old:raise HostBundleError('Host installer changed')
+            os.replace(temporary,'install-host.py',src_dir_fd=host_fd,dst_dir_fd=host_fd);os.fsync(host_fd)
+        finally:
+            try:os.unlink(temporary,dir_fd=host_fd)
+            except FileNotFoundError:pass
+    elif current!=new:raise HostBundleError('Host installer changed')
+    if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
+    if any(read_file(host_fd,name,0o644)!=new_modules[name][1] for name in ADOPTION_GUARDS):
+        raise HostBundleError('Recovery guard adoption is incomplete')
 
 
 def apply_unit_adoption(units_fd, old_units, new_units, *, read_file, authorize):

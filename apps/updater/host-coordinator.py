@@ -51,7 +51,7 @@ def _no_pending(db):
 def adopt_verified_units(db, old_operation, active_operation, *, state_dir, active_env,
                          state_fd, install_fd, host_fd, units_fd, host_lock, install_lock,
                          supervisor, daemon, extractor, backup, bundle, install_host, unit_mask):
-    """Publish signed boot-gated units after the caller provisions recovery guards.
+    """Prepare signed recovery guards and boot-gated units for host adoption.
 
     This phase does not reload systemd or stop services. The caller must retain
     the old release, enable recovery, and activate the host runtime separately.
@@ -62,7 +62,7 @@ def adopt_verified_units(db, old_operation, active_operation, *, state_dir, acti
         raise HostPreparationError('Invalid host adoption context')
     journal_path=os.path.join(state_dir,'journal.sqlite')
     staging_parent=os.path.join(state_dir,'staging')
-    def load_stage(path, required_units, *, need_modules=False):
+    def load_stage(path, required_units, *, module_names=None):
         stage=supervisor._trusted_directory(path,0o700)
         try:
             fd=supervisor._open_root_file(stage,'manifest.json',0o644)
@@ -75,10 +75,10 @@ def adopt_verified_units(db, old_operation, active_operation, *, state_dir, acti
             finally:os.close(fd)
             manifest=extractor._manifest_files(raw)
             units=bundle.collect_units(stage,manifest,required_units)
-            modules=bundle.collect(stage,manifest,install_host.MODULES) if need_modules else None
+            modules=bundle.collect(stage,manifest,module_names) if module_names is not None else None
             return units,modules
         finally:os.close(stage)
-    def guard():
+    def guard_base():
         _same_lock(supervisor,state_fd,'host.lock',host_lock)
         _same_lock(supervisor,install_fd,'install.lock',install_lock)
         fd=supervisor._open_root_file(state_fd,'journal.sqlite',0o600)
@@ -102,7 +102,9 @@ def adopt_verified_units(db, old_operation, active_operation, *, state_dir, acti
         states=unit_mask.capture_service_states()
         if any(states[name]!='active' for name in unit_mask.UNITS[:-1]) or states[unit_mask.UNITS[-1]]!='inactive':
             raise HostPreparationError('Host services are not ready')
-        for name in guards:
+    def guard():
+        guard_base()
+        for name in bundle.ADOPTION_GUARDS:
             mode,content=modules[name]
             if install_host.read_file(host_fd,name,mode)!=content:raise HostPreparationError('Host recovery guard differs')
     _same_lock(supervisor,state_fd,'host.lock',host_lock);_same_lock(supervisor,install_fd,'install.lock',install_lock)
@@ -111,11 +113,13 @@ def adopt_verified_units(db, old_operation, active_operation, *, state_dir, acti
     identities=supervisor.inspect_servus(policy)
     active_digest,active_stage=bundle.completed_update(db,active_operation,staging_parent,policy_path,active_env,policy.image_reference)
     old_digest,old_stage=bundle.historical_completed_update(db,old_operation,staging_parent,active_env)
-    old_units,_=load_stage(old_stage,unit_mask.UNITS)
-    new_units,modules=load_stage(active_stage,install_host.UNITS,need_modules=True)
-    guards=('host-boot-gate.py','host-bundle.py','host-coordinator.py','host-exchange.py','host-fence.py',
-            'host-recovery.py','host-runner.py','host-switch.py','host-unit-mask.py','install-host.py')
-    if not set(guards).issubset(modules):raise HostPreparationError('Host recovery guards are missing')
+    old_units,old_modules=load_stage(old_stage,unit_mask.UNITS,module_names=('install-host.py',))
+    new_units,modules=load_stage(active_stage,install_host.UNITS,module_names=install_host.MODULES)
+    if not set(bundle.ADOPTION_GUARDS).issubset(modules):raise HostPreparationError('Host recovery guards are missing')
+    guard_base()
+    bundle.inspect_unit_adoption(units_fd,old_units,new_units,read_file=install_host.read_file)
+    bundle.install_adoption_guards(host_fd,state_fd,old_modules,modules,read_file=install_host.read_file,
+                                   publish=install_host.publish,authorize=guard_base)
     guard()
     bundle.apply_unit_adoption(units_fd,old_units,new_units,read_file=install_host.read_file,authorize=guard)
 

@@ -164,6 +164,30 @@ class HostBundleTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(),b'old')
         finally:os.close(fd)
 
+    @unittest.skipUnless(__import__('sys').flags.isolated, 'Requires isolated Python')
+    def test_recovery_guards_preserve_installer_and_resume_after_interruption(self):
+        spec=importlib.util.spec_from_file_location('install_host',ROOT/'apps/updater/install-host.py')
+        installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
+        host=self.root/'host';state=self.root/'state';host.mkdir(mode=0o755);state.mkdir(mode=0o700)
+        fd=os.open(host,os.O_RDONLY|os.O_DIRECTORY);state_fd=os.open(state,os.O_RDONLY|os.O_DIRECTORY)
+        old={'install-host.py':(0o644,b'old installer')}
+        new={name:(0o644,('new '+name).encode()) for name in bundle.ADOPTION_GUARDS}
+        path=host/'install-host.py';path.write_bytes(old['install-host.py'][1]);path.chmod(0o644)
+        kwargs=dict(read_file=installer.read_file,publish=installer.publish,authorize=lambda:None)
+        try:
+            with mock.patch.object(bundle.os,'replace',side_effect=OSError('interrupted')):
+                with self.assertRaises(OSError):bundle.install_adoption_guards(fd,state_fd,old,new,**kwargs)
+            self.assertEqual(path.read_bytes(),b'old installer')
+            self.assertEqual((state/'adoption-old-install-host.py').read_bytes(),b'old installer')
+            self.assertEqual((state/'adoption-old-install-host.py').stat().st_mode & 0o777,0o600)
+            bundle.install_adoption_guards(fd,state_fd,old,new,**kwargs)
+            bundle.install_adoption_guards(fd,state_fd,old,new,**kwargs)
+            self.assertEqual(path.read_bytes(),new['install-host.py'][1])
+            (host/'host-runner.py').write_bytes(b'foreign')
+            with self.assertRaises(bundle.HostBundleError):bundle.install_adoption_guards(fd,state_fd,old,new,**kwargs)
+            self.assertEqual((host/'host-runner.py').read_bytes(),b'foreign')
+        finally:os.close(fd);os.close(state_fd)
+
     def test_collects_exact_bytes_and_future_signed_modules(self):
         self.add('future.py', b'future', 0o644)
         self.assertEqual(self.collect(), {'core.py': (0o644, b'core'), 'future.py': (0o644, b'future'),

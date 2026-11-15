@@ -205,7 +205,7 @@ class HostCoordinatorTest(unittest.TestCase):
         modules={name:(0o644,b'verified') for name in guards}
         states={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
         unit_mask=SimpleNamespace(UNITS=names,capture_service_states=mock.Mock(return_value=states))
-        installer=SimpleNamespace(MODULES=guards,UNITS=names,read_file=mock.Mock(return_value=b'verified'))
+        installer=SimpleNamespace(MODULES=guards,UNITS=names,read_file=mock.Mock(return_value=b'verified'),publish=mock.Mock())
         units=self.root/'units';units.mkdir(mode=0o755)
         state_fd=os.open(self.state,os.O_RDONLY|os.O_DIRECTORY);install_fd=os.open(self.install,os.O_RDONLY|os.O_DIRECTORY)
         host_fd=os.open(self.host,os.O_RDONLY|os.O_DIRECTORY);units_fd=os.open(units,os.O_RDONLY|os.O_DIRECTORY)
@@ -221,6 +221,8 @@ class HostCoordinatorTest(unittest.TestCase):
                  mock.patch.object(bundle,'historical_completed_update',return_value=(self.fixture.digest,str(self.stage))), \
                  mock.patch.object(bundle,'collect_units',return_value={name:(0o644,b'unit') for name in names}), \
                  mock.patch.object(bundle,'collect',return_value=modules), \
+                 mock.patch.object(bundle,'inspect_unit_adoption',return_value=()), \
+                 mock.patch.object(bundle,'install_adoption_guards',side_effect=apply), \
                  mock.patch.object(bundle,'apply_unit_adoption',side_effect=apply) as publish:
                 run();publish.assert_called_once()
                 installer.read_file.return_value=b'modified'
