@@ -20,6 +20,7 @@ class HostUnitMaskTest(unittest.TestCase):
         self.base=fixtures.HostSwitchTest();self.base.setUp()
         self.units=self.base.root/'units';self.units.mkdir(mode=0o755);self.fd=os.open(self.units,os.O_RDONLY|os.O_DIRECTORY)
         self.originals={name:('unit:'+name).encode() for name in mask.UNITS}
+        self.states={name:('inactive' if name == 'servus-updater-bootstrap.service' else 'active') for name in mask.UNITS}
         for name,data in self.originals.items():
             path=self.units/name;path.write_bytes(data);path.chmod(0o644)
 
@@ -29,8 +30,8 @@ class HostUnitMaskTest(unittest.TestCase):
         return dict(state=self.base.s,install=self.base.i,units=self.fd,service_lock=self.base.sl,
                     install_lock=self.base.il,supervisor=fixtures.supervisor,coordinator=fixtures.coordinator)
 
-    def apply(self):mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,**self.args())
-    def restore(self):mask.restore_units(self.base.db,self.base.op,self.base.digest,self.originals,**self.args())
+    def apply(self):mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,self.states,**self.args())
+    def restore(self):mask.restore_units(self.base.db,self.base.op,self.base.digest,self.originals,self.states,**self.args())
     def phase(self):return self.base.db.execute('select phase from host_unit_masks').fetchone()[0]
     def assert_originals(self):
         for name,data in self.originals.items():
@@ -43,9 +44,10 @@ class HostUnitMaskTest(unittest.TestCase):
 
     def test_recovery_loads_verified_originals_from_journal(self):
         self.apply()
-        self.assertEqual(mask.load_verified_backup(self.base.db,self.base.op,self.base.digest,self.base.s),self.originals)
-        mask.restore_from_journal(self.base.db,self.base.op,self.base.digest,**self.args())
+        self.assertEqual(mask.load_verified_backup(self.base.db,self.base.op,self.base.digest,self.base.s),(self.originals,self.states))
+        self.assertEqual(mask.restore_from_journal(self.base.db,self.base.op,self.base.digest,**self.args()),self.states)
         self.assertEqual(self.phase(),'restored');self.assert_originals()
+        self.assertEqual(mask.load_verified_backup(self.base.db,self.base.op,self.base.digest,self.base.s),(self.originals,self.states))
 
     def test_journal_recovery_rejects_forged_metadata_and_files(self):
         self.apply();backup=self.base.state/('unit-backup-'+self.base.op)
@@ -55,6 +57,14 @@ class HostUnitMaskTest(unittest.TestCase):
         with self.assertRaises(mask.UnitMaskError):mask.restore_from_journal(self.base.db,self.base.op,self.base.digest,**self.args())
         self.assertEqual(self.phase(),'masked')
         for name in mask.UNITS:self.assertEqual(os.readlink(self.units/name),'/dev/null')
+
+    def test_rejects_invalid_or_active_bootstrap_before_masking(self):
+        for states in ({**self.states, 'servus-updater-bootstrap.service':'active'},
+                       {**self.states, 'servus-updater.service':'activating'},
+                       {name:'active' for name in mask.UNITS[:-1]}):
+            with self.subTest(states=states), self.assertRaises(mask.UnitMaskError):
+                mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,states,**self.args())
+            self.assert_originals()
 
     def test_changed_unit_rejected_before_journal_or_mask(self):
         (self.units/mask.UNITS[0]).write_bytes(b'changed')
@@ -76,14 +86,14 @@ class HostUnitMaskTest(unittest.TestCase):
         with mock.patch.object(mask,'_write',side_effect=OSError('fixture')),self.assertRaises(OSError):self.apply()
         self.assertEqual(self.phase(),'intent');self.assert_originals()
         path=self.base.state/('unit-backup-'+self.base.op);self.assertTrue(path.is_dir())
-        mask.reconcile_unmasked_intent(self.base.db,self.base.op,self.base.digest,self.originals,**self.args())
+        mask.reconcile_unmasked_intent(self.base.db,self.base.op,self.base.digest,self.originals,self.states,**self.args())
         self.assertEqual(self.phase(),'restored');self.assertTrue(path.is_dir());self.assert_originals()
 
     def test_incomplete_backup_intent_cannot_be_retired_after_unit_change(self):
         with mock.patch.object(mask,'_write',side_effect=OSError('fixture')),self.assertRaises(OSError):self.apply()
         (self.units/mask.UNITS[0]).unlink();(self.units/mask.UNITS[0]).symlink_to('/dev/null')
         with self.assertRaises(OSError):
-            mask.reconcile_unmasked_intent(self.base.db,self.base.op,self.base.digest,self.originals,**self.args())
+            mask.reconcile_unmasked_intent(self.base.db,self.base.op,self.base.digest,self.originals,self.states,**self.args())
         self.assertEqual(self.phase(),'intent')
 
     def test_partial_restore_can_resume(self):
@@ -119,7 +129,8 @@ def crash(*args):
  original(*args);count+=1
  if count==2:os._exit(73)
 mask._replace_with_mask=crash
-mask.mask_units(db,op,digest,originals,state=state,install=install,units=units,service_lock=sl,install_lock=il,supervisor=supervisor,coordinator=coordinator);os._exit(99)
+states={name:("inactive" if name=="servus-updater-bootstrap.service" else "active") for name in mask.UNITS}
+mask.mask_units(db,op,digest,originals,states,state=state,install=install,units=units,service_lock=sl,install_lock=il,supervisor=supervisor,coordinator=coordinator);os._exit(99)
 '''
         try:
             result=subprocess.run([sys.executable,'-I','-c',script,str(self.base.root),str(ROOT/'apps/updater')],check=False)

@@ -40,13 +40,16 @@ def _guard(db, state, install, service_lock, install_lock, supervisor, coordinat
     finally: os.close(fd)
 
 
-def _metadata(operation_id, image_digest, originals):
+def _metadata(operation_id, image_digest, originals, service_states):
     if (not isinstance(operation_id, str) or not OPERATION.fullmatch(operation_id) or
         not isinstance(image_digest, str) or not DIGEST.fullmatch(image_digest) or
         not isinstance(originals, dict) or set(originals) != set(UNITS) or
-        any(not isinstance(value, bytes) or not 0 < len(value) <= LIMIT for value in originals.values())):
+        any(not isinstance(value, bytes) or not 0 < len(value) <= LIMIT for value in originals.values()) or
+        not isinstance(service_states, dict) or set(service_states) != set(UNITS) or
+        any(value not in ('active', 'inactive') for value in service_states.values()) or
+        service_states['servus-updater-bootstrap.service'] != 'inactive'):
         raise UnitMaskError('Invalid unit backup input')
-    records = [{'name': name, 'size': len(originals[name]), 'sha256': hashlib.sha256(originals[name]).hexdigest()} for name in UNITS]
+    records = [{'name': name, 'size': len(originals[name]), 'sha256': hashlib.sha256(originals[name]).hexdigest(), 'activeState': service_states[name]} for name in UNITS]
     return (json.dumps({'schema': 1, 'operationId': operation_id, 'imageDigest': image_digest, 'units': records},
                        sort_keys=True, separators=(',', ':')) + '\n').encode()
 
@@ -143,7 +146,7 @@ def load_verified_backup(db, operation_id, image_digest, state):
         raise UnitMaskError('Invalid unit recovery identity')
     row = db.execute('SELECT image_digest,backup_digest,phase FROM host_unit_masks WHERE operation_id=?', (operation_id,)).fetchone()
     if (not row or row[0] != image_digest or not isinstance(row[1], str) or not re.fullmatch(r'[a-f0-9]{64}', row[1]) or
-        row[2] not in ('backed_up', 'masking', 'masked', 'restoring')):
+        row[2] not in ('backed_up', 'masking', 'masked', 'restoring', 'restored')):
         raise UnitMaskError('Unit recovery is unavailable')
     fd = os.open('unit-backup-' + operation_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=state)
     try:
@@ -164,8 +167,9 @@ def load_verified_backup(db, operation_id, image_digest, state):
             document['imageDigest'] != image_digest or not isinstance(document['units'], list) or len(document['units']) != len(UNITS)):
             raise UnitMaskError('Invalid unit backup metadata')
         originals = {}
+        service_states = {}
         for name, item in zip(UNITS, document['units']):
-            if (not isinstance(item, dict) or set(item) != {'name', 'size', 'sha256'} or item['name'] != name or
+            if (not isinstance(item, dict) or set(item) != {'name', 'size', 'sha256', 'activeState'} or item['name'] != name or
                 type(item['size']) is not int or not 0 < item['size'] <= LIMIT or
                 not isinstance(item['sha256'], str) or not re.fullmatch(r'[a-f0-9]{64}', item['sha256'])):
                 raise UnitMaskError('Invalid unit backup metadata')
@@ -173,8 +177,9 @@ def load_verified_backup(db, operation_id, image_digest, state):
             if len(data) != item['size'] or hashlib.sha256(data).hexdigest() != item['sha256']:
                 raise UnitMaskError('Unit backup differs')
             originals[name] = data
-        if _metadata(operation_id, image_digest, originals) != raw: raise UnitMaskError('Unit backup metadata is not canonical')
-        return originals
+            service_states[name] = item['activeState']
+        if _metadata(operation_id, image_digest, originals, service_states) != raw: raise UnitMaskError('Unit backup metadata is not canonical')
+        return originals, service_states
     finally: os.close(fd)
 
 
@@ -204,12 +209,12 @@ def _replace_with_original(parent, unit, content):
         except FileNotFoundError: pass
 
 
-def mask_units(db, operation_id, image_digest, originals, *, state, install, units,
+def mask_units(db, operation_id, image_digest, originals, service_states, *, state, install, units,
                service_lock, install_lock, supervisor, coordinator):
     """Back up expected files, then install persistent masks under journal intent."""
     _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
     _directory(state, 0o700); _directory(install, 0o700); _directory(units, 0o755)
-    metadata = _metadata(operation_id, image_digest, originals)
+    metadata = _metadata(operation_id, image_digest, originals, service_states)
     row = db.execute('SELECT image_digest,generation,status FROM host_preparations WHERE operation_id=?', (operation_id,)).fetchone()
     if row != (image_digest, 'runtime-' + operation_id, 'prepared'): raise UnitMaskError('Prepared host generation is unavailable')
     for unit in UNITS: _read(units, unit, 0o644, originals[unit])
@@ -240,12 +245,12 @@ def mask_units(db, operation_id, image_digest, originals, *, state, install, uni
         raise UnitMaskError('Unit mask journal changed')
 
 
-def restore_units(db, operation_id, image_digest, originals, *, state, install, units,
+def restore_units(db, operation_id, image_digest, originals, service_states, *, state, install, units,
                   service_lock, install_lock, supervisor, coordinator):
     """Restore only verified backups and exact masks, including partial masking."""
     _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
     _directory(state, 0o700); _directory(install, 0o700); _directory(units, 0o755)
-    metadata = _metadata(operation_id, image_digest, originals); digest = hashlib.sha256(metadata).hexdigest()
+    metadata = _metadata(operation_id, image_digest, originals, service_states); digest = hashlib.sha256(metadata).hexdigest()
     row = db.execute('SELECT image_digest,backup_digest,phase FROM host_unit_masks WHERE operation_id=?', (operation_id,)).fetchone()
     if not row or row[:2] != (image_digest, digest) or row[2] not in ('backed_up', 'masking', 'masked', 'restoring'):
         raise UnitMaskError('Unit recovery is unavailable')
@@ -266,12 +271,13 @@ def restore_from_journal(db, operation_id, image_digest, *, state, install, unit
                          service_lock, install_lock, supervisor, coordinator):
     """Recover from the protected journal and backup without external unit bytes."""
     _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
-    originals = load_verified_backup(db, operation_id, image_digest, state)
-    restore_units(db, operation_id, image_digest, originals, state=state, install=install, units=units,
+    originals, service_states = load_verified_backup(db, operation_id, image_digest, state)
+    restore_units(db, operation_id, image_digest, originals, service_states, state=state, install=install, units=units,
                   service_lock=service_lock, install_lock=install_lock, supervisor=supervisor, coordinator=coordinator)
+    return service_states
 
 
-def reconcile_unmasked_intent(db, operation_id, image_digest, originals, *, state, install, units,
+def reconcile_unmasked_intent(db, operation_id, image_digest, originals, service_states, *, state, install, units,
                               service_lock, install_lock, supervisor, coordinator):
     """Retire a pre-backup intent only after every trusted original is intact.
 
@@ -281,7 +287,7 @@ def reconcile_unmasked_intent(db, operation_id, image_digest, originals, *, stat
     """
     _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
     _directory(state, 0o700); _directory(install, 0o700); _directory(units, 0o755)
-    _metadata(operation_id, image_digest, originals)
+    _metadata(operation_id, image_digest, originals, service_states)
     row = db.execute('SELECT image_digest,backup_digest,phase FROM host_unit_masks WHERE operation_id=?', (operation_id,)).fetchone()
     if row != (image_digest, None, 'intent'):
         raise UnitMaskError('Unit intent is not eligible for reconciliation')
