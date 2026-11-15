@@ -110,7 +110,7 @@ def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_l
 
 def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_fd, install_fd, units_fd,
                             host_lock, supervisor, unit_mask, bundle, ready, run=subprocess.run,
-                            host_switch=None, exchange=None, active_parent=None, candidate_parent=None):
+                            host_switch=None, exchange=None, active_parent=None, candidate_parent=None, readiness_timeout=60):
     """Recover a journaled stop before exchange or after verified rollback.
 
     The caller holds the host operation lock, supplies independently verified
@@ -120,7 +120,8 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
     if (sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or
         db.in_transaction or db.isolation_level is not None or db.execute('PRAGMA synchronous').fetchone()[0] < 2 or
         not isinstance(operation_id,str) or not bundle.OPERATION.fullmatch(operation_id) or
-        not isinstance(image_digest,str) or not bundle.DIGEST.fullmatch(image_digest) or not callable(ready)):
+        not isinstance(image_digest,str) or not bundle.DIGEST.fullmatch(image_digest) or not callable(ready) or
+        type(readiness_timeout) not in (int,float) or not 0 <= readiness_timeout <= 300):
         raise HostPreparationError('Invalid updater recovery context')
     _same_lock(supervisor, state_fd, 'host.lock', host_lock)
     fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600)
@@ -162,8 +163,11 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
     finally:os.close(fd)
     try:
         _same_lock(supervisor,state_fd,'host.lock',host_lock)
-        run(['/usr/bin/systemctl','daemon-reload'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,cwd='/',
-            env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'},timeout=60,check=True)
+        for command in (['/usr/bin/systemctl','daemon-reload'],
+                        ['/usr/bin/systemctl','reset-failed','servus-updater-socket.service','servus-supervisor.service','servus-updater.service']):
+            _same_lock(supervisor,state_fd,'host.lock',host_lock)
+            run(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,cwd='/',
+                env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'},timeout=60,check=True)
     except (OSError,subprocess.SubprocessError) as error:
         raise HostPreparationError('Systemd reload requires recovery') from error
     states=unit_mask.capture_service_states()
@@ -193,8 +197,7 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         if db.in_transaction:db.execute('ROLLBACK')
         raise
     try:
-        for command in (['/usr/bin/systemctl','reset-failed','servus-updater-socket.service','servus-supervisor.service','servus-updater.service'],
-                        ['/usr/bin/systemctl','start','servus-updater-socket.service'],
+        for command in (['/usr/bin/systemctl','start','servus-updater-socket.service'],
                         ['/usr/bin/systemctl','start','servus-supervisor.service'],
                         ['/usr/bin/systemctl','start','servus-updater.service']):
             _same_lock(supervisor,state_fd,'host.lock',host_lock)
@@ -202,9 +205,16 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
                 env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'},timeout=60,check=True)
     except (OSError,subprocess.SubprocessError) as error:
         raise HostPreparationError('Updater restart requires recovery') from error
-    verify()
-    if unit_mask.capture_service_states()!=expected or ready() is not None:
-        raise HostPreparationError('Control plane is not ready')
+    deadline=time.monotonic()+readiness_timeout
+    while True:
+        verify()
+        try:
+            if unit_mask.capture_service_states()!=expected or ready() is not None:
+                raise RuntimeError('Control plane is not ready')
+        except (OSError,RuntimeError,unit_mask.UnitMaskError) as error:
+            if time.monotonic()>=deadline:raise HostPreparationError('Control plane is not ready') from error
+            time.sleep(min(0.5,max(0,deadline-time.monotonic())))
+        else:break
     db.execute('BEGIN IMMEDIATE')
     try:
         verify()

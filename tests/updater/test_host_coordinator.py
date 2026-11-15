@@ -142,20 +142,23 @@ class HostCoordinatorTest(unittest.TestCase):
     def test_recovery_keeps_intent_if_control_plane_is_unavailable(self):
         names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
         states={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
-        unit_mask=SimpleNamespace(UNITS=names,_directory=mock.Mock(),_metadata=mock.Mock(),_read=mock.Mock(),capture_service_states=mock.Mock(return_value=states))
+        unit_mask=SimpleNamespace(UNITS=names,UnitMaskError=RuntimeError,_directory=mock.Mock(),_metadata=mock.Mock(),_read=mock.Mock(),capture_service_states=mock.Mock(return_value=states))
         self.db.execute('CREATE TABLE host_stops(operation_id TEXT PRIMARY KEY,image_digest TEXT,status TEXT)')
         self.db.execute("INSERT INTO host_stops VALUES(?,?,'stopped')",(self.fixture.op,self.fixture.digest))
         state_fd=os.open(self.state,os.O_RDONLY|os.O_DIRECTORY);install_fd=os.open(self.install,os.O_RDONLY|os.O_DIRECTORY)
         fcntl.flock(self.install_lock,fcntl.LOCK_UN)
         try:
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(coordinator.HostPreparationError):
                 coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,{name:b'unit' for name in names},
                     state_fd=state_fd,install_fd=install_fd,units_fd=install_fd,host_lock=self.host_lock,supervisor=supervisor,
-                    unit_mask=unit_mask,bundle=bundle,ready=mock.Mock(side_effect=RuntimeError('unavailable')),run=mock.Mock())
+                    unit_mask=unit_mask,bundle=bundle,ready=mock.Mock(side_effect=RuntimeError('unavailable')),run=mock.Mock(),readiness_timeout=0)
             self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('restarting',))
-            coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,{name:b'unit' for name in names},
-                state_fd=state_fd,install_fd=install_fd,units_fd=install_fd,host_lock=self.host_lock,supervisor=supervisor,
-                unit_mask=unit_mask,bundle=bundle,ready=lambda:None,run=mock.Mock())
+            ready=mock.Mock(side_effect=[RuntimeError('settling'),None])
+            with mock.patch.object(coordinator.time,'sleep'):
+                coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,{name:b'unit' for name in names},
+                    state_fd=state_fd,install_fd=install_fd,units_fd=install_fd,host_lock=self.host_lock,supervisor=supervisor,
+                    unit_mask=unit_mask,bundle=bundle,ready=ready,run=mock.Mock())
+            self.assertEqual(ready.call_count,2)
             self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('completed',))
         finally:
             fcntl.flock(self.install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);os.close(state_fd);os.close(install_fd)

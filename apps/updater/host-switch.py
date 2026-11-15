@@ -15,17 +15,16 @@ import sys
 import time
 
 
-class HostSwitchError(Exception):
+class HostSwitchError(RuntimeError):
     pass
 
 
 
-def assert_supervisor_ready(socket_path, operation_id, *, supervisor, bundle):
+def _assert_supervisor_status(socket_path, message, *, supervisor):
     """Query the root supervisor on an authenticated, protected Unix socket."""
     if (sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or
         not isinstance(socket_path, str) or not os.path.isabs(socket_path) or
-        os.path.normpath(socket_path) != socket_path or not isinstance(operation_id, str) or
-        not bundle.OPERATION.fullmatch(operation_id)):
+        os.path.normpath(socket_path) != socket_path):
         raise HostSwitchError('Invalid supervisor readiness context')
     parent, name = os.path.split(socket_path)
     directory = supervisor._trusted_directory(parent, 0o750)
@@ -42,13 +41,24 @@ def assert_supervisor_ready(socket_path, operation_id, *, supervisor, bundle):
             if uid != 0 or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                 raise HostSwitchError('Supervisor readiness peer is not trusted')
             deadline = time.monotonic() + 5
-            supervisor._send_message(peer, {'version': 1, 'type': 'host_status', 'operationId': operation_id}, deadline)
+            supervisor._send_message(peer, message, deadline)
             if supervisor._read_message(peer, deadline) != {'version': 1, 'status': 'ready'}:
                 raise HostSwitchError('Supervisor is not ready')
     except (OSError, ValueError, supervisor.SupervisorError) as error:
         raise HostSwitchError('Supervisor readiness is unavailable') from error
     finally:
         os.close(directory)
+
+
+def assert_supervisor_ready(socket_path, operation_id, *, supervisor, bundle):
+    if not isinstance(operation_id,str) or not bundle.OPERATION.fullmatch(operation_id):
+        raise HostSwitchError('Invalid host operation identity')
+    return _assert_supervisor_status(socket_path,{'version':1,'type':'host_status','operationId':operation_id},supervisor=supervisor)
+
+
+def assert_supervisor_normal_ready(socket_path, *, supervisor):
+    """Verify the normal root-only control channel after a rollback."""
+    return _assert_supervisor_status(socket_path,{'version':1,'type':'status'},supervisor=supervisor)
 
 def _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, fence, *, lock_name='service.lock'):
     if (sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or
