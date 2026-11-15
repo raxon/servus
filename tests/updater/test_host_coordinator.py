@@ -96,6 +96,51 @@ class HostCoordinatorTest(unittest.TestCase):
             self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('stopping',))
         finally:os.close(state_fd);os.close(install_fd)
 
+    def test_recover_stopped_updater_only_before_host_preparation(self):
+        names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
+        expected={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
+        stopped={**expected,'servus-updater.service':'inactive'}
+        originals={name:b'unit' for name in names}
+        unit_mask=SimpleNamespace(UNITS=names,_directory=mock.Mock(),_metadata=mock.Mock(),_read=mock.Mock(),
+                                  capture_service_states=mock.Mock(side_effect=[stopped,expected]))
+        self.db.execute('CREATE TABLE host_stops(operation_id TEXT PRIMARY KEY,image_digest TEXT,status TEXT)')
+        self.db.execute("INSERT INTO host_stops VALUES(?,?,'stopping')",(self.fixture.op,self.fixture.digest))
+        state_fd=os.open(self.state,os.O_RDONLY|os.O_DIRECTORY);install_fd=os.open(self.install,os.O_RDONLY|os.O_DIRECTORY)
+        args=dict(state_fd=state_fd,install_fd=install_fd,units_fd=install_fd,host_lock=self.host_lock,
+                  supervisor=supervisor,unit_mask=unit_mask,bundle=bundle,ready=lambda:None)
+        try:
+            with self.assertRaises(coordinator.HostPreparationError):
+                coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=mock.Mock(),**args)
+            fcntl.flock(self.install_lock,fcntl.LOCK_UN)
+            self.db.execute('CREATE TABLE host_preparations(operation_id TEXT,status TEXT)')
+            self.db.execute("INSERT INTO host_preparations VALUES(?,'prepared')",(self.fixture.op,))
+            with self.assertRaises(coordinator.HostPreparationError):
+                coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=mock.Mock(),**args)
+            self.db.execute('DELETE FROM host_preparations')
+            run=mock.Mock()
+            coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=run,**args)
+            self.assertEqual(run.call_args.args[0],['/usr/bin/systemctl','start','servus-updater.service'])
+            self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('completed',))
+        finally:
+            fcntl.flock(self.install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);os.close(state_fd);os.close(install_fd)
+
+    def test_recovery_keeps_intent_if_control_plane_is_unavailable(self):
+        names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
+        states={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
+        unit_mask=SimpleNamespace(UNITS=names,_directory=mock.Mock(),_metadata=mock.Mock(),_read=mock.Mock(),capture_service_states=mock.Mock(return_value=states))
+        self.db.execute('CREATE TABLE host_stops(operation_id TEXT PRIMARY KEY,image_digest TEXT,status TEXT)')
+        self.db.execute("INSERT INTO host_stops VALUES(?,?,'stopped')",(self.fixture.op,self.fixture.digest))
+        state_fd=os.open(self.state,os.O_RDONLY|os.O_DIRECTORY);install_fd=os.open(self.install,os.O_RDONLY|os.O_DIRECTORY)
+        fcntl.flock(self.install_lock,fcntl.LOCK_UN)
+        try:
+            with self.assertRaises(RuntimeError):
+                coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,{name:b'unit' for name in names},
+                    state_fd=state_fd,install_fd=install_fd,units_fd=install_fd,host_lock=self.host_lock,supervisor=supervisor,
+                    unit_mask=unit_mask,bundle=bundle,ready=mock.Mock(side_effect=RuntimeError('unavailable')),run=mock.Mock())
+            self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('stopped',))
+        finally:
+            fcntl.flock(self.install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);os.close(state_fd);os.close(install_fd)
+
     def test_prepares_verified_generation_and_records_completion(self):
         with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}):name=self.prepare()
         self.assertEqual(name,'runtime-'+self.fixture.op)
