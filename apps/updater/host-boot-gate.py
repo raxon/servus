@@ -5,6 +5,7 @@ This check is not yet wired into systemd. It does not modify the journal or
 perform recovery; a separate trusted recovery service must resolve the state.
 """
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -41,14 +42,29 @@ def assert_safe(state_dir):
                 try:
                     if db.execute('PRAGMA user_version').fetchone()[0]!=8 or not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'").fetchone():
                         raise BootGateError('Unsupported updater journal')
+                    allowed=None
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_stops'").fetchone():
+                        starting=db.execute("SELECT operation_id,image_digest FROM host_stops WHERE status='starting'").fetchall()
+                        if starting:
+                            if len(starting)!=1:raise BootGateError('Ambiguous host activation')
+                            try:
+                                with open('/proc/sys/kernel/random/boot_id',encoding='ascii') as source:boot_id=source.read(64).strip()
+                            except OSError as error:raise BootGateError('Boot identity is unavailable') from error
+                            if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',boot_id):
+                                raise BootGateError('Boot identity is invalid')
+                            match=db.execute("SELECT 1 FROM host_boot_authorizations a JOIN host_preparations p ON p.operation_id=a.operation_id AND p.image_digest=a.image_digest JOIN host_switches s ON s.operation_id=a.operation_id AND s.image_digest=a.image_digest JOIN host_unit_masks m ON m.operation_id=a.operation_id AND m.image_digest=a.image_digest WHERE a.operation_id=? AND a.image_digest=? AND a.boot_id=? AND p.status='prepared' AND s.phase='exchanged' AND m.phase='restored'",(*starting[0],boot_id)).fetchone()
+                            if not match:raise BootGateError('Host activation requires recovery')
+                            allowed=starting[0][0]
                     checks=(('host_stops',"status IS NULL OR status NOT IN ('completed','restarting')"),
                             ('host_preparations',"status IS NULL OR status NOT IN ('completed','abandoned')"),
                             ('host_switches',"phase IS NULL OR phase NOT IN ('completed','rolled_back')"),
                             ('host_unit_masks',"phase IS NULL OR phase != 'restored'"))
                     for table,condition in checks:
                         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
-                            if db.execute('SELECT 1 FROM '+table+' WHERE '+condition+' LIMIT 1').fetchone():
-                                raise BootGateError('Host update requires recovery')
+                            query='SELECT 1 FROM '+table+' WHERE ('+condition+')'
+                            params=()
+                            if allowed is not None:query+=' AND operation_id != ?';params=(allowed,)
+                            if db.execute(query+' LIMIT 1',params).fetchone():raise BootGateError('Host update requires recovery')
                 finally:db.close()
             except sqlite3.Error as error:raise BootGateError('Updater journal is unavailable') from error
             after=os.stat('journal.sqlite',dir_fd=directory,follow_symlinks=False)

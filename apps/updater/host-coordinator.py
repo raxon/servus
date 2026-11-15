@@ -9,6 +9,7 @@ import fcntl
 import os
 import pathlib
 import platform
+import re
 import stat
 import subprocess
 import sys
@@ -74,7 +75,7 @@ def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_l
     db.execute('BEGIN IMMEDIATE')
     try:
         _no_pending(db)
-        db.execute("CREATE TABLE IF NOT EXISTS host_stops (operation_id TEXT PRIMARY KEY,image_digest TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('stopping','stopped','restarting','completed','recovery_required'))) ")
+        db.execute("CREATE TABLE IF NOT EXISTS host_stops (operation_id TEXT PRIMARY KEY,image_digest TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('stopping','stopped','starting','restarting','completed','recovery_required'))) ")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_stop ON host_stops ((1)) WHERE status != 'completed'")
         db.execute("INSERT INTO host_stops VALUES(?,?,'stopping')", (operation_id,image_digest))
         db.execute('COMMIT')
@@ -241,6 +242,38 @@ def recover_exchange(db, operation_id, image_digest, *, state_fd, install_fd, un
     unit_mask.restore_from_journal(db,operation_id,image_digest,state=state_fd,install=install_fd,units=units_fd,
         service_lock=service_lock,install_lock=install_lock,supervisor=supervisor,coordinator=coordinator)
 
+
+def authorize_same_boot_start(db, operation_id, image_digest, *, state_fd, install_fd, units_fd,
+                              active_parent, candidate_parent, host_lock, service_lock, install_lock,
+                              supervisor, unit_mask, host_switch, bundle, exchange):
+    """Allow a verified exchanged runtime to start only during this boot."""
+    coordinator=SimpleNamespace(_same_lock=_same_lock)
+    unit_mask._guard(db,state_fd,install_fd,service_lock,install_lock,supervisor,coordinator)
+    _same_lock(supervisor,state_fd,'host.lock',host_lock)
+    if host_switch.inspect_exchange(db,operation_id,active_parent,candidate_parent,exchange,bundle)!='exchanged':
+        raise HostPreparationError('Exchanged host runtime is unavailable')
+    originals,_=unit_mask.load_verified_backup(db,operation_id,image_digest,state_fd)
+    for name in unit_mask.UNITS:unit_mask._read(units_fd,name,0o644,originals[name])
+    try:
+        with open('/proc/sys/kernel/random/boot_id',encoding='ascii') as source:boot_id=source.read(64).strip()
+    except OSError as error:raise HostPreparationError('Boot identity is unavailable') from error
+    if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',boot_id):
+        raise HostPreparationError('Boot identity is invalid')
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        if host_switch.inspect_exchange(db,operation_id,active_parent,candidate_parent,exchange,bundle)!='exchanged':
+            raise HostPreparationError('Exchanged host runtime changed')
+        row=db.execute("SELECT 1 FROM host_switches s JOIN host_preparations p ON p.operation_id=s.operation_id AND p.image_digest=s.image_digest JOIN host_unit_masks m ON m.operation_id=s.operation_id AND m.image_digest=s.image_digest WHERE s.operation_id=? AND s.image_digest=? AND s.phase='exchanged' AND p.status='prepared' AND m.phase='restored'",(operation_id,image_digest)).fetchone()
+        if not row:raise HostPreparationError('Host activation journal is incomplete')
+        db.execute('CREATE TABLE IF NOT EXISTS host_boot_authorizations(operation_id TEXT PRIMARY KEY,image_digest TEXT NOT NULL,boot_id TEXT NOT NULL)')
+        db.execute('INSERT INTO host_boot_authorizations VALUES(?,?,?)',(operation_id,image_digest,boot_id))
+        if db.execute("UPDATE host_stops SET status='starting' WHERE operation_id=? AND image_digest=? AND status='stopped'",(operation_id,image_digest)).rowcount!=1:
+            raise HostPreparationError('Host stop journal changed')
+        db.execute('COMMIT')
+    except BaseException:
+        if db.in_transaction:db.execute('ROLLBACK')
+        raise
+
 def activate_prepared(db, operation_id, image_digest, originals, initial_states, modules, cli, pin, *,
                       state_fd, install_fd, units_fd, active_parent, candidate_parent, host_lock, service_lock,
                       install_lock, supervisor, unit_mask, host_switch, bundle, exchange, fence, authorize,
@@ -267,6 +300,9 @@ def activate_prepared(db, operation_id, image_digest, originals, initial_states,
         service_lock=service_lock,install_lock=install_lock,active_parent=active_parent,candidate_parent=candidate_parent,
         supervisor=supervisor,coordinator=coordinator,bundle=bundle,exchange=exchange,fence=fence)
     unit_mask.restore_from_journal(db,operation_id,image_digest,**unit_args)
+    authorize_same_boot_start(db,operation_id,image_digest,state_fd=state_fd,install_fd=install_fd,units_fd=units_fd,
+        active_parent=active_parent,candidate_parent=candidate_parent,host_lock=host_lock,service_lock=service_lock,
+        install_lock=install_lock,supervisor=supervisor,unit_mask=unit_mask,host_switch=host_switch,bundle=bundle,exchange=exchange)
     fcntl.flock(service_lock,fcntl.LOCK_UN)
     fcntl.flock(install_lock,fcntl.LOCK_UN)
     host_switch.start_restored(db,operation_id,state_fd=state_fd,install_fd=install_fd,host_lock=host_lock,

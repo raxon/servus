@@ -24,23 +24,37 @@ class HostBootGateTest(unittest.TestCase):
         self.check()
         for table,column,value in (('host_stops','status','completed'),('host_preparations','status','abandoned'),
                                    ('host_switches','phase','rolled_back'),('host_unit_masks','phase','restored')):
-            self.db.execute('CREATE TABLE '+table+'('+column+' TEXT)');self.db.execute('INSERT INTO '+table+' VALUES(?)',(value,))
+            self.db.execute('CREATE TABLE '+table+'(operation_id TEXT,image_digest TEXT,'+column+' TEXT)');self.db.execute('INSERT INTO '+table+' VALUES(?,?,?)',('op','digest',value))
         self.db.commit();self.check()
 
     def test_restart_phase_allows_services_only_after_other_work_is_terminal(self):
-        self.db.execute('CREATE TABLE host_stops(status TEXT)');self.db.execute("INSERT INTO host_stops VALUES('restarting')")
+        self.db.execute('CREATE TABLE host_stops(operation_id TEXT,image_digest TEXT,status TEXT)');self.db.execute("INSERT INTO host_stops VALUES('op','digest','restarting')")
         self.db.execute('CREATE TABLE host_preparations(status TEXT)');self.db.execute("INSERT INTO host_preparations VALUES('recovery_required')")
         self.db.commit()
         with self.assertRaises(gate.BootGateError):self.check()
         self.db.execute("UPDATE host_preparations SET status='abandoned'");self.db.commit();self.check()
 
+    def test_starting_generation_is_allowed_only_for_same_boot_and_matching_journal(self):
+        for table,column,value in (('host_stops','status','starting'),('host_preparations','status','prepared'),
+                                   ('host_switches','phase','exchanged'),('host_unit_masks','phase','restored')):
+            self.db.execute('CREATE TABLE '+table+'(operation_id TEXT,image_digest TEXT,'+column+' TEXT)')
+            self.db.execute('INSERT INTO '+table+' VALUES(?,?,?)',('op','digest',value))
+        self.db.execute('CREATE TABLE host_boot_authorizations(operation_id TEXT,image_digest TEXT,boot_id TEXT)')
+        boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        self.db.execute('INSERT INTO host_boot_authorizations VALUES(?,?,?)',('op','digest',boot));self.db.commit();self.check()
+        self.db.execute("UPDATE host_boot_authorizations SET boot_id='00000000-0000-0000-0000-000000000000'");self.db.commit()
+        with self.assertRaises(gate.BootGateError):self.check()
+        self.db.execute('UPDATE host_boot_authorizations SET boot_id=?',(boot,))
+        self.db.execute("UPDATE host_unit_masks SET phase='restoring'");self.db.commit()
+        with self.assertRaises(gate.BootGateError):self.check()
+
     def test_pending_unknown_or_null_state_blocks_startup(self):
         for table,column,value in (('host_stops','status','stopped'),('host_preparations','status','prepared'),
                                    ('host_switches','phase','exchanged'),('host_unit_masks','phase','restoring')):
             with self.subTest(table=table):
-                self.db.execute('CREATE TABLE '+table+'('+column+' TEXT)')
+                self.db.execute('CREATE TABLE '+table+'(operation_id TEXT,image_digest TEXT,'+column+' TEXT)')
                 for current in (value,'unexpected',None):
-                    self.db.execute('DELETE FROM '+table);self.db.execute('INSERT INTO '+table+' VALUES(?)',(current,));self.db.commit()
+                    self.db.execute('DELETE FROM '+table);self.db.execute('INSERT INTO '+table+' VALUES(?,?,?)',('op','digest',current));self.db.commit()
                     with self.assertRaises(gate.BootGateError):self.check()
                 self.db.execute('DROP TABLE '+table);self.db.commit()
 

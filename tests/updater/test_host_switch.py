@@ -203,6 +203,32 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
             for name,data in originals.items():self.assertEqual((unit_dir/name).read_bytes(),data)
         finally:os.close(units_fd)
 
+    def test_same_boot_start_requires_restored_units_and_exchanged_runtime(self):
+        unit_dir=self.root/'units';unit_dir.mkdir(mode=0o755);units_fd=os.open(unit_dir,os.O_RDONLY|os.O_DIRECTORY)
+        originals={name:('unit:'+name).encode() for name in unit_mask_module.UNITS}
+        for name,data in originals.items():
+            path=unit_dir/name;path.write_bytes(data);path.chmod(0o644)
+        def state(name):
+            active='inactive' if name=='servus-updater-bootstrap.service' else 'active'
+            return f'LoadState=loaded\nActiveState={active}\nSubState={"dead" if active=="inactive" else "running"}\nUnitFileState={"static" if active=="inactive" else "enabled"}\n'
+        try:
+            args=dict(state=self.s,install=self.i,units=units_fd,service_lock=self.sl,install_lock=self.il,supervisor=supervisor,coordinator=coordinator)
+            unit_mask_module.mask_units(self.db,self.op,self.digest,originals,execute=state,**args);self.apply()
+            unit_mask_module.restore_from_journal(self.db,self.op,self.digest,**args)
+            self.db.execute('CREATE TABLE host_stops(operation_id TEXT PRIMARY KEY,image_digest TEXT,status TEXT)')
+            self.db.execute("INSERT INTO host_stops VALUES(?,?,'stopped')",(self.op,self.digest))
+            start_args=dict(state_fd=self.s,install_fd=self.i,units_fd=units_fd,active_parent=self.a,candidate_parent=self.c,
+                host_lock=self.hl,service_lock=self.sl,install_lock=self.il,supervisor=supervisor,unit_mask=unit_mask_module,
+                host_switch=switch,bundle=bundle,exchange=exchange)
+            path=unit_dir/unit_mask_module.UNITS[0];path.write_bytes(b'changed')
+            with self.assertRaises(unit_mask_module.UnitMaskError):coordinator.authorize_same_boot_start(self.db,self.op,self.digest,**start_args)
+            path.write_bytes(originals[unit_mask_module.UNITS[0]])
+            coordinator.authorize_same_boot_start(self.db,self.op,self.digest,**start_args)
+            self.assertEqual(self.db.execute('SELECT status FROM host_stops').fetchone(),('starting',))
+            self.assertEqual(self.db.execute('SELECT boot_id FROM host_boot_authorizations').fetchone(),
+                             (Path('/proc/sys/kernel/random/boot_id').read_text().strip(),))
+        finally:os.close(units_fd)
+
     def test_activation_orders_handoff_and_reacquires_install_lock(self):
         calls=[]
         def record(name):
@@ -218,13 +244,14 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
         unit_mask=SimpleNamespace(mask_units=record('mask'),stop_masked_units=record('stop'),restore_from_journal=record('restore'))
         host_switch=SimpleNamespace(exchange_prepared=record('exchange'),start_restored=start,
             assert_supervisor_ready=record('ready'),complete_exchange=complete,HostSwitchError=switch.HostSwitchError)
+        self.addCleanup(mock.patch.stopall);mock.patch.object(coordinator,'authorize_same_boot_start',side_effect=record('authorize_start')).start()
         try:
             coordinator.activate_prepared(self.db,self.op,self.digest,{}, {},self.modules,self.cli,self.pin,
                 state_fd=self.s,install_fd=self.i,units_fd=self.a,active_parent=self.a,candidate_parent=self.c,
                 host_lock=self.hl,service_lock=self.sl,install_lock=self.il,supervisor=supervisor,unit_mask=unit_mask,
                 host_switch=host_switch,bundle=bundle,exchange=exchange,fence=lambda:None,authorize=lambda:None,
                 supervisor_socket='/control/socket')
-            self.assertEqual(calls,['mask','stop','exchange','restore','start','ready','complete'])
+            self.assertEqual(calls,['mask','stop','exchange','restore','authorize_start','start','ready','complete'])
         finally:fcntl.flock(self.sl,fcntl.LOCK_EX|fcntl.LOCK_NB)
 
     def test_activation_leaves_masks_for_recovery_if_exchange_fails(self):
@@ -300,7 +327,7 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
     def test_complete_requires_restored_units_and_healthy_services(self):
         self.apply()
         self.db.execute('CREATE TABLE host_stops(operation_id TEXT PRIMARY KEY,image_digest TEXT,status TEXT)')
-        self.db.execute("INSERT INTO host_stops VALUES(?,?,'stopped')",(self.op,self.digest))
+        self.db.execute("INSERT INTO host_stops VALUES(?,?,'starting')",(self.op,self.digest))
         self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
         self.db.execute('INSERT INTO host_unit_masks VALUES(?,?,?)',(self.op,self.digest,'masked'))
         args=self.args();args.pop('fence');args.pop('service_lock');args.update(host_lock=self.hl,unit_mask=mock.Mock(unsafe=True), units_fd=self.a,supervisor_socket='/control/socket');ready=mock.Mock(return_value=None)
