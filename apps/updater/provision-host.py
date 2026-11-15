@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pathlib
 import re
 import secrets
 import stat
@@ -119,6 +120,13 @@ def prepare(config_dir, state_dir):
                     raise ProvisionError('Docker configuration must be empty')
             finally: os.close(fd)
         publish_once(state, 'host.lock', b'')
+        try:os.stat('journal.sqlite',dir_fd=state,follow_symlinks=False)
+        except FileNotFoundError:
+            source=os.path.join(os.path.dirname(os.path.realpath(__file__)),'servus-updater.py')
+            spec=importlib.util.spec_from_file_location('servus_initial_journal',source)
+            if not spec or not spec.loader:raise ProvisionError('Updater journal module is unavailable')
+            updater=importlib.util.module_from_spec(spec);spec.loader.exec_module(updater)
+            journal=updater.Journal(pathlib.Path(state_dir));journal.close()
         values = {'SERVUS_UPDATER_STATE_DIR': state_dir, 'SERVUS_UPDATER_SOCKET_DIR': '/run/servus-updater/control',
                   'SERVUS_COMPONENT_UID': '1000', 'SERVUS_UPDATER_SOCKET_GID': '1000',
                   'SERVUS_SUPERVISOR_COMMAND_SOCKET': config_dir + '/supervisor-control/command'}

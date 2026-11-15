@@ -9,6 +9,7 @@ User=root
 Group=root
 UMask=0077
 EnvironmentFile=/etc/servus/updater.env
+ExecStartPre=/usr/bin/python3 -I /usr/local/libexec/servus/host-boot-gate.py
 ExecStart=/usr/bin/python3 -I /usr/local/libexec/servus/provision-socket.py --socket-gid ${SERVUS_UPDATER_SOCKET_GID}
 RemainAfterExit=yes
 NoNewPrivileges=true

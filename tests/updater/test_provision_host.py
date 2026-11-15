@@ -5,6 +5,7 @@ import hashlib
 from types import SimpleNamespace
 from unittest import mock
 import os
+import sqlite3
 from pathlib import Path
 import shutil
 import stat
@@ -137,6 +138,9 @@ class HostProvisioningTest(unittest.TestCase):
         for name in ('staging','maintenance','backups','policies','docker-config','host-generations'):
             value=(self.state/name).stat()
             self.assertEqual((value.st_uid,value.st_gid,stat.S_IMODE(value.st_mode)),(0,0,0o700))
+        with sqlite3.connect(self.state/'journal.sqlite') as journal:
+            self.assertEqual(journal.execute('PRAGMA user_version').fetchone()[0],8)
+            self.assertIsNotNone(journal.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'").fetchone())
         lock=self.state/'host.lock'; lock_inode=lock.stat().st_ino
         self.assertEqual((lock.stat().st_uid,lock.stat().st_gid,stat.S_IMODE(lock.stat().st_mode),lock.read_bytes()),(0,0,0o600,b''))
         self.prepare()

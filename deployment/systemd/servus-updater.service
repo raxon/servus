@@ -10,6 +10,7 @@ User=root
 Group=root
 UMask=0077
 EnvironmentFile=/etc/servus/updater.env
+ExecStartPre=/usr/bin/python3 -I /usr/local/libexec/servus/host-boot-gate.py
 ExecStart=/usr/bin/python3 -I /usr/local/libexec/servus/servus-updater.py --state-dir ${SERVUS_UPDATER_STATE_DIR} --socket-dir ${SERVUS_UPDATER_SOCKET_DIR} --peer-uid ${SERVUS_COMPONENT_UID} --socket-gid ${SERVUS_UPDATER_SOCKET_GID} --supervisor-socket ${SERVUS_SUPERVISOR_COMMAND_SOCKET}
 Restart=on-failure
 RestartSec=5
