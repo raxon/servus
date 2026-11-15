@@ -18,7 +18,7 @@ function owner(operationId: string): string { return `servus-acme-${operationId}
 function isRecord(value: unknown, expected: CloudflareDns01Record): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return ['id','type','name','content','comment'].every(key=>Object.hasOwn(record,key)) && record.id === expected.recordId && record.type === 'TXT' && record.name === expected.name && record.content === expected.value && record.comment === owner(expected.operationId);
+  return ['id','type','name','content','comment'].every(key=>Object.hasOwn(record,key)) && record.id === expected.recordId && record.type === 'TXT' && record.name === expected.name && (record.content === expected.value || record.content === `"${expected.value}"`) && record.comment === owner(expected.operationId);
 }
 
 /** A zone-scoped API token is held only in memory. Callers must never log it. */
@@ -31,7 +31,7 @@ export class CloudflareDns01Provider implements Dns01Provider<CloudflareDns01Rec
     this.#token = token;
   }
 
-  private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<unknown> {
+  private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<{result:unknown;resultInfo:unknown}> {
     let response: Response;
     try {
       response = await this.transport(`${api}/zones/${this.zoneId}/dns_records${path}`, {
@@ -57,7 +57,8 @@ export class CloudflareDns01Provider implements Dns01Provider<CloudflareDns01Rec
       finally { reader.releaseLock(); }
       const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !Object.hasOwn(parsed,'success') || (parsed as {success?:unknown}).success !== true || !Object.hasOwn(parsed,'result')) throw new Error();
-      return (parsed as {result: unknown}).result;
+      const envelope=parsed as {result:unknown;result_info?:unknown};
+      return {result:envelope.result,resultInfo:envelope.result_info};
     } catch { throw new Dns01ProviderError('uncertain'); }
   }
 
@@ -65,7 +66,7 @@ export class CloudflareDns01Provider implements Dns01Provider<CloudflareDns01Rec
     const intent = desired(challenge, this.zone);
     // Persist the intent before calling this method. An uncertain result must
     // not be blindly retried: Cloudflare may have created the record already.
-    const result = await this.request('POST', '', { type: 'TXT', name: intent.name, content: intent.value, ttl: 120, comment: owner(intent.operationId) });
+    const {result} = await this.request('POST', '', { type: 'TXT', name: intent.name, content: `"${intent.value}"`, ttl: 120, comment: owner(intent.operationId) });
     const recordId = result && typeof result === 'object' && !Array.isArray(result) ? (result as {id?:unknown}).id : undefined;
     if (typeof recordId !== 'string' || !dns01IdPattern.test(recordId)) throw new Dns01ProviderError('uncertain');
     const record = { ...intent, recordId };
@@ -78,12 +79,37 @@ export class CloudflareDns01Provider implements Dns01Provider<CloudflareDns01Rec
     if (typeof record.recordId !== 'string' || !dns01IdPattern.test(record.recordId)) throw new Dns01ProviderError('invalid_input');
     const host = record.name.slice('_acme-challenge.'.length);
     if (host !== this.zone && !host.endsWith('.' + this.zone)) throw new Dns01ProviderError('invalid_input');
-    const found = await this.request('GET', `/${record.recordId}`);
+    const {result:found} = await this.request('GET', `/${record.recordId}`);
     if (!isRecord(found, record)) throw new Dns01ProviderError('ownership_mismatch');
     // Cloudflare does not document conditional DELETE for DNS records. A caller
     // must serialize its own changes and keep this record under its control.
-    const deleted = await this.request('DELETE', `/${record.recordId}`);
+    const {result:deleted} = await this.request('DELETE', `/${record.recordId}`);
     if (!deleted || typeof deleted !== 'object' || Array.isArray(deleted) || !Object.hasOwn(deleted,'id') || (deleted as {id?:unknown}).id !== record.recordId) throw new Dns01ProviderError('uncertain');
     return {status:'removed'};
+  }
+
+  /** A missing record is not proof that an earlier timed-out POST has stopped.
+   * A found record is an observation, not a snapshot isolated from other DNS writers.
+   */
+  async findPresented(challenge: Dns01Challenge): Promise<{status:'found';record:CloudflareDns01Record}|{status:'not_observed'}> {
+    const intent=desired(challenge,this.zone), matches:CloudflareDns01Record[]=[];
+    const seen=new Set<string>();let totalPages:number|undefined;
+    for(let page=1;page<=10;page++) {
+      const {result,resultInfo}=await this.request('GET',`?type=TXT&per_page=100&page=${page}`);
+      if (!Array.isArray(result) || result.length>100 || !resultInfo || typeof resultInfo!=='object' || Array.isArray(resultInfo)) throw new Dns01ProviderError('uncertain');
+      const info=resultInfo as {page?:unknown;total_pages?:unknown};
+      if(info.page!==page || typeof info.total_pages!=='number' || !Number.isSafeInteger(info.total_pages) || info.total_pages<0 || info.total_pages>10 || (info.total_pages===0 && result.length!==0) || (totalPages!==undefined && totalPages!==info.total_pages)) throw new Dns01ProviderError('uncertain');
+      totalPages=info.total_pages;
+      for(const entry of result) {
+        const id=entry && typeof entry==='object' && !Array.isArray(entry) ? (entry as {id?:unknown}).id : undefined;
+        if(typeof id!=='string' || !dns01IdPattern.test(id) || seen.has(id))throw new Dns01ProviderError('uncertain');
+        seen.add(id);
+        const record={...intent,recordId:id};
+        if(isRecord(entry,record))matches.push(record);
+      }
+      if(matches.length>1)throw new Dns01ProviderError('ownership_mismatch');
+      if(page>=totalPages)break;
+    }
+    return matches.length ? {status:'found',record:matches[0]!} : {status:'not_observed'};
   }
 }

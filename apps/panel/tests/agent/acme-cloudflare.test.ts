@@ -7,7 +7,7 @@ const zoneId = 'a'.repeat(32), recordId = 'b'.repeat(32), operationId = 'c'.repe
 const token = 'fixture-only-token', value = Buffer.alloc(32, 0x75).toString('base64url');
 const challenge = { operationId, identifier: '*.www.example.com', value };
 const expected = { operationId, name: '_acme-challenge.www.example.com', value, recordId };
-const providerRecord = { id: recordId, type: 'TXT', name: expected.name, content: value, comment: `servus-acme-${operationId}` };
+const providerRecord = { id: recordId, type: 'TXT', name: expected.name, content: `"${value}"`, comment: `servus-acme-${operationId}` };
 const response = (result: unknown) => new Response(JSON.stringify({success:true,result}), {status:200, headers:{'content-type':'application/json'}});
 
 function failure(error: unknown, code: Dns01ProviderError['code']) {
@@ -25,7 +25,13 @@ describe('Cloudflare DNS-01 adapter', () => {
     expect(url).toBe(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`);
     expect(init?.method).toBe('POST'); expect(init?.redirect).toBe('error');
     expect(init?.headers).toMatchObject({authorization:`Bearer ${token}`});
-    expect(JSON.parse(init?.body as string)).toEqual({type:'TXT',name:expected.name,content:value,ttl:120,comment:`servus-acme-${operationId}`});
+    expect(JSON.parse(init?.body as string)).toEqual({type:'TXT',name:expected.name,content:`"${value}"`,ttl:120,comment:`servus-acme-${operationId}`});
+  });
+
+  it('accepts the same TXT value if the provider returns it without presentation quotes',async()=>{
+    const fetcher=vi.fn<typeof fetch>().mockResolvedValue(response({...providerRecord,content:value}));
+    const provider=new CloudflareDns01Provider(zoneId,'example.com',token,fetcher);
+    await expect(provider.present(challenge)).resolves.toEqual({status:'awaiting_dns',record:expected});
   });
 
   it('normalizes international names and requires the challenge to be in the configured zone', async () => {
@@ -97,5 +103,33 @@ describe('Cloudflare DNS-01 adapter', () => {
     fetcher.mockReset().mockResolvedValueOnce(new Response('not found',{status:404}));
     await expect(provider.remove(expected)).rejects.toMatchObject({code:'rejected'});
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('reconciles an uncertain creation by its operation marker across bounded pages',async()=>{
+    const page=(number:number,total:number,entries:unknown[])=>new Response(JSON.stringify({success:true,result:entries,result_info:{page:number,total_pages:total}}),{status:200});
+    const other={...providerRecord,id:'e'.repeat(32),comment:'external'};
+    const fetcher=vi.fn<typeof fetch>().mockResolvedValueOnce(page(1,2,[other])).mockResolvedValueOnce(page(2,2,[providerRecord]));
+    const provider=new CloudflareDns01Provider(zoneId,'example.com',token,fetcher);
+    await expect(provider.findPresented(challenge)).resolves.toEqual({status:'found',record:expected});
+    expect(fetcher.mock.calls.map(([url])=>url)).toEqual([
+      `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?type=TXT&per_page=100&page=1`,
+      `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?type=TXT&per_page=100&page=2`,
+    ]);
+    fetcher.mockReset().mockResolvedValueOnce(page(1,0,[]));
+    await expect(provider.findPresented(challenge)).resolves.toEqual({status:'not_observed'});
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reconcile ambiguous, duplicated or incomplete record lists',async()=>{
+    const page=(number:number,total:number,entries:unknown[])=>new Response(JSON.stringify({success:true,result:entries,result_info:{page:number,total_pages:total}}),{status:200});
+    const fetcher=vi.fn<typeof fetch>(),provider=new CloudflareDns01Provider(zoneId,'example.com',token,fetcher);
+    fetcher.mockResolvedValueOnce(page(1,1,[providerRecord,{...providerRecord,id:'f'.repeat(32)}]));
+    await expect(provider.findPresented(challenge)).rejects.toMatchObject({code:'ownership_mismatch'});
+    fetcher.mockResolvedValueOnce(page(1,11,[]));
+    await expect(provider.findPresented(challenge)).rejects.toMatchObject({code:'uncertain'});
+    fetcher.mockResolvedValueOnce(response([]));
+    await expect(provider.findPresented(challenge)).rejects.toMatchObject({code:'uncertain'});
+    fetcher.mockResolvedValueOnce(page(1,2,[providerRecord])).mockResolvedValueOnce(page(2,2,[providerRecord]));
+    await expect(provider.findPresented(challenge)).rejects.toMatchObject({code:'uncertain'});
   });
 });
