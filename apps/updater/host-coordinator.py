@@ -106,7 +106,7 @@ def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_l
 
 def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_fd, install_fd, units_fd,
                             host_lock, supervisor, unit_mask, bundle, ready, run=subprocess.run):
-    """Recover only a journaled stop that never reached host preparation.
+    """Recover a journaled stop before any unit mask or runtime exchange.
 
     The caller holds the host operation lock, supplies independently verified
     original unit bytes, and checks the authenticated control-plane readiness.
@@ -132,10 +132,14 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         row=db.execute('SELECT image_digest,status FROM host_stops WHERE operation_id=?',(operation_id,)).fetchone()
         if not row or row[0]!=image_digest or row[1] not in ('stopping','stopped'):
             raise HostPreparationError('Updater stop is not eligible for recovery')
-        for table in ('host_preparations','host_switches','host_unit_masks'):
+        for table in ('host_switches','host_unit_masks'):
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
                 if db.execute('SELECT 1 FROM '+table+' WHERE operation_id=?',(operation_id,)).fetchone():
                     raise HostPreparationError('Host exchange has already begun')
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_preparations'").fetchone():
+            preparation=db.execute('SELECT image_digest,status FROM host_preparations WHERE operation_id=?',(operation_id,)).fetchone()
+            if preparation and (preparation[0]!=image_digest or preparation[1] not in ('intent','prepared','recovery_required')):
+                raise HostPreparationError('Host preparation is not eligible for recovery')
         for name in unit_mask.UNITS: unit_mask._read(units_fd,name,0o644,originals[name])
     verify()
     fd=supervisor._open_root_file(install_fd,'install.lock',0o600)
@@ -145,6 +149,13 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         fcntl.flock(fd,fcntl.LOCK_UN)
     finally:os.close(fd)
     states=unit_mask.capture_service_states()
+    if states['servus-updater.service']=='inactive':
+        fd=supervisor._open_root_file(state_fd,'service.lock',0o600)
+        try:
+            try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError as error:raise HostPreparationError('Updater lock is still held') from error
+            fcntl.flock(fd,fcntl.LOCK_UN)
+        finally:os.close(fd)
     for name in unit_mask.UNITS:
         if name!='servus-updater.service' and states[name]!=expected[name]:
             raise HostPreparationError('Host service state changed during recovery')
@@ -159,6 +170,8 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
     db.execute('BEGIN IMMEDIATE')
     try:
         verify()
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_preparations'").fetchone():
+            db.execute("UPDATE host_preparations SET status='abandoned' WHERE operation_id=? AND image_digest=? AND status IN ('intent','prepared','recovery_required')",(operation_id,image_digest))
         if db.execute("UPDATE host_stops SET status='completed' WHERE operation_id=? AND image_digest=? AND status IN ('stopping','stopped')",(operation_id,image_digest)).rowcount!=1:
             raise HostPreparationError('Updater stop journal changed')
         db.execute('COMMIT')
@@ -240,7 +253,7 @@ def prepare_completed(db, operation_id, *, state_dir, install_dir, gate_dir,
         _no_pending(db)
         db.execute('BEGIN IMMEDIATE')
         try:
-            db.execute("CREATE TABLE IF NOT EXISTS host_preparations (operation_id TEXT PRIMARY KEY, image_digest TEXT NOT NULL, generation TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('intent','prepared','recovery_required','completed'))) ")
+            db.execute("CREATE TABLE IF NOT EXISTS host_preparations (operation_id TEXT PRIMARY KEY, image_digest TEXT NOT NULL, generation TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('intent','prepared','recovery_required','completed','abandoned'))) ")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_preparation ON host_preparations ((1)) WHERE status IN ('intent','prepared','recovery_required')")
             db.execute("INSERT INTO host_preparations VALUES(?,?,?,'intent')", (operation_id, digest, 'runtime-' + operation_id))
             db.execute('COMMIT'); inserted = True

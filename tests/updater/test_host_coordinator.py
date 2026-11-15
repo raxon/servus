@@ -112,17 +112,21 @@ class HostCoordinatorTest(unittest.TestCase):
             with self.assertRaises(coordinator.HostPreparationError):
                 coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=mock.Mock(),**args)
             fcntl.flock(self.install_lock,fcntl.LOCK_UN)
-            self.db.execute('CREATE TABLE host_preparations(operation_id TEXT,status TEXT)')
-            self.db.execute("INSERT INTO host_preparations VALUES(?,'prepared')",(self.fixture.op,))
+            self.db.execute('CREATE TABLE host_switches(operation_id TEXT,phase TEXT)')
+            self.db.execute("INSERT INTO host_switches VALUES(?,'intent')",(self.fixture.op,))
             with self.assertRaises(coordinator.HostPreparationError):
                 coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=mock.Mock(),**args)
-            self.db.execute('DELETE FROM host_preparations')
+            self.db.execute('DELETE FROM host_switches')
+            self.db.execute('CREATE TABLE host_preparations(operation_id TEXT,image_digest TEXT,status TEXT)')
+            self.db.execute("INSERT INTO host_preparations VALUES(?,?,'prepared')",(self.fixture.op,self.fixture.digest))
             run=mock.Mock()
+            fcntl.flock(self.service_lock,fcntl.LOCK_UN)
             coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=run,**args)
             self.assertEqual(run.call_args.args[0],['/usr/bin/systemctl','start','servus-updater.service'])
             self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('completed',))
+            self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('abandoned',))
         finally:
-            fcntl.flock(self.install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);os.close(state_fd);os.close(install_fd)
+            fcntl.flock(self.service_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);fcntl.flock(self.install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB);os.close(state_fd);os.close(install_fd)
 
     def test_recovery_keeps_intent_if_control_plane_is_unavailable(self):
         names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
