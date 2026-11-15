@@ -73,10 +73,12 @@ def activate(operation_id, *, modules, paths=PATHS):
         originals={name:modules['install_host'].read_file(units,name,0o644) for name in unit_mask.UNITS}
         service_lock,initial=coordinator.stop_updater(db,operation_id,digest,state_fd=state,install_fd=install,
             host_lock=host_lock,install_lock=install_lock,supervisor=supervisor,unit_mask=unit_mask,bundle=bundle,authorize=authorize)
+        preparation_daemon=types.SimpleNamespace(resolve_active_policy=lambda journal,env:
+            resolve_policy_retry(daemon,supervisor,journal,env))
         generation,prepared_digest,contents,cli,pin=coordinator.prepare_completed(db,operation_id,
             state_dir=paths['state'],install_dir=paths['install'],gate_dir=paths['gate'],candidate_parent=paths['candidates'],
             host_dir=paths['active'],active_env=paths['active_env'],service_lock=service_lock,install_lock=install_lock,
-            supervisor=supervisor,daemon=daemon,extractor=modules['extractor'],backup=modules['backup'],bundle=bundle,
+            supervisor=supervisor,daemon=preparation_daemon,extractor=modules['extractor'],backup=modules['backup'],bundle=bundle,
             install_host=modules['install_host'],install_gh=modules['install_gh'],include_material=True)
         if generation!='runtime-'+operation_id or prepared_digest!=digest:raise HostRunnerError('Prepared release differs')
         coordinator.prepare_recovery_snapshot(db,operation_id,digest,state_fd=state,install_fd=install,active_fd=runtime,

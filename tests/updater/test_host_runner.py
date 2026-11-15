@@ -131,6 +131,20 @@ class HostRunnerTest(unittest.TestCase):
         try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         finally:os.close(fd)
 
+    def test_retries_transient_policy_read_during_host_preparation(self):
+        binding=('/policy','/accepted',self.policy)
+        cause=sqlite3.OperationalError('fixture');cause.sqlite_errorcode=sqlite3.SQLITE_IOERR
+        error=supervisor.SupervisorError('unavailable');error.__cause__=cause
+        self.daemon.resolve_active_policy.side_effect=[binding,binding,binding,error,binding]
+        def prepare(*args,**kwargs):
+            daemon=kwargs['daemon']
+            for _ in range(3):self.assertEqual(daemon.resolve_active_policy('/journal','/env'),binding)
+            return ('runtime-'+self.op,self.digest,{'core.py':(0o644,b'core')},b'cli',('pin',))
+        self.coordinator.prepare_completed.side_effect=prepare
+        with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}),mock.patch.object(runner.time,'sleep'):
+            runner.activate(self.op,modules=self.modules,paths=self.paths)
+        self.assertEqual(self.daemon.resolve_active_policy.call_count,5)
+
     def test_rechecks_running_generation_before_stopping(self):
         def check(*args,**kwargs):kwargs['authorize']()
         self.coordinator.stop_updater.side_effect=check
