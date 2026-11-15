@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Exercise logical exports and restores using disposable databases only.
+set -euo pipefail
+for command in docker python3; do command -v "$command" >/dev/null || { printf 'Missing %s\n' "$command" >&2; exit 1; }; done
+id=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+root="/tmp/servus-db-export-$id"
+mkdir -m 700 "$root"
+names=("servus-db-export-$id-pg-source" "servus-db-export-$id-pg-target" "servus-db-export-$id-maria-source" "servus-db-export-$id-maria-target")
+cleanup() {
+  for name in "${names[@]}"; do
+    if [[ $(docker inspect --format '{{ index .Config.Labels "servus.test" }}' "$name" 2>/dev/null || true) == "$id" ]]; then
+      docker rm -f -v "$name" >/dev/null || printf 'Could not remove fixture %s\n' "$name" >&2
+    fi
+  done
+  python3 -c 'import re,shutil,sys; p=sys.argv[1]; assert re.fullmatch(r"/tmp/servus-db-export-[a-f0-9]{32}",p); shutil.rmtree(p)' "$root"
+}
+trap cleanup EXIT
+password=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
+printf 'POSTGRES_DB=fixture\nPOSTGRES_USER=fixture\nPOSTGRES_PASSWORD=%s\n' "$password" > "$root/postgres.env"
+printf 'MARIADB_DATABASE=fixture\nMARIADB_USER=fixture\nMARIADB_PASSWORD=%s\nMARIADB_ROOT_PASSWORD=%s\n' "$password" "$password" > "$root/mariadb.env"
+chmod 600 "$root"/*.env
+start() {
+  docker run -d --network none --label "servus.test=$id" --name "$1" --env-file "$2" "$3" >/dev/null
+}
+wait_ready() {
+  local name=$1 kind=$2
+  for _ in $(seq 1 90); do
+    if [[ $kind == postgres ]]; then
+      if docker exec "$name" pg_isready -q -h 127.0.0.1 -U fixture -d fixture; then return; fi
+    elif docker exec "$name" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT 1"' >/dev/null 2>&1; then return; fi
+    sleep 1
+  done
+  printf 'Database fixture did not become ready: %s\n' "$name" >&2; return 1
+}
+start "${names[0]}" "$root/postgres.env" postgres:17-alpine
+start "${names[1]}" "$root/postgres.env" postgres:17-alpine
+wait_ready "${names[0]}" postgres; wait_ready "${names[1]}" postgres
+docker exec -i "${names[0]}" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U fixture -d fixture -v ON_ERROR_STOP=1' >/dev/null <<'SQL'
+CREATE TABLE items (id integer PRIMARY KEY, title text NOT NULL);
+INSERT INTO items VALUES (1,'hello'),(2,'Zażółć gęślą jaźń');
+CREATE TABLE empty_items (id integer PRIMARY KEY);
+SQL
+docker exec "${names[0]}" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h 127.0.0.1 -U fixture --format=custom --no-owner --no-privileges fixture' > "$root/postgres.dump"
+test -s "$root/postgres.dump"
+docker exec -i "${names[1]}" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore -h 127.0.0.1 -U fixture -d fixture --exit-on-error --no-owner --no-privileges' < "$root/postgres.dump"
+result=$(docker exec "${names[1]}" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U fixture -d fixture -At -v ON_ERROR_STOP=1 -c "SELECT count(*) || '\''|'\'' || (SELECT title FROM items WHERE id=2) || '\''|'\'' || (SELECT count(*) FROM empty_items) FROM items"')
+[[ $result == '2|Zażółć gęślą jaźń|0' ]]
+docker rm -f -v "${names[0]}" "${names[1]}" >/dev/null
+printf 'PASS PostgreSQL logical export and restore\n'
+start "${names[2]}" "$root/mariadb.env" mariadb:11.4
+start "${names[3]}" "$root/mariadb.env" mariadb:11.4
+wait_ready "${names[2]}" mariadb; wait_ready "${names[3]}" mariadb
+docker exec -i "${names[2]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture --default-character-set=utf8mb4 fixture' <<'SQL'
+CREATE TABLE items (id integer PRIMARY KEY, title varchar(100) NOT NULL) CHARACTER SET utf8mb4;
+INSERT INTO items VALUES (1,'hello'),(2,'Zażółć gęślą jaźń');
+CREATE TABLE empty_items (id integer PRIMARY KEY);
+SQL
+docker exec "${names[2]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb-dump -h 127.0.0.1 -u fixture --single-transaction --quick --skip-lock-tables --no-tablespaces --default-character-set=utf8mb4 fixture' > "$root/mariadb.sql"
+test -s "$root/mariadb.sql"
+docker exec -i "${names[3]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture --default-character-set=utf8mb4 fixture' < "$root/mariadb.sql"
+result=$(docker exec "${names[3]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture --default-character-set=utf8mb4 fixture -N -e "SELECT CONCAT(COUNT(*), '\''|'\'', (SELECT title FROM items WHERE id=2), '\''|'\'', (SELECT COUNT(*) FROM empty_items)) FROM items"')
+[[ $result == '2|Zażółć gęślą jaźń|0' ]]
+printf 'PASS MariaDB logical export and restore\n'
