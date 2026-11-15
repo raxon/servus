@@ -6,7 +6,7 @@ const idPattern = /^[a-f0-9]{32}$/;
 const servicePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
 const transitions: Record<RestorePhase, readonly RestorePhase[]> = {
-  uploading: ['needs_review'],
+  uploading: ['cancelled', 'needs_review'],
   reserved: ['importing', 'cancelled', 'needs_review'],
   importing: ['prepared', 'needs_review'],
   prepared: ['switching', 'needs_review'],

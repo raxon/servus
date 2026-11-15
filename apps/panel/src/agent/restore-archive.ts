@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import { constants, createReadStream, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, statfsSync, closeSync, write, writeSync } from 'node:fs';
+import { constants, createReadStream, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, statfsSync, closeSync, write, writeSync } from 'node:fs';
 import { link, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { Readable, Transform, Writable } from 'node:stream';
@@ -24,6 +24,23 @@ function validate(operationId: string, key: Buffer) {
   if (!idPattern.test(operationId) || !Buffer.isBuffer(key) || key.length !== 32) throw new Error('Invalid restore archive identity.');
 }
 function aad(operationId: string) { return Buffer.from(`servus-restore-archive-v1:${operationId}`); }
+
+/** Remove incomplete upload files only after the writer has stopped. */
+export async function discardUnpublishedRestoreArchive(dataDir: string, operationId: string): Promise<void> {
+  if (!idPattern.test(operationId)) throw new Error('Invalid restore archive identity.');
+  const dir = archiveDirectory(dataDir), destination = join(dir, `${operationId}.enc`);
+  try { lstatSync(destination); throw new Error('A published restore archive requires recovery.'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const pendingPattern = new RegExp(`^\\.pending-${operationId}-[a-f0-9]{32}$`), uid = process.getuid?.();
+  for (const name of readdirSync(dir)) {
+    if (!pendingPattern.test(name)) continue;
+    const path = join(dir, name), info = lstatSync(path);
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || (uid !== undefined && info.uid !== uid) || (info.mode & 0o777) !== 0o600) throw new Error('Incomplete restore archive requires recovery.');
+    await unlink(path);
+  }
+  const dirFd = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+}
 
 /** Persist an authenticated encrypted archive without replacing an existing operation. */
 export async function stageRestoreArchive(options: {

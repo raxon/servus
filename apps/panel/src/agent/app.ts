@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import Database from 'better-sqlite3';
 import websocket from '@fastify/websocket';
-import type { Duplex } from 'node:stream';
+import { Readable, type Duplex } from 'node:stream';
 import type Docker from 'dockerode';
 import { SecretVault } from '../shared/secrets.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
@@ -13,6 +13,7 @@ import type { Service } from '../shared/types.js';
 import { consoleExecStopped, type AgentMaintenanceGate } from './maintenance.js';
 import { DatabaseExportUncertainError, exportDatabase } from './database-export.js';
 import { RestoreJournal } from './restore-journal.js';
+import { uploadRestoreArchive } from './restore-upload.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -111,6 +112,29 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       reply.header('Content-Type','application/octet-stream').header('Content-Length',artifact.size).header('X-Export-Extension',artifact.extension);
       handedOff=true;return reply.send(stream);
     }finally{if(!handedOff)finish();}
+  });
+  let uploads = 0;
+  app.register(async scope => {
+    scope.addContentTypeParser('application/octet-stream', (_req, payload, done) => done(null, payload));
+    scope.post<{Params:{id:string};Querystring:{operationId?:string;kind?:string};Body:Readable}>('/services/:id/database-restore/upload', async (req,reply) => {
+      const id = req.params.id, operationId = req.query.operationId, kind = req.query.kind;
+      const length = req.headers['content-length'];
+      if (!z.string().uuid().safeParse(id).success || !operationId || !/^[a-f0-9]{32}$/.test(operationId) || !['postgres','mariadb'].includes(kind || '') || !length || !/^[1-9][0-9]*$/.test(length) || Number(length) > 2 * 1024 * 1024 * 1024 || !(req.body instanceof Readable)) {
+        return reply.code(400).send({ error: { code: 'INVALID_UPLOAD', message: 'Invalid database restore upload.' } });
+      }
+      const release = maintenance?.admit();
+      if (maintenance && !release) return reply.code(503).send({ error: { code: 'MAINTENANCE', message: 'Agent is draining.' } });
+      if (uploads >= 2) { release?.(); return reply.code(429).send({ error: { code: 'UPLOAD_BUSY', message: 'Too many database restore uploads are active.' } }); }
+      uploads++;
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      req.raw.once('aborted', abort);
+      const timeout = setTimeout(abort, 30 * 60_000); timeout.unref();
+      try {
+        const result = await uploadRestoreArchive({ journal: restores, operationId, serviceId: id, kind: kind as 'postgres'|'mariadb', dataDir: config.dataDir, key: vault.restoreArchiveKey(operationId), input: () => req.body, signal: controller.signal, sizeLimit: Number(length), expectedSize: Number(length) });
+        return { operationId, size: result.size, sha256: result.record.archive_sha256, phase: result.record.phase };
+      } finally { uploads--; clearTimeout(timeout); req.raw.off('aborted', abort); release?.(); }
+    });
   });
   app.get<{Params:{id:string};Querystring:{containerId?:string;shell?:string}}>('/services/:id/console', {websocket:true,preValidation:async(req,reply)=>{
     if(!z.string().uuid().safeParse(req.params.id).success||!['/bin/sh','/bin/bash'].includes(req.query.shell||'/bin/sh')||(req.query.containerId&&!/^[a-f0-9]{12,64}$/.test(req.query.containerId)))return reply.code(400).send({error:{code:'INVALID_CONSOLE',message:'Invalid console target.'}});

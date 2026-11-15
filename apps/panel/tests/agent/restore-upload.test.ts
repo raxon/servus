@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
@@ -41,19 +41,29 @@ it('records the upload before reading and publishes the archive digest only afte
   expect(readdirSync(join(base.dataDir, 'restore-archives'))).toEqual([`${base.operationId}.enc`]);
 });
 
-it('fences an interrupted upload for recovery without permitting a new import', async () => {
+it('cleans and cancels an interrupted upload after the writer stops', async () => {
   const base = fixture(), source = new PassThrough(), controller = new AbortController();
   const pending = uploadRestoreArchive({ ...base, input: () => source, signal: controller.signal });
   source.write('partial'); controller.abort();
   await expect(pending).rejects.toThrow();
-  expect(base.journal.get(base.operationId)?.phase).toBe('needs_review');
-  expect(base.journal.hasUnresolved(base.serviceId)).toBe(true);
+  expect(base.journal.get(base.operationId)?.phase).toBe('cancelled');
+  expect(base.journal.hasUnresolved(base.serviceId)).toBe(false);
   expect(readdirSync(join(base.dataDir, 'restore-archives'))).toEqual([]);
 });
 
 it('keeps the service fenced when recording a completed upload fails', async () => {
   const base = fixture(); vi.spyOn(base.journal, 'finishUpload').mockImplementation(() => { throw new Error('synthetic journal failure'); });
   await expect(uploadRestoreArchive({ ...base, input: () => Readable.from(['archive']) })).rejects.toThrow('synthetic journal failure');
+  expect(base.journal.get(base.operationId)?.phase).toBe('needs_review');
+  expect(base.journal.hasUnresolved(base.serviceId)).toBe(true);
+});
+
+it('keeps the service fenced when an unexpected published path prevents cleanup', async () => {
+  const base = fixture(), source = new PassThrough();
+  const pending = uploadRestoreArchive({ ...base, input: () => source });
+  symlinkSync('/nonexistent', join(base.dataDir, 'restore-archives', `${base.operationId}.enc`));
+  source.destroy(new Error('synthetic upload failure'));
+  await expect(pending).rejects.toThrow('synthetic upload failure');
   expect(base.journal.get(base.operationId)?.phase).toBe('needs_review');
   expect(base.journal.hasUnresolved(base.serviceId)).toBe(true);
 });
