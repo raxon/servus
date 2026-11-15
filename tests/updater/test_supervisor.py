@@ -219,6 +219,11 @@ class SupervisorTest(unittest.TestCase):
             with self.assertRaises(supervisor.SupervisorError):
                 coordinator.stop_after_drain(hub, str(uuid.uuid4()))
 
+    def test_legacy_recovery_marker_blocks_new_maintenance_even_when_malformed(self):
+        with supervisor.MaintenanceSupervisor(self.install,self.gate,self.journal) as coordinator:
+            supervisor._atomic_file(coordinator.journal,'legacy-upload-recovery.json',b'incomplete',0o600)
+            with self.assertRaises(supervisor.SupervisorError):coordinator._verify_no_previous_operation()
+
     def test_drain_diagnostic_never_logs_untrusted_response(self):
         hub = supervisor.DrainHub(mock.Mock(), TOKENS, 1000, POLICY, IDENTITIES)
         hub.connections = {role: mock.Mock() for role in supervisor.ROLES}

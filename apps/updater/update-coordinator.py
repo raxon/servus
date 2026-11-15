@@ -107,7 +107,7 @@ def begin_snapshot(journal, operation_id, lease, supervisor):
     A drained lease does not prove every writer is stopped. The caller must
     establish that independently before creating a snapshot.
     """
-    if not supervisor._uuid4(operation_id) or not isinstance(lease, supervisor.DrainLease):
+    if not supervisor._uuid4(operation_id) or not isinstance(lease, supervisor.DrainLease) or getattr(lease,'_legacy_upload_id',None) is not None:
         raise UpdateError('Invalid snapshot operation')
     lease.assert_locked(operation_id, 'stopped_unverified')
     db = journal.db
@@ -211,7 +211,7 @@ def capture_stopped_snapshot(journal, operation_id, lease, destination, node_fd,
     Root, Docker and any explicitly trusted ingress are inside the trust boundary.
     This operation does not start containers or apply the new release.
     """
-    if not isinstance(lease, supervisor.DrainLease):
+    if not isinstance(lease, supervisor.DrainLease) or getattr(lease,'_legacy_upload_id',None) is not None:
         raise UpdateError('A current maintenance lease is required')
     lease.assert_locked(operation_id, 'stopped_unverified')
     hub = lease._hub
@@ -271,6 +271,70 @@ def capture_stopped_snapshot(journal, operation_id, lease, destination, node_fd,
             os.close(source_fd)
         if destination_fd is not None:
             os.close(destination_fd)
+
+
+def cleanup_stopped_legacy_upload(operation_id, restore_id, service_id, lease, supervisor, quiescence, *, trusted_ingress=None):
+    """Run the fixed image worker while a scoped host maintenance lease is held.
+
+    This leaves a durable marker and does not open the gate or start services.
+    A separate coordinator must verify and finalize the original generation.
+    """
+    if (not isinstance(lease,supervisor.DrainLease) or not supervisor._uuid4(operation_id) or
+        not isinstance(restore_id,str) or not re.fullmatch(r'[a-f0-9]{32}',restore_id) or
+        not isinstance(service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service_id) or
+        getattr(lease,'_legacy_upload_id',None)!=restore_id):
+        raise UpdateError('Invalid legacy upload recovery scope')
+    lease.assert_locked(operation_id,'stopped_unverified')
+    hub=lease._hub
+    if (not isinstance(hub,supervisor.DrainHub) or hub.used is not True or lease._policy_binding is None or
+        hub.expected_uid!=1000 or not isinstance(hub.policy,supervisor.RuntimePolicy) or set(hub.identities)!=set(supervisor.ROLES)):
+        raise UpdateError('Authenticated drain identity is unavailable')
+    try: expected={hub.identities[role]['id'] for role in supervisor.ROLES}
+    except (KeyError,TypeError): raise UpdateError('Authenticated drain identity is unavailable') from None
+    if len(expected)!=3 or not all(isinstance(cid,str) and re.fullmatch(r'[a-f0-9]{64}',cid) for cid in expected):
+        raise UpdateError('Authenticated drain identity is unavailable')
+    data_dir=hub.policy.data_dir
+    if ',' in data_dir or '\n' in data_dir or not re.fullmatch(r'sha256:[a-f0-9]{64}',hub.policy.image_id):
+        raise UpdateError('Worker runtime is unavailable')
+    supervisor._verify_data_directory(data_dir)
+
+    class DockerInspection:
+        @staticmethod
+        def call(*args): return supervisor._docker(*args)
+        @staticmethod
+        def inspect(*ids):
+            try: return json.loads(supervisor._docker('inspect',*ids),object_pairs_hook=_pairs)
+            except (ValueError,UnicodeError,RecursionError): raise UpdateError('Docker inspection is unavailable') from None
+
+    def check():
+        lease.assert_locked(operation_id,'stopped_unverified')
+        quiescence.ensure_host_namespaces()
+        quiescence.ensure_no_other_data_mounts(DockerInspection(),expected,data_dir,trusted_ingress=trusted_ingress)
+        quiescence.ensure_no_mount_aliases(DockerInspection(),data_dir)
+        quiescence.ensure_no_open_data(data_dir)
+        quiescence.ensure_no_uid_writers(hub.expected_uid)
+        lease.assert_locked(operation_id,'stopped_unverified')
+
+    check()
+    marker='legacy-upload-recovery.json'
+    try: os.stat(marker,dir_fd=lease._owner.journal,follow_symlinks=False)
+    except FileNotFoundError: pass
+    else: raise UpdateError('A legacy upload recovery already requires reconciliation')
+    record={'version':1,'operationId':operation_id,'restoreId':restore_id,'serviceId':service_id,'state':'intent'}
+    supervisor._atomic_file(lease._owner.journal,marker,json.dumps(record,separators=(',',':')).encode('ascii')+b'\n',0o600)
+    lease.assert_locked(operation_id,'stopped_unverified')
+    raw=supervisor._docker('run','--rm','--name','servus-recovery-'+operation_id,'--user','1000:1000',
+        '--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges',
+        '--pids-limit','64','--memory','256m','--tmpfs','/tmp:rw,noexec,nosuid,nodev,size=32m',
+        '--mount','type=bind,src='+data_dir+',dst=/data','--entrypoint','node',hub.policy.image_id,
+        '/app/dist/agent/restore-legacy-worker.js',restore_id,service_id,timeout=120)
+    try: result=json.loads(raw,object_pairs_hook=_pairs)
+    except (ValueError,UnicodeError,RecursionError): raise UpdateError('Worker result is unavailable') from None
+    if result!={'operationId':restore_id,'phase':'cancelled'}: raise UpdateError('Worker result is unavailable')
+    check()
+    record['state']='cleaned'
+    supervisor._atomic_file(lease._owner.journal,marker,json.dumps(record,separators=(',',':')).encode('ascii')+b'\n',0o600)
+    return result
 
 
 def create_generation(journal, operation_id, lease, daemon_ownership, approval_journal,

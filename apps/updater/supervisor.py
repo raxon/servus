@@ -741,11 +741,12 @@ class MaintenanceSupervisor(ComponentEndpoint):
         _atomic_file(self.journal, 'maintenance.json', payload, 0o600)
 
     def _verify_no_previous_operation(self):
-        try:
-            os.stat('maintenance.json', dir_fd=self.journal, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        raise SupervisorError('Previous maintenance requires local reconciliation')
+        for name in ('maintenance.json','legacy-upload-recovery.json'):
+            try:
+                os.stat(name, dir_fd=self.journal, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise SupervisorError('Previous maintenance requires local reconciliation')
 
     def _start_maintenance(self):
         fcntl.flock(self.gate_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -816,7 +817,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
             if (by_name.st_dev, by_name.st_ino) != (by_fd.st_dev, by_fd.st_ino):
                 raise SupervisorError('Lifecycle lock changed')
             self._record(request_id, 'stopped_unverified', request_ids, timeout_ms)
-            lease = DrainLease(self, request_id, request_ids, timeout_ms, policy_binding, hub=hub)
+            lease = DrainLease(self, request_id, request_ids, timeout_ms, policy_binding, hub=hub, legacy_upload_id=legacy_upload_id)
             phase = 'update'
             yield lease
             completed = lease._settled
@@ -848,7 +849,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
 class DrainLease:
     """An exclusive gate lease scoped to one durable maintenance intent."""
 
-    def __init__(self, owner, operation_id, request_ids, timeout_ms, policy_binding=None, *, hub=None):
+    def __init__(self, owner, operation_id, request_ids, timeout_ms, policy_binding=None, *, hub=None, legacy_upload_id=None):
         self._owner = owner
         self._operation_id = operation_id
         self._request_ids = request_ids
@@ -858,6 +859,7 @@ class DrainLease:
         self._active = True
         self._policy_binding = policy_binding[:3] if policy_binding is not None else None
         self._hub = hub
+        self._legacy_upload_id = legacy_upload_id
 
     def assert_locked(self, operation_id, state):
         """Recheck the host lock identities and the still-closed startup gate."""
@@ -894,7 +896,7 @@ class DrainLease:
     def record(self, state):
         transitions = {'stopped_unverified': 'snapshotting', 'snapshotting': 'snapshot_verified',
                        'snapshot_verified': 'switching', 'switching': 'starting'}
-        if self._settled or transitions.get(self._state) != state:
+        if self._settled or getattr(self,'_legacy_upload_id',None) is not None or transitions.get(self._state) != state:
             raise SupervisorError('Invalid maintenance transition')
         self.assert_locked(self._operation_id, self._state)
         self._owner._record(self._operation_id, state, self._request_ids, self._timeout_ms)
