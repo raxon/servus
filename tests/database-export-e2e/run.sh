@@ -5,19 +5,24 @@ for command in docker python3; do command -v "$command" >/dev/null || { printf '
 id=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 root="/tmp/servus-db-export-$id"
 mkdir -m 700 "$root"
-names=("servus-db-export-$id-pg-source" "servus-db-export-$id-pg-target" "servus-db-export-$id-maria-source" "servus-db-export-$id-maria-target")
+names=("servus-db-export-$id-pg-source" "servus-db-export-$id-pg-target" "servus-db-export-$id-maria-source" "servus-db-export-$id-maria-target" "servus-db-export-$id-redis-source" "servus-db-export-$id-redis-target")
+redis_volume="servus-db-export-$id-redis-data"
 cleanup() {
   for name in "${names[@]}"; do
     if [[ $(docker inspect --format '{{ index .Config.Labels "servus.test" }}' "$name" 2>/dev/null || true) == "$id" ]]; then
       docker rm -f -v "$name" >/dev/null || printf 'Could not remove fixture %s\n' "$name" >&2
     fi
   done
+  if [[ $(docker volume inspect --format '{{ index .Labels "servus.test" }}' "$redis_volume" 2>/dev/null || true) == "$id" ]]; then
+    docker volume rm "$redis_volume" >/dev/null || printf 'Could not remove fixture volume %s\n' "$redis_volume" >&2
+  fi
   python3 -c 'import re,shutil,sys; p=sys.argv[1]; assert re.fullmatch(r"/tmp/servus-db-export-[a-f0-9]{32}",p); shutil.rmtree(p)' "$root"
 }
 trap cleanup EXIT
 password=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
 printf 'POSTGRES_DB=fixture\nPOSTGRES_USER=fixture\nPOSTGRES_PASSWORD=%s\n' "$password" > "$root/postgres.env"
 printf 'MARIADB_DATABASE=fixture\nMARIADB_USER=fixture\nMARIADB_PASSWORD=%s\nMARIADB_ROOT_PASSWORD=%s\n' "$password" "$password" > "$root/mariadb.env"
+printf 'REDIS_PASSWORD=%s\n' "$password" > "$root/redis.env"
 chmod 600 "$root"/*.env
 start() {
   docker run -d --network none --label "servus.test=$id" --name "$1" --env-file "$2" "$3" >/dev/null
@@ -27,6 +32,8 @@ wait_ready() {
   for _ in $(seq 1 90); do
     if [[ $kind == postgres ]]; then
       if docker exec "$name" pg_isready -q -h 127.0.0.1 -U fixture -d fixture; then return; fi
+    elif [[ $kind == redis ]]; then
+      if docker exec "$name" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --raw PING' 2>/dev/null | grep -qx PONG; then return; fi
     elif docker exec "$name" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT 1"' >/dev/null 2>&1; then return; fi
     sleep 1
   done
@@ -61,3 +68,35 @@ docker exec -i "${names[3]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127
 result=$(docker exec "${names[3]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture --default-character-set=utf8mb4 fixture -N -e "SELECT CONCAT(COUNT(*), '\''|'\'', (SELECT title FROM items WHERE id=2), '\''|'\'', (SELECT COUNT(*) FROM empty_items)) FROM items"')
 [[ $result == '2|Zażółć gęślą jaźń|0' ]]
 printf 'PASS MariaDB logical export and restore\n'
+docker rm -f -v "${names[2]}" "${names[3]}" >/dev/null
+docker run -d --network none --label "servus.test=$id" --name "${names[4]}" --env-file "$root/redis.env" redis:7-alpine sh -c 'exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"' >/dev/null
+wait_ready "${names[4]}" redis
+docker exec "${names[4]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli SET message "Zażółć gęślą jaźń"' >/dev/null
+docker exec "${names[4]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli HSET metadata version 1' >/dev/null
+docker exec "${names[4]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --rdb -' > "$root/redis.rdb"
+test -s "$root/redis.rdb"; chmod 644 "$root/redis.rdb"
+docker volume create --label "servus.test=$id" "$redis_volume" >/dev/null
+docker create --network none --label "servus.test=$id" --name "${names[5]}" --env-file "$root/redis.env" --mount "type=volume,src=$redis_volume,dst=/data" redis:7-alpine sh -c 'exec redis-server --appendonly no --requirepass "$REDIS_PASSWORD"' >/dev/null
+docker cp "$root/redis.rdb" "${names[5]}:/data/dump.rdb"
+docker start "${names[5]}" >/dev/null
+wait_ready "${names[5]}" redis
+for stage in 1 2; do
+  if [[ $(docker exec "${names[5]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --raw GET message') != 'Zażółć gęślą jaźń' ]]; then
+    printf 'Redis snapshot data was not restored\n' >&2; docker logs "${names[5]}" >&2; exit 1
+  fi
+  [[ $(docker exec "${names[5]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --raw HGET metadata version') == 1 ]]
+  if [[ $stage == 1 ]]; then
+    docker exec "${names[5]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli CONFIG SET appendonly yes' | grep -qx OK
+    complete=0
+    for _ in $(seq 1 90); do
+      info=$(docker exec "${names[5]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --raw INFO persistence' | tr -d '\r')
+      if grep -qx 'aof_enabled:1' <<<"$info" && grep -qx 'aof_rewrite_in_progress:0' <<<"$info" && grep -qx 'aof_rewrite_scheduled:0' <<<"$info" && grep -qx 'aof_last_bgrewrite_status:ok' <<<"$info"; then complete=1; break; fi
+      sleep 1
+    done
+    [[ $complete == 1 ]] || { printf 'Redis AOF conversion did not complete\n' >&2; exit 1; }
+    docker stop "${names[5]}" >/dev/null; docker rm "${names[5]}" >/dev/null
+    docker run -d --network none --label "servus.test=$id" --name "${names[5]}" --env-file "$root/redis.env" --mount "type=volume,src=$redis_volume,dst=/data" redis:7-alpine sh -c 'exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"' >/dev/null
+    wait_ready "${names[5]}" redis
+  fi
+done
+printf 'PASS Redis snapshot restore and AOF restart\n'
