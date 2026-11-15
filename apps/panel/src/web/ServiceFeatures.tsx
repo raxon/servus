@@ -1249,15 +1249,7 @@ export function DestroyService({
   }, [status.data?.action.status, onDestroyed, onFailure]);
   return (
     <>
-      <section className="surface danger-zone">
-        <div>
-          <h2>Delete service</h2>
-          <p>
-            Remove its running containers and HTTP routes. Existing managed data
-            is retained.
-          </p>
-        </div>
-        <button
+      <button
           className="button button-danger"
           type="button"
           disabled={busy}
@@ -1265,8 +1257,7 @@ export function DestroyService({
         >
           <Trash2 size={16} />
           Delete service
-        </button>
-      </section>
+      </button>
       {show ? (
         <FeatureModal
           dismissible={!actionId}

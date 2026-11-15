@@ -31,11 +31,12 @@ import {
   ArrowUpRight,
   Box,
   Check,
-  CheckCircle2,
   ChevronRight,
+  ChevronDown,
   Circle,
   CircleAlert,
   Clock3,
+  Database,
   ExternalLink,
   Folder,
   FolderPlus,
@@ -55,6 +56,7 @@ import {
   Square,
   Terminal,
   X,
+  Zap,
 } from "lucide-react";
 import type {
   Action,
@@ -299,13 +301,32 @@ function useActions(projectId?: string) {
   });
 }
 
+const ProjectSearchContext = createContext("");
+
 function Shell() {
   const { user } = useAuth();
   const client = useQueryClient();
   const sessionClient = useContext(SessionClientContext)!;
   const path = useRouterState({ select: (state) => state.location.pathname });
   const projects = useProjects();
-  const runtime = useRuntime();
+  const serviceId = path.startsWith("/services/") ? path.split("/")[2] : undefined;
+  const routeProjectId = path.startsWith("/projects/") ? path.split("/")[2] : undefined;
+  const currentService = useQuery({
+    queryKey: ["service", serviceId],
+    queryFn: () => api<Service>(`/services/${serviceId}`),
+    enabled: !!serviceId,
+  });
+  const projectId = currentService.data?.projectId ?? routeProjectId;
+  const currentProject = projects.data?.find((project) => project.id === projectId);
+  const [projectSearch, setProjectSearch] = useState("");
+  const [keyboardNavigation, setKeyboardNavigation] = useState(false);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Tab") setKeyboardNavigation(true); };
+    const onPointerDown = () => setKeyboardNavigation(false);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => { window.removeEventListener("keydown", onKeyDown); window.removeEventListener("pointerdown", onPointerDown); };
+  }, []);
   const logout = useMutation({
     mutationFn: () => api("/auth/logout", { method: "POST", body: {} }),
     onSuccess: async () => {
@@ -333,13 +354,6 @@ function Shell() {
         <Link to="/" className="brand-link" aria-label="Servus overview">
           <Brand />
         </Link>
-        <div className="workspace-switch">
-          <span className="workspace-avatar">L</span>
-          <span>
-            <strong>Local workspace</strong>
-            <small>Self-hosted</small>
-          </span>
-        </div>
         <div className="nav-label">WORKSPACE</div>
         <nav aria-label="Main navigation">
           <Link to="/" className={`nav-item ${path === "/" ? "active" : ""}`}>
@@ -382,19 +396,6 @@ function Shell() {
           )}
         </div>
         <div className="sidebar-bottom">
-          <div className="sidebar-engine">
-            <span
-              className={`status-dot ${runtime.data?.online ? "online" : "offline"}`}
-            />
-            <span>Docker engine</span>
-            <span>
-              {runtime.data?.online
-                ? "Connected"
-                : runtime.isPending
-                  ? "Checking"
-                  : "Offline"}
-            </span>
-          </div>
           <div className="sidebar-user">
             <span className="user-avatar">{user.email[0]?.toUpperCase()}</span>
             <span>
@@ -417,27 +418,24 @@ function Shell() {
       </aside>
       <div className="app-main">
         <header className="topbar">
-          <div className="breadcrumbs">
-            <span>Workspace</span>
-            <ChevronRight size={14} />
-            <strong>{locationName}</strong>
-          </div>
+          <nav className="breadcrumbs" aria-label="Breadcrumb">
+            <Link to="/">Workspace</Link>
+            <ChevronRight size={14} aria-hidden="true" />
+            {serviceId ? <>
+              {projectId ? <><Link to="/projects/$projectId" params={{ projectId }}>{currentProject?.name ?? "Project"}</Link><ChevronRight size={14} aria-hidden="true" /></> : null}
+              <strong aria-current="page">{currentService.data?.name ?? "Service"}</strong>
+            </> : <strong aria-current="page">{routeProjectId ? currentProject?.name ?? "Project" : locationName}</strong>}
+          </nav>
           <div className="topbar-right">
-            <span className="top-avatar">{user.email[0]?.toUpperCase()}</span>
+            {path === "/" ? <div className={`search-field topbar-search ${keyboardNavigation ? "keyboard-navigation" : ""}`}>
+              <Search size={16} />
+              <input aria-label="Search projects" placeholder="Search projects..." value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
+            </div> : null}
           </div>
         </header>
         <main id="main-content" className="content">
-          <Outlet />
+          <ProjectSearchContext.Provider value={projectSearch}><Outlet /></ProjectSearchContext.Provider>
         </main>
-        <footer className="workspace-footer">
-          <span>
-            Servus <span className="footer-dot">·</span> servus.run
-          </span>
-          <span>
-            <span className="status-dot" />
-            Local control plane
-          </span>
-        </footer>
       </div>
     </div>
   );
@@ -575,98 +573,21 @@ function CreateProject({ onClose }: { onClose: () => void }) {
 function Dashboard() {
   const { user } = useAuth();
   const projects = useProjects();
-  const actions = useActions();
-  const runtime = useRuntime();
   const [showCreate, setShowCreate] = useState(false);
-  const [search, setSearch] = useState("");
-  const visible =
-    projects.data?.filter((project) =>
+  const search = useContext(ProjectSearchContext);
+  const [sort, setSort] = useState<"name" | "time">("name");
+  const visible = (projects.data ?? [])
+    .filter((project) =>
       `${project.name} ${project.description}`
         .toLowerCase()
         .includes(search.toLowerCase()),
-    ) ?? [];
-  const services =
-    projects.data?.reduce((sum, project) => sum + project.serviceCount, 0) ?? 0;
-  const running = actions.data?.filter(pendingAction).length ?? 0;
-  const completed =
-    actions.data?.filter((action) => action.status === "succeeded").length ?? 0;
+    )
+    .sort((a, b) => sort === "name"
+      ? a.name.localeCompare(b.name)
+      : b.createdAt.localeCompare(a.createdAt));
   return (
     <>
-      <div className="page-heading">
-        <div>
-          <div className="eyebrow">YOUR INFRASTRUCTURE</div>
-          <h1>Your workspace</h1>
-          <p>Projects, services, and deployment operations.</p>
-        </div>
-        {user.role === "admin" ? <button
-          className="button button-primary"
-          onClick={() => setShowCreate(true)}
-        >
-          <Plus size={17} />
-          New project
-        </button> : null}
-      </div>
-      <div className="summary-grid">
-        <Summary
-          icon={<Folder size={20} />}
-          label="Projects"
-          value={
-            projects.isPending
-              ? "..."
-              : projects.error
-                ? "--"
-                : String(projects.data?.length ?? 0)
-          }
-          detail="Organized workspaces"
-        />
-        <Summary
-          icon={<Box size={20} />}
-          label="Services"
-          value={
-            projects.isPending
-              ? "..."
-              : projects.error
-                ? "--"
-                : String(services)
-          }
-          detail="Across all projects"
-        />
-        <Summary
-          icon={<Activity size={20} />}
-          label="Active operations"
-          value={
-            actions.isPending ? "..." : actions.error ? "--" : String(running)
-          }
-          detail={running ? "Work in progress" : "No operations in progress"}
-        />
-        <Summary
-          icon={<CheckCircle2 size={20} />}
-          label="Completed operations"
-          value={
-            actions.isPending ? "..." : actions.error ? "--" : String(completed)
-          }
-          detail="Successful recorded actions"
-        />
-        <Summary
-          icon={<Server size={20} />}
-          label="Docker engine"
-          value={
-            runtime.isPending
-              ? "Checking"
-              : runtime.data?.online
-                ? "Connected"
-                : "Offline"
-          }
-          detail={
-            runtime.data?.online
-              ? `Engine ${runtime.data.engineVersion ?? ""}`
-              : "Check your local agent"
-          }
-          good={runtime.data?.online}
-        />
-      </div>
-      <div className="dashboard-workload-grid">
-        <div className="dashboard-project-region">
+      <div className="dashboard-project-region">
           <div className="section-heading">
             <div>
               <h2>
@@ -675,14 +596,31 @@ function Dashboard() {
               </h2>
               <p>Manage related services within a project.</p>
             </div>
-            <div className="search-field">
-              <Search size={16} />
-              <input
-                aria-label="Search projects"
-                placeholder="Search projects..."
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-              />
+            <div className="dashboard-project-controls">
+              <details className="dashboard-sort" onBlur={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
+              }} onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.currentTarget.open = false;
+                  event.currentTarget.querySelector("summary")?.focus();
+                }
+              }}>
+                <summary aria-label={`Sort projects: ${sort === "name" ? "Name" : "Newest"}`}>
+                  <span>{sort === "name" ? "Name" : "Newest"}</span><ChevronDown size={16} aria-hidden="true" />
+                </summary>
+                <div className="dashboard-sort-menu" role="group" aria-label="Sort projects">
+                  {([ ["name", "Name"], ["time", "Newest"] ] as const).map(([value, label]) =>
+                    <button key={value} type="button" aria-pressed={sort === value} onClick={(event) => {
+                      setSort(value);
+                      const details = event.currentTarget.closest("details");
+                      if (details) { details.open = false; details.querySelector("summary")?.focus(); }
+                    }}>{label}{sort === value ? <Check size={15} aria-hidden="true" /> : null}</button>
+                  )}
+                </div>
+              </details>
+              {user.role === "admin" ? <button className="button button-primary" onClick={() => setShowCreate(true)}>
+                <Plus size={17} /> New project
+              </button> : null}
             </div>
           </div>
           <ErrorNotice error={projects.error} />
@@ -691,9 +629,9 @@ function Dashboard() {
               <Spinner label="Loading projects" />
             </div>
           ) : projects.error ? null : projects.data?.length ? (
-            <div className="project-grid">
+            <div className="dashboard-project-list">
               {visible.map((project) => (
-                <ProjectCard key={project.id} project={project} />
+                <DashboardProject key={project.id} project={project} />
               ))}
               {!visible.length ? (
                 <div className="surface no-results">
@@ -724,200 +662,42 @@ function Dashboard() {
               </button> : null}
             </div>
           )}
-          <div className="section-heading activity-heading">
-            <div>
-              <h2>Recent activity</h2>
-              <p>Recent deployments and service changes.</p>
-            </div>
-            <Link to="/activity" className="text-link">
-              View all activity
-              <ArrowRight size={15} />
-            </Link>
-          </div>
-          <ErrorNotice error={actions.error} />
-          <ActionsTable
-            actions={actions.data?.slice(0, 5) ?? []}
-            loading={actions.isPending}
-          />
-          {showCreate ? (
-            <CreateProject onClose={() => setShowCreate(false)} />
-          ) : null}
-        </div>
-        <RuntimeAside
-          runtime={runtime.data}
-          loading={runtime.isPending}
-          actions={actions.data ?? []}
-        />
       </div>
+      {showCreate ? <CreateProject onClose={() => setShowCreate(false)} /> : null}
     </>
   );
 }
 
-function RuntimeAside({
-  runtime,
-  loading,
-  actions,
-}: {
-  runtime?: RuntimeStatus;
-  loading: boolean;
-  actions: Action[];
-}) {
-  const failures = actions.filter(
-    (action) => action.status === "failed",
-  ).length;
-  const active = actions.filter(pendingAction).length;
+function DashboardProject({ project }: { project: Project }) {
+  const services = useQuery({
+    queryKey: ["services", project.id],
+    queryFn: () => api<Service[]>(`/projects/${project.id}/services`),
+    refetchInterval: 5_000,
+  });
   return (
-    <aside className="runtime-aside">
-      <section className="surface runtime-card">
-        <div className="card-heading">
-          <h2>Runtime capacity</h2>
-          <Server size={18} />
-        </div>
-        <p className="runtime-card-description">
-          Resources available to your local Docker engine.
-        </p>
-        <div className="runtime-capacity">
-          <div>
-            <span>CPUs</span>
-            <strong>{loading ? "..." : (runtime?.cpus ?? "--")}</strong>
-            <small>Available processors</small>
-          </div>
-          <div>
-            <span>Memory</span>
-            <strong>
-              {loading
-                ? "..."
-                : runtime?.memoryBytes
-                  ? `${(runtime.memoryBytes / 1024 ** 3).toFixed(1)}`
-                  : "--"}
-              <em>GiB</em>
-            </strong>
-            <small>Engine capacity</small>
-          </div>
-        </div>
-        <div className="runtime-status-row">
-          <span>
-            <span
-              className={`status-dot ${runtime?.online ? "" : "offline"}`}
-            />
-            {runtime?.online
-              ? "Engine connected"
-              : loading
-                ? "Checking connection"
-                : "Engine unavailable"}
-          </span>
-          <span>
-            {runtime?.engineVersion ? `v${runtime.engineVersion}` : "--"}
-          </span>
-        </div>
-        {runtime?.error ? (
-          <p className="runtime-error">{runtime.error}</p>
-        ) : null}
-      </section>
-      <section className="surface runtime-card">
-        <div className="card-heading">
-          <h2>Operation status</h2>
-          <Activity size={18} />
-        </div>
-        <div className="operation-health">
-          <div>
-            <span className="health-dot active-dot" />
-            <span>In progress</span>
-            <strong>{active}</strong>
-          </div>
-          <div>
-            <span className="health-dot success-dot" />
-            <span>Succeeded</span>
-            <strong>
-              {actions.filter((action) => action.status === "succeeded").length}
-            </strong>
-          </div>
-          <div>
-            <span className="health-dot failed-dot" />
-            <span>Failed</span>
-            <strong>{failures}</strong>
-          </div>
-        </div>
-        <p className="runtime-hint">
-          {failures
-            ? "Open activity to inspect the failed operation output."
-            : "Every operation is recorded with its progress and result."}
-        </p>
-        <Link to="/activity" className="runtime-link">
-          View operation history
-          <ArrowUpRight size={15} />
+    <section className="dashboard-project-group">
+      <div className="dashboard-project-heading">
+        <Link to="/projects/$projectId" params={{ projectId: project.id }}>
+          <Folder size={18} />
+          <h3>{project.name}</h3>
+          <ChevronRight size={16} />
         </Link>
-      </section>
-      <section className="surface runtime-card workspace-guide">
-        <span className="guide-icon">
-          <Layers3 size={22} />
-        </span>
-        <h2>Deploy a Docker image</h2>
-        <p>
-          A project groups your services. Start with a Docker image, then follow
-          every step from pull to deployment.
-        </p>
-        <span className="guide-footer">
-          <ShieldCheck size={14} />
-          Hosted on your infrastructure
-        </span>
-      </section>
-    </aside>
-  );
-}
-
-function Summary({
-  icon,
-  label,
-  value,
-  detail,
-  good,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: string;
-  detail: string;
-  good?: boolean;
-}) {
-  return (
-    <div className="summary-card">
-      <div className="summary-label">
-        <span>{label}</span>
-        <span className="summary-icon">{icon}</span>
+        <span>{project.serviceCount} {project.serviceCount === 1 ? "service" : "services"}</span>
       </div>
-      <div className={`summary-value ${good ? "summary-value-connected" : ""}`}>
-        {good ? <span className="status-dot" /> : null}
-        {value}
-      </div>
-      <div className="summary-detail">{detail}</div>
-    </div>
-  );
-}
-
-function ProjectCard({ project }: { project: Project }) {
-  return (
-    <Link
-      to="/projects/$projectId"
-      params={{ projectId: project.id }}
-      className="project-card surface"
-    >
-      <div className="project-card-top">
-        <div className="project-glyph">
-          <Folder size={23} strokeWidth={1.6} />
-        </div>
-        <ArrowUpRight size={18} className="project-arrow" />
-      </div>
-      <h3>{project.name}</h3>
-      <p>{project.description || "A workspace for your applications."}</p>
-      <div className="project-card-bottom">
-        <span>
-          <Box size={14} />
-          {project.serviceCount}{" "}
-          {project.serviceCount === 1 ? "service" : "services"}
-        </span>
-        <span>Created {relative(project.createdAt)}</span>
-      </div>
-    </Link>
+      {services.isPending ? <div className="dashboard-services-message"><Spinner label="Loading services" /></div>
+        : services.error ? <div className="dashboard-services-message"><ErrorNotice error={services.error} /><button className="text-link" onClick={() => void services.refetch()}>Try again</button></div>
+        : services.data?.length ? <div className="dashboard-services-grid">
+          {services.data.map((service) => <Link key={service.id} to="/services/$serviceId" params={{ serviceId: service.id }} className="dashboard-service-card">
+            <span className="dashboard-service-identity">
+              <span className={`dashboard-service-icon dashboard-service-icon-${service.kind ?? "app"}`} aria-hidden="true">
+                {service.kind === "redis" ? <Zap size={19} /> : service.kind === "postgres" || service.kind === "mariadb" ? <Database size={19} /> : <Box size={19} />}
+              </span>
+              <span className="dashboard-service-name"><strong>{service.name}</strong><small>{service.kind ?? "app"}</small></span>
+            </span>
+            <Badge status={service.state} />
+          </Link>)}
+        </div> : <p className="dashboard-services-message">No services yet. Open the project to add one.</p>}
+    </section>
   );
 }
 
@@ -1244,14 +1024,6 @@ function ServicePage() {
       : service.image;
   return (
     <>
-      <Link
-        to="/projects/$projectId"
-        params={{ projectId: service.projectId }}
-        className="back-link"
-      >
-        <ArrowDownLeft size={15} />
-        Back to project
-      </Link>
       <div className="page-heading service-heading">
         <div>
           <div className="eyebrow">
@@ -1280,6 +1052,22 @@ function ServicePage() {
               Open app
             </a>
           ) : null}
+          <DestroyService
+            service={service}
+            busy={busy}
+            onStarted={() => setDestroying(true)}
+            onFailure={() => setDestroying(false)}
+            onDestroyed={() => {
+              void client.invalidateQueries({ queryKey: ["projects"] });
+              void client.invalidateQueries({
+                queryKey: ["services", service.projectId],
+              });
+              void navigate({
+                to: "/projects/$projectId",
+                params: { projectId: service.projectId },
+              });
+            }}
+          />
           <button
             className="button button-primary"
             onClick={() => execute.mutate("deploy")}
@@ -1485,22 +1273,6 @@ function ServicePage() {
             </div>
           </div>
           <ActionLog actionId={latest?.id} />
-          <DestroyService
-            service={service}
-            busy={busy}
-            onStarted={() => setDestroying(true)}
-            onFailure={() => setDestroying(false)}
-            onDestroyed={() => {
-              void client.invalidateQueries({ queryKey: ["projects"] });
-              void client.invalidateQueries({
-                queryKey: ["services", service.projectId],
-              });
-              void navigate({
-                to: "/projects/$projectId",
-                params: { projectId: service.projectId },
-              });
-            }}
-          />
         </>
       )}
     </>
