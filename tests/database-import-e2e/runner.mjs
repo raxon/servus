@@ -2,7 +2,7 @@ import { createReadStream, mkdtempSync, readFileSync, writeFileSync } from 'node
 import Database from '/app/node_modules/better-sqlite3/lib/index.js';
 import Docker from '/app/node_modules/dockerode/lib/docker.js';
 
-const { importDatabaseCandidate } = await import(process.env.SERVUS_IMPORT_MODULE);
+const { DatabaseImportError, importDatabaseCandidate } = await import(process.env.SERVUS_IMPORT_MODULE);
 const { RestoreJournal } = await import(process.env.SERVUS_IMPORT_JOURNAL);
 const { prepareRestoreCandidate } = await import(process.env.SERVUS_IMPORT_PREPARATION);
 const { createRestoreCandidate } = await import(process.env.SERVUS_IMPORT_CANDIDATE);
@@ -29,6 +29,6 @@ const allocation = process.env.SERVUS_IMPORT_EXISTING
 try {
   const result = await prepareRestoreCandidate({ journal, operationId, serviceId, importCandidate: importDatabaseCandidate, ...allocation });
   if (result.phase !== 'prepared') throw new Error('Candidate is not prepared');
-} catch {
-  process.exitCode = journal.get(operationId)?.phase === 'needs_review' ? 12 : 2;
+} catch (error) {
+  process.exitCode = error instanceof DatabaseImportError && journal.get(operationId)?.phase === 'discarding_candidate' ? 12 : 2;
 } finally { db.close(); }
