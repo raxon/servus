@@ -121,6 +121,35 @@ class HostBundleTest(unittest.TestCase):
             with self.assertRaises(OSError):bundle.inspect_unit_adoption(fd,old,new,read_file=installer.read_file)
         finally:os.close(fd)
 
+    @unittest.skipUnless(__import__('sys').flags.isolated, 'Requires isolated Python')
+    def test_interrupted_unit_adoption_is_resumable_and_refuses_foreign_files(self):
+        spec=importlib.util.spec_from_file_location('install_host',ROOT/'apps/updater/install-host.py')
+        installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
+        directory=self.root/'units';directory.mkdir(mode=0o755)
+        fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
+        old={'servus-updater.service':(0o644,b'old')}
+        new={'servus-updater.service':(0o644,b'new'),'servus-host-update.timer':(0o644,b'timer')}
+        path=directory/'servus-updater.service';path.write_bytes(b'old');path.chmod(0o644)
+        guard=mock.Mock(return_value=None)
+        try:
+            with mock.patch.object(bundle.os,'replace',side_effect=OSError('interrupted')):
+                with self.assertRaises(OSError):bundle.apply_unit_adoption(fd,old,new,read_file=installer.read_file,authorize=guard)
+            self.assertEqual(path.read_bytes(),b'old')
+            self.assertEqual((directory/'servus-host-update.timer').read_bytes(),b'timer')
+            self.assertFalse(any(item.name.startswith('.servus-adopt-') for item in directory.iterdir()))
+            bundle.apply_unit_adoption(fd,old,new,read_file=installer.read_file,authorize=guard)
+            self.assertEqual(path.read_bytes(),b'new')
+            self.assertEqual(bundle.inspect_unit_adoption(fd,old,new,read_file=installer.read_file),())
+            path.write_bytes(b'foreign')
+            with self.assertRaises(bundle.HostBundleError):
+                bundle.apply_unit_adoption(fd,old,new,read_file=installer.read_file,authorize=guard)
+            self.assertEqual(path.read_bytes(),b'foreign')
+            path.write_bytes(b'old')
+            with self.assertRaises(bundle.HostBundleError):
+                bundle.apply_unit_adoption(fd,old,new,read_file=installer.read_file,authorize=lambda:'denied')
+            self.assertEqual(path.read_bytes(),b'old')
+        finally:os.close(fd)
+
     def test_collects_exact_bytes_and_future_signed_modules(self):
         self.add('future.py', b'future', 0o644)
         self.assertEqual(self.collect(), {'core.py': (0o644, b'core'), 'future.py': (0o644, b'future'),

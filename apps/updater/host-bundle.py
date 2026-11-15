@@ -10,7 +10,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
+import sys
 
 NAME = re.compile(r'^[a-z0-9][a-z0-9-]{0,63}\.py$')
 UNIT_NAME = re.compile(r'^servus-[a-z0-9][a-z0-9-]{0,63}\.(?:service|timer)$')
@@ -222,6 +224,44 @@ def inspect_unit_adoption(units_fd, old_units, new_units, *, read_file):
             raise HostBundleError('Existing unit differs from verified release')
         pending.append(name)
     return tuple(pending)
+
+
+def apply_unit_adoption(units_fd, old_units, new_units, *, read_file, authorize):
+    """Atomically publish verified units while the caller holds adoption locks.
+
+    The caller must first install and verify all referenced boot guards, retain
+    the verified old release for recovery, and keep systemd from reloading the
+    units until this operation finishes. Interrupted calls may be retried with
+    the same two verified inventories. This function never reloads systemd.
+    """
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or not callable(authorize):
+        raise HostBundleError('Invalid unit adoption context')
+    if authorize() is not None:raise HostBundleError('Unit adoption is not authorized')
+    pending=inspect_unit_adoption(units_fd,old_units,new_units,read_file=read_file)
+    for name in pending:
+        if authorize() is not None:raise HostBundleError('Unit adoption is not authorized')
+        remaining=inspect_unit_adoption(units_fd,old_units,new_units,read_file=read_file)
+        if name not in remaining:continue
+        target=new_units[name][1]
+        temporary='.servus-adopt-'+secrets.token_hex(16)
+        try:
+            _write_file(units_fd,temporary,0o644,target)
+            os.fsync(units_fd)
+            if authorize() is not None:raise HostBundleError('Unit adoption is not authorized')
+            if name not in inspect_unit_adoption(units_fd,old_units,new_units,read_file=read_file):
+                raise HostBundleError('Unit changed during adoption')
+            if name in old_units:
+                os.replace(temporary,name,src_dir_fd=units_fd,dst_dir_fd=units_fd)
+            else:
+                os.link(temporary,name,src_dir_fd=units_fd,dst_dir_fd=units_fd,follow_symlinks=False)
+                os.unlink(temporary,dir_fd=units_fd)
+            os.fsync(units_fd)
+        finally:
+            try:os.unlink(temporary,dir_fd=units_fd)
+            except FileNotFoundError:pass
+    if authorize() is not None:raise HostBundleError('Unit adoption is not authorized')
+    if inspect_unit_adoption(units_fd,old_units,new_units,read_file=read_file):
+        raise HostBundleError('Unit adoption is incomplete')
 
 
 def read_pinned_cli(host_fd, pinned):
