@@ -109,9 +109,26 @@ class HostAdoptionTest(unittest.TestCase):
         with sqlite3.connect(database) as target:fixture.db.backup(target)
         database.chmod(0o600);fixture.tearDown()
         args=dict(state_dir=str(state),active_env='/root/env',source_file=str(modules/'host-adoption.py'))
-        with mock.patch.dict(sys.modules):
-            loaded=adoption.load_verified_modules(fixture.op,**args)
-            self.assertTrue(callable(loaded['runner'].activate))
+        initial=sqlite3.connect(database);initial.execute('PRAGMA journal_mode=WAL');initial.close()
+        script=('import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); '
+                'db.execute("SELECT * FROM policy_approvals").fetchall(); '
+                'print("ready",flush=True); sys.stdin.readline(); db.close()')
+        peer=subprocess.Popen([sys.executable,'-I','-c',script,str(database)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+        live=None
+        try:
+            self.assertEqual(peer.stdout.readline().strip(),'ready')
+            live=sqlite3.connect(database,isolation_level=None);live.execute('SELECT * FROM policy_approvals').fetchall()
+            with mock.patch.dict(sys.modules):
+                loaded=adoption.load_verified_modules(fixture.op,**args)
+                self.assertTrue(callable(loaded['runner'].activate))
+            peer.stdin.write('stop\n');peer.stdin.flush();peer.wait(timeout=10)
+            live.execute('CREATE TABLE wal_fixture(value)');live.execute('INSERT INTO wal_fixture VALUES(1)')
+            with sqlite3.connect('file:'+str(database)+'?mode=ro',uri=True) as reader:
+                self.assertEqual(reader.execute('SELECT COUNT(*) FROM wal_fixture').fetchone(),(1,))
+        finally:
+            if live is not None:live.close()
+            if peer.poll() is None:peer.kill();peer.wait()
+            peer.stdin.close();peer.stdout.close()
         (modules/'host-runner.py').write_bytes(b'changed')
         with self.assertRaises(adoption.HostAdoptionError):adoption.load_verified_modules(fixture.op,**args)
         with self.assertRaises(adoption.HostAdoptionError):
