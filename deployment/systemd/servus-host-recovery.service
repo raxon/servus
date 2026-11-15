@@ -1,0 +1,16 @@
+[Unit]
+Description=Prepare interrupted Servus host recovery
+After=local-fs.target
+Before=servus-updater-socket.service servus-supervisor.service servus-updater.service servus-updater-bootstrap.service
+RequiresMountsFor=/var/lib/servus-updater /usr/local/libexec/servus /opt/servus
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/servus/host-runner.py --recover-prepare
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

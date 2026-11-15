@@ -23,7 +23,7 @@ MODULES = (
     'update-coordinator.py','validate-compose.py','verification-executor.py',
     'verification-fence.py','verify-release.py',
 )
-UNITS = ('servus-supervisor.service','servus-updater.service',
+UNITS = ('servus-host-recovery.service','servus-host-recovery-finish.service','servus-supervisor.service','servus-updater.service',
          'servus-updater-bootstrap.service','servus-updater-socket.service')
 MAX_FILE = 4 * 1024 * 1024
 LEGACY_VERIFIERS = {
@@ -109,7 +109,7 @@ def publish(parent,name,data,mode):
 
 
 def services_inactive():
-    for unit in ('servus-supervisor.service','servus-updater.service','servus-updater-bootstrap.service','servus-updater-socket.service'):
+    for unit in UNITS:
         result=subprocess.run(['/usr/bin/systemctl','show','--property=ActiveState','--value',unit],stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,cwd='/',
                               env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C'},timeout=10)
