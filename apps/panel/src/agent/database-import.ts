@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
@@ -15,11 +16,11 @@ export class DatabaseImportError extends Error {
 /** Import into an isolated, operation-labelled candidate. A failed candidate must be discarded. */
 export async function importDatabaseCandidate(options: {
   containerId: string; dockerSocket: string; operationId: string; kind: DatabaseKind;
-  database: string; user: string; input: () => Readable; signal?: AbortSignal;
+  database: string; user: string; archiveSha256: string; input: () => Readable; signal?: AbortSignal;
 }): Promise<void> {
   if (!/^[a-f0-9]{64}$/.test(options.containerId) || !/^[a-f0-9]{32}$/.test(options.operationId) ||
     !options.dockerSocket.startsWith('/') || options.dockerSocket.includes('\0') ||
-    !['postgres', 'mariadb'].includes(options.kind) || !identifier.test(options.database) || !identifier.test(options.user)) {
+    !['postgres', 'mariadb'].includes(options.kind) || !identifier.test(options.database) || !identifier.test(options.user) || !/^[a-f0-9]{64}$/.test(options.archiveSha256)) {
     throw new DatabaseImportError('Invalid database import target.', false);
   }
   options.signal?.throwIfAborted();
@@ -68,8 +69,8 @@ empty=$(mariadb --no-defaults -h 127.0.0.1 -u "$1" "$2" --batch --skip-column-na
 [ "$empty" = 1 ]; exec timeout 300 mariadb --no-defaults -h 127.0.0.1 -u "$1" "$2" --default-character-set=utf8mb4`;
   const child = spawn('docker', ['--host', host, 'exec', '-i', options.containerId, 'sh', '-c', options.kind === 'postgres' ? postgres : mariadb, 'servus-import', options.user, options.database],
     { stdio: ['pipe', 'ignore', 'ignore'], env: childEnvironment() });
-  let received = 0;
-  const limit = new Transform({ transform(chunk: Buffer, _encoding, callback) { received += chunk.length; callback(received > maximumBytes ? new Error('Import exceeds the supported size.') : null, chunk); } });
+  let received = 0; const hash = createHash('sha256');
+  const limit = new Transform({ transform(chunk: Buffer, _encoding, callback) { received += chunk.length; if(received > maximumBytes)return callback(new Error('Import exceeds the supported size.'));hash.update(chunk);callback(null,chunk); } });
   const exit = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
   exit.catch(() => {});
   const stop = () => child.kill('SIGKILL');
@@ -81,5 +82,6 @@ empty=$(mariadb --no-defaults -h 127.0.0.1 -u "$1" "$2" --batch --skip-column-na
     try { [status] = await Promise.all([exit, pipeline(options.input(), limit, child.stdin)]); }
     catch (error) { stop(); await exit.catch(() => {}); throw new DatabaseImportError('Database import failed; discard the candidate.', Boolean(child.pid), { cause: error }); }
     if (status !== 0 || received === 0 || options.signal?.aborted) throw new DatabaseImportError('Database import failed; discard the candidate.', true);
+    if (hash.digest('hex') !== options.archiveSha256) throw new DatabaseImportError('Database import digest mismatch; discard the candidate.', true);
   } finally { clearTimeout(timer); options.signal?.removeEventListener('abort', stop); }
 }

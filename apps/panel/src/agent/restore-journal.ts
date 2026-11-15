@@ -15,7 +15,10 @@ const transitions: Record<RestorePhase, readonly RestorePhase[]> = {
 
 /** Durable intent and fencing. External effects require independent verification. */
 export class RestoreJournal {
-  constructor(private readonly db: Database.Database, private readonly isLocked: (serviceId: string) => boolean) {
+  private readonly db: Database.Database;
+  private readonly isLocked: (serviceId: string) => boolean;
+  constructor(db: Database.Database, isLocked: (serviceId: string) => boolean) {
+    this.db = db; this.isLocked = isLocked;
     db.exec(`CREATE TABLE IF NOT EXISTS restore_operations (
       id TEXT PRIMARY KEY, service_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('postgres','mariadb','redis')),
       archive_sha256 TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('reserved','importing','prepared','switching','needs_review','completed','cancelled')),

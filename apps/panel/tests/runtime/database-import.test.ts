@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { delimiter, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
 import { DatabaseImportError, importDatabaseCandidate } from '../../src/agent/database-import.js';
 
 const containerId = 'a'.repeat(64), operationId = 'b'.repeat(32);
@@ -20,7 +21,7 @@ function fixture(options: { network?: string; privileged?: boolean; label?: stri
   chmodSync(docker, 0o700); vi.stubEnv('PATH', dir + delimiter + (process.env.PATH || '')); vi.stubEnv('SERVUS_INPUT', join(dir, 'input')); vi.stubEnv('SERVUS_STARTED', join(dir, 'started'));
   return dir;
 }
-function target(input: string) { return { containerId, operationId, dockerSocket: '/var/run/docker.sock', kind: 'postgres' as const, database: 'fixture', user: 'fixture', input: () => Readable.from([input]) }; }
+function target(input: string) { return { containerId, operationId, dockerSocket: '/var/run/docker.sock', kind: 'postgres' as const, database: 'fixture', user: 'fixture', archiveSha256:createHash('sha256').update(input).digest('hex'), input: () => Readable.from([input]) }; }
 
 it('imports only after verifying isolated candidate and its labelled volume', async () => {
   const dir = fixture(); await importDatabaseCandidate(target('synthetic-dump'));
@@ -41,6 +42,11 @@ it('marks failed imports as requiring candidate disposal', async () => {
   fixture({ exec: 'cat > "$SERVUS_INPUT"; exit 1' });
   await expect(importDatabaseCandidate(target('synthetic-dump'))).rejects.toMatchObject({ candidateMayBeDirty: true });
   await expect(importDatabaseCandidate({ ...target('x'), operationId: 'bad' })).rejects.toBeInstanceOf(DatabaseImportError);
+});
+
+it('marks a candidate dirty when the received archive does not match the reserved digest', async () => {
+  fixture();
+  await expect(importDatabaseCandidate({ ...target('tampered-data'), archiveSha256: 'f'.repeat(64) })).rejects.toMatchObject({ candidateMayBeDirty: true, message: expect.stringContaining('digest mismatch') });
 });
 
 it('marks an interrupted import as requiring candidate disposal', async () => {

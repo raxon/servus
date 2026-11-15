@@ -32,17 +32,26 @@ wait_ready() {
   printf 'Candidate database did not become ready\n' >&2; return 1
 }
 run_import() {
-  local kind=$1 dump=$2 target module
+  local kind=$1 dump=$2 target module journal_module preparation_module digest
   local -a mounts=()
   target=$(docker inspect --format '{{.Id}}' "$candidate_name")
-  if [[ $SERVUS_IMPORT_SOURCE == image ]]; then module=/app/dist/agent/database-import.js; else
-    module=/fixture-import.ts; mounts+=(--mount "type=bind,src=$SERVUS_IMPORT_SOURCE,dst=$module,readonly")
+  digest=${3:-$(sha256sum "$dump" | cut -d' ' -f1)}
+  if [[ $SERVUS_IMPORT_SOURCE == image ]]; then
+    module=/app/dist/agent/database-import.js; journal_module=/app/dist/agent/restore-journal.js; preparation_module=/app/dist/agent/restore-preparation.js
+  else
+    module=/fixture-import.ts; journal_module=/fixture-journal.ts; preparation_module=/fixture-preparation.ts
+    mounts+=(--mount "type=bind,src=$SERVUS_IMPORT_SOURCE,dst=$module,readonly" --mount "type=bind,src=$(dirname "$SERVUS_IMPORT_SOURCE")/restore-journal.ts,dst=$journal_module,readonly" --mount "type=bind,src=$(dirname "$SERVUS_IMPORT_SOURCE")/restore-preparation.ts,dst=$preparation_module,readonly")
   fi
   docker run --rm --network none --user 0 --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
     "${mounts[@]}" \
     --mount "type=bind,src=$dump,dst=/fixture-data,readonly" \
-    -e PATH=/usr/bin:/bin -e "SERVUS_IMPORT_CONTAINER=$target" -e "SERVUS_IMPORT_OPERATION=$id" -e "SERVUS_IMPORT_KIND=$kind" -e "SERVUS_IMPORT_MODULE=$module" \
-    --entrypoint /usr/local/bin/node "$SERVUS_IMPORT_IMAGE" --input-type=module -e 'import {createReadStream} from "node:fs";const {importDatabaseCandidate}=await import(process.env.SERVUS_IMPORT_MODULE);await importDatabaseCandidate({containerId:process.env.SERVUS_IMPORT_CONTAINER,dockerSocket:"/var/run/docker.sock",operationId:process.env.SERVUS_IMPORT_OPERATION,kind:process.env.SERVUS_IMPORT_KIND,database:"fixture",user:"fixture",input:()=>createReadStream("/fixture-data")});'
+    -e PATH=/usr/bin:/bin -e "SERVUS_IMPORT_CONTAINER=$target" -e "SERVUS_IMPORT_OPERATION=$id" -e "SERVUS_IMPORT_KIND=$kind" -e "SERVUS_IMPORT_MODULE=$module" -e "SERVUS_IMPORT_JOURNAL=$journal_module" -e "SERVUS_IMPORT_PREPARATION=$preparation_module" -e "SERVUS_IMPORT_SHA256=$digest" \
+    --entrypoint /usr/local/bin/node "$SERVUS_IMPORT_IMAGE" --input-type=module -e 'import {createReadStream} from "node:fs";import Database from "/app/node_modules/better-sqlite3/lib/index.js";const {importDatabaseCandidate}=await import(process.env.SERVUS_IMPORT_MODULE);const {RestoreJournal}=await import(process.env.SERVUS_IMPORT_JOURNAL);const {prepareRestoreCandidate}=await import(process.env.SERVUS_IMPORT_PREPARATION);const db=new Database(":memory:");db.exec("CREATE TABLE operations(id TEXT PRIMARY KEY,service_id TEXT,state TEXT)");const journal=new RestoreJournal(db,()=>false),operationId=process.env.SERVUS_IMPORT_OPERATION,serviceId="11111111-1111-4111-8111-111111111111";journal.reserve({id:operationId,serviceId,kind:process.env.SERVUS_IMPORT_KIND,archiveSha256:process.env.SERVUS_IMPORT_SHA256});try{const result=await prepareRestoreCandidate({journal,operationId,serviceId,importCandidate:importDatabaseCandidate,target:{containerId:process.env.SERVUS_IMPORT_CONTAINER,dockerSocket:"/var/run/docker.sock",database:"fixture",user:"fixture",input:()=>createReadStream("/fixture-data")}});if(result.phase!=="prepared")throw Error("Candidate is not prepared");}catch{process.exitCode=journal.get(operationId)?.phase==="needs_review"?12:2;}finally{db.close();}'
+}
+reject_import() {
+  local status=0
+  run_import "$@" >/dev/null 2>&1 || status=$?
+  if [[ $status != 12 ]]; then printf 'Expected a fenced import failure, got status %s\n' "$status" >&2; return 1; fi
 }
 for kind in postgres mariadb; do
   if [[ $kind == postgres ]]; then image=postgres:17-alpine; data=/var/lib/postgresql/data; else image=mariadb:11.4; data=/var/lib/mysql; fi
@@ -62,11 +71,14 @@ for kind in postgres mariadb; do
     docker exec "$source_name" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb-dump -h 127.0.0.1 -u fixture --single-transaction --quick --skip-lock-tables --no-tablespaces fixture' > "$root/dump"
   fi
   if [[ $kind == postgres ]]; then printf 'invalid archive' > "$root/bad-dump"; else printf 'CREATE TABLE partial (id INT);\nINVALID SQL;\n' > "$root/bad-dump"; fi
-  if run_import "$kind" "$root/bad-dump" >/dev/null 2>&1; then printf 'Invalid import was accepted\n' >&2; exit 1; fi
+  reject_import "$kind" "$root/bad-dump"
   if [[ $kind == mariadb ]]; then
     partial=$(docker exec "$candidate_name" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='\''partial'\''"')
     [[ $partial == 1 ]]
   fi
+  docker rm -f -v "$candidate_name" >/dev/null; docker volume rm "$volume" >/dev/null
+  start_candidate
+  reject_import "$kind" "$root/dump" "$(printf 'f%.0s' {1..64})"
   docker rm -f -v "$candidate_name" >/dev/null; docker volume rm "$volume" >/dev/null
   start_candidate
   run_import "$kind" "$root/dump"
@@ -76,7 +88,7 @@ for kind in postgres mariadb; do
     result=$(docker exec "$candidate_name" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"')
   fi
   [[ $result == expected-marker ]]
-  if run_import "$kind" "$root/dump" >/dev/null 2>&1; then printf 'Nonempty candidate was accepted\n' >&2; exit 1; fi
+  reject_import "$kind" "$root/dump"
   printf 'PASS %s isolated import and nonempty-target rejection\n' "$kind"
   docker rm -f -v "$source_name" "$candidate_name" >/dev/null
   docker volume rm "$volume" >/dev/null
