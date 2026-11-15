@@ -44,7 +44,7 @@ try:
         source=data/'source-database';source.write_text('source fixture');source.chmod(0o600);os.chown(source,1000,1000)
         directory=os.open(state,os.O_RDONLY|os.O_DIRECTORY)
         try:
-            lease=object.__new__(supervisor.DrainLease);lease._legacy_upload_id=restore;lease._policy_binding=('/root/policy','a','b');lease._owner=SimpleNamespace(journal=directory)
+            lease=object.__new__(supervisor.DrainLease);lease._legacy_upload_id=restore;lease._policy_binding=('/root/policy','sha256:'+'1'*64,'sha256:'+'2'*64);lease._owner=SimpleNamespace(journal=directory)
             hub=mock.create_autospec(supervisor.DrainHub,instance=True);hub.used=True;hub.expected_uid=1000
             hub.identities={role:{'id':char*64} for role,char in zip(supervisor.ROLES,'abc')}
             hub.policy=mock.create_autospec(supervisor.RuntimePolicy,instance=True);hub.policy.data_dir=str(data);hub.policy.image_id=image;lease._hub=hub

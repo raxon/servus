@@ -23,8 +23,10 @@ class LegacyCleanupCoordinatorTest(unittest.TestCase):
         self.op=str(uuid.uuid4());self.restore='a'*32;self.service=str(uuid.uuid4())
         self.lease=object.__new__(supervisor.DrainLease)
         self.lease._legacy_upload_id=self.restore
-        self.lease._policy_binding=('/root/policy','a','b')
-        self.lease._owner=SimpleNamespace(journal=self.directory)
+        self.lease._policy_binding=('/root/policy','sha256:'+'1'*64,'sha256:'+'2'*64)
+        self.lease._owner=SimpleNamespace(journal=self.directory,_record=mock.Mock())
+        self.lease._operation_id=self.op;self.lease._request_ids={role:str(uuid.uuid4()) for role in supervisor.ROLES}
+        self.lease._timeout_ms=5000;self.lease._state='stopped_unverified';self.lease._settled=False
         hub=mock.create_autospec(supervisor.DrainHub,instance=True)
         hub.used=True;hub.expected_uid=1000
         hub.identities={role:{'id':char*64} for role,char in zip(supervisor.ROLES,'abc')}
@@ -48,7 +50,8 @@ class LegacyCleanupCoordinatorTest(unittest.TestCase):
 
     def test_runs_fixed_worker_only_after_checks_and_retains_a_cleaned_marker(self):
         self.assertEqual(self.invoke(),{'operationId':self.restore,'phase':'cancelled'})
-        self.assertEqual(self.marker(),{'version':1,'operationId':self.op,'restoreId':self.restore,'serviceId':self.service,'state':'cleaned'})
+        self.assertEqual(self.marker(),{'version':1,'operationId':self.op,'restoreId':self.restore,'serviceId':self.service,'state':'cleaned',
+            'policyBinding':list(self.lease._policy_binding),'containerIds':{role:self.lease._hub.identities[role]['id'] for role in supervisor.ROLES}})
         self.assertEqual(self.checks.ensure_no_open_data.call_count,2)
         args,kwargs=self.docker_mock.call_args
         self.assertEqual(args[0],'run');self.assertIn('--read-only',args);self.assertIn('--cap-drop',args)
@@ -86,6 +89,25 @@ class LegacyCleanupCoordinatorTest(unittest.TestCase):
         self.lease._settled=False;self.lease._state='stopped_unverified'
         with self.assertRaises(supervisor.SupervisorError):self.lease.record('snapshotting')
         self.docker_mock.assert_not_called()
+
+    @unittest.skipUnless(os.geteuid()==0,'Requires root-owned marker')
+    def test_start_requires_cleaned_marker_bound_to_scope_policy_and_containers(self):
+        self.invoke();self.lease.record_legacy_start()
+        self.assertEqual(self.marker()['state'],'starting');self.assertEqual(self.lease._state,'starting')
+        self.lease._owner._record.assert_called_once_with(self.op,'starting',self.lease._request_ids,5000)
+
+    @unittest.skipUnless(os.geteuid()==0,'Requires root-owned marker')
+    def test_start_rejects_a_changed_marker_before_recording_start(self):
+        self.invoke();marker=self.marker();marker['containerIds']['agent']='f'*64
+        supervisor._atomic_file(self.directory,'legacy-upload-recovery.json',json.dumps(marker).encode()+b'\n',0o600)
+        with self.assertRaises(supervisor.SupervisorError):self.lease.record_legacy_start()
+        self.lease._owner._record.assert_not_called();self.assertEqual(self.lease._state,'stopped_unverified')
+
+    @unittest.skipUnless(os.geteuid()==0,'Requires root-owned marker')
+    def test_failed_durable_start_keeps_the_cleaned_marker(self):
+        self.invoke();self.lease._owner._record.side_effect=OSError('fixture write failure')
+        with self.assertRaises(OSError):self.lease.record_legacy_start()
+        self.assertEqual(self.marker()['state'],'cleaned');self.assertEqual(self.lease._state,'stopped_unverified')
 
 
 if __name__=='__main__': unittest.main()

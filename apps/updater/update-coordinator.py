@@ -286,7 +286,10 @@ def cleanup_stopped_legacy_upload(operation_id, restore_id, service_id, lease, s
         raise UpdateError('Invalid legacy upload recovery scope')
     lease.assert_locked(operation_id,'stopped_unverified')
     hub=lease._hub
-    if (not isinstance(hub,supervisor.DrainHub) or hub.used is not True or lease._policy_binding is None or
+    binding=lease._policy_binding
+    if (not isinstance(hub,supervisor.DrainHub) or hub.used is not True or not isinstance(binding,tuple) or len(binding)!=3 or
+        not isinstance(binding[0],str) or not os.path.isabs(binding[0]) or
+        any(not isinstance(value,str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',value) for value in binding[1:]) or
         hub.expected_uid!=1000 or not isinstance(hub.policy,supervisor.RuntimePolicy) or set(hub.identities)!=set(supervisor.ROLES)):
         raise UpdateError('Authenticated drain identity is unavailable')
     try: expected={hub.identities[role]['id'] for role in supervisor.ROLES}
@@ -320,7 +323,8 @@ def cleanup_stopped_legacy_upload(operation_id, restore_id, service_id, lease, s
     try: os.stat(marker,dir_fd=lease._owner.journal,follow_symlinks=False)
     except FileNotFoundError: pass
     else: raise UpdateError('A legacy upload recovery already requires reconciliation')
-    record={'version':1,'operationId':operation_id,'restoreId':restore_id,'serviceId':service_id,'state':'intent'}
+    record={'version':1,'operationId':operation_id,'restoreId':restore_id,'serviceId':service_id,'state':'intent',
+            'policyBinding':list(binding),'containerIds':{role:hub.identities[role]['id'] for role in supervisor.ROLES}}
     supervisor._atomic_file(lease._owner.journal,marker,json.dumps(record,separators=(',',':')).encode('ascii')+b'\n',0o600)
     lease.assert_locked(operation_id,'stopped_unverified')
     raw=supervisor._docker('run','--rm','--name','servus-recovery-'+operation_id,'--label','servus.recovery='+operation_id,'--user','1000:1000',

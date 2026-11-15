@@ -909,6 +909,37 @@ class DrainLease:
         self.assert_locked(self._operation_id, self._state)
         self._settled = True
 
+    def record_legacy_start(self):
+        """Record an exact cleaned recovery before permitting the original start."""
+        self.assert_locked(self._operation_id,'stopped_unverified')
+        if (not isinstance(self._legacy_upload_id,str) or not re.fullmatch(r'[a-f0-9]{32}',self._legacy_upload_id) or
+            not isinstance(self._hub,DrainHub) or self._hub.used is not True or
+            not isinstance(self._policy_binding,tuple) or len(self._policy_binding)!=3):
+            raise SupervisorError('Legacy recovery scope is unavailable')
+        fd=_open_root_file(self._owner.journal,'legacy-upload-recovery.json',0o600)
+        try:
+            info=os.fstat(fd);raw=os.read(fd,4097)
+            if len(raw)>4096:raise SupervisorError('Legacy recovery marker is invalid')
+            marker=json.loads(raw,object_pairs_hook=_pairs)
+            named=os.stat('legacy-upload-recovery.json',dir_fd=self._owner.journal,follow_symlinks=False)
+            if (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino):raise SupervisorError('Legacy recovery marker changed')
+        except (ValueError,UnicodeError,RecursionError,OSError) as error:
+            raise SupervisorError('Legacy recovery marker is invalid') from error
+        finally:os.close(fd)
+        try: identities={role:self._hub.identities[role]['id'] for role in ROLES}
+        except (KeyError,TypeError):raise SupervisorError('Legacy recovery identity is unavailable') from None
+        if (not isinstance(marker,dict) or set(marker)!={'version','operationId','restoreId','serviceId','state','policyBinding','containerIds'} or
+            type(marker['version']) is not int or marker['version']!=1 or marker['operationId']!=self._operation_id or
+            marker['restoreId']!=self._legacy_upload_id or not isinstance(marker['serviceId'],str) or
+            not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',marker['serviceId']) or marker['state']!='cleaned' or
+            marker['policyBinding']!=list(self._policy_binding) or marker['containerIds']!=identities):
+            raise SupervisorError('Legacy recovery marker does not match')
+        self.assert_locked(self._operation_id,'stopped_unverified')
+        self._owner._record(self._operation_id,'starting',self._request_ids,self._timeout_ms)
+        marker['state']='starting'
+        _atomic_file(self._owner.journal,'legacy-upload-recovery.json',json.dumps(marker,separators=(',',':')).encode('ascii')+b'\n',0o600)
+        self._state='starting'
+
     def release_for_start(self):
         """Open the gate only after a durable starting marker has been recorded."""
         self.assert_locked(self._operation_id, 'starting')
