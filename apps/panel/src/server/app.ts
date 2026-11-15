@@ -7,13 +7,14 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
+import { Readable } from 'node:stream';
 import { z } from 'zod';
 import type { ActionType, RuntimeStatus, User } from '../shared/types.js';
 import { hashPassword, verifyPassword } from './auth.js';
 import { AppError } from './errors.js';
 import { Store } from './store.js';
 import { nameSchema, normalizeServiceInput, parseServicePatch } from './configuration.js';
-import { agentRequest as defaultAgentRequest, agentDatabaseExport, AgentRequestError } from '../agent/client.js';
+import { agentRequest as defaultAgentRequest, agentDatabaseExport, agentDatabaseUpload, AgentRequestError } from '../agent/client.js';
 import { registerConsole } from './console.js';
 import { registerCentralAuth } from './central-auth.js';
 import { BUILD_INFO } from './generated-build-info.js';
@@ -284,6 +285,44 @@ export async function createApp(options: AppOptions) {
       .header('Content-Disposition',`attachment; filename="servus-${service.id}.${ticket.extension}"`);
     reply.raw.once('close',()=>{if(!ticket.stream.destroyed)ticket.stream.destroy();});
     return reply.send(ticket.stream);
+  });
+  app.register(async scope => {
+    scope.addContentTypeParser('application/octet-stream', (_req, payload, done) => done(null, payload));
+    scope.post<{Params:{id:string;operationId:string};Body:Readable}>(`${prefix}/services/:id/database-restore/:operationId/upload`, {
+      onRequest: async req => {
+        const {service} = serviceAccess(req,req.params.id,true);
+        if (!/^[a-f0-9]{32}$/.test(req.params.operationId)) throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
+        if (!['postgres','mariadb'].includes(service.kind || '')) throw new AppError('NOT_FOUND','Managed database not found',404);
+        store.connectionInfo(service.id);
+        const size = req.headers['content-length'];
+        if (typeof size !== 'string' || !/^[1-9][0-9]*$/.test(size) || Number(size) > 2*1024*1024*1024 || req.headers['content-type']?.split(';',1)[0]?.trim().toLowerCase() !== 'application/octet-stream') throw new AppError('INVALID_UPLOAD','Invalid database restore upload',400);
+      },
+    }, async (req,reply) => {
+      const {auth,service} = serviceAccess(req,req.params.id,true);
+      if (!(req.body instanceof Readable)) throw new AppError('INVALID_UPLOAD','Invalid database restore upload',400);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      req.raw.once('aborted',abort); reply.raw.once('close',abort);
+      store.recordAudit(auth.user.id,'database.restore.upload.started',service.id);
+      try {
+        const result = await agentDatabaseUpload(service.id,{operationId:req.params.operationId,kind:service.kind as 'postgres'|'mariadb',size:Number(req.headers['content-length']),stream:req.body,signal:controller.signal},options.agentConnection);
+        store.recordAudit(auth.user.id,'database.restore.upload.staged',service.id);
+        return result;
+      } finally { req.raw.off('aborted',abort); reply.raw.off('close',abort); }
+    });
+  });
+  app.get<{Params:{id:string;operationId:string}}>(`${prefix}/services/:id/database-restore/:operationId`,async req => {
+    serviceAccess(req,req.params.id,true);
+    if (!/^[a-f0-9]{32}$/.test(req.params.operationId)) throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
+    return runtimeRequest(`/services/${req.params.id}/database-restore/${req.params.operationId}`,undefined,options.agentConnection);
+  });
+  app.post<{Params:{id:string;operationId:string}}>(`${prefix}/services/:id/database-restore/:operationId/cancel`,async req => {
+    const {auth,service} = serviceAccess(req,req.params.id,true);
+    if (!/^[a-f0-9]{32}$/.test(req.params.operationId)) throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
+    z.object({}).strict().parse(req.body ?? {});
+    const result = await runtimeRequest(`/services/${req.params.id}/database-restore/${req.params.operationId}/cancel`,{},options.agentConnection);
+    store.recordAudit(auth.user.id,'database.restore.cancelled',service.id);
+    return result;
   });
   app.get<{Params:{id:string};Querystring:{tail?:string;since?:string}}>(`${prefix}/services/:id/logs`,async req=>{
     serviceAccess(req,req.params.id);
