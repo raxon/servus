@@ -30,7 +30,8 @@ def _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coo
             raise HostSwitchError('The journal identity differs')
     finally:
         os.close(fd)
-    fence()
+    if fence() is not None:
+        raise HostSwitchError('Host process fence returned an invalid result')
 
 
 def inspect_exchange(db, operation_id, active_parent, candidate_parent, exchange, bundle):

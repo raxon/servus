@@ -37,7 +37,7 @@ class HostSwitchTest(unittest.TestCase):
         self.modules={'core.py':(0o644,b'new')};self.cli=b'gh';self.pin=('b'*64,hashlib.sha256(self.cli).hexdigest(),len(self.cli))
         bundle.stage_runtime_tree(self.c,self.op,self.digest,self.modules,self.cli,self.pin)
         self.db.execute('INSERT INTO host_preparations VALUES(?,?,?,?)',(self.op,self.digest,'runtime-'+self.op,'prepared'))
-        self.fence=mock.Mock();self.old=exchange.identity(self.a,'servus');self.new=exchange.identity(self.c,'runtime-'+self.op)
+        self.fence=mock.Mock(return_value=None);self.old=exchange.identity(self.a,'servus');self.new=exchange.identity(self.c,'runtime-'+self.op)
 
     def tearDown(self):
         self.db.close()
@@ -111,6 +111,11 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
         with self.assertRaises(RuntimeError):self.apply()
         self.assertEqual(exchange.identity(self.a,'servus'),self.old)
         self.assertIsNone(self.db.execute("select name from sqlite_master where name='host_switches'").fetchone())
+
+    def test_rejects_nonvoid_fence_result_before_exchange(self):
+        self.fence.return_value=False
+        with self.assertRaises(switch.HostSwitchError):self.apply()
+        self.assertEqual(exchange.identity(self.a,'servus'),self.old)
 
     def test_failed_exchange_preserves_intent_and_original_tree(self):
         with mock.patch.object(exchange,'exchange',side_effect=OSError('exchange unavailable')),self.assertRaises(OSError):self.apply()

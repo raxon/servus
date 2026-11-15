@@ -16,7 +16,7 @@ import sys
 
 MODULES = (
     'adoption-proof.py','backup.py','bootstrap-handoff.py','bootstrap-initial.py','bootstrap-policy.py','bootstrap-release.py',
-    'discover-release.py','extract-install.py','guarded-verifier.py','host-bundle.py','host-coordinator.py','host-exchange.py','host-switch.py','initial-generation.py',
+    'discover-release.py','extract-install.py','guarded-verifier.py','host-bundle.py','host-coordinator.py','host-exchange.py','host-fence.py','host-switch.py','initial-generation.py',
     'install-gh.py','install-host.py','legacy-bootstrap.py','legacy-early-recovery.py','legacy-host-bootstrap.py','legacy-migrate.py','legacy-prepare.py','legacy-recovery.py','legacy-rollback-early.py','legacy-rollback.py','legacy-run.py','legacy-stop.py','legacy-transition.py','migration-fence.py','preflight.py','prepare-verified.py','preparation-fence.py',
     'provision-verifier-group.py','provision-socket.py','provision-host.py','quiescence.py',
     'restore-snapshot.py','runtime-policy.py','servus-updater.py','supervisor-daemon.py','supervisor.py',
