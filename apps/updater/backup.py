@@ -65,6 +65,7 @@ PANEL_SCHEMA = {
  'central_link_proofs': {'token_hash','user_id','session_hash','issuer','subject','expires_at'},
 }
 AGENT_SCHEMA = {'operations': {'id','request_hash','state','response','updated_at','previous_spec','previous_recorded','target_spec','operation_stage','previous_error','service_id'}}
+AGENT_RESTORE_SCHEMA = {**AGENT_SCHEMA, 'restore_operations': {'id','service_id','kind','archive_sha256','phase','updated_at'}}
 
 class CaptureError(Exception): pass
 
@@ -356,6 +357,19 @@ def _schema(db,expected,version):
     for table,cols in expected.items():
         if {r[1] for r in db.execute(f'PRAGMA table_info({table})')}!=cols: raise CaptureError('Unsupported database schema')
 
+def _agent_schema(db):
+    has_restore = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_operations'").fetchone())
+    _schema(db, AGENT_RESTORE_SCHEMA if has_restore else AGENT_SCHEMA, 0)
+    if not has_restore: return
+    for ident, service, kind, digest, phase, updated in db.execute('SELECT id,service_id,kind,archive_sha256,phase,updated_at FROM restore_operations'):
+        if phase not in ('completed', 'cancelled'):
+            raise CaptureError('Unresolved database restore requires recovery')
+        if (not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or
+            not isinstance(service,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service) or
+            kind not in ('postgres','mariadb','redis') or not isinstance(digest,str) or not re.fullmatch(r'[a-f0-9]{64}',digest) or
+            not isinstance(updated,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',updated)):
+            raise CaptureError('Database restore journal is invalid')
+
 def _config_references(config, refs, service_id, owners, purposes=None, git_requirements=None):
     if not isinstance(config,dict): raise CaptureError('Service configuration is invalid')
     environment=config.get('environment',[])
@@ -478,7 +492,7 @@ def _validate_staging(dest_fd,node_fd):
                 for (value,) in db.execute(f'SELECT {col} FROM {table} WHERE {col} IS NOT NULL'):
                     encrypted.append(_sealed(value,table=='central_pairings' and col=='redeemed_credentials'))
     with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/agent.sqlite?mode=ro&immutable=1',uri=True)) as db:
-        _schema(db,AGENT_SCHEMA,0)
+        _agent_schema(db)
         with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/panel.sqlite?mode=ro&immutable=1',uri=True)) as panel:
             _validate_operation_history(panel, db)
         for (response,) in db.execute('SELECT response FROM operations'):

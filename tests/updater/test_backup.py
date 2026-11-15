@@ -550,6 +550,34 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         with self.assertRaisesRegex(backup.CaptureError,'Unresolved agent'): self.capture()
         self.assertFalse((self.dst/'manifest.json').exists())
 
+    def test_unresolved_restore_is_refused(self):
+        for phase in ('reserved','importing','prepared','switching','needs_review'):
+            with self.subTest(phase=phase):
+                self.agent.execute('DELETE FROM restore_operations')
+                self.agent.execute('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)',('a'*32,UUID,'postgres','b'*64,phase,'2026-11-15T00:00:00.000Z'))
+                with self.assertRaisesRegex(backup.CaptureError,'Unresolved database restore'): backup._agent_schema(self.agent)
+        self.agent.commit();self.fix_permissions()
+        with self.assertRaisesRegex(backup.CaptureError,'Unresolved database restore'): self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
+
+    def test_terminal_restore_journal_is_validated(self):
+        self.agent.execute('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)',('a'*32,UUID,'postgres','b'*64,'completed','2026-11-15T00:00:00.000Z'))
+        self.agent.commit();self.fix_permissions();self.capture()
+        with sqlite3.connect(self.dst/'agent.sqlite') as restored:
+            self.assertEqual(restored.execute('SELECT phase FROM restore_operations').fetchone(),('completed',))
+        self.agent.execute("UPDATE restore_operations SET phase='cancelled'");backup._agent_schema(self.agent)
+
+    def test_invalid_restore_journal_is_refused(self):
+        self.agent.execute('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)',('bad',UUID,'postgres','b'*64,'completed','2026-11-15T00:00:00.000Z'))
+        self.agent.commit();self.fix_permissions()
+        with self.assertRaisesRegex(backup.CaptureError,'Database restore journal is invalid'): self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
+
+    def test_legacy_agent_without_restore_table_is_supported(self):
+        self.agent.execute('DROP TABLE restore_operations');self.agent.commit();self.fix_permissions();self.capture()
+        with sqlite3.connect(self.dst/'agent.sqlite') as restored:
+            self.assertIsNone(restored.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='restore_operations'").fetchone())
+
     def test_failed_agent_rollback_is_refused(self):
         self.agent.execute("UPDATE operations SET state='failed',operation_stage='rolling_back'");self.agent.commit();self.fix_permissions()
         with self.assertRaisesRegex(backup.CaptureError,'Unresolved failed operations'): self.capture()
