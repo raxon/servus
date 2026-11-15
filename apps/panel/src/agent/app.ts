@@ -146,6 +146,14 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       } finally { uploads--; clearTimeout(timeout); req.raw.off('aborted', abort); release?.(); }
     });
   });
+  app.get<{Params:{id:string}}>('/services/:id/database-restore', async (req,reply) => {
+    if (!z.string().uuid().safeParse(req.params.id).success) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
+    const record=restores.latestForService(req.params.id);
+    if (!record) return {operation:null};
+    const stage=record.phase==='switching'?restores.switchIntent(record.id)?.stage:undefined;
+    const rolledBack=record.phase==='cancelled' && restores.retainedVolume(record.id)?.reason==='rollback_candidate';
+    return {operation:{operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{}),...(rolledBack?{rolledBack:true}:{})}};
+  });
   app.get<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId', async (req,reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
     const record = restores.get(req.params.operationId);

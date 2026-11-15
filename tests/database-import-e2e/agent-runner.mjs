@@ -6,6 +6,7 @@ import Docker from '/app/node_modules/dockerode/lib/docker.js';
 import Database from '/app/node_modules/better-sqlite3/lib/index.js';
 import { Store } from '/app/dist/server/store.js';
 import { createAgent } from '/app/dist/agent/app.js';
+import { createApp } from '/app/dist/server/app.js';
 import { RestoreJournal } from '/app/dist/agent/restore-journal.js';
 import { prepareRestoreSwitchIntent, readRestoreSwitchIntent } from '/app/dist/agent/restore-switch-intent.js';
 import { applyRestoreSwitch } from '/app/dist/agent/restore-switch-apply.js';
@@ -25,6 +26,7 @@ store.db.prepare(`INSERT INTO services(id,project_id,name,image,port,hostname,re
 const reference = store.vault.put(password);
 store.db.prepare("INSERT INTO service_secret_refs(reference,service_id,purpose) VALUES(?,?,'database')").run(reference,serviceId);
 const snapshot = {id:serviceId,projectId:project.id,kind,database:{database:'fixture',user:'fixture',passwordSecretRef:reference}};
+store.db.prepare('UPDATE services SET config=? WHERE id=?').run(JSON.stringify({kind,database:snapshot.database}),serviceId);
 store.db.prepare("INSERT INTO actions VALUES(?,?,?,?,?,'succeeded','complete',NULL,?,?,?)").run(actionId,project.id,serviceId,actor.id,'deploy',now,now,now);
 store.db.prepare("INSERT INTO jobs(id,action_id,service_id,snapshot,status,created_at) VALUES(?,?,?,?,'succeeded',?)").run(jobId,actionId,serviceId,JSON.stringify(snapshot),now);
 if (kind === 'mariadb') {
@@ -36,16 +38,22 @@ let sourceContainerId=process.env.SERVUS_IMPORT_SOURCE_ID;
 const runtime = {status:async()=>({online:true}),inspectService:async()=>({state:'running'}),apply:async()=>{throw new Error('Unexpected mutation');},consoleContainer:async()=>docker.getContainer(sourceContainerId)};
 const token = 'fixture-agent-token';
 const agent = await createAgent({dataDir,token,socketPath:join(dataDir,'socket'),dockerSocket:'/var/run/docker.sock',ingressPort:18080,ingressImage:'unused'},runtime);
+await agent.listen({path:join(dataDir,'socket')});
+const panel=await createApp({dataDir,store,agentConnection:{socketPath:join(dataDir,'socket'),token}});
+const session=store.createSession(actor.id),panelHeaders={cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken};
+const panelPath=`/api/v1/services/${serviceId}/database-restore/${operationId}`;
 const headers = {authorization:`Bearer ${token}`};
 const path = `/services/${serviceId}/database-restore/${operationId}`;
 let switchDb, switchPlan, switchOptions, recordedInspection, bindingCompleted=false;
 try {
-  const upload = await agent.inject({method:'POST',url:`/services/${serviceId}/database-restore/upload?operationId=${operationId}&kind=${kind}`,headers:{...headers,'content-type':'application/octet-stream'},payload:readFileSync('/fixture-data')});
+  const upload = await panel.inject({method:'POST',url:`${panelPath}/upload`,headers:{...panelHeaders,'content-type':'application/octet-stream'},payload:readFileSync('/fixture-data')});
   if (upload.statusCode !== 200 || upload.json().phase !== 'reserved') throw new Error(`Upload failed: ${upload.statusCode}`);
-  const prepared = await agent.inject({method:'POST',url:`${path}/prepare`,headers,payload:{}});
+  const prepared = await panel.inject({method:'POST',url:`${panelPath}/prepare`,headers:panelHeaders,payload:{}});
   if (prepared.statusCode !== 200 || prepared.json().phase !== 'prepared') throw new Error(`Preparation failed: ${prepared.statusCode} ${JSON.stringify(prepared.json())}`);
-  const status = await agent.inject({method:'GET',url:path,headers});
+  const status = await panel.inject({method:'GET',url:panelPath,headers:panelHeaders});
   if (status.statusCode !== 200 || status.json().phase !== 'prepared') throw new Error('Prepared state was not recorded');
+  const latest=await panel.inject({method:'GET',url:`/api/v1/services/${serviceId}/database-restore`,headers:panelHeaders});
+  if(latest.statusCode!==200||latest.json().operation?.operationId!==operationId||latest.json().operation?.phase!=='prepared')throw new Error('Prepared state could not be rediscovered');
   if (process.env.SERVUS_SWITCH_INSPECT === '1') {
     const inspection = await agent.inject({method:'GET',url:`${path}/switch-inspection`,headers});
     if (inspection.statusCode !== 200 || inspection.json().sourceContainerId !== process.env.SERVUS_IMPORT_SOURCE_ID || inspection.json().sourceVolume !== `panel-data-${serviceId}-database` || inspection.json().candidateVolume !== `panel-restore-${operationId}`) throw new Error(`Switch inspection failed: ${inspection.statusCode} ${JSON.stringify(inspection.json())}`);
@@ -77,9 +85,9 @@ try {
     };
     const verifyTarget=async plan=>{await verifyRestoreDatabase({docker,plan,side:'target',kind});await verifyData(plan);};
     if(process.env.SERVUS_SWITCH_BINDING==='1'){
-      const commit=await agent.inject({method:'POST',url:`${path}/commit`,headers,payload:{}});
+      const commit=await panel.inject({method:'POST',url:`${panelPath}/commit`,headers:panelHeaders,payload:{confirm:true}});
       if(commit.statusCode!==200||commit.json().phase!=='completed'||commit.json().rolledBack)throw new Error(`Agent commit failed: ${commit.statusCode} ${JSON.stringify(commit.json())}`);
-      const repeat=await agent.inject({method:'POST',url:`${path}/commit`,headers,payload:{}});
+      const repeat=await panel.inject({method:'POST',url:`${panelPath}/commit`,headers:panelHeaders,payload:{confirm:true}});
       if(repeat.statusCode!==200||repeat.json().phase!=='completed')throw new Error('Agent commit was not repeatable');
       bindingCompleted=true;
       const actual=new DockerRuntime('/var/run/docker.sock',18080,'unused',dataDir);
@@ -147,5 +155,5 @@ try {
       await finalizeRestoreRollback({...switchOptions,dataDir,verifySource});
     }
   }
-  switchDb?.close();await agent.close(); store.close(); rmSync(dataDir,{recursive:true,force:true});
+  switchDb?.close();await panel.close();await agent.close(); store.close(); rmSync(dataDir,{recursive:true,force:true});
 }

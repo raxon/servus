@@ -59,6 +59,9 @@ export class RestoreJournal {
     }).immediate();
   }
   get(id: string): RestoreRecord | undefined { return this.db.prepare('SELECT * FROM restore_operations WHERE id=?').get(id) as RestoreRecord | undefined; }
+  latestForService(serviceId: string): RestoreRecord | undefined {
+    return this.db.prepare("SELECT * FROM restore_operations WHERE service_id=? ORDER BY CASE WHEN phase NOT IN ('completed','cancelled') THEN 0 ELSE 1 END, updated_at DESC, rowid DESC LIMIT 1").get(serviceId) as RestoreRecord | undefined;
+  }
   hasUnresolved(serviceId?: string): boolean {
     return serviceId === undefined
       ? Boolean(this.db.prepare("SELECT 1 FROM restore_operations WHERE phase NOT IN ('completed','cancelled') LIMIT 1").get())

@@ -26,6 +26,13 @@ const prefix = '/api/v1';
 const cookieName = 'panel_session';
 const slug = nameSchema;
 const credentials = z.object({ email: z.string().email().max(254), password: z.string().min(8).max(128) });
+const restoreStatusSchema = z.object({
+  operationId:z.string().regex(/^[a-f0-9]{32}$/),
+  phase:z.enum(['uploading','reserved','discarding','discarding_candidate','importing','prepared','switching','needs_review','completed','cancelled']),
+  kind:z.enum(['postgres','mariadb','redis']),
+  stage:z.enum(['pending','candidate_stop','candidate_detached','applying','applied','rolling_back','rolled_back']).optional(),
+  rolledBack:z.literal(true).optional(),
+}).strict();
 
 export interface AppOptions {
   dataDir: string; webDir?: string; store?: Store; logger?: boolean;
@@ -311,6 +318,13 @@ export async function createApp(options: AppOptions) {
       } finally { req.raw.off('aborted',abort); reply.raw.off('close',abort); }
     });
   });
+  app.get<{Params:{id:string}}>(`${prefix}/services/:id/database-restore`,async req => {
+    serviceAccess(req,req.params.id,true);
+    const result=await runtimeRequest(`/services/${req.params.id}/database-restore`,undefined,options.agentConnection);
+    const parsed=z.object({operation:restoreStatusSchema.nullable()}).strict().safeParse(result);
+    if(!parsed.success)throw new AppError('RESTORE_INVALID','The restore status could not be verified',502);
+    return parsed.data;
+  });
   app.get<{Params:{id:string;operationId:string}}>(`${prefix}/services/:id/database-restore/:operationId`,async req => {
     serviceAccess(req,req.params.id,true);
     if (!/^[a-f0-9]{32}$/.test(req.params.operationId)) throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
@@ -324,6 +338,31 @@ export async function createApp(options: AppOptions) {
     store.recordAudit(auth.user.id,'database.restore.cancelled',service.id);
     return result;
   });
+  for (const action of ['prepare','commit'] as const) {
+    app.post<{Params:{id:string;operationId:string}}>(`${prefix}/services/:id/database-restore/:operationId/${action}`,async req => {
+      const {auth,service}=serviceAccess(req,req.params.id,true);
+      if(!/^[a-f0-9]{32}$/.test(req.params.operationId))throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
+      if(!['postgres','mariadb'].includes(service.kind || ''))throw new AppError('NOT_FOUND','Managed database not found',404);
+      if(action==='commit')z.object({confirm:z.literal(true)}).strict().parse(req.body);
+      else z.object({}).strict().parse(req.body ?? {});
+      store.connectionInfo(service.id);
+      store.recordAudit(auth.user.id,`database.restore.${action}.started`,service.id);
+      try {
+        const result=await runtimeRequest(`/services/${service.id}/database-restore/${req.params.operationId}/${action}`,{}, {...options.agentConnection,timeoutMs:900_000});
+        const schema=action==='prepare'
+          ? z.object({operationId:z.literal(req.params.operationId),phase:z.literal('prepared')}).strict()
+          : z.object({operationId:z.literal(req.params.operationId),phase:z.enum(['completed','cancelled']),rolledBack:z.boolean()}).strict().refine(value=>value.phase!=='completed'||!value.rolledBack);
+        const parsed=schema.safeParse(result);
+        if(!parsed.success)throw new AppError('RESTORE_UNCERTAIN','The restore outcome is unknown. Check the operation status.',503);
+        store.recordAudit(auth.user.id,`database.restore.${action}.${parsed.data.phase}`,service.id);
+        return parsed.data;
+      } catch(error) {
+        if(error instanceof AgentRequestError && error.certainty==='definitive' && error.statusCode===409)throw new AppError('RESTORE_BUSY','The restore cannot continue in its current state',409);
+        if(error instanceof AgentRequestError && error.certainty==='uncertain')throw new AppError('RESTORE_UNCERTAIN','The restore outcome is unknown. Check the operation status.',503);
+        throw error;
+      }
+    });
+  }
   app.get<{Params:{id:string};Querystring:{tail?:string;since?:string}}>(`${prefix}/services/:id/logs`,async req=>{
     serviceAccess(req,req.params.id);
     const tail=z.coerce.number().int().min(1).max(500).default(200).parse(req.query.tail);

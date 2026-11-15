@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,18 +7,19 @@ import { request } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import Database from 'better-sqlite3';
 import { createAgent } from '../../src/agent/app.js';
+import { AgentRequestError } from '../../src/agent/client.js';
 import { createApp } from '../../src/server/app.js';
 import { Store } from '../../src/server/store.js';
 import { hashPassword } from '../../src/server/auth.js';
 
 const cleanup:(()=>Promise<void>)[]=[];
 afterEach(async()=>{for(const fn of cleanup.splice(0).reverse())await fn();});
-async function fixture(){
+async function fixture(agentRequest?:Parameters<typeof createApp>[0]['agentRequest']){
   const dataDir=mkdtempSync(join(tmpdir(),'panel-restore-upload-')),store=new Store(dataDir),socketPath=join(dataDir,'agent.sock'),token='agent-test-token';
   const runtime={status:async()=>({online:true}),inspectService:async()=>({state:'unknown' as const}),apply:async()=>({state:'running' as const,deployedRevision:1,messages:[]})};
   const agent=await createAgent({dataDir,token,socketPath,dockerSocket:'/unused',ingressPort:18080,ingressImage:'unused'},runtime as never);
   await agent.listen({path:socketPath});
-  const app=await createApp({dataDir,store,agentConnection:{socketPath,token}});
+  const app=await createApp({dataDir,store,agentConnection:{socketPath,token},agentRequest});
   cleanup.push(async()=>{await app.close();await agent.close();store.close();rmSync(dataDir,{recursive:true,force:true});});
   const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'admin@example.test',password:'testing-password'}});
   const headers={cookie:`panel_session=${setup.cookies.find(cookie=>cookie.name==='panel_session')!.value}`,'x-csrf-token':setup.json().csrfToken};
@@ -46,13 +47,46 @@ it('stages, reports and cancels an archive through the authenticated agent',asyn
   const {app,store,headers,service,operationId,path}=await fixture(),payload=Buffer.from('private fixture');
   const upload=await app.inject({method:'POST',url:`${path}/upload`,headers:{...headers,'content-type':'application/octet-stream'},payload});
   expect(upload.statusCode).toBe(200); expect(upload.json()).toMatchObject({operationId,size:payload.length,phase:'reserved'});
+  expect((await app.inject({url:`/api/v1/services/${service.id}/database-restore`,headers})).json()).toEqual({operation:{operationId,phase:'reserved',kind:'postgres'}});
   const status=await app.inject({url:path,headers}); expect(status.statusCode).toBe(200);expect(status.json()).toEqual({operationId,phase:'reserved',kind:'postgres'});
   expect((await app.inject({method:'POST',url:`${path}/cancel`,headers:{cookie:headers.cookie},payload:{}})).statusCode).toBe(403);
   const cancelled=await app.inject({method:'POST',url:`${path}/cancel`,headers,payload:{}});
   expect(cancelled.statusCode).toBe(200); expect(cancelled.json()).toEqual({operationId,phase:'cancelled'});
   expect((await app.inject({url:path,headers})).json().phase).toBe('cancelled');
+  const nextId=randomBytes(16).toString('hex'),nextPath=`/api/v1/services/${service.id}/database-restore/${nextId}`;
+  expect((await app.inject({method:'POST',url:`${nextPath}/upload`,headers:{...headers,'content-type':'application/octet-stream'},payload})).statusCode).toBe(200);
+  expect((await app.inject({url:`/api/v1/services/${service.id}/database-restore`,headers})).json()).toEqual({operation:{operationId:nextId,phase:'reserved',kind:'postgres'}});
+  expect((await app.inject({method:'POST',url:`${nextPath}/cancel`,headers,payload:{}})).statusCode).toBe(200);
   const events=store.db.prepare('SELECT operation FROM audit_events WHERE resource_id=?').all(service.id) as {operation:string}[];
   expect(events.map(event=>event.operation)).toEqual(expect.arrayContaining(['database.restore.upload.started','database.restore.upload.staged','database.restore.cancelled']));
+});
+
+it('requires write access and explicit confirmation before starting restore actions',async()=>{
+  const requestAgent=vi.fn(async(path:string)=>({operationId:path.split('/').at(-2),phase:path.endsWith('/prepare')?'prepared':'completed',...(path.endsWith('/commit')?{rolledBack:false}:{})}));
+  const {app,store,headers,project,service,operationId,path}=await fixture(requestAgent as never);
+  const viewer=store.createUser('viewer@example.test',await hashPassword('testing-password'));
+  store.addMember(project.id,viewer.id,'viewer');const session=store.createSession(viewer.id);
+  const viewerHeaders={cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken};
+  expect((await app.inject({method:'POST',url:`${path}/prepare`,payload:{}})).statusCode).toBe(401);
+  expect((await app.inject({method:'POST',url:`${path}/prepare`,headers:{cookie:headers.cookie},payload:{}})).statusCode).toBe(403);
+  expect((await app.inject({method:'POST',url:`${path}/prepare`,headers:viewerHeaders,payload:{}})).statusCode).toBe(404);
+  expect((await app.inject({method:'POST',url:`${path}/commit`,headers,payload:{}})).statusCode).toBe(400);
+  expect(requestAgent).not.toHaveBeenCalled();
+  expect((await app.inject({method:'POST',url:`${path}/prepare`,headers,payload:{}})).json()).toEqual({operationId,phase:'prepared'});
+  expect((await app.inject({method:'POST',url:`${path}/commit`,headers,payload:{confirm:true}})).json()).toEqual({operationId,phase:'completed',rolledBack:false});
+  expect(requestAgent).toHaveBeenCalledTimes(2);
+  expect(requestAgent.mock.calls[0][0]).toBe(`/services/${service.id}/database-restore/${operationId}/prepare`);
+  const events=store.db.prepare('SELECT operation FROM audit_events WHERE resource_id=?').all(service.id) as {operation:string}[];
+  expect(events.map(event=>event.operation)).toEqual(expect.arrayContaining(['database.restore.prepare.started','database.restore.prepare.prepared','database.restore.commit.started','database.restore.commit.completed']));
+});
+
+it('reports an uncertain result without retrying the commit',async()=>{
+  const requestAgent=vi.fn(async()=>{throw new AgentRequestError('connection closed','uncertain');});
+  const {app,headers,path}=await fixture(requestAgent as never);
+  const response=await app.inject({method:'POST',url:`${path}/commit`,headers,payload:{confirm:true}});
+  expect(response.statusCode).toBe(503);
+  expect(response.json().error.code).toBe('RESTORE_UNCERTAIN');
+  expect(requestAgent).toHaveBeenCalledTimes(1);
 });
 
 it('streams archives larger than the JSON body limit',async()=>{
