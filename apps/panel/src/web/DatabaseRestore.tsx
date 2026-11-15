@@ -10,6 +10,7 @@ type RestoreOperation = {
   phase: "uploading" | "reserved" | "discarding" | "discarding_candidate" | "importing" | "prepared" | "switching" | "needs_review" | "completed" | "cancelled";
   kind: "postgres" | "mariadb" | "redis";
   reviewPhase?: "uploading" | "reserved" | "discarding" | "importing" | "prepared" | "switching";
+  recoveryReason?: "legacy_upload_unverified";
   rolledBack?: true;
 };
 
@@ -36,8 +37,10 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
     queryFn: () => api<{operation: RestoreOperation | null}>(base, {csrf:true}),
     retry: false,
     refetchInterval: query => {
-      const phase = query.state.data?.operation?.phase;
+      const operation = query.state.data?.operation;
+      const phase = operation?.phase;
       if(uploadInProgress)return 1000;
+      if(operation?.recoveryReason === "legacy_upload_unverified")return false;
       return phase && ["uploading", "importing", "switching", "discarding", "discarding_candidate"].includes(phase) ? 3000 : false;
     },
   });
@@ -88,7 +91,12 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
           <button className="button button-danger" type="button" disabled={busy || !confirmed} onClick={() => action.mutate({type:"commit",operationId:operation!.operationId})}>{busy ? <FeatureLoading label="Restoring" /> : phase === "prepared" ? "Restore database" : "Resume restore"}</button>
         </>}
         {(phase === "reserved" || phase === "prepared") && <button className="button" type="button" disabled={busy} onClick={() => action.mutate({type:"cancel",operationId:operation!.operationId})}>Cancel restore</button>}
-        {phase === "uploading" && <>
+        {phase === "uploading" && operation?.recoveryReason === "legacy_upload_unverified" && <div role="alert">
+          <p>This older upload has no recorded process lock, so its writer cannot be verified as stopped.</p>
+          <p>The service remains locked for changes. Ask an administrator to review this restore.</p>
+          <p>Restore ID: <code>{operation.operationId}</code></p>
+        </div>}
+        {phase === "uploading" && operation?.recoveryReason !== "legacy_upload_unverified" && <>
           <FeatureLoading label="Uploading export" />
           <button className="button" type="button" disabled={cancelUpload.isPending} onClick={() => cancelUpload.mutate(operation!.operationId)}>{cancelUpload.isPending ? <FeatureLoading label="Cancelling" /> : "Cancel upload"}</button>
         </>}

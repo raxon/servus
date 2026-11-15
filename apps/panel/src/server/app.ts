@@ -32,8 +32,9 @@ const restoreStatusSchema = z.object({
   kind:z.enum(['postgres','mariadb','redis']),
   stage:z.enum(['pending','candidate_stop','candidate_detached','applying','applied','rolling_back','rolled_back']).optional(),
   reviewPhase:z.enum(['uploading','reserved','discarding','importing','prepared','switching']).optional(),
+  recoveryReason:z.literal('legacy_upload_unverified').optional(),
   rolledBack:z.literal(true).optional(),
-}).strict();
+}).strict().refine(value=>!value.recoveryReason||value.phase==='uploading');
 
 export interface AppOptions {
   dataDir: string; webDir?: string; store?: Store; logger?: boolean;

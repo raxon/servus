@@ -76,6 +76,20 @@ it('returns a review status through the authenticated panel status endpoint',asy
   } finally {db.close();}
 });
 
+it('reports an unverifiable legacy upload to authorized clients',async()=>{
+  const {app,store,headers,service,operationId,path}=await fixture();
+  const db=new Database(join(store.dataDir,'agent.sqlite'));
+  try {
+    new RestoreJournal(db,()=>false).beginUpload({id:operationId,serviceId:service.id,kind:'postgres'});
+    const expected={operationId,kind:'postgres',phase:'uploading',recoveryReason:'legacy_upload_unverified'};
+    const response=await app.inject({url:`/api/v1/services/${service.id}/database-restore`,headers});
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({operation:expected});
+    expect((await app.inject({url:path,headers})).json()).toEqual(expected);
+    expect((await app.inject({url:path})).statusCode).toBe(401);
+  } finally {db.close();}
+});
+
 it('requires write access and explicit confirmation before starting restore actions',async()=>{
   const requestAgent=vi.fn(async(path:string)=>({operationId:path.split('/').at(-2),phase:path.endsWith('/prepare')?'prepared':'completed',...(path.endsWith('/commit')?{rolledBack:false}:{})}));
   const {app,store,headers,project,service,operationId,path}=await fixture(requestAgent as never);
