@@ -59,4 +59,23 @@ for unit in servus-supervisor.service servus-updater.service servus-updater-sock
   guest sudo systemctl is-enabled --quiet "$unit"
 done
 node tests/signed-update-e2e/browser.mjs "http://127.0.0.1:$test_port" "$base_version" "$target_version" "$base_revision"
+guest sudo /usr/bin/python3 -I - "$target_version" <<'PY'
+import sqlite3, sys, time
+target='v'+sys.argv[1]
+deadline=time.monotonic()+240
+while time.monotonic()<deadline:
+    with sqlite3.connect('/var/lib/servus-updater/journal.sqlite') as db:
+        tables={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if {'host_stops','host_preparations','host_switches'} <= tables:
+            rows=db.execute("SELECT h.status,p.status,s.phase FROM operations o JOIN host_stops h ON h.operation_id=o.id LEFT JOIN host_preparations p ON p.operation_id=o.id LEFT JOIN host_switches s ON s.operation_id=o.id WHERE o.tag=?",(target,)).fetchall()
+            if rows==[('completed','completed','completed')]:break
+            if len(rows)>1 or any('recovery_required' in row or 'rolled_back' in row for row in rows):
+                raise RuntimeError('Host update requires recovery: '+repr(rows))
+    time.sleep(2)
+else:raise RuntimeError('Host update did not complete')
+print('PASS verified host generation was exchanged and started',flush=True)
+PY
+for unit in servus-updater.service servus-supervisor.service servus-host-update.timer; do
+  guest sudo systemctl is-active --quiet "$unit"
+done
 printf 'PASS real update from v%s to v%s in the browser\n' "$base_version" "$target_version"
