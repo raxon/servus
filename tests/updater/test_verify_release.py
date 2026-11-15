@@ -300,7 +300,8 @@ spec = importlib.util.spec_from_file_location('test_verifier', sys.argv[1])
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 def task():
     process = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(30)'])
-    pathlib.Path(sys.argv[2]).write_text(str(os.getpid()) + ' ' + str(process.pid))
+    target = pathlib.Path(sys.argv[2]); temporary = target.with_name('pids.tmp')
+    temporary.write_text(str(os.getpid()) + ' ' + str(process.pid)); os.replace(temporary, target)
     time.sleep(30)
     return {'verified': True}
 module.bounded_verification(task, 30)
