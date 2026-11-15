@@ -38,6 +38,7 @@ import type {
   SourceConfig,
 } from "../shared/types.js";
 import { api, errorMessage } from "./api.js";
+import { DatabaseRestore } from "./DatabaseRestore.js";
 import { combineEnvironment, formatEnvironment } from "./environment.js";
 import { TerminalBoundary } from "./TerminalBoundary.js";
 import {
@@ -1064,6 +1065,7 @@ export function DatabaseConnection({ service }: { service: Service }) {
             </button>
           </div>
           <p className="feature-helper">Exports up to 2 GiB of database data. Application files are not included.</p>
+          {(service.kind === "postgres" || service.kind === "mariadb") && <DatabaseRestore service={service} />}
         </>
       ) : null}
     </section>

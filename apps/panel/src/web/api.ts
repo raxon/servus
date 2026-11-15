@@ -19,20 +19,22 @@ export function setCsrfToken(value: string) {
 
 export async function api<T>(
   path: string,
-  options: { method?: string; body?: unknown; idempotent?: boolean; signal?: AbortSignal } = {},
+  options: { method?: string; body?: unknown; binary?: Blob; csrf?: boolean; idempotent?: boolean; signal?: AbortSignal } = {},
 ): Promise<T> {
   const method = options.method ?? "GET";
   const requestEpoch = sessionEpoch;
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (options.body !== undefined) headers["Content-Type"] = "application/json";
-  if (method !== "GET" && csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  if (options.body !== undefined && options.binary !== undefined) throw new Error("A request cannot contain both JSON and binary data.");
+  if (options.binary !== undefined) headers["Content-Type"] = "application/octet-stream";
+  else if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if ((method !== "GET" || options.csrf) && csrfToken) headers["X-CSRF-Token"] = csrfToken;
   if (options.idempotent) headers["Idempotency-Key"] = crypto.randomUUID();
   const response = await fetch(`/api/v1${path}`, {
     method,
     headers,
     credentials: "same-origin",
     signal: options.signal,
-    ...(options.body !== undefined
+    ...(options.binary !== undefined ? {body:options.binary} : options.body !== undefined
       ? { body: JSON.stringify(options.body) }
       : {}),
   });

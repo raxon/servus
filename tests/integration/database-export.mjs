@@ -33,6 +33,26 @@ try {
   browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});
   for(const viewport of [{width:1280,height:900},{width:375,height:850}]){
     const page=await browser.newPage({viewport,acceptDownloads:true});
+    let operation=null,commits=0,uploads=0;
+    await page.route(`**/api/v1/services/${service.id}/database-restore**`,async route=>{
+      const request=route.request(),path=new URL(request.url()).pathname;
+      assert(request.headers()['x-csrf-token']);
+      if(request.method()==='GET')return route.fulfill({json:{operation}});
+      const operationId=path.split('/').at(-2);
+      if(path.endsWith('/upload')){
+        uploads++;assert.equal(request.headers()['content-type'],'application/octet-stream');
+        assert.equal(request.postDataBuffer().toString(),'fixture-export');
+        operation={operationId,kind:'postgres',phase:'reserved'};
+        return route.fulfill({json:{operationId,phase:'reserved'}});
+      }
+      if(path.endsWith('/prepare')){operation.phase='prepared';return route.fulfill({json:{operationId,phase:'prepared'}});}
+      if(path.endsWith('/commit')){
+        commits++;assert.deepEqual(request.postDataJSON(),{confirm:true});operation.phase='completed';
+        if(viewport.width===375)return route.fulfill({status:503,json:{error:{code:'RESTORE_UNCERTAIN',message:'The restore outcome is unknown. Check the operation status.'}}});
+        return route.fulfill({json:{operationId,phase:'completed',rolledBack:false}});
+      }
+      throw new Error(`Unexpected restore request: ${path}`);
+    });
     await page.goto(`${origin}/services/${service.id}`);
     await page.getByLabel('Email address').fill('fixture@example.test');
     await page.getByLabel('Password',{exact:true}).fill('fixture-password');
@@ -43,9 +63,28 @@ try {
     await section.getByRole('button',{name:'Download',exact:true}).click();
     const download=await downloadPromise;assert.equal(download.suggestedFilename(),`servus-${service.id}.dump`);
     const path=join(root,`download-${viewport.width}`);await download.saveAs(path);assert.equal(readFileSync(path,'utf8'),'fixture-export');
+    await section.getByRole('button',{name:'Restore',exact:true}).click();
+    const dialog=page.getByRole('dialog',{name:'Restore database'});
+    await dialog.getByLabel('Export file').setInputFiles({name:'fixture.dump',mimeType:'application/octet-stream',buffer:Buffer.from('fixture-export')});
+    await dialog.getByRole('button',{name:'Upload export'}).click();
+    await dialog.getByRole('button',{name:'Prepare restore'}).click();
+    await dialog.getByText('The export is ready.',{exact:false}).waitFor();
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+    await page.screenshot({path:`/tmp/servus-restore-${viewport.width}.png`});
+    await page.reload();
+    await section.getByRole('button',{name:'Restore',exact:true}).click();
+    await dialog.getByText('The export is ready.',{exact:false}).waitFor();
+    const restore=dialog.getByRole('button',{name:'Restore database'});
+    assert.equal(await restore.isDisabled(),true);
+    await dialog.getByLabel('I understand that current database data will be replaced.').check();
+    await restore.click();
+    await dialog.getByText('The database was restored.').waitFor();
+    if(viewport.width===375)await dialog.getByText('The restore outcome is unknown. Check the operation status.').waitFor();
+    assert.equal(uploads,1);assert.equal(commits,1);
+    await dialog.getByRole('button',{name:'Close dialog'}).click();
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
     if(viewport.width===1280)await page.screenshot({path:'/tmp/servus-database-export-ui.png'});
     await page.close();
   }
-  console.log('PASS database export download on desktop and mobile');
+  console.log('PASS database export and restore interface on desktop and mobile');
 } finally {await browser?.close();await app.close();store.close();rmSync(root,{recursive:true,force:true});}

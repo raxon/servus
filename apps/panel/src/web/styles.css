@@ -4721,6 +4721,17 @@ select:disabled {
 .connection-password .button {
   margin-bottom: 3px;
 }
+.restore-dialog {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 24px 27px;
+}
+.restore-dialog p, .restore-dialog label { margin: 0; }
+.restore-file-label { width: 100%; }
+.restore-confirm { display: flex; align-items: flex-start; gap: 10px; }
+.restore-confirm input { width: 16px; height: 16px; min-height: 0; margin: 2px 0 0; padding: 0; flex: none; }
 .feature-panel-heading {
   display: flex;
   align-items: flex-start;
