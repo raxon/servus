@@ -129,6 +129,14 @@ class HostAdoptionTest(unittest.TestCase):
             if live is not None:live.close()
             if peer.poll() is None:peer.kill();peer.wait()
             peer.stdin.close();peer.stdout.close()
+        manifest=stage/'manifest.json'
+        document=json.loads(manifest.read_text())
+        document['minimumUpdaterAbi']=2;manifest.write_text(json.dumps(document))
+        with mock.patch.dict(sys.modules):
+            self.assertTrue(callable(adoption.load_verified_modules(fixture.op,**args)['runner'].activate))
+        document['minimumUpdaterAbi']=3;manifest.write_text(json.dumps(document))
+        with self.assertRaises(adoption.HostAdoptionError):adoption.load_verified_modules(fixture.op,**args)
+        document['minimumUpdaterAbi']=1;manifest.write_text(json.dumps(document))
         (modules/'host-runner.py').write_bytes(b'changed')
         with self.assertRaises(adoption.HostAdoptionError):adoption.load_verified_modules(fixture.op,**args)
         with self.assertRaises(adoption.HostAdoptionError):

@@ -74,7 +74,7 @@ LEGACY_V015_FILES = {
     'deployment/systemd/servus-supervisor.service': 0o644,
     'scripts/install.sh': 0o755,
 }
-UPDATER_ABI = 1
+UPDATER_ABI = 2
 MANIFEST_LIMIT = 256 * 1024
 LEGACY_V015_DIGEST = 'sha256:32f7cccf97841716ffae6bbff4f4234d5c3575e3b3ad9daa61dcf5afba72a13c'
 

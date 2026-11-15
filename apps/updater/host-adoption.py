@@ -123,7 +123,7 @@ def load_verified_modules(operation_id, *, state_dir, active_env, source_file):
         except (ValueError,UnicodeError,RecursionError) as error:raise HostAdoptionError('Invalid release manifest') from error
         if (not isinstance(document,dict) or set(document)!={'schema','minimumUpdaterAbi','files'} or
             type(document['schema']) is not int or document['schema']!=1 or
-            type(document['minimumUpdaterAbi']) is not int or document['minimumUpdaterAbi']!=1 or
+            type(document['minimumUpdaterAbi']) is not int or not 1<=document['minimumUpdaterAbi']<=2 or
             not isinstance(document['files'],list) or not 1<=len(document['files'])<=256):
             raise HostAdoptionError('Unsupported release manifest')
         records={}
