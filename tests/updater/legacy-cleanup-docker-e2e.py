@@ -23,6 +23,7 @@ if (os.geteuid()!=0 or os.environ.get('SERVUS_RECOVERY_FIXTURE')!='1' or
     raise SystemExit('A disposable root Docker fixture and built worker are required')
 
 operation=str(uuid.uuid4());restore='a'*32;service=str(uuid.uuid4());name='servus-recovery-'+operation
+containers={role:'servus-legacy-fixture-'+operation+'-'+role for role in supervisor.ROLES}
 try:
     with tempfile.TemporaryDirectory(prefix='servus-host-worker-',dir='/tmp') as root:
         root=Path(root);data=root/'data';state=root/'state';data.mkdir(mode=0o700);state.mkdir(mode=0o700)
@@ -44,14 +45,19 @@ try:
         source=data/'source-database';source.write_text('source fixture');source.chmod(0o600);os.chown(source,1000,1000)
         directory=os.open(state,os.O_RDONLY|os.O_DIRECTORY)
         try:
-            lease=object.__new__(supervisor.DrainLease);lease._legacy_upload_id=restore;lease._policy_binding=('/root/policy','sha256:'+'1'*64,'sha256:'+'2'*64);lease._owner=SimpleNamespace(journal=directory)
+            lease=object.__new__(supervisor.DrainLease);lease._legacy_upload_id=restore;lease._policy_binding=('/root/policy','sha256:'+'1'*64,'sha256:'+'2'*64);lease._owner=SimpleNamespace(journal=directory,_record=mock.Mock())
+            lease._operation_id=operation;lease._request_ids={role:str(uuid.uuid4()) for role in supervisor.ROLES};lease._timeout_ms=5000;lease._state='stopped_unverified';lease._settled=False
             hub=mock.create_autospec(supervisor.DrainHub,instance=True);hub.used=True;hub.expected_uid=1000
-            hub.identities={role:{'id':char*64} for role,char in zip(supervisor.ROLES,'abc')}
-            hub.policy=mock.create_autospec(supervisor.RuntimePolicy,instance=True);hub.policy.data_dir=str(data);hub.policy.image_id=image;lease._hub=hub
+            hub.identities={}
+            for role in supervisor.ROLES:
+                cid=supervisor._docker('create','--name',containers[role],'--label','servus.test='+operation,'--user','1000:1000','--network','none','--read-only','--entrypoint','node',image,'-e','setInterval(()=>{},1000)').decode().strip()
+                assert re.fullmatch(r'[a-f0-9]{64}',cid);hub.identities[role]={'id':cid}
+            hub.policy=mock.create_autospec(supervisor.RuntimePolicy,instance=True);hub.policy.data_dir=str(data);hub.policy.image_id=image;hub.policy.healthchecks={role:None for role in supervisor.ROLES};lease._hub=hub
             actual_docker=supervisor._docker
             def docker(*args,**kwargs):
-                if args[0]!='run':raise AssertionError('Unexpected Docker call')
-                index=args.index('--entrypoint');args=(*args[:index],'--mount','type=bind,src='+dist+',dst=/app/dist,readonly',*args[index:])
+                if args[0]=='run':
+                    index=args.index('--entrypoint');args=(*args[:index],'--mount','type=bind,src='+dist+',dst=/app/dist,readonly',*args[index:])
+                elif args[0] not in ('start','inspect'):raise AssertionError('Unexpected Docker call')
                 return actual_docker(*args,**kwargs)
             with mock.patch.object(lease,'assert_locked'),mock.patch.object(supervisor,'_verify_data_directory'),mock.patch.object(supervisor,'_docker',side_effect=docker):
                 result=coordinator.cleanup_stopped_legacy_upload(operation,restore,service,lease,supervisor,mock.Mock())
@@ -59,9 +65,22 @@ try:
             with sqlite3.connect(database) as db:assert db.execute('SELECT phase FROM restore_operations WHERE id=?',(restore,)).fetchone()==('cancelled',)
             assert not pending.exists() and source.read_text()=='source fixture'
             assert '"state":"cleaned"' in (state/'legacy-upload-recovery.json').read_text()
+            binding=(*lease._policy_binding,hub.policy)
+            daemon=SimpleNamespace(resolve_active_policy=mock.Mock(return_value=(binding[0],'/root/accepted',hub.policy)),approved_policy_binding=mock.Mock(return_value=binding))
+            owner=SimpleNamespace(directory=123,assert_held=mock.Mock())
+            with mock.patch.object(lease,'assert_locked'),mock.patch.object(lease,'release_for_start') as release, \
+                 mock.patch.object(coordinator.os,'readlink',return_value='/root/control'),mock.patch.object(supervisor,'_verify_data_directory'), \
+                 mock.patch.object(supervisor,'inspect_servus',return_value=hub.identities),mock.patch.object(supervisor,'_docker',side_effect=docker):
+                result=coordinator.start_cleaned_legacy_upload(operation,lease,owner,'/root/journal','/root/active',supervisor,daemon,mock.Mock())
+            release.assert_called_once();assert result==hub.identities
+            assert '"state":"starting"' in (state/'legacy-upload-recovery.json').read_text()
         finally:os.close(directory)
 finally:
     inspect=subprocess.run(['/usr/bin/docker','inspect','--format','{{ index .Config.Labels "servus.recovery" }}',name],capture_output=True,text=True,check=False)
     if inspect.returncode==0 and inspect.stdout.strip()==operation:
         subprocess.run(['/usr/bin/docker','rm','-f',name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
-print('PASS host dispatch to restricted worker; host quiescence checks were mocked')
+    for fixture in containers.values():
+        inspect=subprocess.run(['/usr/bin/docker','inspect','--format','{{ index .Config.Labels "servus.test" }}',fixture],capture_output=True,text=True,check=False)
+        if inspect.returncode==0 and inspect.stdout.strip()==operation:
+            subprocess.run(['/usr/bin/docker','rm','-f',fixture],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+print('PASS host dispatch and original-container start; host gates and identity checks were mocked')

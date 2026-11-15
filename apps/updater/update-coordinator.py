@@ -341,6 +341,83 @@ def cleanup_stopped_legacy_upload(operation_id, restore_id, service_id, lease, s
     return result
 
 
+def start_cleaned_legacy_upload(operation_id, lease, daemon_ownership, approval_journal, active_env,
+                                supervisor, daemon, quiescence, *, trusted_ingress=None, timeout=120):
+    """Start the original approved containers; finalization needs fresh channels."""
+    if (not isinstance(lease,supervisor.DrainLease) or not supervisor._uuid4(operation_id) or
+        not isinstance(getattr(lease,'_legacy_upload_id',None),str) or
+        not re.fullmatch(r'[a-f0-9]{32}',lease._legacy_upload_id) or type(timeout) is not int or not 1<=timeout<=180):
+        raise UpdateError('Invalid legacy upload recovery start')
+    lease.assert_locked(operation_id,'stopped_unverified')
+    hub=lease._hub
+    if (not isinstance(hub,supervisor.DrainHub) or hub.used is not True or hub.expected_uid!=1000 or
+        not isinstance(hub.policy,supervisor.RuntimePolicy) or set(hub.identities)!=set(supervisor.ROLES)):
+        raise UpdateError('Authenticated drain identity is unavailable')
+    try: identities={role:hub.identities[role]['id'] for role in supervisor.ROLES}
+    except (KeyError,TypeError):raise UpdateError('Authenticated drain identity is unavailable') from None
+    if len(set(identities.values()))!=3 or any(not isinstance(cid,str) or not re.fullmatch(r'[a-f0-9]{64}',cid) for cid in identities.values()):
+        raise UpdateError('Authenticated drain identity is unavailable')
+    control_dir=os.readlink('/proc/self/fd/'+str(daemon_ownership.directory))
+    daemon_ownership.assert_held(control_dir)
+    policy_path,accepted_env,policy=daemon.resolve_active_policy(approval_journal,active_env)
+    binding=daemon.approved_policy_binding(hub,policy_path,approval_journal,accepted_env)
+    if policy!=hub.policy or not isinstance(binding,tuple) or len(binding)!=4 or binding[:3]!=lease._policy_binding or binding[3]!=policy:
+        raise UpdateError('Active recovery policy changed')
+
+    class DockerInspection:
+        @staticmethod
+        def call(*args):return supervisor._docker(*args)
+        @staticmethod
+        def inspect(*ids):
+            try:return json.loads(supervisor._docker('inspect',*ids),object_pairs_hook=_pairs)
+            except (ValueError,UnicodeError,RecursionError):raise UpdateError('Docker inspection is unavailable') from None
+
+    supervisor._verify_data_directory(policy.data_dir)
+    quiescence.ensure_host_namespaces()
+    quiescence.ensure_no_other_data_mounts(DockerInspection(),set(identities.values()),policy.data_dir,trusted_ingress=trusted_ingress)
+    quiescence.ensure_no_mount_aliases(DockerInspection(),policy.data_dir)
+    quiescence.ensure_no_open_data(policy.data_dir)
+    quiescence.ensure_no_uid_writers(hub.expected_uid)
+    lease.assert_locked(operation_id,'stopped_unverified')
+    daemon_ownership.assert_held(control_dir)
+    if daemon.approved_policy_binding(hub,policy_path,approval_journal,accepted_env)!=binding:
+        raise UpdateError('Active recovery policy changed')
+    lease.record_legacy_start()
+    lease.release_for_start()
+    deadline=time.monotonic()+timeout
+    for role in ('agent','api','worker'):
+        remaining=deadline-time.monotonic()
+        if remaining<=0:raise UpdateError('Recovery start timed out')
+        supervisor._docker('start',identities[role],timeout=min(remaining,30))
+    while True:
+        remaining=deadline-time.monotonic()
+        if remaining<=0:raise UpdateError('Recovery health check timed out')
+        ids=[identities[role] for role in supervisor.ROLES]
+        try:records=json.loads(supervisor._docker('inspect',*ids,timeout=min(remaining,15)),object_pairs_hook=_pairs)
+        except (ValueError,UnicodeError,RecursionError):raise UpdateError('Recovery health is unavailable') from None
+        if not isinstance(records,list) or len(records)!=len(ids):raise UpdateError('Recovery health is unavailable')
+        by_id={item.get('Id'):item for item in records if isinstance(item,dict)}
+        if set(by_id)!=set(ids):raise UpdateError('Recovery identity changed')
+        ready=True
+        for role in supervisor.ROLES:
+            item=by_id[identities[role]];state=item.get('State')
+            if not isinstance(state,dict) or state.get('Running') is not True or item.get('Image')!=policy.image_id:
+                raise UpdateError('A recovery container failed to start')
+            if policy.healthchecks[role] is not None:
+                health=state.get('Health')
+                if not isinstance(health,dict) or health.get('Status') not in ('starting','healthy'):raise UpdateError('A recovery container is unhealthy')
+                if health['Status']!='healthy':ready=False
+        if ready:break
+        time.sleep(min(1,max(0,deadline-time.monotonic())))
+    running=supervisor.inspect_servus(policy)
+    if time.monotonic()>=deadline or any(running.get(role,{}).get('id')!=identities[role] for role in supervisor.ROLES):
+        raise UpdateError('Recovery container identity changed')
+    daemon_ownership.assert_held(control_dir)
+    if daemon.resolve_active_policy(approval_journal,active_env)!=(policy_path,accepted_env,policy):
+        raise UpdateError('Active recovery policy changed')
+    return running
+
+
 def create_generation(journal, operation_id, lease, daemon_ownership, approval_journal,
                       active_env, docker_config, supervisor, daemon, extractor,
                       runtime_policy, backup_module, node_fd):

@@ -109,5 +109,43 @@ class LegacyCleanupCoordinatorTest(unittest.TestCase):
         with self.assertRaises(OSError):self.lease.record_legacy_start()
         self.assertEqual(self.marker()['state'],'cleaned');self.assertEqual(self.lease._state,'stopped_unverified')
 
+    def start_fixture(self):
+        hub=self.lease._hub;hub.policy.healthchecks={'api':{},'worker':None,'agent':{}}
+        binding=(*self.lease._policy_binding,hub.policy)
+        daemon=SimpleNamespace(resolve_active_policy=mock.Mock(return_value=(binding[0],'/root/accepted',hub.policy)),approved_policy_binding=mock.Mock(return_value=binding))
+        ownership=SimpleNamespace(directory=123,assert_held=mock.Mock())
+        states=[{'Id':hub.identities[role]['id'],'Image':hub.policy.image_id,'State':{'Running':True,'Health':{'Status':'healthy'}}} for role in supervisor.ROLES]
+        self.docker_mock.side_effect=[b'',b'',b'',json.dumps(states).encode()]
+        return hub,daemon,ownership
+
+    def test_start_uses_only_original_containers_after_rechecking_policy_and_writers(self):
+        hub,daemon,ownership=self.start_fixture()
+        with mock.patch.object(coordinator.os,'readlink',return_value='/root/control'), \
+             mock.patch.object(self.lease,'record_legacy_start') as record, mock.patch.object(self.lease,'release_for_start') as release, \
+             mock.patch.object(supervisor,'inspect_servus',return_value=hub.identities):
+            result=coordinator.start_cleaned_legacy_upload(self.op,self.lease,ownership,'/root/journal','/root/active',supervisor,daemon,self.checks)
+        self.assertEqual(result,hub.identities);record.assert_called_once();release.assert_called_once()
+        starts=[call.args for call in self.docker_mock.call_args_list if call.args[0]=='start']
+        self.assertEqual(starts,[('start',hub.identities[role]['id']) for role in ('agent','api','worker')])
+        self.checks.ensure_no_open_data.assert_called_once();self.checks.ensure_no_uid_writers.assert_called_once()
+
+    def test_changed_policy_never_opens_gate_or_starts_containers(self):
+        _hub,daemon,ownership=self.start_fixture();daemon.approved_policy_binding.return_value=('/wrong','sha256:'+'1'*64,'sha256:'+'2'*64,self.lease._hub.policy)
+        with mock.patch.object(coordinator.os,'readlink',return_value='/root/control'), \
+             mock.patch.object(self.lease,'record_legacy_start') as record, mock.patch.object(self.lease,'release_for_start') as release:
+            with self.assertRaises(coordinator.UpdateError):
+                coordinator.start_cleaned_legacy_upload(self.op,self.lease,ownership,'/root/journal','/root/active',supervisor,daemon,self.checks)
+        record.assert_not_called();release.assert_not_called();self.docker_mock.assert_not_called()
+
+    @unittest.skipUnless(os.geteuid()==0,'Requires root-owned marker')
+    def test_interrupted_start_retains_starting_marker_without_retry(self):
+        self.invoke();self.docker_mock.reset_mock()
+        _hub,daemon,ownership=self.start_fixture();self.docker_mock.side_effect=[b'',RuntimeError('start outcome unknown')]
+        with mock.patch.object(coordinator.os,'readlink',return_value='/root/control'), mock.patch.object(self.lease,'release_for_start') as release:
+            with self.assertRaises(RuntimeError):
+                coordinator.start_cleaned_legacy_upload(self.op,self.lease,ownership,'/root/journal','/root/active',supervisor,daemon,self.checks)
+        release.assert_called_once();self.assertEqual(self.marker()['state'],'starting')
+        self.assertEqual([call.args[0] for call in self.docker_mock.call_args_list],['start','start'])
+
 
 if __name__=='__main__': unittest.main()
