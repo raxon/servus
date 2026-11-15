@@ -44,10 +44,12 @@ it('retains the in-progress fence after a process is killed', async () => {
   const moduleUrl = new URL('../../src/agent/restore-journal.ts', import.meta.url).href;
   const program = `const {default:Database}=await import(process.argv[1]);const {RestoreJournal}=await import(process.argv[2]);const db=new Database(process.argv[3]);const journal=new RestoreJournal(db,()=>false);const request=JSON.parse(process.argv[4]);journal.reserve(request);journal.advance(request.id,'reserved','importing');process.stdout.write('ready\\n');setInterval(()=>{},1000);`;
   const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', program, sqlitePath, moduleUrl, path, JSON.stringify(request)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    const [chunk] = await once(child.stdout, 'data'); expect(chunk.toString()).toBe('ready\n');
+    const started = await Promise.race([once(child.stdout, 'data'), once(child, 'exit').then(() => { throw new Error('Restore fixture exited before writing its journal.'); }), new Promise<never>((_, reject) => { timeout=setTimeout(() => reject(new Error('Restore fixture did not start.')), 5000); })]);
+    expect(started[0].toString()).toBe('ready\n');
     const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited;
-  } finally { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); }
+  } finally { if(timeout)clearTimeout(timeout);if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); }
   const reopened = new Database(path); cleanup.push(() => reopened.close());
   const journal = new RestoreJournal(reopened, () => false);
   expect(journal.get(request.id)?.phase).toBe('importing'); expect(journal.hasUnresolved(request.serviceId)).toBe(true);
