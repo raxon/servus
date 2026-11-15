@@ -196,6 +196,45 @@ class DaemonTest(unittest.TestCase):
                     client.close()
                     for first, second in pairs: first.close(); second.close()
 
+    def test_host_status_checks_exchange_and_identity_without_install_lock(self):
+        for scenario in ('valid', 'unrestored', 'changed_identity', 'changed_approval'):
+            with self.subTest(scenario=scenario):
+                command, client = socket.socketpair()
+                pairs = [socket.socketpair() for _ in supervisor.ROLES]
+                marker = object();identities = object();operation = str(uuid.uuid4())
+                hub = SimpleNamespace(used=False, policy=marker, identities=identities,
+                                      connections=dict(zip(supervisor.ROLES, [pair[0] for pair in pairs])))
+                listener = SimpleNamespace(accept=lambda: (command, None))
+                client.sendall(json.dumps({'version':1,'type':'host_status','operationId':operation}).encode()+b'\n')
+                try:
+                    with mock.patch.object(supervisor,'MaintenanceSupervisor',side_effect=AssertionError('must not lock')), \
+                         mock.patch.object(daemon,'host_exchange_restored',return_value=scenario!='unrestored'), \
+                         mock.patch.object(daemon,'load_approved_policy',return_value=object() if scenario=='changed_approval' else marker) as approved, \
+                         mock.patch.object(supervisor,'inspect_servus',return_value=object() if scenario=='changed_identity' else identities):
+                        daemon.handle_command(listener,hub,'/install','/gate','/journal','/policy','/approval','/env')
+                    result=json.loads(client.recv(4096))
+                    self.assertEqual(result['status'],'ready' if scenario=='valid' else 'waiting')
+                    if scenario=='valid':self.assertEqual(approved.call_args.kwargs['expected_operation_id'],operation)
+                finally:
+                    client.close()
+                    for first,second in pairs:first.close();second.close()
+
+    def test_host_exchange_restored_requires_matching_journal_phases(self):
+        with tempfile.TemporaryDirectory(dir='/root') as temporary:
+            path=Path(temporary)/'journal.sqlite';operation=str(uuid.uuid4())
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE host_switches(operation_id TEXT,image_digest TEXT,phase TEXT)')
+                db.execute('CREATE TABLE host_preparations(operation_id TEXT,image_digest TEXT,status TEXT)')
+                db.execute('CREATE TABLE host_unit_masks(operation_id TEXT,image_digest TEXT,phase TEXT)')
+                db.execute("INSERT INTO host_switches VALUES(?,?,'exchanged')",(operation,'digest'))
+                db.execute("INSERT INTO host_preparations VALUES(?,?,'prepared')",(operation,'digest'))
+                db.execute("INSERT INTO host_unit_masks VALUES(?,?,'restored')",(operation,'digest'))
+            path.chmod(0o600)
+            self.assertTrue(daemon.host_exchange_restored(str(path),operation))
+            with sqlite3.connect(path) as db:db.execute("UPDATE host_unit_masks SET phase='masking'")
+            self.assertFalse(daemon.host_exchange_restored(str(path),operation))
+            self.assertFalse(daemon.host_exchange_restored(str(path),'invalid'))
+
     def test_stop_rechecks_approval_while_installation_lock_is_held(self):
         original = object()
         for scenario in ('valid', 'changed_policy', 'changed_env', 'recovery_required'):

@@ -498,6 +498,20 @@ def command_listener(directory):
         raise
 
 
+
+def host_exchange_restored(approval_journal, operation_id):
+    """Read the protected exchange journal for a root-only readiness probe."""
+    if not supervisor._uuid4(operation_id):
+        return False
+    _private_file(approval_journal, 64 * 1024 * 1024)
+    uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=ro'
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
+            row = db.execute("SELECT 1 FROM host_switches s JOIN host_preparations p ON p.operation_id=s.operation_id AND p.image_digest=s.image_digest JOIN host_unit_masks m ON m.operation_id=s.operation_id AND m.image_digest=s.image_digest WHERE s.operation_id=? AND s.phase='exchanged' AND p.status='prepared' AND m.phase='restored'", (operation_id,)).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+
 def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env, *, apply=None):
     connection, _ = listener.accept()
     try:
@@ -507,6 +521,22 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
         deadline = time.monotonic() + 5
         request = supervisor._read_message(connection, deadline)
         kind = request.get('type')
+        if (kind == 'host_status' and set(request) == {'version', 'type', 'operationId'} and
+            type(request.get('version')) is int and request['version'] == 1 and supervisor._uuid4(request.get('operationId'))):
+            ready = (hub is not None and not hub.used and set(hub.connections) == set(supervisor.ROLES)
+                     and not select.select(list(hub.connections.values()), [], [], 0)[0])
+            if ready:
+                try:
+                    ready = (host_exchange_restored(approval_journal, request['operationId']) and
+                             load_approved_policy(policy_path, approval_journal, accepted_env,
+                                                  expected_operation_id=request['operationId']) == hub.policy and
+                             supervisor.inspect_servus(hub.policy) == hub.identities and
+                             not select.select(list(hub.connections.values()), [], [], 0)[0] and
+                             host_exchange_restored(approval_journal, request['operationId']))
+                except (supervisor.SupervisorError, OSError, ValueError):
+                    ready = False
+            supervisor._send_message(connection, {'version': 1, 'status': 'ready' if ready else 'waiting'}, time.monotonic() + 1)
+            return
         if kind == 'status' and set(request) == {'version', 'type'} and type(request.get('version')) is int and request['version'] == 1:
             ready = (hub is not None and not hub.used and set(hub.connections) == set(supervisor.ROLES)
                      and not select.select(list(hub.connections.values()), [], [], 0)[0])
