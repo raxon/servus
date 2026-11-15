@@ -1,4 +1,5 @@
 import { domainToASCII } from 'node:url';
+import { isIP } from 'node:net';
 
 export interface Dns01Challenge {
   operationId: string;
@@ -33,9 +34,9 @@ export function validDns01Value(value: unknown): value is string {
 }
 
 export function canonicalDnsName(input: string): string {
-  if (typeof input !== 'string' || !input || input.endsWith('.') || input.includes('*')) throw new Dns01ProviderError('invalid_input');
+  if (typeof input !== 'string' || !input || input.endsWith('.') || input.includes('*') || /[\s\x00-\x1f\x7f/\\?#@:%\[\]]/.test(input)) throw new Dns01ProviderError('invalid_input');
   const ascii = domainToASCII(input).toLowerCase();
-  if (!ascii || ascii.length > 253 || !ascii.includes('.') || ascii.split('.').some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
+  if (!ascii || isIP(ascii) || ascii.length > 253 || !ascii.includes('.') || ascii.split('.').some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
     throw new Dns01ProviderError('invalid_input');
   }
   return ascii;

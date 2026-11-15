@@ -32,7 +32,7 @@ describe('Cloudflare DNS-01 adapter', () => {
     const fetcher=vi.fn<typeof fetch>().mockResolvedValue(response({...providerRecord,name:'_acme-challenge.xn--domen-7wa.example.com'}));
     const provider=new CloudflareDns01Provider(zoneId,'example.com',token,fetcher);
     await expect(provider.present({...challenge,identifier:'domeną.example.com'})).resolves.toMatchObject({status:'awaiting_dns',record:{name:'_acme-challenge.xn--domen-7wa.example.com'}});
-    for (const identifier of ['example.com.attacker.test','*.attacker.test','foo..example.com','example.com.','*.*.example.com','https://example.com']) {
+    for (const identifier of ['example.com.attacker.test','*.attacker.test','foo..example.com','example.com.','*.*.example.com','https://example.com','example.com/path','example.com#fragment','example.com?query','example.com\\evil','127.0.0.1']) {
       await expect(provider.present({...challenge,identifier})).rejects.toMatchObject({code:'invalid_input'});
     }
     const longHost=[...Array(3).fill('a'.repeat(63)),'b'.repeat(38),'example','com'].join('.');
