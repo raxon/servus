@@ -6,12 +6,47 @@ The root caller must verify the completed release and live generation, fence
 all host code consumers, and provide the current trusted release bytes.
 """
 import os
+import socket
+import stat
+import struct
 import sys
+import time
 
 
 class HostSwitchError(Exception):
     pass
 
+
+
+def assert_supervisor_ready(socket_path, operation_id, *, supervisor, bundle):
+    """Query the root supervisor on an authenticated, protected Unix socket."""
+    if (sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or
+        not isinstance(socket_path, str) or not os.path.isabs(socket_path) or
+        os.path.normpath(socket_path) != socket_path or not isinstance(operation_id, str) or
+        not bundle.OPERATION.fullmatch(operation_id)):
+        raise HostSwitchError('Invalid supervisor readiness context')
+    parent, name = os.path.split(socket_path)
+    directory = supervisor._trusted_directory(parent, 0o750)
+    try:
+        before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0 or before.st_gid != 0 or
+            stat.S_IMODE(before.st_mode) != 0o600):
+            raise HostSwitchError('Supervisor readiness socket is not trusted')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(5)
+            peer.connect(socket_path)
+            _, uid, _ = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+            after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if uid != 0 or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise HostSwitchError('Supervisor readiness peer is not trusted')
+            deadline = time.monotonic() + 5
+            supervisor._send_message(peer, {'version': 1, 'type': 'host_status', 'operationId': operation_id}, deadline)
+            if supervisor._read_message(peer, deadline) != {'version': 1, 'status': 'ready'}:
+                raise HostSwitchError('Supervisor is not ready')
+    except (OSError, ValueError, supervisor.SupervisorError) as error:
+        raise HostSwitchError('Supervisor readiness is unavailable') from error
+    finally:
+        os.close(directory)
 
 def _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, fence, *, lock_name='service.lock'):
     if (sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or
@@ -139,13 +174,14 @@ def reconcile_original(db, operation_id, *, state_fd, install_fd, service_lock, 
 
 
 def complete_exchange(db, operation_id, *, state_fd, install_fd, host_lock, install_lock,
-                      active_parent, candidate_parent, supervisor, coordinator, bundle, exchange, unit_mask, units_fd, ready):
+                      active_parent, candidate_parent, supervisor, coordinator, bundle, exchange, unit_mask, units_fd, supervisor_socket):
     """Record a healthy exchange only after the caller verifies restored services.
 
     The caller holds a separate host operation lock across the exchange and
-    restart. The readiness check verifies authenticated control-plane health
-    without acquiring the already-held installation lock; it must return None.
+    restart. The authenticated supervisor verifies control-plane readiness without
+    acquiring the already-held installation lock.
     """
+    ready = lambda: assert_supervisor_ready(supervisor_socket, operation_id, supervisor=supervisor, bundle=bundle)
     _guard(db, state_fd, install_fd, host_lock, install_lock, supervisor, coordinator, ready, lock_name='host.lock')
     if inspect_exchange(db, operation_id, active_parent, candidate_parent, exchange, bundle) != 'exchanged':
         raise HostSwitchError('The new host runtime is not present')
