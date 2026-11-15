@@ -166,11 +166,25 @@ class Journal:
         self.db.execute("UPDATE apply_requests SET state='completed' WHERE state IN ('dispatching','awaiting_completion') AND EXISTS (SELECT 1 FROM update_transactions t WHERE t.operation_id=apply_requests.operation_id AND t.phase='completed')")
         self.db.execute("UPDATE apply_requests SET state='recovery_required' WHERE state IN ('dispatching','awaiting_completion')")
 
+    def host_update_pending(self):
+        """Block new update work while a host runtime exchange needs recovery."""
+        checks = (
+            ('host_preparations', "status != 'completed'"),
+            ('host_switches', "phase NOT IN ('completed','rolled_back')"),
+            ('host_unit_masks', "phase != 'restored'"),
+        )
+        for table, condition in checks:
+            exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            if exists and self.db.execute('SELECT 1 FROM ' + table + ' WHERE ' + condition + ' LIMIT 1').fetchone():
+                return True
+        return False
+
     def request_apply(self, operation_id):
         """Queue one previously verified, fully prepared update exactly once."""
         if not valid_uuid(operation_id): raise ProtocolError('invalid_request')
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            if self.host_update_pending(): raise ProtocolError('recovery_required')
             existing = self.db.execute('SELECT state FROM apply_requests WHERE operation_id=?', (operation_id,)).fetchone()
             if existing:
                 self.db.execute('COMMIT')
@@ -195,6 +209,9 @@ class Journal:
     def claim_apply_request(self):
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            if self.host_update_pending():
+                self.db.execute('COMMIT')
+                return None
             row = self.db.execute("SELECT operation_id FROM apply_requests WHERE state='requested'").fetchone()
             if row:
                 cursor = self.db.execute("UPDATE apply_requests SET state='dispatching' WHERE operation_id=? AND state='requested'", row)
@@ -210,6 +227,7 @@ class Journal:
         if not valid_uuid(operation_id): raise ProtocolError('invalid_request')
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            if self.host_update_pending(): raise ProtocolError('recovery_required')
             row = self.db.execute("SELECT p.preparation_id,p.attempt_id,p.attempt_nonce,o.digest FROM preparations p JOIN operations o ON o.id=p.operation_id WHERE p.operation_id=? AND p.status='prepared' AND o.status='verified' AND o.attempt_id=p.attempt_id AND o.attempt_nonce=p.attempt_nonce", (operation_id,)).fetchone()
             if not row or not valid_uuid(row[0]) or not valid_uuid(row[1]) or not re.fullmatch(r'[a-f0-9]{64}', row[2] or '') or not DIGEST_PATTERN.fullmatch(row[3] or ''):
                 raise ProtocolError('not_found')
@@ -228,6 +246,7 @@ class Journal:
         if not valid_uuid(operation_id): raise ProtocolError('invalid_request')
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            if self.host_update_pending(): raise ProtocolError('recovery_required')
             row = self.db.execute("SELECT commit_sha,digest,tag,attempt_id,attempt_nonce,config_digest FROM operations WHERE id=? AND status='verified'", (operation_id,)).fetchone()
             if not row or not valid_uuid(row[3]) or not isinstance(row[4], str) or not re.fullmatch(r'[a-f0-9]{64}', row[4]) or not isinstance(row[5], str) or not DIGEST_PATTERN.fullmatch(row[5]):
                 raise ProtocolError('not_found')
@@ -322,6 +341,7 @@ class Journal:
     def submit(self, operation_id, commit, digest, tag):
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            if self.host_update_pending(): raise ProtocolError('recovery_required')
             row = self.db.execute('SELECT id,commit_sha,digest,tag,status,created_at FROM operations WHERE id=?', (operation_id,)).fetchone()
             if row:
                 if row[1] != commit or row[2] != digest or row[3] != tag:
@@ -339,6 +359,7 @@ class Journal:
     def retry(self, operation_id):
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            if self.host_update_pending(): raise ProtocolError('recovery_required')
             row = self.db.execute('SELECT status FROM operations WHERE id=?', (operation_id,)).fetchone()
             if not row: raise ProtocolError('not_found')
             if row[0] == 'recovery_required':
@@ -356,6 +377,9 @@ class Journal:
     def claim(self):
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            if self.host_update_pending():
+                self.db.execute('COMMIT')
+                return None
             row = self.db.execute("SELECT id,commit_sha,digest,tag,status,created_at FROM operations WHERE status='accepted'").fetchone()
             if row:
                 attempt_id, attempt_nonce = str(uuid.uuid4()), secrets.token_hex(32)

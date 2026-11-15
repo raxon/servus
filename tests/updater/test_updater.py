@@ -73,6 +73,27 @@ class JournalContractTest(unittest.TestCase):
         finally:
             journal.close()
 
+    def test_unfinished_host_exchange_blocks_new_update_work(self):
+        journal = self.module.Journal(self.state)
+        try:
+            journal.db.execute("CREATE TABLE host_preparations(operation_id TEXT, status TEXT)")
+            journal.db.execute("CREATE TABLE host_switches(operation_id TEXT, phase TEXT)")
+            journal.db.execute("CREATE TABLE host_unit_masks(operation_id TEXT, phase TEXT)")
+            journal.db.execute("INSERT INTO host_preparations VALUES(?, 'prepared')", (UUID,))
+            with self.assertRaises(self.module.ProtocolError) as error:
+                self.module.process(journal, REQUEST)
+            self.assertEqual(error.exception.code, 'recovery_required')
+            self.assertIsNone(journal.claim());self.assertIsNone(journal.claim_apply_request())
+            journal.db.execute("UPDATE host_preparations SET status='completed'")
+            journal.db.execute("INSERT INTO host_switches VALUES(?, 'exchanged')", (UUID,))
+            with self.assertRaises(self.module.ProtocolError):self.module.process(journal, REQUEST)
+            journal.db.execute("UPDATE host_switches SET phase='completed'")
+            journal.db.execute("INSERT INTO host_unit_masks VALUES(?, 'restoring')", (UUID,))
+            with self.assertRaises(self.module.ProtocolError):self.module.process(journal, REQUEST)
+            journal.db.execute("UPDATE host_unit_masks SET phase='restored'")
+            self.assertEqual(self.module.process(journal, REQUEST)['status'], 'accepted')
+        finally: journal.close()
+
     def test_legacy_journal_is_preserved_and_rejected(self):
         path = self.state / 'journal.sqlite'
         with sqlite3.connect(path) as db:
