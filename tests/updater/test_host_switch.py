@@ -176,6 +176,32 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
             with self.assertRaises(switch.HostSwitchError):switch.assert_supervisor_ready(str(path),self.op,supervisor=supervisor,bundle=bundle)
         finally:server.close()
 
+    def test_restart_requires_released_locks_and_restores_only_active_services(self):
+        self.apply()
+        self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
+        self.db.execute('INSERT INTO host_unit_masks VALUES(?,?,?)',(self.op,self.digest,'restored'))
+        names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
+        states={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
+        unit_mask=SimpleNamespace(UNITS=names,load_verified_backup=mock.Mock(return_value=({name:b'unit' for name in names},states)),_read=mock.Mock(),_directory=mock.Mock())
+        args=dict(state_fd=self.s,install_fd=self.i,host_lock=self.hl,active_parent=self.a,candidate_parent=self.c,
+                  units_fd=self.a,supervisor=supervisor,coordinator=coordinator,bundle=bundle,exchange=exchange,unit_mask=unit_mask)
+        run=mock.Mock()
+        with self.assertRaises(switch.HostSwitchError):switch.start_restored(self.db,self.op,run=run,**args)
+        self.assertFalse(run.called)
+        for fd in (self.sl,self.il):fcntl.flock(fd,fcntl.LOCK_UN)
+        try:
+            switch.start_restored(self.db,self.op,run=run,**args)
+            self.assertEqual([call.args[0] for call in run.call_args_list],[
+                ['/usr/bin/systemctl','daemon-reload'],
+                ['/usr/bin/systemctl','start','servus-updater-socket.service'],
+                ['/usr/bin/systemctl','start','servus-supervisor.service'],
+                ['/usr/bin/systemctl','start','servus-updater.service']])
+            run.reset_mock();run.side_effect=subprocess.CalledProcessError(1,'systemctl')
+            with self.assertRaises(switch.HostSwitchError):switch.start_restored(self.db,self.op,run=run,**args)
+            self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('exchanged',))
+        finally:
+            for fd in (self.sl,self.il):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
     def test_completion_queries_real_supervisor_protocol_with_install_lock_held(self):
         self.apply()
         self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')

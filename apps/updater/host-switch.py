@@ -1,14 +1,16 @@
 #!/usr/bin/python3 -I
 """Journal an atomic host runtime exchange for an independently fenced caller.
 
-This module does not stop services, authorize a release, or restart anything.
+This module does not stop services or authorize a release.
 The root caller must verify the completed release and live generation, fence
 all host code consumers, and provide the current trusted release bytes.
 """
+import fcntl
 import os
 import socket
 import stat
 import struct
+import subprocess
 import sys
 import time
 
@@ -172,6 +174,58 @@ def reconcile_original(db, operation_id, *, state_fd, install_fd, service_lock, 
         if db.in_transaction: db.execute('ROLLBACK')
         raise
 
+
+
+def start_restored(db, operation_id, *, state_fd, install_fd, host_lock, active_parent,
+                   candidate_parent, units_fd, supervisor, coordinator, bundle, exchange, unit_mask,
+                   run=subprocess.run):
+    """Start the previously active units while retaining the host operation lock.
+
+    The caller must release the installation lock before startup and relinquish
+    the updater service lock if the service is not already running. Reacquire
+    the installation lock before completing the exchange. Repeating
+    this operation after interruption is safe because systemd start is idempotent.
+    """
+    if (sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or
+        db.in_transaction or db.isolation_level is not None or db.execute('PRAGMA synchronous').fetchone()[0] < 2):
+        raise HostSwitchError('An isolated root coordinator is required')
+    coordinator._same_lock(supervisor, state_fd, 'host.lock', host_lock)
+    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600)
+    try:
+        named = os.stat(db.execute('PRAGMA database_list').fetchone()[2], follow_symlinks=False)
+        opened = os.fstat(fd)
+        if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+            raise HostSwitchError('The journal identity differs')
+    finally: os.close(fd)
+    for parent, name in ((install_fd, 'install.lock'),):
+        fd = supervisor._open_root_file(parent, name, 0o600)
+        try:
+            try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error: raise HostSwitchError('A service startup lock is still held') from error
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally: os.close(fd)
+    if inspect_exchange(db, operation_id, active_parent, candidate_parent, exchange, bundle) != 'exchanged':
+        raise HostSwitchError('The new host runtime is not present')
+    row = db.execute('SELECT image_digest,phase FROM host_switches WHERE operation_id=?', (operation_id,)).fetchone()
+    if (not row or row[1] != 'exchanged' or
+        db.execute("SELECT 1 FROM host_preparations p JOIN host_unit_masks m ON m.operation_id=p.operation_id AND m.image_digest=p.image_digest WHERE p.operation_id=? AND p.image_digest=? AND p.status='prepared' AND m.phase='restored'", (operation_id, row[0])).fetchone() is None):
+        raise HostSwitchError('Host restoration is not ready for startup')
+    unit_mask._directory(units_fd, 0o755)
+    originals, states = unit_mask.load_verified_backup(db, operation_id, row[0], state_fd)
+    for unit in unit_mask.UNITS: unit_mask._read(units_fd, unit, 0o644, originals[unit])
+    if any(states[unit] != 'active' for unit in ('servus-updater-socket.service', 'servus-supervisor.service', 'servus-updater.service')):
+        raise HostSwitchError('The host services were not all active before the exchange')
+    try:
+        for command in (['/usr/bin/systemctl', 'daemon-reload'],
+                        ['/usr/bin/systemctl', 'start', 'servus-updater-socket.service'],
+                        ['/usr/bin/systemctl', 'start', 'servus-supervisor.service'],
+                        ['/usr/bin/systemctl', 'start', 'servus-updater.service']):
+            coordinator._same_lock(supervisor, state_fd, 'host.lock', host_lock)
+            run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd='/', env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C'},
+                timeout=60, check=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise HostSwitchError('Host service startup requires recovery') from error
 
 def complete_exchange(db, operation_id, *, state_fd, install_fd, host_lock, install_lock,
                       active_parent, candidate_parent, supervisor, coordinator, bundle, exchange, unit_mask, units_fd, supervisor_socket):
