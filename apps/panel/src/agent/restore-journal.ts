@@ -4,6 +4,7 @@ export type RestorePhase = 'uploading' | 'reserved' | 'discarding' | 'discarding
 export type RestoreRecord = { id: string; service_id: string; kind: 'postgres' | 'mariadb' | 'redis'; archive_sha256: string; phase: RestorePhase; updated_at: string };
 export type RestoreSwitchStage = 'pending'|'candidate_stop'|'candidate_detached'|'applying'|'applied'|'rolling_back'|'rolled_back';
 export type RestoreSwitchIntent = { id:string; service_id:string; service_version:number; sealed_plan:string; created_at:string; stage:RestoreSwitchStage };
+export type RetainedRestoreVolume = {operation_id:string;service_id:string;volume_name:string;reason:'rollback_candidate';created_at:string};
 const idPattern = /^[a-f0-9]{32}$/;
 const servicePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
@@ -48,6 +49,7 @@ export class RestoreJournal {
         db.exec('ALTER TABLE restore_switch_intents RENAME TO restore_switch_intents_old');db.exec(switchSchema);
         db.exec('INSERT INTO restore_switch_intents SELECT id,service_id,service_version,sealed_plan,created_at,stage FROM restore_switch_intents_old; DROP TABLE restore_switch_intents_old');
       }
+      db.exec("CREATE TABLE IF NOT EXISTS restore_retained_volumes (operation_id TEXT PRIMARY KEY, service_id TEXT NOT NULL, volume_name TEXT NOT NULL UNIQUE, reason TEXT NOT NULL CHECK(reason='rollback_candidate'), created_at TEXT NOT NULL)");
     }).immediate();
   }
   get(id: string): RestoreRecord | undefined { return this.db.prepare('SELECT * FROM restore_operations WHERE id=?').get(id) as RestoreRecord | undefined; }
@@ -104,6 +106,20 @@ export class RestoreJournal {
       if(this.get(id)?.phase!=='switching'||this.switchIntent(id)?.stage!==expected)throw new Error('Restore switch stage does not match.');
       this.db.prepare('UPDATE restore_switch_intents SET stage=? WHERE id=? AND stage=?').run(next,id,expected);
       return this.switchIntent(id)!;
+    }).immediate();
+  }
+  retainedVolume(id:string):RetainedRestoreVolume|undefined { return this.db.prepare('SELECT * FROM restore_retained_volumes WHERE operation_id=?').get(id) as RetainedRestoreVolume|undefined; }
+  finalizeRollback(id:string,serviceId:string):RestoreRecord {
+    if(!idPattern.test(id)||!servicePattern.test(serviceId))throw new Error('Invalid restore rollback identity.');
+    return this.db.transaction(()=>{
+      const record=this.get(id),existing=this.retainedVolume(id);
+      if(record?.phase==='cancelled'&&record.service_id===serviceId&&existing?.service_id===serviceId&&existing.volume_name===`panel-restore-${id}`)return record;
+      if(!record||record.service_id!==serviceId||record.phase!=='switching'||this.switchIntent(id)?.stage!=='rolled_back'||existing)throw new Error('Restore rollback is not ready for finalization.');
+      const timestamp=new Date().toISOString();
+      this.db.prepare("INSERT INTO restore_retained_volumes(operation_id,service_id,volume_name,reason,created_at) VALUES(?,?,?,'rollback_candidate',?)").run(id,serviceId,`panel-restore-${id}`,timestamp);
+      this.db.prepare('DELETE FROM restore_switch_intents WHERE id=?').run(id);
+      this.db.prepare("UPDATE restore_operations SET phase='cancelled',updated_at=? WHERE id=? AND phase='switching'").run(timestamp,id);
+      return this.get(id)!;
     }).immediate();
   }
   advance(id: string, expected: RestorePhase, next: RestorePhase): RestoreRecord {

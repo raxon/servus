@@ -113,6 +113,18 @@ class RestoreJournalSchemaTest(unittest.TestCase):
             db.execute('INSERT INTO restore_switch_intents(id,service_id,service_version,sealed_plan,created_at) VALUES(?,?,?,?,?)',('a'*32,UUID,'1','encrypted','2026-11-15T00:00:00.000Z'))
             with self.assertRaisesRegex(backup.CaptureError,'Unresolved database restore'): backup._agent_schema(db)
 
+    def test_retained_volume_must_reference_a_cancelled_restore(self):
+        with sqlite3.connect(':memory:') as db:
+            schema={**backup.AGENT_SWITCH_SCHEMA,'restore_retained_volumes':backup.AGENT_RETAINED_COLUMNS}
+            for table, columns in schema.items():
+                db.execute('CREATE TABLE ' + table + ' (' + ','.join(column + ' TEXT' for column in columns) + ')')
+            now='2026-11-15T00:00:00.000Z'; ident='a'*32
+            db.execute('INSERT INTO restore_operations(id,service_id,kind,archive_sha256,phase,updated_at) VALUES(?,?,?,?,?,?)',(ident,UUID,'postgres','b'*64,'cancelled',now))
+            db.execute('INSERT INTO restore_retained_volumes(operation_id,service_id,volume_name,reason,created_at) VALUES(?,?,?,?,?)',(ident,UUID,'panel-restore-'+ident,'rollback_candidate',now))
+            backup._agent_schema(db)
+            db.execute("UPDATE restore_retained_volumes SET volume_name='wrong'")
+            with self.assertRaisesRegex(backup.CaptureError,'Retained database restore volume is invalid'): backup._agent_schema(db)
+
 
 class OperationHistoryTest(unittest.TestCase):
     def setUp(self):

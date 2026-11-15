@@ -8,6 +8,7 @@ import { RestoreJournal } from '../../src/agent/restore-journal.js';
 import { SecretVault } from '../../src/shared/secrets.js';
 import { applyRestoreSwitch } from '../../src/agent/restore-switch-apply.js';
 import { rollbackRestoreSwitch } from '../../src/agent/restore-switch-rollback.js';
+import { finalizeRestoreRollback } from '../../src/agent/restore-rollback-finalize.js';
 
 const cleanup:(()=>void)[]=[];
 afterEach(()=>{for(const remove of cleanup.splice(0).reverse())remove();});
@@ -28,7 +29,7 @@ function fixture(){
   const service={inspect:vi.fn(async()=>({ID:'swarm-id',Version:{Index:version},Spec:serviceSpec})),update:vi.fn(async(input:typeof previousSpec & {version:number})=>{const {version:_version,...spec}=input;serviceSpec=spec;version++;})};
   const docker={getService:()=>service,getContainer:(id:string)=>id===inspection.candidateContainerId?candidate:{inspect:async()=>sourceInfo},info:async()=>({Swarm:{NodeID:'node'}}),getVolume:(name:string)=>({inspect:async()=>name===inspection.candidateVolume?{Name:name,Driver:'local',Labels:labels}:{Name:name,Driver:'local',Labels:{'panel.owner':'self-hosted-panel','panel.service':serviceId}}}),listContainers:async({filters}:{filters:{volume:string[]}})=>filters.volume[0]===inspection.sourceVolume?[{Id:inspection.sourceContainerId}]:[...(candidatePresent?[{Id:inspection.candidateContainerId}]:[]),...(extraAttachment?[{Id:'f'.repeat(64)}]:[])]};
   const verifyTarget=vi.fn(async()=>{});
-  return {journal,inspection,candidate,service,verifyTarget,setExtra:(value:boolean)=>{extraAttachment=value;},options:{docker:docker as never,journal,vault,serviceId,operationId,verifyTarget}};
+  return {dataDir,db,journal,inspection,candidate,service,verifyTarget,setExtra:(value:boolean)=>{extraAttachment=value;},options:{docker:docker as never,journal,vault,serviceId,operationId,verifyTarget}};
 }
 
 it('records each step, switches once, and keeps the operation fenced',async()=>{
@@ -87,4 +88,27 @@ it('retries rollback after the Docker response is lost',async()=>{
   await expect(rollbackRestoreSwitch({...f.options,verifySource})).rejects.toThrow('response lost');
   expect(f.journal.switchIntent(f.options.operationId)?.stage).toBe('rolling_back');
   await rollbackRestoreSwitch({...f.options,verifySource});expect(f.journal.switchIntent(f.options.operationId)?.stage).toBe('rolled_back');
+});
+
+it('retains the candidate volume and atomically releases a verified rollback',async()=>{
+  const f=fixture(),verifySource=vi.fn(async()=>{});await applyRestoreSwitch(f.options);await rollbackRestoreSwitch({...f.options,verifySource});
+  const result=await finalizeRestoreRollback({...f.options,dataDir:f.dataDir,verifySource});
+  expect(result.phase).toBe('cancelled');expect(f.journal.hasUnresolved(f.options.serviceId)).toBe(false);
+  expect(f.journal.retainedVolume(f.options.operationId)).toMatchObject({service_id:f.options.serviceId,volume_name:f.inspection.candidateVolume,reason:'rollback_candidate'});
+  expect(f.journal.switchIntent(f.options.operationId)).toBeUndefined();
+  expect((await finalizeRestoreRollback({...f.options,dataDir:f.dataDir,verifySource})).phase).toBe('cancelled');
+});
+
+it('leaves the service fenced if an unexpected container holds the retained volume',async()=>{
+  const f=fixture(),verifySource=vi.fn(async()=>{});await applyRestoreSwitch(f.options);await rollbackRestoreSwitch({...f.options,verifySource});f.setExtra(true);
+  await expect(finalizeRestoreRollback({...f.options,dataDir:f.dataDir,verifySource})).rejects.toThrow();
+  expect(f.journal.switchIntent(f.options.operationId)?.stage).toBe('rolled_back');expect(f.journal.retainedVolume(f.options.operationId)).toBeUndefined();
+  expect(f.journal.hasUnresolved(f.options.serviceId)).toBe(true);
+});
+
+it('does not release the fence when retention metadata cannot be written',async()=>{
+  const f=fixture(),verifySource=vi.fn(async()=>{});await applyRestoreSwitch(f.options);await rollbackRestoreSwitch({...f.options,verifySource});
+  f.db.exec("CREATE TRIGGER fail_retention BEFORE INSERT ON restore_retained_volumes BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END");
+  await expect(finalizeRestoreRollback({...f.options,dataDir:f.dataDir,verifySource})).rejects.toThrow('synthetic failure');
+  expect(f.journal.switchIntent(f.options.operationId)?.stage).toBe('rolled_back');expect(f.journal.hasUnresolved(f.options.serviceId)).toBe(true);
 });

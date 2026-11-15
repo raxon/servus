@@ -10,6 +10,7 @@ import { RestoreJournal } from '/app/dist/agent/restore-journal.js';
 import { prepareRestoreSwitchIntent, readRestoreSwitchIntent } from '/app/dist/agent/restore-switch-intent.js';
 import { applyRestoreSwitch } from '/app/dist/agent/restore-switch-apply.js';
 import { rollbackRestoreSwitch } from '/app/dist/agent/restore-switch-rollback.js';
+import { finalizeRestoreRollback } from '/app/dist/agent/restore-rollback-finalize.js';
 
 const dataDir = mkdtempSync('/tmp/restore-agent-e2e-'), store = new Store(dataDir);
 const serviceId = process.env.SERVUS_IMPORT_SERVICE_ID || '11111111-1111-4111-8111-111111111111', kind = process.env.SERVUS_IMPORT_KIND;
@@ -92,6 +93,10 @@ try {
     await rollbackRestoreSwitch({...switchOptions,verifySource});
     if(switchOptions.journal.switchIntent(operationId)?.stage!=='rolled_back')throw new Error('Rollback was not recorded');
     await rollbackRestoreSwitch({...switchOptions,verifySource});
+    const finished=await finalizeRestoreRollback({...switchOptions,dataDir,verifySource});
+    if(finished.phase!=='cancelled'||switchOptions.journal.hasUnresolved(serviceId)||switchOptions.journal.retainedVolume(operationId)?.volume_name!==switchPlan.inspection.candidateVolume)throw new Error('Rollback retention was not recorded');
+    await docker.getVolume(switchPlan.inspection.candidateVolume).inspect();
+    await finalizeRestoreRollback({...switchOptions,dataDir,verifySource});
   }
   switchDb?.close();await agent.close(); store.close(); rmSync(dataDir,{recursive:true,force:true});
 }
