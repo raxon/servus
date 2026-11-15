@@ -81,6 +81,32 @@ class HostRunnerTest(unittest.TestCase):
                 sys.modules.pop('servus_saved_'+key,None)
             db.close();os.close(parent)
 
+    def test_recovery_falls_back_only_before_host_exchange(self):
+        database=Path(self.paths['state'])/'journal.sqlite'
+        with sqlite3.connect(database) as db:
+            db.execute('CREATE TABLE host_stops(operation_id TEXT,image_digest TEXT,status TEXT)')
+            db.execute("INSERT INTO host_stops VALUES(?,?,'stopped')",(self.op,self.digest))
+        recovery=SimpleNamespace(recover=mock.Mock());modules={**self.modules,'bundle':bundle,'recovery':recovery}
+        runner.recover_pending(modules=modules,paths=self.paths,prepare_only=True)
+        recovery.recover.assert_called_once_with(self.op,self.digest,modules=modules,paths=self.paths,prepare_only=True)
+        with sqlite3.connect(database) as db:
+            db.execute('CREATE TABLE host_switches(operation_id TEXT,phase TEXT)')
+            db.execute("INSERT INTO host_switches VALUES(?,'intent')",(self.op,))
+        with self.assertRaises(runner.HostRunnerError):runner.recover_pending(modules=modules,paths=self.paths,prepare_only=True)
+        self.assertEqual(recovery.recover.call_count,1)
+
+    def test_recovery_rejects_ambiguous_journal_and_noops_when_complete(self):
+        database=Path(self.paths['state'])/'journal.sqlite'
+        with sqlite3.connect(database) as db:
+            db.execute('CREATE TABLE host_stops(operation_id TEXT,image_digest TEXT,status TEXT)')
+            db.execute("INSERT INTO host_stops VALUES(?,?,'completed')",(self.op,self.digest))
+        recovery=SimpleNamespace(recover=mock.Mock());modules={**self.modules,'bundle':bundle,'recovery':recovery}
+        runner.recover_pending(modules=modules,paths=self.paths,prepare_only=False);recovery.recover.assert_not_called()
+        with sqlite3.connect(database) as db:
+            db.execute("UPDATE host_stops SET status='stopped'");db.execute("INSERT INTO host_stops VALUES(?,?,'stopped')",('12345678-1234-4234-8234-123456789abd',self.digest))
+        with self.assertRaises(runner.HostRunnerError):runner.recover_pending(modules=modules,paths=self.paths,prepare_only=False)
+        recovery.recover.assert_not_called()
+
     def test_unverified_release_never_stops_updater(self):
         self.bundle.completed_update.side_effect=RuntimeError('unverified')
         with mock.patch.object(supervisor,'inspect_servus',return_value={'api':'same'}),self.assertRaises(RuntimeError):

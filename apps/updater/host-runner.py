@@ -103,7 +103,7 @@ def load_modules():
     try:
         names={'daemon':'supervisor-daemon','bundle':'host-bundle','coordinator':'host-coordinator',
                'unit_mask':'host-unit-mask','switch':'host-switch','exchange':'host-exchange',
-               'fence':'host-fence','quiescence':'quiescence','extractor':'extract-install',
+               'fence':'host-fence','quiescence':'quiescence','recovery':'host-recovery','extractor':'extract-install',
                'backup':'backup','install_host':'install-host','install_gh':'install-gh'}
         result={'supervisor':supervisor}
         for key,name in names.items():
@@ -142,11 +142,55 @@ def load_recovery_snapshot(db, operation_id, image_digest, candidate_parent, *, 
             if key!='supervisor':sys.modules.pop('servus_saved_'+key,None)
         raise
 
+
+def recover_pending(*, modules, paths=PATHS, prepare_only):
+    """Resolve the sole unfinished host operation and invoke verified recovery."""
+    supervisor=modules['supervisor'];bundle=modules['bundle']
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or type(prepare_only) is not bool:
+        raise HostRunnerError('Invalid host recovery context')
+    state=supervisor._trusted_directory(paths['state'],0o700);candidates=None;db=None
+    try:
+        fd=supervisor._open_root_file(state,'journal.sqlite',0o600)
+        try:
+            named=os.stat(paths['state']+'/journal.sqlite',follow_symlinks=False);opened=os.fstat(fd)
+            if (named.st_dev,named.st_ino)!=(opened.st_dev,opened.st_ino):raise HostRunnerError('Journal identity differs')
+        finally:os.close(fd)
+        db=sqlite3.connect(paths['state']+'/journal.sqlite',isolation_level=None,timeout=5)
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_stops'").fetchone():return
+        rows=db.execute("SELECT operation_id,image_digest,status FROM host_stops WHERE status!='completed' OR status IS NULL").fetchall()
+        if not rows:return
+        if (len(rows)!=1 or not isinstance(rows[0][0],str) or not bundle.OPERATION.fullmatch(rows[0][0]) or
+            not isinstance(rows[0][1],str) or not bundle.DIGEST.fullmatch(rows[0][1]) or
+            rows[0][2] not in ('stopping','stopped','starting','restarting')):
+            raise HostRunnerError('Host recovery journal is ambiguous')
+        operation_id,image_digest,_=rows[0]
+        has_snapshot=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_recovery_snapshots'").fetchone()
+        snapshot=db.execute('SELECT status FROM host_recovery_snapshots WHERE operation_id=?',(operation_id,)).fetchone() if has_snapshot else None
+        if snapshot and snapshot[0] in ('prepared','abandoned'):
+            candidates=supervisor._trusted_directory(paths['candidates'],0o700)
+            chosen=load_recovery_snapshot(db,operation_id,image_digest,candidates,bundle=bundle)
+        else:
+            has_switch=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_switches'").fetchone()
+            if has_switch and db.execute('SELECT 1 FROM host_switches WHERE operation_id=?',(operation_id,)).fetchone():
+                raise HostRunnerError('Recovery snapshot is required after host exchange')
+            chosen=modules
+        recovery=chosen.get('recovery')
+        if recovery is None:raise HostRunnerError('Recovery module is unavailable')
+    finally:
+        if db is not None:db.close()
+        if candidates is not None:os.close(candidates)
+        os.close(state)
+    recovery.recover(operation_id,image_digest,modules=chosen,paths=paths,prepare_only=prepare_only)
+
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('operation_id');args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('operation_id',nargs='?')
+    choice=parser.add_mutually_exclusive_group();choice.add_argument('--recover-prepare',action='store_true');choice.add_argument('--recover-finish',action='store_true')
+    args=parser.parse_args()
     if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated:raise HostRunnerError('Isolated root is required')
-    sys.path.insert(0,PATHS['active'])
-    activate(args.operation_id,modules=load_modules())
+    if bool(args.operation_id)==bool(args.recover_prepare or args.recover_finish):parser.error('Select an operation or one recovery mode')
+    sys.path.insert(0,PATHS['active']);modules=load_modules()
+    if args.operation_id:activate(args.operation_id,modules=modules)
+    else:recover_pending(modules=modules,prepare_only=args.recover_prepare)
 
 
 if __name__=='__main__':main()
