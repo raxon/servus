@@ -22,8 +22,9 @@ writeFileSync(join(source,'proof'),'servus-private-git-fixture\n');
 git(['add','.']);git(['-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-m','fixture']);
 const commit=git(['rev-parse','HEAD']);git(['clone','--bare',source,bare],root);
 const username='fixture',token=randomUUID(),authorization='Basic '+Buffer.from(`${username}:${token}`).toString('base64');
-let authenticated=0;
+let authenticated=0,contacted=0;
 const server=createServer({key:readFileSync(join(root,'key.pem')),cert:readFileSync(join(root,'cert.pem'))},(req,res)=>{
+  contacted++;
   if(req.headers.authorization!==authorization){res.writeHead(401,{'WWW-Authenticate':'Basic realm="fixture"'}).end();return;}
   authenticated++;
   const url=new URL(req.url,'https://fixture');
@@ -46,6 +47,16 @@ const server=createServer({key:readFileSync(join(root,'key.pem')),cert:readFileS
 });
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 const repository=`https://127.0.0.1:${server.address().port}/private.git`;
+const resolvedFixture=`https://servus-git-fixture.invalid:${server.address().port}/private.git`;
+try {
+  const probe=spawn('git',['-c',`http.curloptResolve=servus-git-fixture.invalid:${server.address().port}:127.0.0.1`,
+    '-c','http.followRedirects=false','ls-remote',resolvedFixture],{env:{PATH:'/usr/bin:/bin',HOME:root,GIT_CONFIG_NOSYSTEM:'1',
+    GIT_CONFIG_GLOBAL:'/dev/null',GIT_TERMINAL_PROMPT:'0',GIT_SSL_CAINFO:join(root,'cert.pem')},stdio:'ignore'});
+  const probeExit=await new Promise((resolve,reject)=>{probe.once('error',reject);probe.once('close',resolve);});
+  assert.notEqual(probeExit,0);assert.ok(contacted>0,'Git must connect to the pinned address');
+} catch(error) {
+  await new Promise(resolve=>server.close(resolve));throw error;
+}
 process.env.PANEL_GIT_HTTP_HOSTS='127.0.0.1';process.env.PANEL_GIT_TEST_CA=join(root,'cert.pem');
 const vault=new SecretVault(data),id=randomUUID(),operationId=randomUUID();
 const secretRef=vault.put(JSON.stringify({kind:'git-credential-v1',serviceId:id,repository,username,token}));

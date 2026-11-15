@@ -1,26 +1,39 @@
 import { spawn } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
+import { BlockList, isIP } from 'node:net';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { SecretVault } from '../shared/secrets.js';
 import type { Service } from '../shared/types.js';
 import { gitCredentials } from './git-credentials.js';
 
-export async function validateRepository(repository: string): Promise<URL> {
+const deniedV4 = new BlockList();
+for (const [address,prefix] of [['0.0.0.0',8],['10.0.0.0',8],['100.64.0.0',10],['127.0.0.0',8],
+  ['169.254.0.0',16],['172.16.0.0',12],['192.0.0.0',24],['192.0.2.0',24],['192.88.99.0',24],
+  ['192.168.0.0',16],['198.18.0.0',15],['198.51.100.0',24],['203.0.113.0',24],['224.0.0.0',4],['240.0.0.0',4]] as const) deniedV4.addSubnet(address,prefix,'ipv4');
+const globalV6 = new BlockList();globalV6.addSubnet('2000::',3,'ipv6');
+const deniedV6 = new BlockList();
+for (const [address,prefix] of [['2001::',32],['2001:db8::',32],['2002::',16]] as const) deniedV6.addSubnet(address,prefix,'ipv6');
+
+export async function resolveRepository(repository: string): Promise<{url:URL;resolve?:string}> {
   const url = new URL(repository);
   if (url.username || url.password || url.search || url.hash) throw new Error('Git URLs must not contain credentials, query strings or fragments.');
   const allowed = (process.env.PANEL_GIT_HTTP_HOSTS || '').split(',').map(value => value.trim()).filter(Boolean);
-  if (allowed.includes(url.hostname) && (url.protocol === 'http:' || url.protocol === 'https:')) return url;
+  if (allowed.includes(url.hostname) && (url.protocol === 'http:' || url.protocol === 'https:')) return {url};
   if (url.protocol !== 'https:') throw new Error('Git repositories require HTTPS. Local HTTP fixtures need an explicit host allowlist.');
-  const addresses = await lookup(url.hostname, { all: true });
-  if (addresses.some(({ address }) => privateAddress(address))) throw new Error('Git repositories cannot target private network addresses.');
-  return url;
+  const hostname=url.hostname.replace(/^\[|\]$/g,'');
+  const literal=isIP(hostname);
+  const addresses=literal ? [{address:hostname,family:literal}] : await lookup(hostname,{all:true});
+  if (!addresses.length || addresses.some(({address})=>privateAddress(address))) throw new Error('Git repositories cannot target private network addresses.');
+  if(literal) return {url};
+  const targets=[...new Set(addresses.map(({address})=>isIP(address)===6?`[${address}]`:address))];
+  return {url,resolve:`${hostname}:${url.port||'443'}:${targets.join(',')}`};
 }
 function privateAddress(value: string): boolean {
-  if (value.includes(':')) return /^(::|::1$|fc|fd|fe[89ab]|::ffff:)/i.test(value);
-  const parts = value.split('.').map(Number), [a = 0, b = 0] = parts;
-  return a === 0 || a === 10 || a === 127 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 100 && b >= 64 && b <= 127;
+  const family=isIP(value);
+  return family===4 ? deniedV4.check(value,'ipv4') : family===6 ? !globalV6.check(value,'ipv6')||deniedV6.check(value,'ipv6') : true;
 }
+export async function validateRepository(repository:string):Promise<URL> {return (await resolveRepository(repository)).url;}
 function confined(root: string, value: string): string {
   const target = realpathSync(resolve(root, value.replace(/^\/+/, '')));
   const path = relative(realpathSync(root), target);
@@ -79,7 +92,7 @@ async function run(command: string, args: string[], cwd: string, log: string, va
 export async function buildSource(service: Service, operationId: string, dataDir: string, dockerSocket: string, vault: SecretVault): Promise<{ image: string; sourceCommit: string }> {
   if (service.source?.type !== 'git') throw new Error('A Git source is required.');
   const source = service.source;
-  const repository=await validateRepository(source.repository);
+  const resolved=await resolveRepository(source.repository),repository=resolved.url;
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/.test(source.branch) || source.branch.includes('..') || source.branch.endsWith('/')) throw new Error('Invalid Git branch.');
   const credentials = (service.environment || []).filter(item => item.secretRef).map(item => vault.getServiceSecret(item.secretRef!,service.id,'environment'));
   const directory = join(dataDir, 'builds'); mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -88,6 +101,8 @@ export async function buildSource(service: Service, operationId: string, dataDir
   appendFileSync(log, `${new Date().toISOString()} Fetching source branch ${source.branch}\n`, { mode: 0o600 });
   const gitEnv:NodeJS.ProcessEnv = {PATH:'/usr/local/bin:/usr/bin:/bin',HOME:workspace,LANG:'C',GIT_TERMINAL_PROMPT:'0',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_ASKPASS:'/bin/false',
     GIT_CONFIG_COUNT:'2',GIT_CONFIG_KEY_0:'protocol.file.allow',GIT_CONFIG_VALUE_0:'never',GIT_CONFIG_KEY_1:'http.followRedirects',GIT_CONFIG_VALUE_1:'false'};
+  const addGitConfig=(key:string,value:string)=>{const index=Number(gitEnv.GIT_CONFIG_COUNT);gitEnv[`GIT_CONFIG_KEY_${index}`]=key;gitEnv[`GIT_CONFIG_VALUE_${index}`]=value;gitEnv.GIT_CONFIG_COUNT=String(index+1);};
+  if(resolved.resolve)addGitConfig('http.curloptResolve',resolved.resolve);
   const testHosts=(process.env.PANEL_GIT_HTTP_HOSTS??'').split(',').map(value=>value.trim());
   if(testHosts.includes(repository.hostname)&&process.env.PANEL_GIT_TEST_CA)gitEnv.GIT_SSL_CAINFO=process.env.PANEL_GIT_TEST_CA;
   let helper:Awaited<ReturnType<typeof gitCredentials>>|undefined;
@@ -99,7 +114,7 @@ export async function buildSource(service: Service, operationId: string, dataDir
       if(!record||typeof record!=='object'||!('kind' in record)||record.kind!=='git-credential-v1'||!('serviceId' in record)||record.serviceId!==service.id||!('repository' in record)||record.repository!==repository.href||!('username' in record)||record.username!==source.credential.username||!('token' in record)||typeof record.token!=='string'||!/^[^\x00-\x20\x7f]+$/.test(record.token)||!/^[^\x00-\x20\x7f:=]+$/.test(source.credential.username))throw new Error('Invalid private Git credential.');
       credentials.push(record.token,encodeURIComponent(record.token),Buffer.from(record.token).toString('base64'),Buffer.from(`${source.credential.username}:${record.token}`).toString('base64'));
       helper=await gitCredentials(workspace,repository,source.credential.username,record.token);
-      gitEnv.SERVUS_GIT_SOCKET=helper.socket;gitEnv.GIT_CONFIG_COUNT='4';gitEnv.GIT_CONFIG_KEY_2='credential.useHttpPath';gitEnv.GIT_CONFIG_VALUE_2='true';gitEnv.GIT_CONFIG_KEY_3='credential.helper';gitEnv.GIT_CONFIG_VALUE_3=helper.helper;
+      gitEnv.SERVUS_GIT_SOCKET=helper.socket;addGitConfig('credential.useHttpPath','true');addGitConfig('credential.helper',helper.helper);
     }
     const checkout = join(workspace, 'code');
     const revisions = join(dataDir, 'source-revisions'); mkdirSync(revisions, { recursive: true, mode: 0o700 });
