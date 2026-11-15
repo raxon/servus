@@ -10,12 +10,14 @@ import { createAgent } from '/app/dist/agent/app.js';
 
 const dataDir='/fixture',operationId=process.env.TEST_OPERATION,serviceId=process.env.TEST_SERVICE;
 if(!/^[a-f0-9]{32}$/.test(operationId)||!/^[a-f0-9-]{36}$/.test(serviceId))throw new Error('Invalid fixture identity');
-if(['writer','legacy_writer','compat_writer','unregistered_writer'].includes(process.env.TEST_MODE)){
+if(['writer','legacy_writer','compat_writer','unregistered_writer','unregistered_legacy_writer'].includes(process.env.TEST_MODE)){
   const db=new Database(`${dataDir}/agent.sqlite`);db.exec('CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,service_id TEXT,state TEXT)');
   const journal=new RestoreJournal(db,()=>false),source=new PassThrough();let held;
   if(process.env.TEST_MODE==='unregistered_writer') {
     if(!/^[a-f0-9]{32}$/.test(process.env.TEST_LOCK_ID))throw new Error('Invalid fixture lock identity');
     held=acquireRestoreUploadLock(dataDir,operationId,true,process.env.TEST_LOCK_ID);
+  } else if(process.env.TEST_MODE==='unregistered_legacy_writer') {
+    held=acquireRestoreUploadLock(dataDir,operationId,true);
   } else if(['legacy_writer','compat_writer'].includes(process.env.TEST_MODE)) {
     journal.beginUpload({id:operationId,serviceId,kind:'postgres'});
     if(process.env.TEST_MODE==='compat_writer')held=acquireRestoreUploadLock(dataDir,operationId,true);
@@ -23,7 +25,7 @@ if(['writer','legacy_writer','compat_writer','unregistered_writer'].includes(pro
   } else {
     void uploadRestoreArchive({journal,operationId,serviceId,kind:'postgres',dataDir,key:Buffer.alloc(32),input:()=>source}).catch(()=>{});
   }
-  if(process.env.TEST_MODE!=='unregistered_writer')source.write('private fixture data');
+  if(!['unregistered_writer','unregistered_legacy_writer'].includes(process.env.TEST_MODE))source.write('private fixture data');
   setTimeout(()=>writeFileSync(`${dataDir}/ready`,'ready',{mode:0o600}),500);
   setInterval(()=>{void held;},1000);
 }else{

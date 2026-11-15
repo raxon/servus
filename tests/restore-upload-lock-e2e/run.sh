@@ -8,11 +8,13 @@ legacy_name="servus-upload-legacy-$(openssl rand -hex 8)"
 compat_name="servus-upload-compat-$(openssl rand -hex 8)"
 gap_name="servus-upload-gap-$(openssl rand -hex 8)"
 gap_legacy_name="servus-upload-gap-legacy-$(openssl rand -hex 8)"
+old_gap_name="servus-upload-old-gap-$(openssl rand -hex 8)"
+old_gap_writer_name="servus-upload-old-gap-writer-$(openssl rand -hex 8)"
 operation=$(openssl rand -hex 16)
 service=$(python3 -c 'import uuid; print(uuid.uuid4())')
 runner="$(pwd)/tests/restore-upload-lock-e2e/runner.mjs"
 cleanup(){
-  for container in "$name" "$legacy_name" "$compat_name" "$gap_name" "$gap_legacy_name"; do
+  for container in "$name" "$legacy_name" "$compat_name" "$gap_name" "$gap_legacy_name" "$old_gap_name" "$old_gap_writer_name"; do
     if [[ $(docker inspect --format '{{ index .Config.Labels "servus.test" }}' "$container" 2>/dev/null || true) == "$fixture_id" ]]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
   done
   rm -rf "$root"
@@ -77,6 +79,23 @@ docker run --rm "${gap_common[@]}" -e TEST_MODE=legacy_live "$SERVUS_LOCK_IMAGE"
 docker kill "$gap_legacy_name" >/dev/null
 docker run --rm "${gap_common[@]}" -e TEST_MODE=legacy_dead "$SERVUS_LOCK_IMAGE" /fixture-runner.mjs
 echo 'PASS crash before journal publication cannot unlock a legacy writer'
+mkdir -m 700 "$root/old-gap"
+old_gap_operation=$(openssl rand -hex 16)
+old_gap_service=$(python3 -c 'import uuid; print(uuid.uuid4())')
+old_gap_common=(--label "servus.test=$fixture_id" --user "$(id -u):$(id -g)" --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=32m --mount "type=bind,src=$root/old-gap,dst=/fixture" --mount "type=bind,src=$runner,dst=/fixture-runner.mjs,readonly" -e "TEST_OPERATION=$old_gap_operation" -e "TEST_SERVICE=$old_gap_service" --entrypoint node)
+if [[ -n ${SERVUS_LOCK_DIST:-} ]]; then old_gap_common+=(--mount "type=bind,src=$SERVUS_LOCK_DIST,dst=/app/dist,readonly"); fi
+docker run -d --name "$old_gap_name" "${old_gap_common[@]}" -e TEST_MODE=unregistered_legacy_writer "$SERVUS_LOCK_IMAGE" /fixture-runner.mjs >/dev/null
+for _ in {1..100}; do [[ -f "$root/old-gap/ready" ]] && break; sleep 0.1; done
+[[ -f "$root/old-gap/ready" ]] || { docker logs "$old_gap_name"; exit 1; }
+docker kill "$old_gap_name" >/dev/null
+rm "$root/old-gap/ready"
+docker run -d --name "$old_gap_writer_name" "${old_gap_common[@]}" -e TEST_MODE=legacy_writer "$SERVUS_LOCK_IMAGE" /fixture-runner.mjs >/dev/null
+for _ in {1..100}; do [[ -f "$root/old-gap/ready" ]] && break; sleep 0.1; done
+[[ -f "$root/old-gap/ready" ]] || { docker logs "$old_gap_writer_name"; exit 1; }
+docker run --rm "${old_gap_common[@]}" -e TEST_MODE=legacy_live "$SERVUS_LOCK_IMAGE" /fixture-runner.mjs
+docker kill "$old_gap_writer_name" >/dev/null
+docker run --rm "${old_gap_common[@]}" -e TEST_MODE=legacy_dead "$SERVUS_LOCK_IMAGE" /fixture-runner.mjs
+echo 'PASS orphan legacy lock cannot unlock an unprotected writer'
 active_mounts=()
 if [[ -n ${SERVUS_LOCK_DIST:-} ]]; then active_mounts+=(--mount "type=bind,src=$SERVUS_LOCK_DIST,dst=/app/dist,readonly"); fi
 for kind in postgres mariadb; do
