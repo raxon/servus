@@ -31,6 +31,14 @@ it('persists private ciphertext and authenticates an exact round trip', async ()
   expect(await read(readRestoreArchive(base))).toEqual(secret);
 });
 
+it('streams a multi-chunk archive with the correct digest', async () => {
+  const base = fixture(), original = randomBytes(2 * 1024 * 1024 + 17);
+  const pieces = Array.from({ length: Math.ceil(original.length / 65536) }, (_, index) => original.subarray(index * 65536, (index + 1) * 65536));
+  const result = await stageRestoreArchive({ ...base, input: () => Readable.from(pieces) });
+  expect(result.sha256).toBe(createHash('sha256').update(original).digest('hex'));
+  expect(await read(readRestoreArchive(base))).toEqual(original);
+});
+
 it('never replaces an existing archive with a reused operation identity', async () => {
   const base = fixture(); await stageRestoreArchive({ ...base, input: () => Readable.from(['first']) });
   await expect(stageRestoreArchive({ ...base, input: () => Readable.from(['second']) })).rejects.toThrow();
@@ -77,6 +85,13 @@ it('removes an unfinished archive when upload is aborted', async () => {
   source.write('partial archive');
   controller.abort();
   await expect(upload).rejects.toMatchObject({ name: 'AbortError' });
+  expect(readdirSync(join(base.dataDir, 'restore-archives'))).toEqual([]);
+});
+
+it('removes a partial archive when the source fails', async () => {
+  const base = fixture();
+  async function* input() { yield Buffer.from('partial data'); throw new Error('synthetic stream failure'); }
+  await expect(stageRestoreArchive({ ...base, input: () => Readable.from(input()) })).rejects.toThrow('synthetic stream failure');
   expect(readdirSync(join(base.dataDir, 'restore-archives'))).toEqual([]);
 });
 
