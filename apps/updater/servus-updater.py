@@ -106,6 +106,17 @@ class LegacyRecoveryJournal:
             if version not in (0,1):raise RuntimeError('Unsupported legacy recovery journal')
             self.db.execute("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY,restore_id TEXT NOT NULL UNIQUE,service_id TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('requested','dispatching','awaiting_completion','completed','recovery_required')),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_legacy_recovery ON requests ((1)) WHERE state != 'completed'")
+            columns=self.db.execute('PRAGMA table_info(requests)').fetchall()
+            if ({row[1] for row in columns}!={'id','restore_id','service_id','state','created_at'} or len(columns)!=5 or
+                any(row[2]!='TEXT' or row[5]!=(1 if row[1]=='id' else 0) for row in columns)):
+                raise RuntimeError('Unsupported legacy recovery journal')
+            indexes=self.db.execute('PRAGMA index_list(requests)').fetchall()
+            active=next((row for row in indexes if row[1]=='one_active_legacy_recovery'),None)
+            sql=self.db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='one_active_legacy_recovery'").fetchone()
+            unique_restore=any(row[2]==1 and isinstance(row[1],str) and re.fullmatch(r'[A-Za-z0-9_]+',row[1]) and [col[2] for col in self.db.execute('PRAGMA index_info('+row[1]+')')]==['restore_id'] for row in indexes)
+            if (not active or active[2]!=1 or active[4]!=1 or not sql or not isinstance(sql[0],str) or
+                not re.sub(r'\s+','',sql[0]).lower().endswith("onrequests((1))wherestate!='completed'") or not unique_restore):
+                raise RuntimeError('Unsupported legacy recovery journal')
             self.db.execute('PRAGMA user_version=1');self.db.execute('COMMIT')
         except BaseException:
             self.db.execute('ROLLBACK');self.db.close();raise
@@ -123,6 +134,14 @@ class LegacyRecoveryJournal:
         row=self.db.execute('SELECT id,restore_id,service_id,state FROM requests WHERE id=?',(operation_id,)).fetchone()
         if not row:raise ProtocolError('not_found')
         return dict(zip(('operationId','restoreId','serviceId','status'),row))
+    @staticmethod
+    def update_busy(update_journal):
+        return bool(update_journal.host_update_pending() or
+            update_journal.db.execute("SELECT 1 FROM operations WHERE status IN ('accepted','verifying','recovery_required') LIMIT 1").fetchone() or
+            update_journal.db.execute("SELECT 1 FROM preparations WHERE status IN ('preparing','prepared','recovery_required') LIMIT 1").fetchone() or
+            update_journal.db.execute("SELECT 1 FROM extraction_probes WHERE status='intent' LIMIT 1").fetchone() or
+            update_journal.db.execute("SELECT 1 FROM update_transactions WHERE phase != 'completed' LIMIT 1").fetchone() or
+            update_journal.db.execute("SELECT 1 FROM apply_requests WHERE state != 'completed' LIMIT 1").fetchone())
     def submit(self,operation_id,restore_id,service_id,update_journal):
         if (not valid_uuid(operation_id) or not isinstance(restore_id,str) or not re.fullmatch(r'[a-f0-9]{32}',restore_id) or
             not isinstance(service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service_id)):
@@ -134,21 +153,16 @@ class LegacyRecoveryJournal:
                 if old!=(restore_id,service_id):raise ProtocolError('idempotency_conflict')
                 result=self.status(operation_id);self.db.execute('COMMIT');return result
             if self.active() or self.db.execute('SELECT 1 FROM requests WHERE restore_id=?',(restore_id,)).fetchone():raise ProtocolError('operation_in_progress')
-            if (update_journal.host_update_pending() or
-                update_journal.db.execute("SELECT 1 FROM operations WHERE status IN ('accepted','verifying','recovery_required') LIMIT 1").fetchone() or
-                update_journal.db.execute("SELECT 1 FROM preparations WHERE status IN ('preparing','prepared','recovery_required') LIMIT 1").fetchone() or
-                update_journal.db.execute("SELECT 1 FROM update_transactions WHERE phase != 'completed' LIMIT 1").fetchone() or
-                update_journal.db.execute("SELECT 1 FROM apply_requests WHERE state != 'completed' LIMIT 1").fetchone()):
-                raise ProtocolError('operation_in_progress')
+            if self.update_busy(update_journal):raise ProtocolError('operation_in_progress')
             self.db.execute("INSERT INTO requests(id,restore_id,service_id,state) VALUES(?,?,?,'requested')",(operation_id,restore_id,service_id))
             result=self.status(operation_id);self.db.execute('COMMIT');return result
         except BaseException:
             if self.db.in_transaction:self.db.execute('ROLLBACK')
             raise
-    def claim(self):
+    def claim(self,update_journal):
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            row=self.db.execute("SELECT id,restore_id,service_id FROM requests WHERE state='requested'").fetchone()
+            row=None if self.update_busy(update_journal) else self.db.execute("SELECT id,restore_id,service_id FROM requests WHERE state='requested'").fetchone()
             if row and self.db.execute("UPDATE requests SET state='dispatching' WHERE id=? AND state='requested'",(row[0],)).rowcount!=1:raise RuntimeError('Recovery request changed')
             self.db.execute('COMMIT');return row
         except BaseException:
@@ -1122,6 +1136,42 @@ class ApplyWorker:
             self.journal.db.execute("UPDATE apply_requests SET state='recovery_required' WHERE operation_id=? AND state='dispatching'", (self.operation,))
 
 
+class LegacyRecoveryWorker:
+    """Dispatch once and reconcile completion only from root-owned evidence."""
+    def __init__(self,journal,update_journal,socket_path,sender=dispatch_legacy_recovery,query=query_legacy_recovery):
+        self.journal,self.update_journal,self.socket_path,self.sender,self.query=journal,update_journal,socket_path,sender,query
+        self.thread=self.task=self.row=self.result=None;self.next_query=0.0
+    def _run(self,task,row):
+        try:
+            if task=='dispatch':self.sender(self.socket_path,*row);self.result='sent'
+            else:self.result=self.query(self.socket_path,*row[:3])
+        except Exception:self.result=None
+    def _start(self,task,row):
+        self.task,self.row,self.result=task,row,None
+        self.thread=threading.Thread(target=self._run,args=(task,row),daemon=True)
+        try:self.thread.start()
+        except RuntimeError:
+            self.thread=None
+            if task=='dispatch':self.journal.finish_dispatch(row[0],False)
+            self.task=self.row=None;self.next_query=time.monotonic()+5
+    def tick(self):
+        if self.thread is not None:
+            if self.thread.is_alive():return
+            task,row,result=self.task,self.row,self.result
+            self.thread=self.task=self.row=self.result=None
+            if task=='dispatch':self.journal.finish_dispatch(row[0],result=='sent')
+            elif result in ('unknown','in_progress','completed','recovery_required'):self.journal.confirm(row[0],result)
+            self.next_query=time.monotonic()+2
+        pending=self.journal.pending_confirmation()
+        if pending:
+            if time.monotonic()>=self.next_query:self._start('query',pending)
+            return
+        row=self.journal.claim(self.update_journal)
+        if row:self._start('dispatch',row)
+    def close(self):
+        if self.task=='dispatch' and self.row is not None:self.journal.finish_dispatch(self.row[0],False)
+
+
 class DiscoveryWorker:
     """Run bounded release discovery without blocking updater requests."""
 
@@ -1223,10 +1273,18 @@ def dns_journal_backup_supported():
         if fd is not None: os.close(fd)
 
 
-def process(journal, request, *, allow_apply=False, discovery=None):
+def process(journal, request, *, allow_apply=False, discovery=None, recovery=None):
     if not isinstance(request, dict) or request.get('version') != 1 or type(request.get('version')) is not int:
         raise ProtocolError('invalid_request')
     action = request.get('action')
+    if action=='legacy_recovery' and set(request)=={'version','action','operationId','restoreId','serviceId'}:
+        if not allow_apply or recovery is None:raise ProtocolError('unavailable')
+        return recovery.submit(request['operationId'],request['restoreId'],request['serviceId'],journal)
+    if action=='legacy_recovery_status' and set(request)=={'version','action','operationId'}:
+        if recovery is None:raise ProtocolError('unavailable')
+        return recovery.status(request['operationId'])
+    if recovery is not None and recovery.active() and action in ('submit','retry','prepare','apply'):
+        raise ProtocolError('operation_in_progress')
     if action == 'backup_schema' and set(request) == {'version', 'action'}:
         return {'backupFileDnsJournalVersion': 1 if allow_apply and dns_journal_backup_supported() else 0}
     if action == 'discover' and set(request) == {'version', 'action', 'current'}:
@@ -1311,6 +1369,9 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
         preparation_worker = PreparationWorker(journal, state)
         apply_worker = ApplyWorker(journal, supervisor_socket) if supervisor_socket is not None else None
         discovery_worker = DiscoveryWorker() if supervisor_socket is not None else None
+        recovery_journal = LegacyRecoveryJournal(state) if supervisor_socket is not None else None
+        if recovery_journal is not None:recovery_journal.recover()
+        recovery_worker = LegacyRecoveryWorker(recovery_journal,journal,supervisor_socket) if recovery_journal is not None else None
         socket_path = directory / 'updater.sock'
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         bound_inode = None
@@ -1352,6 +1413,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
                 preparation_worker.tick()
                 if apply_worker is not None: apply_worker.tick()
                 if discovery_worker is not None: discovery_worker.tick()
+                if recovery_worker is not None: recovery_worker.tick()
                 try:
                     client, _ = server.accept()
                 except TimeoutError:
@@ -1362,7 +1424,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
                         _pid, uid, _gid = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
                         if uid != allowed_uid:
                             raise ProtocolError('unauthorized')
-                        value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None, discovery=discovery_worker)
+                        value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None, discovery=discovery_worker,recovery=recovery_journal)
                         response = {'ok': True, 'operation': value}
                     except ProtocolError as error:
                         response = {'ok': False, 'error': error.code}
@@ -1377,6 +1439,8 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
             preparation_worker.close()
             if apply_worker is not None: apply_worker.close()
             if discovery_worker is not None: discovery_worker.close()
+            if recovery_worker is not None: recovery_worker.close()
+            if recovery_journal is not None: recovery_journal.close()
             server.close()
             try:
                 info = socket_path.lstat()
