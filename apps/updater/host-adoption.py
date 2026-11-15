@@ -6,6 +6,7 @@ verified, root-owned source. The active and historical releases are rebound to
 the protected updater journal by the coordinator before any unit changes.
 """
 import argparse
+from contextlib import closing
 import fcntl
 import hashlib
 import json
@@ -72,6 +73,18 @@ def _read(directory,name,mode,limit):
     finally:os.close(fd)
 
 
+def _check_journal(directory):
+    """Validate the journal without affecting existing SQLite locks."""
+    fd=os.open('journal.sqlite',os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=directory)
+    try:
+        info=os.fstat(fd);named=os.stat('journal.sqlite',dir_fd=directory,follow_symlinks=False)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or info.st_nlink!=1 or
+            stat.S_IMODE(info.st_mode)!=0o600 or info.st_size>64*1024*1024 or
+            (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino)):
+            raise HostAdoptionError('Untrusted journal')
+    finally:os.close(fd)
+
+
 def load_verified_modules(operation_id, *, state_dir, active_env, source_file):
     """Verify the active stage and all dependency bytes before executing any."""
     if (sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or
@@ -81,9 +94,9 @@ def load_verified_modules(operation_id, *, state_dir, active_env, source_file):
     state=_directory(state_dir,0o700);stage_fd=apps_fd=module_fd=None
     try:
         journal=os.path.join(state_dir,'journal.sqlite')
-        _read(state,'journal.sqlite',0o600,64*1024*1024)
+        _check_journal(state)
         uri='file:'+urllib.parse.quote(journal,safe='/')+'?mode=ro'
-        with sqlite3.connect(uri,uri=True,timeout=5) as db:
+        with closing(sqlite3.connect(uri,uri=True,timeout=5)) as db:
             rows=db.execute("SELECT p.staging_path FROM operations o JOIN preparations p ON p.operation_id=o.id "
                 "JOIN update_transactions t ON t.operation_id=o.id JOIN apply_requests r ON r.operation_id=o.id "
                 "JOIN policy_approvals a ON a.operation_id=o.id WHERE o.id=? AND o.status='verified' "
@@ -136,7 +149,7 @@ def load_verified_modules(operation_id, *, state_dir, active_env, source_file):
             if len(data)!=record['size'] or hashlib.sha256(data).hexdigest()!=record['sha256']:
                 raise HostAdoptionError('Release dependency differs')
             contents[name]=data
-        _read(state,'journal.sqlite',0o600,64*1024*1024)
+        _check_journal(state)
         result={}
         for key,name in MODULE_FILES.items():
             module_name='supervisor' if key=='supervisor' else 'servus_adoption_'+key

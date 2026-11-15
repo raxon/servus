@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -24,6 +25,30 @@ adoption=load('host-adoption');bundle=load('host-bundle');installer=load('instal
 
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
 class HostAdoptionTest(unittest.TestCase):
+    def test_bootstrap_journal_check_preserves_sqlite_locks(self):
+        path=Path(self.paths['state'])/'journal.sqlite'
+        initial=sqlite3.connect(path);initial.execute('PRAGMA journal_mode=WAL')
+        initial.execute('CREATE TABLE fixture(value)');initial.commit();initial.close()
+        script=('import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); '
+                'db.execute("SELECT * FROM fixture").fetchall(); '
+                'print("ready",flush=True); sys.stdin.readline(); db.close()')
+        peer=subprocess.Popen([sys.executable,'-I','-c',script,str(path)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+        db=None;directory=None
+        try:
+            self.assertEqual(peer.stdout.readline().strip(),'ready')
+            db=sqlite3.connect(path,isolation_level=None);db.execute('SELECT * FROM fixture').fetchall()
+            directory=adoption._directory(self.paths['state'],0o700)
+            adoption._check_journal(directory)
+            peer.stdin.write('stop\n');peer.stdin.flush();peer.wait(timeout=10)
+            db.execute('INSERT INTO fixture VALUES(1)')
+            with sqlite3.connect('file:'+str(path)+'?mode=ro',uri=True) as reader:
+                self.assertEqual(reader.execute('SELECT COUNT(*) FROM fixture').fetchone(),(1,))
+        finally:
+            if directory is not None:os.close(directory)
+            if db is not None:db.close()
+            if peer.poll() is None:peer.kill();peer.wait()
+            peer.stdin.close();peer.stdout.close()
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(dir='/root');root=Path(self.tmp.name)
         self.paths={key:str(root/key) for key in ('state','install','active','units','active_env')}
