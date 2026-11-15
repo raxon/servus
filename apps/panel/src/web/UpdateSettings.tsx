@@ -119,7 +119,7 @@ export function UpdateSettings() {
     return () => { controller.abort(); if (timer) clearTimeout(timer); };
   }, [run, capability.data?.applyAvailable, resume]);
 
-  const candidate = discovery.data?.discovery;
+  const candidate = completed || discovery.isFetching ? undefined : discovery.data?.discovery;
   const start = () => {
     if (!candidate || candidate.status !== "candidate") return;
     try {
@@ -148,7 +148,7 @@ export function UpdateSettings() {
           {completed ? <p role="status">Update installed.</p> : null}
           {discovery.error ? <div className="error-notice" role="alert">Could not check for updates. Try again.</div> : null}
           {failure ? <div className="error-notice" role="alert">{failure}</div> : null}
-          {candidate?.status === "checking" ? <p role="status">Checking for updates...</p> : null}
+          {discovery.isFetching || candidate?.status === "checking" ? <p role="status">Checking for updates...</p> : null}
           {candidate?.status === "unavailable" ? <p role="status">Update information is unavailable. Try again later.</p> : null}
           {candidate?.status === "no_newer_version" ? <p role="status">Servus is up to date.</p> : null}
           {candidate?.status === "ahead" ? <p role="status">This installation is newer than the latest release.</p> : null}

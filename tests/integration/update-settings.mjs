@@ -78,6 +78,9 @@ try {
   await page.getByText('Update installed.').waitFor();
   assert.equal(applyCount, 1);
   assert.equal(await page.evaluate(() => localStorage.getItem('servus.update.operation.v1')), null);
+  assert.equal(await page.getByRole('button', { name: 'Install update' }).count(), 0);
+  await page.getByRole('button', { name: 'Check for updates' }).click();
+  await page.getByRole('button', { name: 'Install update' }).waitFor();
   console.log('Update settings: discovery, verification retry, installation and recovery after reload passed');
 } finally {
   await browser?.close(); server.kill('SIGTERM'); await exited; await rm(directory, { recursive: true, force: true });
