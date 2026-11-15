@@ -826,6 +826,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
             yield lease
             completed = lease._settled
         except BaseException:
+            print('servus maintenance operation=' + request_id + ' failure phase=' + phase, file=sys.stderr, flush=True)
             print('servus maintenance failure phase=' + phase, file=sys.stderr, flush=True)
             try:
                 self._record(request_id, 'recovery_required', request_ids, timeout_ms)

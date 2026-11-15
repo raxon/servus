@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for failed Servus updates every minute
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=servus-update-recovery.service
+
+[Install]
+WantedBy=timers.target

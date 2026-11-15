@@ -1,0 +1,16 @@
+[Unit]
+Description=Servus recovery of an unchanged pre-switch generation
+After=docker.service
+Requires=docker.service
+ConditionPathExists=/var/lib/servus-updater/maintenance/maintenance.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/servus-recovery/recover-pre-switch.py
+TimeoutStartSec=420
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/etc/servus/lifecycle
