@@ -1,5 +1,7 @@
 import fcntl
+import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -12,6 +14,7 @@ from unittest import mock
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'apps/updater'))
 import supervisor
+import test_host_bundle as fixtures
 
 def load(name):
     spec=importlib.util.spec_from_file_location(name.replace('-','_'),ROOT/'apps/updater'/(name+'.py'))
@@ -64,5 +67,29 @@ class HostAdoptionTest(unittest.TestCase):
         self.runner.activate.side_effect=RuntimeError('recovery required')
         with self.assertRaises(RuntimeError):self.run_adoption()
         self.assertNotIn(('enable','--now','servus-host-update.timer'),self.events)
+
+    def test_bootstrap_verifies_active_stage_before_loading_dependencies(self):
+        fixture=fixtures.CompletedUpdateTest();fixture.setUp()
+        state=Path(self.paths['state']);stage=state/'staging'/('servus-install-'+'c'*32)
+        modules=stage/'apps'/'updater';modules.mkdir(parents=True,mode=0o755)
+        (state/'staging').chmod(0o700);stage.chmod(0o700);(stage/'apps').chmod(0o755)
+        entries=[]
+        for name in set(adoption.MODULE_FILES.values())|{'host-adoption.py'}:
+            data=(ROOT/'apps/updater'/name).read_bytes();path=modules/name;path.write_bytes(data);path.chmod(0o644)
+            entries.append({'path':'apps/updater/'+name,'type':'file','mode':0o644,'size':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+        (stage/'manifest.json').write_text(json.dumps({'schema':1,'minimumUpdaterAbi':1,'files':entries}))
+        (stage/'manifest.json').chmod(0o644)
+        database=state/'journal.sqlite';database.unlink()
+        fixture.db.execute('UPDATE preparations SET staging_path=?',(str(stage),));fixture.db.commit()
+        with sqlite3.connect(database) as target:fixture.db.backup(target)
+        database.chmod(0o600);fixture.tearDown()
+        args=dict(state_dir=str(state),active_env='/root/env',source_file=str(modules/'host-adoption.py'))
+        with mock.patch.dict(sys.modules):
+            loaded=adoption.load_verified_modules(fixture.op,**args)
+            self.assertTrue(callable(loaded['runner'].activate))
+        (modules/'host-runner.py').write_bytes(b'changed')
+        with self.assertRaises(adoption.HostAdoptionError):adoption.load_verified_modules(fixture.op,**args)
+        with self.assertRaises(adoption.HostAdoptionError):
+            adoption.load_verified_modules(fixture.op,**{**args,'source_file':'/root/other.py'})
 
 if __name__=='__main__':unittest.main()
