@@ -97,6 +97,10 @@ jobs:
         env:
           IMAGE_ID: ${{ steps.build.outputs.image_id }}
         run: SERVUS_EXPORT_SOURCE=image SERVUS_EXPORT_IMAGE="$IMAGE_ID" bash tests/database-export-e2e/run.sh
+      - name: Test isolated database imports in the release image
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.image_id }}
+        run: SERVUS_IMPORT_SOURCE=image SERVUS_IMPORT_IMAGE="$IMAGE_ID" bash tests/database-import-e2e/run.sh
       - name: Test supervisor entrypoints in the built image
         env:
           IMAGE_ID: ${{ steps.build.outputs.image_id }}
