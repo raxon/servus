@@ -139,7 +139,7 @@ def reconcile_original(db, operation_id, *, state_fd, install_fd, service_lock, 
 
 
 def complete_exchange(db, operation_id, *, state_fd, install_fd, service_lock, install_lock,
-                      active_parent, candidate_parent, supervisor, coordinator, bundle, exchange, ready):
+                      active_parent, candidate_parent, supervisor, coordinator, bundle, exchange, unit_mask, units_fd, ready):
     """Record a healthy exchange only after the caller verifies restored services.
 
     The caller's readiness check must verify restored unit files, original service
@@ -153,7 +153,9 @@ def complete_exchange(db, operation_id, *, state_fd, install_fd, service_lock, i
     preparation = db.execute('SELECT image_digest,status FROM host_preparations WHERE operation_id=?', (operation_id,)).fetchone()
     if not switch or row != (switch[0], 'restored') or switch[1] != 'exchanged' or preparation != (switch[0], 'prepared'):
         raise HostSwitchError('Host recovery state is not ready for completion')
+    unit_mask.assert_restored(db, operation_id, switch[0], state=state_fd, units=units_fd)
     _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, ready)
+    unit_mask.assert_restored(db, operation_id, switch[0], state=state_fd, units=units_fd)
     db.execute('BEGIN IMMEDIATE')
     try:
         if inspect_exchange(db, operation_id, active_parent, candidate_parent, exchange, bundle) != 'exchanged':

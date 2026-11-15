@@ -334,3 +334,24 @@ def reconcile_unmasked_intent(db, operation_id, image_digest, originals, service
     _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
     if db.execute("UPDATE host_unit_masks SET phase='restored' WHERE operation_id=? AND image_digest=? AND phase='intent' AND backup_digest IS NULL", (operation_id, image_digest)).rowcount != 1:
         raise UnitMaskError('Unit mask journal changed')
+
+
+def assert_restored(db, operation_id, image_digest, *, state, units, execute=_systemctl):
+    """Check protected unit bytes and their recorded stable runtime states.
+
+    The caller must hold the installation and updater locks and separately
+    verify the authenticated control plane before completing the exchange.
+    """
+    _directory(state, 0o700); _directory(units, 0o755)
+    originals, expected = load_verified_backup(db, operation_id, image_digest, state)
+    row = db.execute('SELECT image_digest,phase FROM host_unit_masks WHERE operation_id=?', (operation_id,)).fetchone()
+    if row != (image_digest, 'restored'):
+        raise UnitMaskError('Unit restoration is not complete')
+    for unit in UNITS:
+        _read(units, unit, 0o644, originals[unit])
+    if capture_service_states(execute=execute) != expected:
+        raise UnitMaskError('Host unit state differs from its recorded state')
+    for unit in UNITS:
+        _read(units, unit, 0o644, originals[unit])
+    if capture_service_states(execute=execute) != expected:
+        raise UnitMaskError('Host unit state changed during verification')

@@ -55,6 +55,31 @@ class HostUnitMaskTest(unittest.TestCase):
         self.assertEqual(self.phase(),'restored');self.assert_originals()
         self.assertEqual(mask.load_verified_backup(self.base.db,self.base.op,self.base.digest,self.base.s),(self.originals,self.states))
 
+    def test_restored_check_requires_exact_files_and_original_states(self):
+        self.apply()
+        with self.assertRaises(mask.UnitMaskError):
+            mask.assert_restored(self.base.db,self.base.op,self.base.digest,state=self.base.s,units=self.fd,execute=self.execute)
+        self.restore()
+        mask.assert_restored(self.base.db,self.base.op,self.base.digest,state=self.base.s,units=self.fd,execute=self.execute)
+        self.states['servus-supervisor.service']='inactive'
+        with self.assertRaises(mask.UnitMaskError):
+            mask.assert_restored(self.base.db,self.base.op,self.base.digest,state=self.base.s,units=self.fd,execute=self.execute)
+        self.states['servus-supervisor.service']='active'
+        (self.units/mask.UNITS[0]).write_bytes(b'changed')
+        with self.assertRaises(mask.UnitMaskError):
+            mask.assert_restored(self.base.db,self.base.op,self.base.digest,state=self.base.s,units=self.fd,execute=self.execute)
+
+    def test_restored_check_detects_state_change_during_verification(self):
+        self.apply();self.restore();calls=0
+        def changing(unit):
+            nonlocal calls
+            calls+=1
+            if calls > len(mask.UNITS) and unit=='servus-supervisor.service':
+                return 'LoadState=loaded\nActiveState=inactive\nSubState=dead\nUnitFileState=enabled\n'
+            return self.execute(unit)
+        with self.assertRaises(mask.UnitMaskError):
+            mask.assert_restored(self.base.db,self.base.op,self.base.digest,state=self.base.s,units=self.fd,execute=changing)
+
     def test_journal_recovery_rejects_forged_metadata_and_files(self):
         self.apply();backup=self.base.state/('unit-backup-'+self.base.op)
         metadata=backup/'complete.json';original=metadata.read_bytes();metadata.write_bytes(original+b' ')
