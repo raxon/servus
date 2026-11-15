@@ -234,6 +234,29 @@ class HostApply:
             os.close(fd)
             raise
 
+    def recover_legacy_upload(self, operation_id, restore_id, service_id, hub, maintenance):
+        """Run one scoped recovery; the daemon finalizer confirms fresh roles."""
+        if (not supervisor._uuid4(operation_id) or not isinstance(restore_id,str) or not re.fullmatch(r'[a-f0-9]{32}',restore_id) or
+            not isinstance(service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service_id) or
+            not isinstance(hub,supervisor.DrainHub) or not isinstance(maintenance,supervisor.MaintenanceSupervisor)):
+            raise supervisor.SupervisorError('Invalid legacy recovery request')
+        modules={name:self._load('servus_recovery_'+name.replace('-','_'),name+'.py')
+                 for name in ('update-coordinator','quiescence','provision-host','runtime-policy')}
+        control_dir=os.readlink('/proc/self/fd/'+str(self.ownership.directory))
+        self.ownership.assert_held(control_dir)
+        policy_path,accepted_env,policy=resolve_active_policy(self.approval_journal,self.active_env)
+        if policy!=hub.policy:raise supervisor.SupervisorError('Active recovery policy changed')
+        binding=approved_policy_binding(hub,policy_path,self.approval_journal,accepted_env)
+        ingress=self._current_ingress(modules['provision-host'],modules['runtime-policy'])
+        coordinator=modules['update-coordinator'];quiescence=modules['quiescence']
+        coordinator.preflight_external_containers(hub,supervisor,quiescence,trusted_ingress=ingress)
+        self.ownership.assert_held(control_dir)
+        with maintenance.drained_window(hub,operation_id,policy_binding=binding,legacy_upload_id=restore_id) as lease:
+            coordinator.cleanup_stopped_legacy_upload(operation_id,restore_id,service_id,lease,supervisor,quiescence,trusted_ingress=ingress)
+            daemon=SimpleNamespace(resolve_active_policy=resolve_active_policy,approved_policy_binding=approved_policy_binding)
+            return coordinator.start_cleaned_legacy_upload(operation_id,lease,self.ownership,self.approval_journal,self.active_env,
+                                                            supervisor,daemon,quiescence,trusted_ingress=ingress)
+
     def _current_ingress(self, provision, runtime):
         """Resolve the pinned ingress identity immediately before maintenance."""
         current = provision.trusted_ingress(self.config['dockerConfig'], runtime)
@@ -661,7 +684,10 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
                  type(request['timeoutMs']) is not int or not 1 <= request['timeoutMs'] <= 60000)) or
                 (kind == 'complete' and set(request) != {'version', 'type', 'operationId'}) or
                 (kind == 'apply' and (set(request) != {'version', 'type', 'operationId'} or apply is None)) or
-                kind not in ('stop', 'complete', 'apply')):
+                (kind == 'recover_legacy_upload' and (set(request)!={'version','type','operationId','restoreId','serviceId'} or apply is None or
+                 not isinstance(request.get('restoreId'),str) or not re.fullmatch(r'[a-f0-9]{32}',request['restoreId']) or
+                 not isinstance(request.get('serviceId'),str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',request['serviceId']))) or
+                kind not in ('stop', 'complete', 'apply', 'recover_legacy_upload')):
             raise supervisor.SupervisorError('Invalid or unavailable command')
         with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
             # The installation lock remains held through validation and drain.
@@ -676,6 +702,9 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
                 result = 'completed'
             elif kind == 'apply':
                 apply(request['operationId'], hub, operation)
+                result = 'starting'
+            elif kind == 'recover_legacy_upload':
+                apply.recover_legacy_upload(request['operationId'],request['restoreId'],request['serviceId'],hub,operation)
                 result = 'starting'
             else:
                 result = operation.stop_after_drain(hub, request['operationId'], request['timeoutMs'])

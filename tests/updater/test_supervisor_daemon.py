@@ -145,6 +145,32 @@ class DaemonTest(unittest.TestCase):
                 finally:
                     client.close()
 
+    def test_legacy_recovery_command_requires_exact_fields_and_approved_policy(self):
+        operation_id=str(uuid.uuid4());restore_id='a'*32;service_id=str(uuid.uuid4());policy=object()
+        for scenario in ('allowed','disabled','extra','invalid_restore','invalid_service','changed_policy'):
+            with self.subTest(scenario=scenario):
+                server,client=socket.socketpair();listener=SimpleNamespace(accept=lambda:(server,None))
+                hub=SimpleNamespace(used=False,connections={role:object() for role in supervisor.ROLES},policy=policy)
+                state={'locked':False}
+                class Operation:
+                    def __enter__(self):state['locked']=True;return self
+                    def __exit__(self,*_):state['locked']=False
+                apply=mock.Mock()
+                def recover(*_):self.assertTrue(state['locked'])
+                apply.recover_legacy_upload.side_effect=recover
+                request={'version':1,'type':'recover_legacy_upload','operationId':operation_id,'restoreId':restore_id,'serviceId':service_id}
+                if scenario=='extra':request['path']='/untrusted'
+                if scenario=='invalid_restore':request['restoreId']='../invalid'
+                if scenario=='invalid_service':request['serviceId']='invalid'
+                client.sendall(json.dumps(request).encode()+b'\n')
+                try:
+                    approved=object() if scenario=='changed_policy' else policy
+                    with mock.patch.object(supervisor,'MaintenanceSupervisor',return_value=Operation()),mock.patch.object(daemon,'load_approved_policy',return_value=approved):
+                        daemon.handle_command(listener,hub,'/install','/gate','/journal','/policy','/approval','/env',apply=None if scenario=='disabled' else apply)
+                    self.assertEqual(json.loads(client.recv(4096))['status'],'starting' if scenario=='allowed' else 'failed')
+                    self.assertEqual(apply.recover_legacy_upload.call_count,1 if scenario=='allowed' else 0)
+                finally:client.close()
+
     def test_resolves_current_policy_generation_and_rejects_drift(self):
         with tempfile.TemporaryDirectory(dir='/root') as temporary:
             path = Path(temporary) / 'journal.sqlite'
