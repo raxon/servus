@@ -1,7 +1,8 @@
 import type { Readable } from 'node:stream';
+import { randomBytes } from 'node:crypto';
 import { discardUnpublishedRestoreArchive, RestoreArchiveCommitUncertainError, stageRestoreArchive } from './restore-archive.js';
 import type { RestoreJournal, RestoreRecord } from './restore-journal.js';
-import { acquireRestoreUploadLock } from './restore-upload-lock.js';
+import { acquireRestoreUploadLock, discardUnregisteredUploadLock } from './restore-upload-lock.js';
 
 /** Fence the service before consuming a stream and publish only its verified digest. */
 export async function uploadRestoreArchive(options: {
@@ -9,11 +10,12 @@ export async function uploadRestoreArchive(options: {
   dataDir: string; key: Buffer; input: () => Readable; signal?: AbortSignal; sizeLimit?: number; expectedSize?: number;
 }): Promise<{ record: RestoreRecord; size: number }> {
   options.signal?.throwIfAborted();
-  options.journal.beginUpload({ id: options.operationId, serviceId: options.serviceId, kind: options.kind });
-  let release:()=>void;
-  try { release=acquireRestoreUploadLock(options.dataDir,options.operationId,true); }
+  const lockId=randomBytes(16).toString('hex');
+  const release=acquireRestoreUploadLock(options.dataDir,options.operationId,true,lockId);
+  try { options.journal.beginUpload({ id: options.operationId, serviceId: options.serviceId, kind: options.kind, lockId }); }
   catch(error) {
-    try { if(options.journal.get(options.operationId)?.phase==='uploading')options.journal.advance(options.operationId,'uploading','needs_review'); } catch { /* Preserve the unresolved upload. */ }
+    release();
+    try { if(options.journal.uploadLockId(options.operationId)!==lockId)discardUnregisteredUploadLock(options.dataDir,options.operationId,lockId); } catch { /* Keep any lock whose registration or cleanup is uncertain. */ }
     throw error;
   }
   try {

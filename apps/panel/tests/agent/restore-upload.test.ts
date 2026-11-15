@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
@@ -11,6 +11,7 @@ import { createRequire } from 'node:module';
 import { RestoreJournal } from '../../src/agent/restore-journal.js';
 import { uploadRestoreArchive } from '../../src/agent/restore-upload.js';
 import { prepareRestoreCandidate } from '../../src/agent/restore-preparation.js';
+import { acquireRestoreUploadLock } from '../../src/agent/restore-upload-lock.js';
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const remove of cleanup.splice(0).reverse()) remove(); });
@@ -23,6 +24,42 @@ function fixture() {
   const journal = new RestoreJournal(db, () => false), operationId = randomBytes(16).toString('hex'), serviceId = randomUUID();
   return { db, journal, operationId, serviceId, dataDir, key: randomBytes(32), kind: 'postgres' as const };
 }
+
+it('holds a uniquely named process lock before publishing its journal fence', async () => {
+  const base = fixture(), begin = base.journal.beginUpload.bind(base.journal);
+  vi.spyOn(base.journal, 'beginUpload').mockImplementation(input => {
+    expect(input.lockId).toMatch(/^[a-f0-9]{32}$/);
+    expect(existsSync(join(base.dataDir, 'restore-upload-locks', `${base.operationId}-${input.lockId}.sqlite`))).toBe(true);
+    expect(() => acquireRestoreUploadLock(base.dataDir, base.operationId, false, input.lockId)).toThrow();
+    return begin(input);
+  });
+  const result = await uploadRestoreArchive({ ...base, input: () => Readable.from(['archive']) });
+  expect(result.record.phase).toBe('reserved');
+  expect(base.journal.uploadLockId(base.operationId)).toMatch(/^[a-f0-9]{32}$/);
+});
+
+it('leaves no journal entry when the process lock cannot be created', async () => {
+  const base = fixture();
+  symlinkSync('/nonexistent', join(base.dataDir, 'restore-upload-locks'));
+  await expect(uploadRestoreArchive({ ...base, input: () => Readable.from(['archive']) })).rejects.toThrow();
+  expect(base.journal.get(base.operationId)).toBeUndefined();
+  expect(base.journal.hasUnresolved(base.serviceId)).toBe(false);
+});
+
+it('does not leave a new lock when a pre-existing legacy operation conflicts', async () => {
+  const base = fixture();
+  base.journal.beginUpload({ id: base.operationId, serviceId: base.serviceId, kind: base.kind });
+  await expect(uploadRestoreArchive({ ...base, input: () => Readable.from(['archive']) })).rejects.toThrow('unresolved');
+  expect(base.journal.get(base.operationId)?.phase).toBe('uploading');
+  expect(readdirSync(join(base.dataDir, 'restore-upload-locks'))).toEqual([]);
+});
+
+it('refuses to create a new upload when a legacy-format lock already exists', async () => {
+  const base=fixture(),unlock=acquireRestoreUploadLock(base.dataDir,base.operationId,true);unlock();
+  await expect(uploadRestoreArchive({...base,input:()=>Readable.from(['archive'])})).rejects.toThrow('Legacy restore upload lock');
+  expect(base.journal.get(base.operationId)).toBeUndefined();
+  expect(readdirSync(join(base.dataDir,'restore-upload-locks'))).toEqual([`${base.operationId}.sqlite`]);
+});
 
 it('records the upload before reading and publishes the archive digest only after staging', async () => {
   const base = fixture(), content = Buffer.from('fixture archive'), source = new PassThrough();

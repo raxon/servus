@@ -11,6 +11,7 @@ import { once } from 'node:events';
 import { createRequire } from 'node:module';
 import { createAgent } from '../../src/agent/app.js';
 import { AgentMaintenanceGate } from '../../src/agent/maintenance.js';
+import { acquireRestoreUploadLock } from '../../src/agent/restore-upload-lock.js';
 
 const cleanup: (() => Promise<void> | void)[] = [];
 afterEach(async () => { for (const remove of cleanup.splice(0).reverse()) await remove(); });
@@ -81,6 +82,30 @@ it('does not release an interrupted upload without a live writer to reconcile',a
     expect(response.statusCode).toBe(409);
     expect((db.prepare('SELECT phase FROM restore_operations WHERE id=?').get(operationId) as {phase:string}).phase).toBe('uploading');
   }finally{db.close();}
+});
+
+it('does not mistake an unregistered new-format lock for proof that a legacy writer stopped',async()=>{
+  const {app,dataDir,serviceId,operationId}=await fixture(),lockId=randomBytes(16).toString('hex');
+  const unlock=acquireRestoreUploadLock(dataDir,operationId,true,lockId);unlock();
+  const db=new Database(join(dataDir,'agent.sqlite'));
+  try {
+    db.prepare('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)').run(operationId,serviceId,'postgres','0'.repeat(64),'uploading',new Date().toISOString());
+    const response=await app.inject({method:'POST',url:`/services/${serviceId}/database-restore/${operationId}/cancel`,headers:{authorization:'Bearer fixture-token'}});
+    expect(response.statusCode).toBe(409);
+    expect((db.prepare('SELECT phase FROM restore_operations WHERE id=?').get(operationId) as {phase:string}).phase).toBe('uploading');
+  } finally { db.close(); }
+});
+
+it('keeps an interrupted upload fenced if its recorded lock identity is malformed',async()=>{
+  const {app,dataDir,serviceId,operationId}=await fixture();
+  const db=new Database(join(dataDir,'agent.sqlite'));
+  try {
+    db.prepare('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)').run(operationId,serviceId,'postgres','0'.repeat(64),'uploading',new Date().toISOString());
+    db.prepare('INSERT INTO restore_upload_locks(operation_id,lock_id) VALUES(?,?)').run(operationId,'../invalid');
+    const response=await app.inject({method:'POST',url:`/services/${serviceId}/database-restore/${operationId}/cancel`,headers:{authorization:'Bearer fixture-token'}});
+    expect(response.statusCode).toBe(409);
+    expect((db.prepare('SELECT phase FROM restore_operations WHERE id=?').get(operationId) as {phase:string}).phase).toBe('uploading');
+  } finally { db.close(); }
 });
 
 it('recovers a killed writer but refuses while another process holds its upload lock',async()=>{

@@ -181,7 +181,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       if(upload){upload.controller.abort();await upload.done;}
       else if(record.phase==='uploading'){
         let unlock:()=>void;
-        try{unlock=acquireRestoreUploadLock(config.dataDir,record.id,false);}
+        try{unlock=acquireRestoreUploadLock(config.dataDir,record.id,false,restores.uploadLockId(record.id));}
         catch{return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'The interrupted upload requires recovery.'}});}
         try{
           const current=restores.get(record.id);

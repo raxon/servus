@@ -21,6 +21,20 @@ function database() {
 }
 function intent(serviceId = randomUUID()) { return { id: 'a'.repeat(32), serviceId, kind: 'postgres' as const, archiveSha256: 'b'.repeat(64) }; }
 
+it('records an upload and its lock identity atomically and preserves it across restart', () => {
+  const {db,path}=database(),journal=new RestoreJournal(db,()=>false),request=intent(),lockId='c'.repeat(32);
+  journal.beginUpload({...request,lockId});
+  db.close();
+  const reopened=new Database(path);cleanup.push(()=>reopened.close());
+  const recovered=new RestoreJournal(reopened,()=>false);
+  expect(recovered.get(request.id)?.phase).toBe('uploading');
+  expect(recovered.uploadLockId(request.id)).toBe(lockId);
+  const other=intent();
+  expect(()=>recovered.beginUpload({...other,id:'d'.repeat(32),lockId})).toThrow();
+  expect(recovered.get('d'.repeat(32))).toBeUndefined();
+  expect(recovered.hasUnresolved(other.serviceId)).toBe(false);
+});
+
 it('persists immutable identity and unresolved phases across restart', () => {
   const { db, path } = database(), journal = new RestoreJournal(db, () => false), request = intent();
   expect(journal.reserve(request).phase).toBe('reserved');
