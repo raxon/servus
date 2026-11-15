@@ -4,6 +4,10 @@ import { delimiter, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { createRestoreCandidate } from '../../src/agent/restore-candidate.js';
+import { prepareRestoreCandidate } from '../../src/agent/restore-preparation.js';
+import { RestoreJournal } from '../../src/agent/restore-journal.js';
+import Database from 'better-sqlite3';
+import { Readable } from 'node:stream';
 
 const cleanup: string[] = [], operationId = 'a'.repeat(32), sourceId = 'b'.repeat(64), candidateId = 'c'.repeat(64), imageId = `sha256:${'d'.repeat(64)}`;
 afterEach(() => { vi.unstubAllEnvs(); for (const dir of cleanup.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -54,4 +58,23 @@ it('stops waiting when Docker inspection is interrupted', async () => {
   f.docker.getContainer.mockReturnValue({ inspect: () => new Promise(() => {}) } as never);
   const result = createRestoreCandidate({ ...f.options, signal: controller.signal }); controller.abort();
   await expect(result).rejects.toThrow('interrupted'); expect(f.docker.createVolume).not.toHaveBeenCalled();
+});
+
+it('retains the restore fence if a volume creation completes after the client aborts', async () => {
+  const f=fixture(),controller=new AbortController(),db=new Database(':memory:');
+  db.exec('CREATE TABLE operations(id TEXT PRIMARY KEY, service_id TEXT, state TEXT)');
+  const journal=new RestoreJournal(db,()=>false);
+  journal.reserve({id:operationId,serviceId:f.options.serviceId,kind:'postgres',archiveSha256:'e'.repeat(64)});
+  let enter!:()=>void,finish!:()=>void,lateCreated=false;
+  const entered=new Promise<void>(resolve=>{enter=resolve;});
+  f.docker.createVolume.mockImplementation(input=>{enter();return new Promise(resolve=>{finish=()=>{lateCreated=true;resolve(input);};});});
+  const run=prepareRestoreCandidate({journal,operationId,serviceId:f.options.serviceId,importCandidate:vi.fn(async()=>{}),
+    allocateTarget:async()=>{const candidate=await createRestoreCandidate({...f.options,journal,signal:controller.signal});return {...candidate,dockerSocket:'/var/run/docker.sock',database:'fixture',user:'fixture',input:()=>Readable.from(['archive'])};}});
+  try {
+    await entered;controller.abort();await expect(run).rejects.toThrow('interrupted');
+    expect(journal.get(operationId)?.phase).toBe('needs_review');
+    finish();await new Promise(resolve=>setImmediate(resolve));
+    expect(lateCreated).toBe(true);expect(journal.hasUnresolved(f.options.serviceId)).toBe(true);
+    expect(f.docker.createContainer).not.toHaveBeenCalled();
+  } finally {controller.abort();db.close();}
 });
