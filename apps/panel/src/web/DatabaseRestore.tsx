@@ -26,6 +26,7 @@ export function DatabaseRestore({ service }: { service: Service }) {
 function RestoreDialog({ service, onClose }: { service: Service; onClose: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [confirmed, setConfirmed] = useState(false);
+  const [uploadInProgress, setUploadInProgress] = useState(false);
   const client = useQueryClient();
   const key = ["database-restore", service.id];
   const base = `/services/${service.id}/database-restore`;
@@ -35,6 +36,7 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
     retry: false,
     refetchInterval: query => {
       const phase = query.state.data?.operation?.phase;
+      if(uploadInProgress)return 1000;
       return phase && ["uploading", "importing", "switching", "discarding", "discarding_candidate"].includes(phase) ? 3000 : false;
     },
   });
@@ -46,7 +48,12 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
       }
       return api(`${base}/${input.operationId}/${input.type}`, {method:"POST", body:input.type === "commit" ? {confirm:true} : {}});
     },
-    onSettled: () => { setConfirmed(false); void client.invalidateQueries({queryKey:key}); },
+    onMutate:input=>{if(input.type==='upload'){cancelUpload.reset();setUploadInProgress(true);}},
+    onSettled: () => { setUploadInProgress(false); setConfirmed(false); void client.invalidateQueries({queryKey:key}); },
+  });
+  const cancelUpload = useMutation({
+    mutationFn:(operationId:string)=>api(`${base}/${operationId}/cancel`,{method:"POST",body:{}}),
+    onSettled:()=>{void client.invalidateQueries({queryKey:key});},
   });
   const operation = status.data?.operation;
   const phase = operation?.phase;
@@ -56,7 +63,7 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
   const fileValid = !!file && file.size > 0 && file.size <= 2 * 1024 ** 3;
   return <FeatureModal title="Restore database" description={`Restore a ${extension} export to this ${service.kind === "postgres" ? "PostgreSQL" : "MariaDB"} database.`} onClose={onClose}>
     <div className="restore-dialog">
-      <FeatureError error={status.error ?? action.error} />
+      <FeatureError error={status.error ?? cancelUpload.error ?? (cancelUpload.isSuccess && phase === "cancelled" ? null : action.error)} />
       {status.isPending ? <FeatureLoading label="Checking restore status" /> : status.data && !status.error ? <>
         {phase === "completed" && <p role="status">The database was restored.</p>}
         {phase === "cancelled" && <p role="status">{operation?.rolledBack ? "The restore was rolled back. The previous database is running." : "The restore was cancelled."}</p>}
@@ -80,7 +87,11 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
           <button className="button button-danger" type="button" disabled={busy || !confirmed} onClick={() => action.mutate({type:"commit",operationId:operation!.operationId})}>{busy ? <FeatureLoading label="Restoring" /> : phase === "prepared" ? "Restore database" : "Resume restore"}</button>
         </>}
         {(phase === "reserved" || phase === "prepared") && <button className="button" type="button" disabled={busy} onClick={() => action.mutate({type:"cancel",operationId:operation!.operationId})}>Cancel restore</button>}
-        {phase && ["uploading", "importing", "discarding"].includes(phase) && <FeatureLoading label="Restore in progress" />}
+        {phase === "uploading" && <>
+          <FeatureLoading label="Uploading export" />
+          <button className="button" type="button" disabled={cancelUpload.isPending} onClick={() => cancelUpload.mutate(operation!.operationId)}>{cancelUpload.isPending ? <FeatureLoading label="Cancelling" /> : "Cancel upload"}</button>
+        </>}
+        {phase && ["importing", "discarding"].includes(phase) && <FeatureLoading label="Restore in progress" />}
         {phase === "discarding_candidate" && <>
           <p role="status">The temporary database is being removed. If cleanup was interrupted, try again.</p>
           <button className="button" type="button" disabled={busy} onClick={() => action.mutate({type:"cancel",operationId:operation!.operationId})}>Finish cleanup</button>

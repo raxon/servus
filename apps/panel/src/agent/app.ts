@@ -124,6 +124,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     }finally{if(!handedOff)finish();}
   });
   let uploads = 0;
+  const activeUploads = new Map<string,{serviceId:string;controller:AbortController;done:Promise<void>}>();
   app.register(async scope => {
     scope.addContentTypeParser('application/octet-stream', (_req, payload, done) => done(null, payload));
     scope.post<{Params:{id:string};Querystring:{operationId?:string;kind?:string};Body:Readable}>('/services/:id/database-restore/upload', async (req,reply) => {
@@ -134,16 +135,20 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       }
       const release = maintenance?.admit();
       if (maintenance && !release) return reply.code(503).send({ error: { code: 'MAINTENANCE', message: 'Agent is draining.' } });
+      if (activeUploads.has(operationId) || cancellingRestores.has(operationId)) { release?.(); return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore is already active.'}}); }
       if (uploads >= 2) { release?.(); return reply.code(429).send({ error: { code: 'UPLOAD_BUSY', message: 'Too many database restore uploads are active.' } }); }
       uploads++;
       const controller = new AbortController();
+      let resolveDone!:()=>void;
+      const entry={serviceId:id,controller,done:new Promise<void>(resolve=>{resolveDone=resolve;})};
+      activeUploads.set(operationId,entry);
       const abort = () => controller.abort();
       req.raw.once('aborted', abort);
       const timeout = setTimeout(abort, 30 * 60_000); timeout.unref();
       try {
         const result = await uploadRestoreArchive({ journal: restores, operationId, serviceId: id, kind: kind as 'postgres'|'mariadb', dataDir: config.dataDir, key: vault.restoreArchiveKey(operationId), input: () => req.body, signal: controller.signal, sizeLimit: Number(length), expectedSize: Number(length) });
         return { operationId, size: result.size, sha256: result.record.archive_sha256, phase: result.record.phase };
-      } finally { uploads--; clearTimeout(timeout); req.raw.off('aborted', abort); release?.(); }
+      } finally { uploads--; clearTimeout(timeout); req.raw.off('aborted', abort); if(activeUploads.get(operationId)===entry)activeUploads.delete(operationId); resolveDone(); release?.(); }
     });
   });
   app.get<{Params:{id:string}}>('/services/:id/database-restore', async (req,reply) => {
@@ -165,11 +170,17 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
     const record = restores.get(req.params.operationId);
     if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
-    if (!['reserved','discarding','prepared','discarding_candidate','cancelled'].includes(record.phase) || cancellingRestores.has(record.id)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be cancelled now.'}});
+    if (!['uploading','reserved','discarding','prepared','discarding_candidate','cancelled'].includes(record.phase) || cancellingRestores.has(record.id)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be cancelled now.'}});
+    const upload=record.phase==='uploading'?activeUploads.get(record.id):undefined;
+    if(record.phase==='uploading'&&(!upload||upload.serviceId!==req.params.id))return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'The interrupted upload requires recovery.'}});
     const release = maintenance?.admit();
     if (maintenance && !release) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     cancellingRestores.add(record.id);
-    try { const result = ['prepared','discarding_candidate'].includes(record.phase)
+    try {
+      if(upload){upload.controller.abort();await upload.done;}
+      const current=restores.get(record.id);
+      if(!current||current.service_id!==req.params.id||!['reserved','discarding','prepared','discarding_candidate','cancelled'].includes(current.phase))throw new RestoreCommitUncertainError('Restore upload cleanup requires recovery.');
+      const result = ['prepared','discarding_candidate'].includes(current.phase)
       ? await cancelPreparedRestore({journal:restores,docker:new Docker({socketPath:config.dockerSocket}),dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId})
       : cancelStagedRestore({journal:restores,dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId}); return {operationId:result.id,phase:result.phase}; }
     finally { cancellingRestores.delete(record.id);release?.(); }

@@ -115,3 +115,25 @@ it('cancels the agent upload when a panel client disconnects mid-stream',async()
   try{await waitFor('uploading');outgoing.destroy();await waitFor('cancelled');}
   finally{outgoing.destroy();db.close();}
 });
+
+it('cancels an active upload before accepting a new restore',async()=>{
+  const {app,store,headers,service,operationId,path}=await fixture();
+  const address=new URL(await app.listen({host:'127.0.0.1',port:0}));
+  const db=new Database(join(store.dataDir,'agent.sqlite'),{readonly:true});
+  const phase=()=> (db.prepare('SELECT phase FROM restore_operations WHERE id=?').get(operationId) as {phase:string}|undefined)?.phase;
+  const outgoing=request({hostname:'127.0.0.1',port:address.port,path:`${path}/upload`,method:'POST',headers:{...headers,'content-type':'application/octet-stream','content-length':'10000'}});
+  outgoing.on('error',()=>{});outgoing.write('partial restore data');
+  try{
+    for(let i=0;i<100&&phase()!=='uploading';i++)await delay(10);
+    expect(phase()).toBe('uploading');
+    const duplicate=await app.inject({method:'POST',url:`${path}/upload`,headers:{...headers,'content-type':'application/octet-stream'},payload:Buffer.from('duplicate')});
+    expect(duplicate.statusCode).not.toBe(200);expect(phase()).toBe('uploading');
+    expect((await app.inject({method:'POST',url:`${path}/cancel`,headers:{cookie:headers.cookie},payload:{}})).statusCode).toBe(403);
+    const cancelled=await app.inject({method:'POST',url:`${path}/cancel`,headers,payload:{}});
+    expect(cancelled.statusCode).toBe(200);expect(cancelled.json()).toEqual({operationId,phase:'cancelled'});
+    expect(phase()).toBe('cancelled');
+    const nextId=randomBytes(16).toString('hex');
+    const next=await app.inject({method:'POST',url:`/api/v1/services/${service.id}/database-restore/${nextId}/upload`,headers:{...headers,'content-type':'application/octet-stream'},payload:Buffer.from('new archive')});
+    expect(next.statusCode).toBe(200);
+  }finally{outgoing.destroy();db.close();}
+});

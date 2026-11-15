@@ -68,3 +68,14 @@ it('authorizes status and idempotent cancellation only for the matching service'
   }
   expect((await app.inject({method:'GET',url:path,headers:auth})).json().phase).toBe('cancelled');
 });
+
+it('does not release an interrupted upload without a live writer to reconcile',async()=>{
+  const {app,dataDir,serviceId,operationId}=await fixture();
+  const db=new Database(join(dataDir,'agent.sqlite'));
+  try{
+    db.prepare('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)').run(operationId,serviceId,'postgres','0'.repeat(64),'uploading',new Date().toISOString());
+    const response=await app.inject({method:'POST',url:`/services/${serviceId}/database-restore/${operationId}/cancel`,headers:{authorization:'Bearer fixture-token'}});
+    expect(response.statusCode).toBe(409);
+    expect((db.prepare('SELECT phase FROM restore_operations WHERE id=?').get(operationId) as {phase:string}).phase).toBe('uploading');
+  }finally{db.close();}
+});

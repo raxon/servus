@@ -334,7 +334,12 @@ export async function createApp(options: AppOptions) {
     const {auth,service} = serviceAccess(req,req.params.id,true);
     if (!/^[a-f0-9]{32}$/.test(req.params.operationId)) throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
     z.object({}).strict().parse(req.body ?? {});
-    const result = await runtimeRequest(`/services/${req.params.id}/database-restore/${req.params.operationId}/cancel`,{},options.agentConnection);
+    let result:unknown;
+    try { result = await runtimeRequest(`/services/${req.params.id}/database-restore/${req.params.operationId}/cancel`,{},options.agentConnection); }
+    catch(error) {
+      if(error instanceof AgentRequestError && error.certainty==='definitive' && error.statusCode===409)throw new AppError('RESTORE_BUSY','The restore cannot be cancelled now. Check the operation status.',409);
+      throw error;
+    }
     store.recordAudit(auth.user.id,'database.restore.cancelled',service.id);
     return result;
   });
