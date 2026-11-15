@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request } from 'node:http';
+import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import Database from 'better-sqlite3';
 import { createAgent } from '../../src/agent/app.js';
@@ -15,12 +16,12 @@ import { RestoreJournal } from '../../src/agent/restore-journal.js';
 
 const cleanup:(()=>Promise<void>)[]=[];
 afterEach(async()=>{for(const fn of cleanup.splice(0).reverse())await fn();});
-async function fixture(agentRequest?:Parameters<typeof createApp>[0]['agentRequest']){
+async function fixture(agentRequest?:Parameters<typeof createApp>[0]['agentRequest'],updaterSocketPath?:string){
   const dataDir=mkdtempSync(join(tmpdir(),'panel-restore-upload-')),store=new Store(dataDir),socketPath=join(dataDir,'agent.sock'),token='agent-test-token';
   const runtime={status:async()=>({online:true}),inspectService:async()=>({state:'unknown' as const}),apply:async()=>({state:'running' as const,deployedRevision:1,messages:[]})};
   const agent=await createAgent({dataDir,token,socketPath,dockerSocket:'/unused',ingressPort:18080,ingressImage:'unused'},runtime as never);
   await agent.listen({path:socketPath});
-  const app=await createApp({dataDir,store,agentConnection:{socketPath,token},agentRequest});
+  const app=await createApp({dataDir,store,agentConnection:{socketPath,token},agentRequest,updaterSocketPath,updaterApplyEnabled:!!updaterSocketPath});
   cleanup.push(async()=>{await app.close();await agent.close();store.close();rmSync(dataDir,{recursive:true,force:true});});
   const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'admin@example.test',password:'testing-password'}});
   const headers={cookie:`panel_session=${setup.cookies.find(cookie=>cookie.name==='panel_session')!.value}`,'x-csrf-token':setup.json().csrfToken};
@@ -31,6 +32,38 @@ async function fixture(agentRequest?:Parameters<typeof createApp>[0]['agentReque
   const operationId=randomBytes(16).toString('hex'),path=`/api/v1/services/${service.id}/database-restore/${operationId}`;
   return {app,store,headers,project,service,operationId,path};
 }
+
+it('allows only administrators to request recovery of the exact legacy upload',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'legacy-updater-')),socketPath=join(dir,'socket');
+  let submitted:Record<string,string>|undefined;
+  const server=createServer(socket=>{let data='';socket.on('data',chunk=>{
+    data+=chunk.toString();if(!data.endsWith('\n'))return;
+    const input=JSON.parse(data);
+    if(input.action==='legacy_recovery')submitted=input;
+    const operation=submitted&&input.operationId===submitted.operationId?{operationId:submitted.operationId,restoreId:submitted.restoreId,serviceId:submitted.serviceId,status:'requested'}:null;
+    socket.end(JSON.stringify(operation?{ok:true,operation}:{ok:false,error:'not_found'})+'\n');
+  });});
+  await new Promise<void>(resolve=>server.listen(socketPath,resolve));
+  cleanup.push(async()=>{await new Promise<void>(resolve=>server.close(()=>resolve()));rmSync(dir,{recursive:true,force:true});});
+  const {app,store,headers,project,service,operationId,path}=await fixture(undefined,socketPath);
+  const db=new Database(join(store.dataDir,'agent.sqlite'));
+  try {
+    new RestoreJournal(db,()=>false).beginUpload({id:operationId,serviceId:service.id,kind:'postgres'});
+    const url=`${path}/legacy-recovery`;
+    expect((await app.inject({method:'POST',url,payload:{}})).statusCode).toBe(401);
+    expect((await app.inject({method:'POST',url,headers:{cookie:headers.cookie},payload:{}})).statusCode).toBe(403);
+    const editor=store.createUser('editor@example.test',await hashPassword('testing-password'));
+    store.addMember(project.id,editor.id,'editor');const session=store.createSession(editor.id);
+    const editorHeaders={cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken};
+    expect((await app.inject({method:'POST',url,headers:editorHeaders,payload:{}})).statusCode).toBe(403);
+    expect((await app.inject({url,headers})).statusCode).toBe(404);
+    const response=await app.inject({method:'POST',url,headers,payload:{}});
+    expect(response.statusCode).toBe(200);expect(response.json().operation).toMatchObject({restoreId:operationId,serviceId:service.id,status:'requested'});
+    expect((await app.inject({url,headers})).json()).toEqual(response.json());
+    const wrong=path.replace(operationId,'f'.repeat(32))+'/legacy-recovery';
+    expect((await app.inject({method:'POST',url:wrong,headers,payload:{}})).statusCode).not.toBe(200);
+  } finally {db.close();}
+});
 
 it('checks session, CSRF, project access and origin before accepting an upload',async()=>{
   const {app,store,headers,project,path}=await fixture(), payload=Buffer.from('archive'), upload=`${path}/upload`, content={'content-type':'application/octet-stream'};

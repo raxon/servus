@@ -21,6 +21,7 @@ import { BUILD_INFO } from './generated-build-info.js';
 import { clientAddress, normalizeClientAddress, trustedProxyRequest } from './proxy-address.js';
 import { MaintenanceGate } from './maintenance.js';
 import { registerUpdates } from './updates.js';
+import { startLegacyRecovery, legacyRecoveryStatus, UpdaterClientError } from './updater-client.js';
 
 const prefix = '/api/v1';
 const cookieName = 'panel_session';
@@ -331,6 +332,43 @@ export async function createApp(options: AppOptions) {
     serviceAccess(req,req.params.id,true);
     if (!/^[a-f0-9]{32}$/.test(req.params.operationId)) throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
     return runtimeRequest(`/services/${req.params.id}/database-restore/${req.params.operationId}`,undefined,options.agentConnection);
+  });
+  // The host operation can restart the panel, so only an instance administrator may start it.
+  const legacyRecoveryIdentity=(restoreId:string,serviceId:string)=>{
+    const bytes=createHash('sha256').update('servus-legacy-recovery\0').update(restoreId).digest().subarray(0,16);
+    bytes[6]=(bytes[6]! & 0x0f)|0x40; bytes[8]=(bytes[8]! & 0x3f)|0x80;
+    const hex=bytes.toString('hex');
+    return {operationId:`${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`,restoreId,serviceId};
+  };
+  const recoveryEndpoint=()=>{
+    if(!options.updaterApplyEnabled||!options.updaterSocketPath)throw new AppError('RECOVERY_UNAVAILABLE','Recovery is not available on this installation',503);
+    return {socketPath:options.updaterSocketPath};
+  };
+  const recoveryError=(error:unknown):never=>{
+    if(error instanceof UpdaterClientError && error.certainty==='definitive') {
+      if(error.code==='not_found')throw new AppError('NOT_FOUND','Recovery operation not found',404);
+      if(['operation_in_progress','idempotency_conflict','recovery_required'].includes(error.code))throw new AppError('RESTORE_BUSY','Recovery cannot start in the current state',409);
+    }
+    throw new AppError('RECOVERY_UNAVAILABLE','Recovery status is unavailable. Check its status before retrying.',503);
+  };
+  app.get<{Params:{id:string;operationId:string}}>(`${prefix}/services/:id/database-restore/:operationId/legacy-recovery`,async req=>{
+    administrator(req);const {service}=serviceAccess(req,req.params.id);
+    if(!/^[a-f0-9]{32}$/.test(req.params.operationId))throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
+    try{return {operation:await legacyRecoveryStatus(legacyRecoveryIdentity(req.params.operationId,service.id),recoveryEndpoint())};}
+    catch(error){if(error instanceof AppError)throw error;return recoveryError(error);}
+  });
+  app.post<{Params:{id:string;operationId:string}}>(`${prefix}/services/:id/database-restore/:operationId/legacy-recovery`,{config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async req=>{
+    const actor=administrator(req,true),{service}=serviceAccess(req,req.params.id,true);
+    if(!/^[a-f0-9]{32}$/.test(req.params.operationId))throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
+    z.object({}).strict().parse(req.body??{});
+    if(!['postgres','mariadb'].includes(service.kind||''))throw new AppError('NOT_FOUND','Managed database not found',404);
+    const endpoint=recoveryEndpoint();
+    const response=await runtimeRequest(`/services/${service.id}/database-restore/${req.params.operationId}`,undefined,options.agentConnection);
+    const parsed=restoreStatusSchema.safeParse(response);
+    if(!parsed.success||parsed.data.operationId!==req.params.operationId||parsed.data.kind!==service.kind||parsed.data.recoveryReason!=='legacy_upload_unverified')throw new AppError('RESTORE_BUSY','This restore does not need legacy upload recovery',409);
+    store.recordAudit(actor.id,'database.restore.legacy_recovery.requested',service.id);
+    try{return {operation:await startLegacyRecovery(legacyRecoveryIdentity(req.params.operationId,service.id),endpoint)};}
+    catch(error){return recoveryError(error);}
   });
   app.post<{Params:{id:string;operationId:string}}>(`${prefix}/services/:id/database-restore/:operationId/cancel`,async req => {
     const {auth,service} = serviceAccess(req,req.params.id,true);
