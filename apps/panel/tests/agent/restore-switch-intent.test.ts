@@ -64,3 +64,12 @@ it('rejects a corrupted encrypted plan',async()=>{
   f.db.prepare('UPDATE restore_switch_intents SET sealed_plan=? WHERE id=?').run(sealed.slice(0,-8)+'AAAAAAAA',f.options.operationId);
   expect(()=>readRestoreSwitchIntent(f.options)).toThrow();expect(f.journal.hasUnresolved(f.options.serviceId)).toBe(true);
 });
+
+it('migrates an existing switch journal without losing its in-progress stage',async()=>{
+  const f=fixture();await prepareRestoreSwitchIntent(f.options);
+  f.journal.advanceSwitchStage(f.options.operationId,'pending','candidate_stop');
+  f.db.exec("ALTER TABLE restore_switch_intents RENAME TO new_switch; CREATE TABLE restore_switch_intents(id TEXT PRIMARY KEY,service_id TEXT NOT NULL,service_version INTEGER NOT NULL,sealed_plan TEXT NOT NULL,created_at TEXT NOT NULL,stage TEXT NOT NULL CHECK(stage IN ('pending','candidate_stop','candidate_detached','applying','applied'))); INSERT INTO restore_switch_intents SELECT * FROM new_switch; DROP TABLE new_switch");
+  const migrated=new RestoreJournal(f.db,()=>false);
+  expect(migrated.switchIntent(f.options.operationId)?.stage).toBe('candidate_stop');
+  expect(migrated.advanceSwitchStage(f.options.operationId,'candidate_stop','rolling_back').stage).toBe('rolling_back');
+});
