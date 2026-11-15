@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
+import { createCipheriv, createDecipheriv, hkdfSync, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
@@ -39,6 +39,12 @@ export class SecretVault {
     cipher.setAAD(Buffer.from('panel-secret-v1'));
     const data = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
     return `enc:v1:${Buffer.concat([iv, cipher.getAuthTag(), data]).toString('base64')}`;
+  }
+
+  /** Derive a per-operation archive key without exposing the installation key. */
+  restoreArchiveKey(operationId: string): Buffer {
+    if (!/^[a-f0-9]{32}$/.test(operationId)) throw new Error('Invalid restore operation identity.');
+    return Buffer.from(hkdfSync('sha256', this.key, Buffer.from('servus-restore-archive-v1'), Buffer.from(operationId, 'ascii'), 32));
   }
 
   open(value: string): string {
