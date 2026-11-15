@@ -620,9 +620,16 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         self.assertFalse((self.dst/'manifest.json').exists())
 
     def test_legacy_agent_without_restore_table_is_supported(self):
-        self.agent.execute('DROP TABLE restore_operations');self.agent.commit();self.fix_permissions();self.capture()
+        for table in ('restore_switch_intents','restore_retained_volumes','restore_volume_bindings','restore_operations'):
+            self.agent.execute(f'DROP TABLE {table}')
+        self.agent.commit();self.fix_permissions();self.capture()
         with sqlite3.connect(self.dst/'agent.sqlite') as restored:
             self.assertIsNone(restored.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='restore_operations'").fetchone())
+
+    def test_restore_tables_without_journal_are_refused(self):
+        self.agent.execute('DROP TABLE restore_operations');self.agent.commit();self.fix_permissions()
+        with self.assertRaisesRegex(backup.CaptureError,'Unsupported database schema'): self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
 
     def test_failed_agent_rollback_is_refused(self):
         self.agent.execute("UPDATE operations SET state='failed',operation_stage='rolling_back'");self.agent.commit();self.fix_permissions()
