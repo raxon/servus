@@ -101,5 +101,23 @@ class ApplyQueueTest(unittest.TestCase):
         finally:
             server.close()
 
+    def test_legacy_recovery_dispatch_and_status_use_exact_bound_identity(self):
+        control=self.root/'control';control.mkdir(mode=0o750)
+        path=control/'command';server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);server.bind(str(path));os.chmod(path,0o600);server.listen(3)
+        restore='a'*32;service=str(uuid.uuid4());received=[]
+        def serve():
+            for response in ('ready','starting','completed'):
+                with server.accept()[0] as peer:
+                    received.append(json.loads(peer.recv(4096)));peer.sendall(json.dumps({'version':1,'status':response}).encode()+b'\n')
+        thread=threading.Thread(target=serve);thread.start()
+        try:
+            updater.dispatch_legacy_recovery(str(path),self.op,restore,service)
+            self.assertEqual(updater.query_legacy_recovery(str(path),self.op,restore,service),'completed')
+            thread.join(timeout=2)
+            self.assertEqual(received,[{'version':1,'type':'status'},
+                {'version':1,'type':'recover_legacy_upload','operationId':self.op,'restoreId':restore,'serviceId':service},
+                {'version':1,'type':'legacy_recovery_status','operationId':self.op,'restoreId':restore,'serviceId':service}])
+        finally:server.close()
+
 
 if __name__ == '__main__': unittest.main()

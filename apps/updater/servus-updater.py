@@ -1025,31 +1025,31 @@ class PreparationWorker:
         if self.operation is not None: self.fail()
 
 
-def dispatch_apply(socket_path, operation_id):
-    """Send only an operation identity to the protected root supervisor."""
-    if not valid_uuid(operation_id) or not isinstance(socket_path, str) or not os.path.isabs(socket_path) or os.path.normpath(socket_path) != socket_path:
+def supervisor_request(socket_path,message,timeout):
+    if not isinstance(socket_path,str) or not os.path.isabs(socket_path) or os.path.normpath(socket_path)!=socket_path or not isinstance(message,dict) or not isinstance(timeout,(int,float)) or isinstance(timeout,bool) or not 0<timeout<=1800:
         raise RuntimeError('Invalid supervisor command')
     path = pathlib.Path(socket_path)
     trusted_directory(path.parent, 0o750)
-    def request(message, timeout):
-        before = path.lstat()
-        if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) != 0o600:
-            raise RuntimeError('Supervisor command socket is not trusted')
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
-            peer.settimeout(timeout)
-            peer.connect(socket_path)
-            _pid, uid, _gid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
-            after = path.lstat()
-            if uid != 0 or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                raise RuntimeError('Supervisor command peer is not trusted')
-            peer.sendall(json.dumps(message, separators=(',', ':')).encode() + b'\n')
-            return receive(peer, time.monotonic() + timeout)
+    before = path.lstat()
+    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) != 0o600:
+        raise RuntimeError('Supervisor command socket is not trusted')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(timeout);peer.connect(socket_path)
+        _pid, uid, _gid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+        after = path.lstat()
+        if uid != 0 or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise RuntimeError('Supervisor command peer is not trusted')
+        peer.sendall(json.dumps(message, separators=(',', ':')).encode() + b'\n')
+        return receive(peer, time.monotonic() + timeout)
+
+
+def wait_supervisor_ready(socket_path):
 
     # Readiness checks are side-effect free; never retry an apply command.
     deadline = time.monotonic() + 60
     while True:
         try:
-            status = request({'version': 1, 'type': 'status'}, 5)
+            status = supervisor_request(socket_path,{'version': 1, 'type': 'status'}, 5)
         except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
             status = {'version': 1, 'status': 'waiting'}
         if status == {'version': 1, 'status': 'ready'}:
@@ -1057,8 +1057,32 @@ def dispatch_apply(socket_path, operation_id):
         if status != {'version': 1, 'status': 'waiting'} or time.monotonic() >= deadline:
             raise RuntimeError('Supervisor is not ready')
         time.sleep(min(0.5, max(0, deadline - time.monotonic())))
-    if request({'version': 1, 'type': 'apply', 'operationId': operation_id}, 1800) != {'version': 1, 'status': 'starting'}:
+
+def dispatch_apply(socket_path, operation_id):
+    """Send only an operation identity to the protected root supervisor."""
+    if not valid_uuid(operation_id):raise RuntimeError('Invalid supervisor command')
+    wait_supervisor_ready(socket_path)
+    if supervisor_request(socket_path,{'version': 1, 'type': 'apply', 'operationId': operation_id}, 1800) != {'version': 1, 'status': 'starting'}:
         raise RuntimeError('Supervisor did not confirm startup')
+
+
+def dispatch_legacy_recovery(socket_path,operation_id,restore_id,service_id):
+    if (not valid_uuid(operation_id) or not isinstance(restore_id,str) or not re.fullmatch(r'[a-f0-9]{32}',restore_id) or
+        not isinstance(service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service_id)):
+        raise RuntimeError('Invalid supervisor command')
+    wait_supervisor_ready(socket_path)
+    if supervisor_request(socket_path,{'version':1,'type':'recover_legacy_upload','operationId':operation_id,'restoreId':restore_id,'serviceId':service_id},1800)!={'version':1,'status':'starting'}:
+        raise RuntimeError('Supervisor did not confirm recovery start')
+
+
+def query_legacy_recovery(socket_path,operation_id,restore_id,service_id):
+    if (not valid_uuid(operation_id) or not isinstance(restore_id,str) or not re.fullmatch(r'[a-f0-9]{32}',restore_id) or
+        not isinstance(service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service_id)):
+        raise RuntimeError('Invalid supervisor command')
+    result=supervisor_request(socket_path,{'version':1,'type':'legacy_recovery_status','operationId':operation_id,'restoreId':restore_id,'serviceId':service_id},5)
+    if not isinstance(result,dict) or set(result)!={'version','status'} or type(result.get('version')) is not int or result['version']!=1 or result.get('status') not in ('unknown','in_progress','completed','recovery_required'):
+        raise RuntimeError('Supervisor recovery status is unavailable')
+    return result['status']
 
 
 class ApplyWorker:
