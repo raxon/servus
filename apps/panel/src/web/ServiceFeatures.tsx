@@ -6,6 +6,7 @@ import {
   Check,
   Copy,
   Database,
+  Download,
   ExternalLink,
   Eye,
   EyeOff,
@@ -955,6 +956,23 @@ export function DatabaseConnection({ service }: { service: Service }) {
       setVisible(true);
     },
   });
+  const exportMutation = useMutation({
+    mutationFn: async () => {
+      const result = await api<{ downloadUrl: string }>(`/services/${service.id}/database-export`, { method: "POST", body: {} });
+      const expected = `/api/v1/services/${service.id}/database-export/download`;
+      if (result.downloadUrl !== expected) throw new Error("The export could not be downloaded.");
+      return expected;
+    },
+    onSuccess: (url) => {
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "";
+      link.hidden = true;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    },
+  });
   useEffect(() => {
     setVisible(false);
     setRevealed(null);
@@ -973,7 +991,7 @@ export function DatabaseConnection({ service }: { service: Service }) {
         <Database size={18} />
         <h2>Database connection</h2>
       </div>
-      <FeatureError error={connection.error ?? reveal.error} />
+      <FeatureError error={connection.error ?? reveal.error ?? exportMutation.error} />
       {connection.isPending ? (
         <FeatureLoading label="Loading connection details" />
       ) : connection.data ? (
@@ -1039,6 +1057,13 @@ export function DatabaseConnection({ service }: { service: Service }) {
             This address is reachable by services in the project network.
             Revealed credentials are hidden after one minute.
           </p>
+          <div className="detail-row">
+            <span>Database export</span>
+            <button className="button button-small" type="button" disabled={exportMutation.isPending} onClick={() => exportMutation.mutate()}>
+              {exportMutation.isPending ? <FeatureLoading label="Preparing export" /> : <><Download size={15} /> Download</>}
+            </button>
+          </div>
+          <p className="feature-helper">Exports up to 2 GiB of database data. Application files are not included.</p>
         </>
       ) : null}
     </section>

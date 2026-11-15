@@ -1,4 +1,4 @@
-import { request } from 'node:http';
+import { request, type IncomingMessage } from 'node:http';
 import { z } from 'zod';
 import { agentConfig } from './config.js';
 import type { RuntimeStatus, Service, ServiceState } from '../shared/types.js';
@@ -75,4 +75,23 @@ export async function applyService(operationId: string, service: Service, type: 
   const parsed = resultSchema.safeParse(data);
   if(!parsed.success) throw new AgentRequestError('Agent returned an invalid operation result; its outcome is unknown.','uncertain');
   return parsed.data;
+}
+
+export function agentDatabaseExport(serviceId:string, input:{kind:'postgres'|'mariadb'|'redis';database:string;user:string}, options:AgentRequestOptions={}):Promise<IncomingMessage> {
+  const config=options.socketPath&&options.token?undefined:agentConfig();
+  return new Promise((resolve,reject)=>{
+    let settled=false;
+    const body=JSON.stringify(input);
+    const req=request({socketPath:options.socketPath??config!.socketPath,path:`/services/${serviceId}/database-export`,method:'POST',
+      headers:{authorization:`Bearer ${options.token??config!.token}`,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{
+      clearTimeout(timer);
+      if(res.statusCode!==200){
+        res.resume();settled=true;reject(new AgentRequestError('The database export could not be created.','definitive',res.statusCode));return;
+      }
+      settled=true;res.setTimeout(300_000,()=>res.destroy(new Error('Database export transfer timed out.')));resolve(res);
+    });
+    const timer=setTimeout(()=>req.destroy(new Error('Database export timed out.')),options.timeoutMs??330_000);
+    req.once('error',error=>{clearTimeout(timer);if(!settled){settled=true;reject(new AgentRequestError('The database export service is unavailable.','uncertain',undefined,undefined,{cause:error}));}});
+    req.end(body);
+  });
 }

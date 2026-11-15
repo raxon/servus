@@ -118,6 +118,7 @@ jobs:
           npx playwright install --with-deps chromium
           node tests/integration/session-races.mjs
           node tests/integration/private-git.mjs
+          node tests/integration/database-export.mjs
           node tests/integration/update-settings.mjs
       - name: Test control-plane capture and restore
         run: |

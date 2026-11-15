@@ -23,9 +23,22 @@ password=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
 printf 'POSTGRES_DB=fixture\nPOSTGRES_USER=fixture\nPOSTGRES_PASSWORD=%s\n' "$password" > "$root/postgres.env"
 printf 'MARIADB_DATABASE=fixture\nMARIADB_USER=fixture\nMARIADB_PASSWORD=%s\nMARIADB_ROOT_PASSWORD=%s\n' "$password" "$password" > "$root/mariadb.env"
 printf 'REDIS_PASSWORD=%s\n' "$password" > "$root/redis.env"
-chmod 600 "$root"/*.env
+printf '%s' "$password" > "$root/password"
+chmod 600 "$root"/*.env "$root/password"
 start() {
-  docker run -d --network none --label "servus.test=$id" --name "$1" --env-file "$2" "$3" >/dev/null
+  docker run -d --network none --label "servus.test=$id" --name "$1" --env-file "$2" --mount "type=bind,src=$root/password,dst=/run/secrets/panel-db-password,readonly" "$3" >/dev/null
+}
+export_with_agent() {
+  local container=$1 kind=$2 output=$3 container_id module
+  local -a mounts=()
+  [[ -n ${SERVUS_EXPORT_SOURCE:-} && -n ${SERVUS_EXPORT_IMAGE:-} ]] || return 1
+  container_id=$(docker inspect --format '{{.Id}}' "$container")
+  if [[ $SERVUS_EXPORT_SOURCE == image ]]; then module=/app/dist/agent/database-export.js; else
+    module=/fixture-export.ts; mounts+=(--mount "type=bind,src=$SERVUS_EXPORT_SOURCE,dst=$module,readonly")
+  fi
+  docker run --rm --network none --user 0 --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+    "${mounts[@]}" -e "SERVUS_EXPORT_CONTAINER=$container_id" -e "SERVUS_EXPORT_KIND=$kind" -e "SERVUS_EXPORT_MODULE=$module" --entrypoint node "$SERVUS_EXPORT_IMAGE" \
+    --input-type=module -e 'import {pipeline} from "node:stream/promises"; const {exportDatabase}=await import(process.env.SERVUS_EXPORT_MODULE); const result=await exportDatabase({containerId:process.env.SERVUS_EXPORT_CONTAINER,dockerSocket:"/var/run/docker.sock",kind:process.env.SERVUS_EXPORT_KIND,database:"fixture",user:"fixture"}); try {await pipeline(result.stream(),process.stdout,{end:false});} finally {result.close();}' > "$output"
 }
 wait_ready() {
   local name=$1 kind=$2
@@ -47,7 +60,9 @@ CREATE TABLE items (id integer PRIMARY KEY, title text NOT NULL);
 INSERT INTO items VALUES (1,'hello'),(2,'Zażółć gęślą jaźń');
 CREATE TABLE empty_items (id integer PRIMARY KEY);
 SQL
-docker exec "${names[0]}" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h 127.0.0.1 -U fixture --format=custom --no-owner --no-privileges fixture' > "$root/postgres.dump"
+if [[ -n ${SERVUS_EXPORT_SOURCE:-} ]]; then export_with_agent "${names[0]}" postgres "$root/postgres.dump"; else
+  docker exec "${names[0]}" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h 127.0.0.1 -U fixture --format=custom --no-owner --no-privileges fixture' > "$root/postgres.dump"
+fi
 test -s "$root/postgres.dump"
 docker exec -i "${names[1]}" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore -h 127.0.0.1 -U fixture -d fixture --exit-on-error --no-owner --no-privileges' < "$root/postgres.dump"
 result=$(docker exec "${names[1]}" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U fixture -d fixture -At -v ON_ERROR_STOP=1 -c "SELECT count(*) || '\''|'\'' || (SELECT title FROM items WHERE id=2) || '\''|'\'' || (SELECT count(*) FROM empty_items) FROM items"')
@@ -62,18 +77,22 @@ CREATE TABLE items (id integer PRIMARY KEY, title varchar(100) NOT NULL) CHARACT
 INSERT INTO items VALUES (1,'hello'),(2,'Zażółć gęślą jaźń');
 CREATE TABLE empty_items (id integer PRIMARY KEY);
 SQL
-docker exec "${names[2]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb-dump -h 127.0.0.1 -u fixture --single-transaction --quick --skip-lock-tables --no-tablespaces --default-character-set=utf8mb4 fixture' > "$root/mariadb.sql"
+if [[ -n ${SERVUS_EXPORT_SOURCE:-} ]]; then export_with_agent "${names[2]}" mariadb "$root/mariadb.sql"; else
+  docker exec "${names[2]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb-dump -h 127.0.0.1 -u fixture --single-transaction --quick --skip-lock-tables --no-tablespaces --default-character-set=utf8mb4 fixture' > "$root/mariadb.sql"
+fi
 test -s "$root/mariadb.sql"
 docker exec -i "${names[3]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture --default-character-set=utf8mb4 fixture' < "$root/mariadb.sql"
 result=$(docker exec "${names[3]}" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture --default-character-set=utf8mb4 fixture -N -e "SELECT CONCAT(COUNT(*), '\''|'\'', (SELECT title FROM items WHERE id=2), '\''|'\'', (SELECT COUNT(*) FROM empty_items)) FROM items"')
 [[ $result == '2|Zażółć gęślą jaźń|0' ]]
 printf 'PASS MariaDB logical export and restore\n'
 docker rm -f -v "${names[2]}" "${names[3]}" >/dev/null
-docker run -d --network none --label "servus.test=$id" --name "${names[4]}" --env-file "$root/redis.env" redis:7-alpine sh -c 'exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"' >/dev/null
+docker run -d --network none --label "servus.test=$id" --name "${names[4]}" --env-file "$root/redis.env" --mount "type=bind,src=$root/password,dst=/run/secrets/panel-db-password,readonly" redis:7-alpine sh -c 'exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"' >/dev/null
 wait_ready "${names[4]}" redis
 docker exec "${names[4]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli SET message "Zażółć gęślą jaźń"' >/dev/null
 docker exec "${names[4]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli HSET metadata version 1' >/dev/null
-docker exec "${names[4]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --rdb -' > "$root/redis.rdb"
+if [[ -n ${SERVUS_EXPORT_SOURCE:-} ]]; then export_with_agent "${names[4]}" redis "$root/redis.rdb"; else
+  docker exec "${names[4]}" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --rdb -' > "$root/redis.rdb"
+fi
 test -s "$root/redis.rdb"; chmod 644 "$root/redis.rdb"
 docker volume create --label "servus.test=$id" "$redis_volume" >/dev/null
 docker create --network none --label "servus.test=$id" --name "${names[5]}" --env-file "$root/redis.env" --mount "type=volume,src=$redis_volume,dst=/data" redis:7-alpine sh -c 'exec redis-server --appendonly no --requirepass "$REDIS_PASSWORD"' >/dev/null

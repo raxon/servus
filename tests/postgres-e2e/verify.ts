@@ -73,6 +73,16 @@ async function waitAction(id: string) {
     return result.status === 'succeeded' ? result : undefined;
   }, 'action completion', 300);
 }
+async function downloadExport(serviceId:string) {
+  const prepare=await fetch(`${origin}/api/v1/services/${serviceId}/database-export`,{method:'POST',headers:{origin,cookie,'x-csrf-token':csrf,'content-type':'application/json'},body:'{}',signal:AbortSignal.timeout(330_000)});
+  assert.equal(prepare.status,200);
+  const ticket=prepare.headers.get('set-cookie')?.split(';')[0];assert(ticket?.startsWith('panel_export='));
+  const path=(await prepare.json() as {downloadUrl:string}).downloadUrl;
+  const response=await fetch(`${origin}${path}`,{headers:{cookie:`${cookie}; ${ticket}`},signal:AbortSignal.timeout(60_000)});
+  assert.equal(response.status,200);const data=Buffer.from(await response.arrayBuffer());
+  assert.equal((await fetch(`${origin}${path}`,{headers:{cookie:`${cookie}; ${ticket}`}})).status,404);
+  return data;
+}
 
 try {
   const contextInfo = JSON.parse(cli(['context', 'inspect', context]))[0];
@@ -124,9 +134,9 @@ try {
   } finally { journal.close(); }
   console.log('PASS saved target recovered after SIGKILL of the real agent');
   const serviceName = `panel-app-${serviceId}`;
-  async function runningContainer() {
+  async function runningContainer(targetId=serviceId) {
     return waitUntil(async () => {
-      const ids = cli(['ps', '-q', '--filter', `label=com.docker.swarm.service.name=${serviceName}`]).trim().split('\n').filter(Boolean);
+      const ids = cli(['ps', '-q', '--filter', `label=com.docker.swarm.service.name=panel-app-${targetId}`]).trim().split('\n').filter(Boolean);
       return ids.length === 1 && /^[a-f0-9]{12,64}$/.test(ids[0]!) ? ids[0] : undefined;
     }, 'PostgreSQL container', 500);
   }
@@ -138,6 +148,12 @@ try {
   const valid = 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -w -h 127.0.0.1 -U app -d app -v ON_ERROR_STOP=1 -tA';
   const marker = `marker_${randomBytes(12).toString('hex')}`;
   assert.equal(run(container, `${valid} -c "CREATE TABLE marker(value text); INSERT INTO marker VALUES ('${marker}'); SELECT value FROM marker"`).trim().split('\n').at(-1), marker);
+  const exported=await downloadExport(serviceId);assert.equal(exported.subarray(0,5).toString(),'PGDMP');
+  run(container,'PGPASSWORD="$(cat /run/secrets/panel-db-password)" createdb -h 127.0.0.1 -U app restore_fixture');
+  execFileSync('docker',['--context',context,'exec','-i',container,'/bin/sh','-c',
+    'PGPASSWORD="$(cat /run/secrets/panel-db-password)" pg_restore -h 127.0.0.1 -U app -d restore_fixture --exit-on-error --no-owner --no-privileges'],{input:exported,stdio:['pipe','pipe','pipe'],timeout:60_000});
+  assert.equal(run(container,'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -h 127.0.0.1 -U app -d restore_fixture -At -c "SELECT value FROM marker"').trim(),marker);
+  console.log('PASS authenticated database download and restore');
   const spec = JSON.parse(cli(['service', 'inspect', serviceName]))[0].Spec;
   assert.deepEqual(spec.EndpointSpec?.Ports ?? [], []);
   assert(!JSON.stringify(spec).includes(dbPassword));
@@ -146,6 +162,26 @@ try {
   container = await runningContainer();
   assert.equal(run(container, `${valid} -c 'SELECT value FROM marker'`).trim(), marker);
   console.log('PASS TCP/socket auth and persistent data after API restart');
+  const createDatabase=async(name:string,kind:'mariadb'|'redis')=>{
+    const item=await api(`/projects/${project.id}/services`,'POST',{name,kind,replicas:1,database:{database:'app',user:'app',password:dbPassword},resources:{cpu:0.5,memoryMb:256}},randomUUID());
+    await waitAction(item.action.id);return {id:item.service.id as string,container:await runningContainer(item.service.id)};
+  };
+  const maria=await createDatabase('maria-source','mariadb');
+  run(maria.container,`MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u app app -e "CREATE TABLE marker(value varchar(128)); INSERT INTO marker VALUES ('${marker}')"`);
+  const mariaExport=await downloadExport(maria.id);
+  const mariaTarget=await createDatabase('maria-target','mariadb');
+  execFileSync('docker',['--context',context,'exec','-i',mariaTarget.container,'/bin/sh','-c',
+    'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u app app'],{input:mariaExport,stdio:['pipe','pipe','pipe'],timeout:60_000});
+  assert.equal(run(mariaTarget.container,'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u app app -N -e "SELECT value FROM marker"').trim(),marker);
+  console.log('PASS MariaDB download and restore through the panel');
+  const redis=await createDatabase('redis-source','redis');
+  run(redis.container,`REDISCLI_AUTH="$(cat /run/secrets/panel-db-password)" redis-cli SET marker '${marker}'`);
+  const redisExport=await downloadExport(redis.id);assert.equal(redisExport.subarray(0,5).toString(),'REDIS');
+  const rdbPath=`/tmp/servus-${randomBytes(8).toString('hex')}.rdb`;
+  const checked=execFileSync('docker',['--context',context,'exec','-i',redis.container,'/bin/sh','-c',
+    `set -eu; trap 'rm -f ${rdbPath}' EXIT; cat > ${rdbPath}; redis-check-rdb ${rdbPath}`],{input:redisExport,encoding:'utf8',stdio:['pipe','pipe','pipe'],timeout:60_000});
+  assert.match(checked,/Checksum OK|RDB looks OK/);
+  console.log('PASS Redis snapshot download through the panel');
 } finally {
   for (const child of [...children]) await terminate(child, 'SIGTERM').catch(() => child.kill('SIGKILL'));
   rmSync(data, { recursive: true, force: true });

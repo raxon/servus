@@ -11,6 +11,7 @@ import { agentConfig } from './config.js';
 import { DockerRuntime, message, isUncertainRuntimeError, type RecoveryContext } from './runtime.js';
 import type { Service } from '../shared/types.js';
 import { consoleExecStopped, type AgentMaintenanceGate } from './maintenance.js';
+import { DatabaseExportUncertainError, exportDatabase } from './database-export.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -81,6 +82,32 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if(!z.string().uuid().safeParse(req.params.id).success)return reply.code(400).send({error:{code:'INVALID_ID',message:'Invalid service identity.'}});
     if(operation==='logs') { const parsed=query.safeParse(req.query); if(!parsed.success)return reply.code(400).send({error:{code:'INVALID_QUERY',message:'Invalid log query.'}}); return runtime.logs!(req.params.id,parsed.data.tail,parsed.data.since); }
     return runtime[operation]!(req.params.id);
+  });
+  app.post<{Params:{id:string}}>('/services/:id/database-export',async(req,reply)=>{
+    const parsed=z.object({kind:z.enum(['postgres','mariadb','redis']),database:z.string().min(1).max(63),user:z.string().min(1).max(63)}).strict().safeParse(req.body);
+    if(!z.string().uuid().safeParse(req.params.id).success||!parsed.success)return reply.code(400).send({error:{code:'INVALID_EXPORT',message:'Invalid database export request.'}});
+    const release=maintenance?.admit();
+    if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    let handedOff=false,held=false,finished=false,artifact:Awaited<ReturnType<typeof exportDatabase>>|undefined;
+    const finish=()=>{if(finished)return;finished=true;artifact?.close();if(held)locks.delete(req.params.id);release?.();};
+    try{
+      const unresolved=journal.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(req.params.id);
+      if(unresolved||locks.has(req.params.id))return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'Another operation is changing this service.'}});
+      locks.add(req.params.id);held=true;
+      if(!runtime.consoleContainer)throw new Error('Database export is unavailable.');
+      const container=await runtime.consoleContainer(req.params.id);
+      const info=await container.inspect();
+      const values=new Map((info.Config.Env||[]).map(item=>{const index=item.indexOf('=');return [item.slice(0,index),item.slice(index+1)];}));
+      if(parsed.data.kind==='postgres'&&(values.get('POSTGRES_DB')!==parsed.data.database||values.get('POSTGRES_USER')!==parsed.data.user))throw new Error('Database identity does not match the running service.');
+      if(parsed.data.kind==='mariadb'&&(values.get('MARIADB_DATABASE')!==parsed.data.database||values.get('MARIADB_USER')!==parsed.data.user))throw new Error('Database identity does not match the running service.');
+      try { artifact=await exportDatabase({containerId:container.id,dockerSocket:config.dockerSocket,...parsed.data}); }
+      catch(error){if(error instanceof DatabaseExportUncertainError)maintenance?.markUncertain();throw error;}
+      if(reply.raw.destroyed)return;
+      const stream=artifact.stream();
+      reply.raw.once('close',finish);stream.once('error',finish);
+      reply.header('Content-Type','application/octet-stream').header('Content-Length',artifact.size).header('X-Export-Extension',artifact.extension);
+      handedOff=true;return reply.send(stream);
+    }finally{if(!handedOff)finish();}
   });
   app.get<{Params:{id:string};Querystring:{containerId?:string;shell?:string}}>('/services/:id/console', {websocket:true,preValidation:async(req,reply)=>{
     if(!z.string().uuid().safeParse(req.params.id).success||!['/bin/sh','/bin/bash'].includes(req.query.shell||'/bin/sh')||(req.query.containerId&&!/^[a-f0-9]{12,64}$/.test(req.query.containerId)))return reply.code(400).send({error:{code:'INVALID_CONSOLE',message:'Invalid console target.'}});

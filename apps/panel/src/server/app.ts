@@ -5,13 +5,15 @@ import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
 import type { ActionType, RuntimeStatus, User } from '../shared/types.js';
 import { hashPassword, verifyPassword } from './auth.js';
 import { AppError } from './errors.js';
 import { Store } from './store.js';
 import { nameSchema, normalizeServiceInput, parseServicePatch } from './configuration.js';
-import { agentRequest as defaultAgentRequest, AgentRequestError } from '../agent/client.js';
+import { agentRequest as defaultAgentRequest, agentDatabaseExport, AgentRequestError } from '../agent/client.js';
 import { registerConsole } from './console.js';
 import { registerCentralAuth } from './central-auth.js';
 import { BUILD_INFO } from './generated-build-info.js';
@@ -28,6 +30,7 @@ export interface AppOptions {
   dataDir: string; webDir?: string; store?: Store; logger?: boolean;
   runtimeStatus?: () => Promise<RuntimeStatus>; allowedOrigins?: string[]; secureCookies?: boolean;
   agentRequest?:typeof defaultAgentRequest; agentConnection?:{socketPath:string;token:string};
+  databaseExport?:typeof agentDatabaseExport;
   trustedProxySecret?: string;
   maintenance?: MaintenanceGate;
   updaterSocketPath?: string;
@@ -38,6 +41,9 @@ export async function createApp(options: AppOptions) {
   if(options.trustedProxySecret!==undefined && !/^[a-f0-9]{64}$/.test(options.trustedProxySecret))throw new Error('Invalid trusted proxy secret configuration');
   const store = options.store ?? new Store(options.dataDir);
   const app = Fastify({ logger: options.logger ?? false, logController: new LogController({ disableRequestLogging: true }), bodyLimit: 256 * 1024, trustProxy: false });
+  const exportTickets=new Map<string,{serviceId:string;sessionHash:string;stream:IncomingMessage;length:string;extension:string;timer:ReturnType<typeof setTimeout>}>();
+  let exportsPreparing=0;
+  app.addHook('onClose',async()=>{for(const ticket of exportTickets.values()){clearTimeout(ticket.timer);ticket.stream.destroy();}exportTickets.clear();});
   await app.register(cookie);
   await app.register(rateLimit, { global: false, keyGenerator: req => clientAddress(req,options.trustedProxySecret) });
   await app.register(websocket,{options:{maxPayload:65536}});
@@ -239,6 +245,46 @@ export async function createApp(options: AppOptions) {
   app.get(`${prefix}/runtime`, async req => {session(req);return options.runtimeStatus ? options.runtimeStatus() : {online:false,error:'Runtime agent is not connected'};});
   app.get<{Params:{id:string}}>(`${prefix}/services/:id/connection`,async req=>{serviceAccess(req,req.params.id);return store.connectionInfo(req.params.id);});
   app.post<{Params:{id:string}}>(`${prefix}/services/:id/connection/reveal`,async req=>{const {auth}=serviceAccess(req,req.params.id,true);const result=store.connectionInfo(req.params.id,true);store.recordAudit(auth.user.id,'connection.reveal',req.params.id);return result;});
+  app.post<{Params:{id:string}}>(`${prefix}/services/:id/database-export`,async(req,reply)=>{
+    const {auth,service}=serviceAccess(req,req.params.id,true);
+    z.object({}).strict().parse(req.body??{});
+    if(!service.kind||service.kind==='app')throw new AppError('NOT_FOUND','Managed database not found',404);
+    const connection=store.connectionInfo(service.id);
+    if(exportTickets.size+exportsPreparing>=8)throw new AppError('EXPORT_BUSY','Too many exports are in progress',429);
+    exportsPreparing++;
+    try {
+      const upstream=await (options.databaseExport??agentDatabaseExport)(service.id,{kind:service.kind,database:connection.database,user:connection.user},options.agentConnection);
+      const length=upstream.headers['content-length'],extension=upstream.headers['x-export-extension'];
+      const expected={postgres:'dump',mariadb:'sql',redis:'rdb'}[service.kind];
+      if(typeof length!=='string'||! /^[1-9][0-9]*$/.test(length)||Number(length)>2*1024*1024*1024||extension!==expected){
+        upstream.destroy();throw new AppError('EXPORT_INVALID','The database export response is invalid',502);
+      }
+      const token=randomBytes(32).toString('hex'),sessionHash=createHash('sha256').update(req.cookies[cookieName]!).digest('hex');
+      const timer=setTimeout(()=>{exportTickets.delete(token);upstream.destroy();},60_000);timer.unref();
+      exportTickets.set(token,{serviceId:service.id,sessionHash,stream:upstream,length,extension:expected,timer});
+      upstream.once('error',()=>{clearTimeout(timer);exportTickets.delete(token);});
+      const path=`${prefix}/services/${service.id}/database-export/download`;
+      reply.setCookie('panel_export',token,{path,httpOnly:true,sameSite:'strict',secure:options.secureCookies??false,maxAge:60});
+      store.recordAudit(auth.user.id,'database.export.prepared',service.id);
+      return {downloadUrl:path};
+    } finally {exportsPreparing--;}
+  });
+  app.get<{Params:{id:string}}>(`${prefix}/services/:id/database-export/download`,async(req,reply)=>{
+    const {auth,service}=serviceAccess(req,req.params.id);
+    const path=`${prefix}/services/${service.id}/database-export/download`,token=req.cookies.panel_export;
+    reply.clearCookie('panel_export',{path});
+    const ticket=token?exportTickets.get(token):undefined;
+    if(ticket){exportTickets.delete(token!);clearTimeout(ticket.timer);}
+    const sessionHash=createHash('sha256').update(req.cookies[cookieName]!).digest('hex');
+    if(!ticket||ticket.serviceId!==service.id||ticket.sessionHash!==sessionHash||!store.canAccess(auth.user,service.projectId,true)){
+      ticket?.stream.destroy();throw new AppError('EXPORT_EXPIRED','The database export has expired',404);
+    }
+    store.recordAudit(auth.user.id,'database.export.download',service.id);
+    reply.header('Content-Type','application/octet-stream').header('Content-Length',ticket.length)
+      .header('Content-Disposition',`attachment; filename="servus-${service.id}.${ticket.extension}"`);
+    reply.raw.once('close',()=>{if(!ticket.stream.destroyed)ticket.stream.destroy();});
+    return reply.send(ticket.stream);
+  });
   app.get<{Params:{id:string};Querystring:{tail?:string;since?:string}}>(`${prefix}/services/:id/logs`,async req=>{
     serviceAccess(req,req.params.id);
     const tail=z.coerce.number().int().min(1).max(500).default(200).parse(req.query.tail);
