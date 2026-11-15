@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import select
 import signal
 import socket
@@ -368,12 +369,100 @@ def finalize_initial_preparation(hub, operation, policy_path, approval_journal, 
         raise supervisor.SupervisorError('Initial preparation cannot be completed') from error
 
 
+def finalize_legacy_recovery(hub, operation, policy_path, approval_journal, accepted_env):
+    """Finalize only a bound recovery after every original role reconnects."""
+    try:marker_fd=supervisor._open_root_file(operation.journal,'legacy-upload-recovery.json',0o600)
+    except FileNotFoundError:return False
+    try:
+        marker_info=os.fstat(marker_fd);raw=os.read(marker_fd,4097)
+        if len(raw)>4096:raise supervisor.SupervisorError('Legacy recovery marker is invalid')
+        marker=json.loads(raw,object_pairs_hook=supervisor._pairs)
+    except (ValueError,UnicodeError,RecursionError) as error:raise supervisor.SupervisorError('Legacy recovery marker is invalid') from error
+    finally:os.close(marker_fd)
+    if (not isinstance(marker,dict) or set(marker)!={'version','operationId','restoreId','serviceId','state','policyBinding','containerIds'} or
+        type(marker['version']) is not int or marker['version']!=1 or not supervisor._uuid4(marker['operationId']) or
+        not isinstance(marker['restoreId'],str) or not re.fullmatch(r'[a-f0-9]{32}',marker['restoreId']) or
+        not isinstance(marker['serviceId'],str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',marker['serviceId']) or marker['state']!='starting'):
+        raise supervisor.SupervisorError('Legacy recovery marker is invalid')
+    if (hub is None or hub.used or set(hub.connections)!=set(supervisor.ROLES) or
+        select.select(list(hub.connections.values()),[],[],0)[0]):return False
+    try:identities={role:hub.identities[role]['id'] for role in supervisor.ROLES}
+    except (KeyError,TypeError):raise supervisor.SupervisorError('Legacy recovery identity is unavailable') from None
+    if (any(not isinstance(value,str) or not supervisor.CONTAINER.fullmatch(value) for value in identities.values()) or len(set(identities.values()))!=3 or
+        marker['containerIds']!=identities or supervisor.inspect_servus(hub.policy)!=hub.identities):
+        raise supervisor.SupervisorError('Legacy recovery identity changed')
+    binding=approved_policy_binding(hub,policy_path,approval_journal,accepted_env)
+    if not isinstance(binding,tuple) or len(binding)!=4 or marker['policyBinding']!=list(binding[:3]) or binding[3]!=hub.policy:
+        raise supervisor.SupervisorError('Legacy recovery policy changed')
+    state_fd=supervisor._open_root_file(operation.gate,'state',0o644)
+    try:
+        if os.read(state_fd,64)!=b'servus-lifecycle-v1 normal\n':raise supervisor.SupervisorError('Legacy recovery gate is not open')
+    finally:os.close(state_fd)
+    def verify_health():
+        try:
+            ids=[identities[role] for role in supervisor.ROLES]
+            records=json.loads(supervisor._docker('inspect',*ids),object_pairs_hook=supervisor._pairs)
+            if not isinstance(records,list) or len(records)!=len(ids):raise supervisor.SupervisorError('Legacy recovery health is unavailable')
+            by_id={item.get('Id'):item for item in records if isinstance(item,dict)}
+            if set(by_id)!=set(ids):raise supervisor.SupervisorError('Legacy recovery identity changed')
+            for role in supervisor.ROLES:
+                state=by_id[identities[role]].get('State')
+                if (not isinstance(state,dict) or state.get('Running') is not True or
+                    (role in ('api','agent') and (not isinstance(state.get('Health'),dict) or state['Health'].get('Status')!='healthy'))):
+                    raise supervisor.SupervisorError('Legacy recovery health is unavailable')
+        except (ValueError,UnicodeError,RecursionError) as error:raise supervisor.SupervisorError('Legacy recovery health is unavailable') from error
+    verify_health()
+    maintenance_info=None
+    try:fd=supervisor._open_root_file(operation.journal,'maintenance.json',0o600)
+    except FileNotFoundError:pass
+    else:
+        try:
+            maintenance_info=os.fstat(fd);raw=os.read(fd,4097)
+            if len(raw)>4096:raise supervisor.SupervisorError('Maintenance marker is invalid')
+            maintenance=json.loads(raw,object_pairs_hook=supervisor._pairs)
+        except (ValueError,UnicodeError,RecursionError) as error:raise supervisor.SupervisorError('Maintenance marker is invalid') from error
+        finally:os.close(fd)
+        if (not isinstance(maintenance,dict) or set(maintenance)!={'version','operationId','state','requestIds','timeoutMs'} or
+            type(maintenance['version']) is not int or maintenance['version']!=1 or maintenance['operationId']!=marker['operationId'] or
+            maintenance['state']!='starting' or not isinstance(maintenance['requestIds'],dict) or set(maintenance['requestIds'])!=set(supervisor.ROLES) or
+            not all(supervisor._uuid4(value) for value in maintenance['requestIds'].values()) or len(set(maintenance['requestIds'].values()))!=len(supervisor.ROLES) or
+            type(maintenance['timeoutMs']) is not int or not 1<=maintenance['timeoutMs']<=60000):
+            raise supervisor.SupervisorError('Maintenance marker does not match recovery')
+    history_name='legacy-upload-validated-'+marker['operationId']+'.json'
+    history={**marker,'state':'validated'}
+    try:fd=supervisor._open_root_file(operation.journal,history_name,0o600)
+    except FileNotFoundError:
+        if maintenance_info is None:raise supervisor.SupervisorError('Legacy recovery history is unavailable')
+        supervisor._atomic_file(operation.journal,history_name,json.dumps(history,separators=(',',':')).encode('ascii')+b'\n',0o600)
+    else:
+        try:
+            raw=os.read(fd,4097)
+            if len(raw)>4096 or json.loads(raw,object_pairs_hook=supervisor._pairs)!=history:raise supervisor.SupervisorError('Legacy recovery history changed')
+        except (ValueError,UnicodeError,RecursionError) as error:raise supervisor.SupervisorError('Legacy recovery history is invalid') from error
+        finally:os.close(fd)
+    verify_health()
+    if (supervisor.inspect_servus(hub.policy)!=hub.identities or select.select(list(hub.connections.values()),[],[],0)[0] or
+        approved_policy_binding(hub,policy_path,approval_journal,accepted_env)!=binding):
+        raise supervisor.SupervisorError('Legacy recovery identity changed')
+    if maintenance_info is not None:
+        named=os.stat('maintenance.json',dir_fd=operation.journal,follow_symlinks=False)
+        if (named.st_dev,named.st_ino)!=(maintenance_info.st_dev,maintenance_info.st_ino):raise supervisor.SupervisorError('Maintenance marker changed')
+        os.unlink('maintenance.json',dir_fd=operation.journal);os.fsync(operation.journal)
+    named=os.stat('legacy-upload-recovery.json',dir_fd=operation.journal,follow_symlinks=False)
+    if (named.st_dev,named.st_ino)!=(marker_info.st_dev,marker_info.st_ino):raise supervisor.SupervisorError('Legacy recovery marker changed')
+    os.unlink('legacy-upload-recovery.json',dir_fd=operation.journal);os.fsync(operation.journal)
+    return True
+
+
 def finalize_started_update(hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env):
     """Finalize only a matching durable start after every new role reconnects."""
     if (hub is None or hub.used or set(hub.connections) != set(supervisor.ROLES) or
         select.select(list(hub.connections.values()), [], [], 0)[0]):
         return False
     with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
+        try:os.stat('legacy-upload-recovery.json',dir_fd=operation.journal,follow_symlinks=False)
+        except FileNotFoundError:pass
+        else:return finalize_legacy_recovery(hub,operation,policy_path,approval_journal,accepted_env)
         try:
             marker_fd = supervisor._open_root_file(operation.journal, 'maintenance.json', 0o600)
         except FileNotFoundError:

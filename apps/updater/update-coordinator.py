@@ -355,7 +355,7 @@ def start_cleaned_legacy_upload(operation_id, lease, daemon_ownership, approval_
         raise UpdateError('Authenticated drain identity is unavailable')
     try: identities={role:hub.identities[role]['id'] for role in supervisor.ROLES}
     except (KeyError,TypeError):raise UpdateError('Authenticated drain identity is unavailable') from None
-    if len(set(identities.values()))!=3 or any(not isinstance(cid,str) or not re.fullmatch(r'[a-f0-9]{64}',cid) for cid in identities.values()):
+    if any(not isinstance(cid,str) or not re.fullmatch(r'[a-f0-9]{64}',cid) for cid in identities.values()) or len(set(identities.values()))!=3:
         raise UpdateError('Authenticated drain identity is unavailable')
     control_dir=os.readlink('/proc/self/fd/'+str(daemon_ownership.directory))
     daemon_ownership.assert_held(control_dir)
