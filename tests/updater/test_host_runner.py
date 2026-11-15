@@ -217,5 +217,32 @@ class HostRunnerTest(unittest.TestCase):
             runner.activate_current(modules=self.modules,paths=self.paths)
         activate.assert_not_called()
 
+    def test_scheduled_activation_defers_while_application_update_holds_install_lock(self):
+        lock=os.open(Path(self.paths['install'])/'install.lock',os.O_RDONLY)
+        try:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            with mock.patch.object(runner,'activate') as activate:
+                runner.activate_current(modules=self.modules,paths=self.paths)
+            self.daemon.resolve_active_policy.assert_not_called()
+            activate.assert_not_called()
+        finally:os.close(lock)
+
+    def test_scheduled_activation_reads_policy_under_install_lock_and_releases_before_activation(self):
+        def policy(*_args):
+            other=os.open(Path(self.paths['install'])/'install.lock',os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError):fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            finally:os.close(other)
+            return '/policy','/accepted',self.policy
+        def activate(*_args,**_kwargs):
+            other=os.open(Path(self.paths['install'])/'install.lock',os.O_RDONLY)
+            try:fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            finally:os.close(other)
+        self.daemon.resolve_active_policy.side_effect=policy
+        with mock.patch.object(runner,'pending_activation',return_value=self.op), \
+             mock.patch.object(runner,'activate',side_effect=activate) as call:
+            runner.activate_current(modules=self.modules,paths=self.paths)
+        call.assert_called_once()
+
 
 if __name__=='__main__':unittest.main()

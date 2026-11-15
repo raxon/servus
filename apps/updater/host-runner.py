@@ -119,8 +119,13 @@ def pending_activation(db, policy_path, active_env, image_reference, staging_par
 def activate_current(*, modules, paths=PATHS):
     """Activate the current completed release once; activation rechecks trust."""
     supervisor=modules['supervisor'];daemon=modules['daemon']
-    state=supervisor._trusted_directory(paths['state'],0o700)
+    state=install=install_lock=None
     try:
+        state=supervisor._trusted_directory(paths['state'],0o700)
+        install=supervisor._trusted_directory(paths['install'],0o700)
+        install_lock=supervisor._open_root_file(install,'install.lock',0o600)
+        try:fcntl.flock(install_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:return  # An application update is changing the active policy.
         fd=supervisor._open_root_file(state, 'journal.sqlite', 0o600, path_only=True)
         try:
             named=os.stat(paths['state']+'/journal.sqlite',follow_symlinks=False);opened=os.fstat(fd)
@@ -133,7 +138,9 @@ def activate_current(*, modules, paths=PATHS):
             operation_id=pending_activation(db,policy_path,paths['active_env'],policy.image_reference,
                 paths['state']+'/staging',bundle=modules['bundle'])
         finally:db.close()
-    finally:os.close(state)
+    finally:
+        for fd in (install_lock,install,state):
+            if fd is not None:os.close(fd)
     if operation_id is not None:activate(operation_id,modules=modules,paths=paths)
 
 
