@@ -32,11 +32,11 @@ if(['writer','legacy_writer','compat_writer','unregistered_writer'].includes(pro
   try{
     const path=`/services/${serviceId}/database-restore/${operationId}`,headers={authorization:'Bearer fixture-token'};
     const response=await app.inject({method:'POST',url:`${path}/cancel`,headers});
-    const expected=['dead','compat_dead'].includes(process.env.TEST_MODE)?200:409;
+    const expected=process.env.TEST_MODE==='dead'?200:409;
     if(response.statusCode!==expected)throw new Error(`Expected ${expected}, got ${response.statusCode}`);
     const status=await app.inject({url:path,headers});
     if(status.json().phase!==(expected===409?'uploading':'cancelled'))throw new Error('Unexpected journal state');
-    if(process.env.TEST_MODE.startsWith('legacy_')&&readdirSync(`${dataDir}/restore-archives`).length!==1)throw new Error('Legacy archive was changed without proof that its writer stopped');
+    if((process.env.TEST_MODE.startsWith('legacy_')||process.env.TEST_MODE.startsWith('compat_'))&&readdirSync(`${dataDir}/restore-archives`).length!==1)throw new Error('Legacy archive was changed without proof that its writer stopped');
     if(expected===200){
       if(readdirSync(`${dataDir}/restore-archives`).length!==0)throw new Error('Interrupted archive was retained');
       const nextId=randomBytes(16).toString('hex');

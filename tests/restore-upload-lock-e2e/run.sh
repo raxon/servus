@@ -58,7 +58,7 @@ for _ in {1..100}; do [[ -f "$root/compat/ready" ]] && break; sleep 0.1; done
 docker run --rm "${compat_common[@]}" -e TEST_MODE=compat_live "$SERVUS_LOCK_IMAGE" /fixture-runner.mjs
 docker kill "$compat_name" >/dev/null
 docker run --rm "${compat_common[@]}" -e TEST_MODE=compat_dead "$SERVUS_LOCK_IMAGE" /fixture-runner.mjs
-echo 'PASS existing locked upload recovers across versions'
+echo 'PASS unregistered legacy lock remains fenced after its writer stops'
 mkdir -m 700 "$root/gap"
 gap_operation=$(openssl rand -hex 16)
 gap_service=$(python3 -c 'import uuid; print(uuid.uuid4())')
