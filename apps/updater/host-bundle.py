@@ -270,6 +270,53 @@ def verify_generation(parent_fd, operation_id, image_digest, modules):
         os.close(directory)
 
 
+
+def load_generation(parent_fd, operation_id, image_digest, metadata_size, metadata_sha256, required):
+    """Load an intact private generation bound to protected journal metadata."""
+    if (not isinstance(operation_id,str) or not OPERATION.fullmatch(operation_id) or
+        not isinstance(image_digest,str) or not DIGEST.fullmatch(image_digest) or
+        type(metadata_size) is not int or not 0 < metadata_size <= 65536 or
+        not isinstance(metadata_sha256,str) or not re.fullmatch(r'[a-f0-9]{64}',metadata_sha256) or
+        not isinstance(required,(tuple,list)) or not required or
+        any(not isinstance(name,str) or not NAME.fullmatch(name) for name in required) or len(set(required))!=len(required)):
+        raise HostBundleError('Invalid saved generation identity')
+    parent=os.fstat(parent_fd)
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid!=0 or parent.st_gid!=0 or stat.S_IMODE(parent.st_mode)!=0o700):
+        raise HostBundleError('Unsafe generation parent')
+    name='host-'+operation_id
+    directory=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent_fd)
+    try:
+        info=os.fstat(directory);named=os.stat(name,dir_fd=parent_fd,follow_symlinks=False)
+        if (info.st_uid!=0 or info.st_gid!=0 or stat.S_IMODE(info.st_mode)!=0o700 or info.st_dev!=parent.st_dev or
+            (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino)):
+            raise HostBundleError('Unsafe saved generation')
+        raw=_read_module(directory,'complete.json',(0o600,metadata_size,metadata_sha256),info.st_dev,allowed_modes=(0o600,),max_size=65536)[1]
+        def unique(pairs):
+            result={}
+            for key,value in pairs:
+                if key in result:raise HostBundleError('Duplicate generation metadata field')
+                result[key]=value
+            return result
+        try:document=json.loads(raw,object_pairs_hook=unique)
+        except (ValueError,UnicodeError,RecursionError) as error:raise HostBundleError('Invalid generation metadata') from error
+        if (not isinstance(document,dict) or set(document)!={'schema','operationId','imageDigest','modules'} or
+            type(document['schema']) is not int or document['schema']!=1 or document['operationId']!=operation_id or
+            document['imageDigest']!=image_digest or not isinstance(document['modules'],list) or
+            not 1 <= len(document['modules']) <= MAX_MODULES):
+            raise HostBundleError('Invalid generation metadata')
+        modules={}
+        for item in document['modules']:
+            if (not isinstance(item,dict) or set(item)!={'name','mode','size','sha256'} or
+                not isinstance(item['name'],str) or not NAME.fullmatch(item['name']) or item['name'] in modules):
+                raise HostBundleError('Invalid generation record')
+            mode,content=_read_module(directory,item['name'],(item['mode'],item['size'],item['sha256']),info.st_dev)
+            modules[item['name']]=(mode,content)
+        if not set(required).issubset(modules) or set(os.listdir(directory))!=set(modules)|{'complete.json'}:
+            raise HostBundleError('Incomplete saved generation')
+    finally:os.close(directory)
+    verify_generation(parent_fd,operation_id,image_digest,modules)
+    return modules
+
 def stage_generation(parent_fd, operation_id, image_digest, modules):
     """Write a candidate; the caller must separately authorize activation.
 

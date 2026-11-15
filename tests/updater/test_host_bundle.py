@@ -210,6 +210,16 @@ class HostBundleTest(unittest.TestCase):
         (path/'unexpected').touch()
         with self.assertRaises(bundle.HostBundleError):bundle.verify_generation(self.fd,operation,digest,modules)
 
+    def test_saved_generation_load_requires_journal_metadata_and_intact_files(self):
+        operation='12345678-1234-4234-8234-123456789abc';digest='sha256:'+'a'*64;modules=self.collect()
+        name=bundle.stage_generation(self.fd,operation,digest,modules);path=self.root/name;raw=(path/'complete.json').read_bytes()
+        sha=hashlib.sha256(raw).hexdigest()
+        self.assertEqual(bundle.load_generation(self.fd,operation,digest,len(raw),sha,('core.py','runner.py')),modules)
+        with self.assertRaises(bundle.HostBundleError):bundle.load_generation(self.fd,operation,digest,len(raw),'0'*64,('core.py',))
+        with self.assertRaises(bundle.HostBundleError):bundle.load_generation(self.fd,operation,digest,len(raw),sha,('missing.py',))
+        (path/'core.py').write_bytes(b'evil')
+        with self.assertRaises(bundle.HostBundleError):bundle.load_generation(self.fd,operation,digest,len(raw),sha,('core.py',))
+
     def test_runtime_tree_contains_pinned_cli_and_readable_modules(self):
         operation='12345678-1234-4234-8234-123456789abc';digest='sha256:'+'a'*64
         modules=self.collect();cli=b'trusted cli';pin=('a'*64,hashlib.sha256(cli).hexdigest(),len(cli))
