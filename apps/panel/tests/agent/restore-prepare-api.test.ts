@@ -37,7 +37,7 @@ it('prepares the staged archive against the confirmed source and service-owned c
   const response=await f.agent.inject({method:'POST',url:`${f.path}/prepare`,headers:f.auth,payload:{}});
   expect(response.statusCode).toBe(200);expect(response.json()).toEqual({operationId:f.operationId,phase:'prepared'});
   expect(mocks.allocate).toHaveBeenCalledWith(expect.objectContaining({serviceId:f.service.id,sourceContainerId:'c'.repeat(64),database:'example',user:'fixture',password:'synthetic-password'}));
-  expect((await f.agent.inject({method:'POST',url:`${f.path}/cancel`,headers:f.auth,payload:{}})).statusCode).toBe(409);
+  expect((await f.agent.inject({method:'GET',url:f.path,headers:f.auth})).json().phase).toBe('prepared');
 });
 
 it('does not allocate without authentication or when the source is not running',async()=>{

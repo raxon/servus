@@ -108,14 +108,13 @@ for kind in postgres mariadb; do
   docker rm -f -v "$candidate_name" >/dev/null; docker volume rm "$volume" >/dev/null
   run_agent_import "$kind" "$root/dump"
   if [[ $kind == postgres ]]; then
-    result=$(docker exec "$candidate_name" sh -c 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"')
     source_result=$(docker exec "$source_name" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"')
   else
-    result=$(docker exec "$candidate_name" sh -c 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"')
     source_result=$(docker exec "$source_name" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"')
   fi
-  [[ $result == expected-marker && $source_result == expected-marker ]]
-  printf 'PASS %s agent upload and isolated preparation\n' "$kind"
-  docker rm -f -v "$source_name" "$candidate_name" >/dev/null
-  docker volume rm "$volume" >/dev/null
+  [[ $source_result == expected-marker ]]
+  ! docker inspect "$candidate_name" >/dev/null 2>&1
+  ! docker volume inspect "$volume" >/dev/null 2>&1
+  printf 'PASS %s agent preparation and candidate cancellation\n' "$kind"
+  docker rm -f -v "$source_name" >/dev/null
 done

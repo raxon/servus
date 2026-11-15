@@ -98,7 +98,7 @@ class RestoreJournalSchemaTest(unittest.TestCase):
         with sqlite3.connect(':memory:') as db:
             for table, columns in backup.AGENT_RESTORE_SCHEMA.items():
                 db.execute('CREATE TABLE ' + table + ' (' + ','.join(column + ' TEXT' for column in columns) + ')')
-            for phase in ('uploading', 'discarding'):
+            for phase in ('uploading', 'discarding', 'discarding_candidate'):
                 with self.subTest(phase=phase):
                     db.execute('DELETE FROM restore_operations')
                     db.execute('INSERT INTO restore_operations(id,service_id,kind,archive_sha256,phase,updated_at) VALUES(?,?,?,?,?,?)',

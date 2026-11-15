@@ -1,6 +1,7 @@
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import Docker from '/app/node_modules/dockerode/lib/docker.js';
 import { Store } from '/app/dist/server/store.js';
 import { createAgent } from '/app/dist/agent/app.js';
@@ -34,4 +35,12 @@ try {
   if (prepared.statusCode !== 200 || prepared.json().phase !== 'prepared') throw new Error(`Preparation failed: ${prepared.statusCode} ${JSON.stringify(prepared.json())}`);
   const status = await agent.inject({method:'GET',url:path,headers});
   if (status.statusCode !== 200 || status.json().phase !== 'prepared') throw new Error('Prepared state was not recorded');
+  const query = kind === 'postgres'
+    ? 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"'
+    : 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"';
+  if (execFileSync('docker',['exec',`panel-restore-${operationId}`,'sh','-c',query],{encoding:'utf8',env:{...process.env,PATH:`${process.env.PATH}:/usr/local/bin`}}).trim() !== 'expected-marker') throw new Error('Candidate data does not match');
+  for (let attempt=0;attempt<2;attempt++) {
+    const cancelled = await agent.inject({method:'POST',url:`${path}/cancel`,headers,payload:{}});
+    if (cancelled.statusCode !== 200 || cancelled.json().phase !== 'cancelled') throw new Error(`Cancellation failed: ${cancelled.statusCode} ${JSON.stringify(cancelled.json())}`);
+  }
 } finally { await agent.close(); store.close(); rmSync(dataDir,{recursive:true,force:true}); }

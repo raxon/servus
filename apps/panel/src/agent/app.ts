@@ -15,6 +15,7 @@ import { DatabaseExportUncertainError, exportDatabase } from './database-export.
 import { RestoreJournal } from './restore-journal.js';
 import { uploadRestoreArchive } from './restore-upload.js';
 import { cancelStagedRestore } from './restore-cancel.js';
+import { cancelPreparedRestore } from './restore-candidate-cancel.js';
 import { loadRestoreSource } from './restore-source.js';
 import { prepareRestoreCandidate } from './restore-preparation.js';
 import { createRestoreCandidate } from './restore-candidate.js';
@@ -72,6 +73,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     }
   }
   const active = new Map<string, Promise<unknown>>();
+  const cancellingRestores = new Set<string>();
   const locks = new Set<string>();
   const consoles = new Map<string, number>(), uncertainConsoles = new Set<string>();
   const restores = new RestoreJournal(journal, serviceId => locks.has(serviceId) || (consoles.get(serviceId) ?? 0) > 0 || uncertainConsoles.has(serviceId));
@@ -152,11 +154,14 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
     const record = restores.get(req.params.operationId);
     if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
-    if (!['reserved','discarding','cancelled'].includes(record.phase)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be cancelled now.'}});
+    if (!['reserved','discarding','prepared','discarding_candidate','cancelled'].includes(record.phase) || cancellingRestores.has(record.id)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be cancelled now.'}});
     const release = maintenance?.admit();
     if (maintenance && !release) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
-    try { const result = cancelStagedRestore({journal:restores,dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId}); return {operationId:result.id,phase:result.phase}; }
-    finally { release?.(); }
+    cancellingRestores.add(record.id);
+    try { const result = ['prepared','discarding_candidate'].includes(record.phase)
+      ? await cancelPreparedRestore({journal:restores,docker:new Docker({socketPath:config.dockerSocket}),dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId})
+      : cancelStagedRestore({journal:restores,dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId}); return {operationId:result.id,phase:result.phase}; }
+    finally { cancellingRestores.delete(record.id);release?.(); }
   });
   app.post<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/prepare', async (req,reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
