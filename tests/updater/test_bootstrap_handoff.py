@@ -64,7 +64,19 @@ class HandoffTest(unittest.TestCase):
 
     def test_handoff_yields_lock_to_services_then_starts_and_completes(self):
         self.run_handoff()
-        self.assertEqual([event[0] for event in self.events],['is-active','start','start','launch','enable'])
+        self.assertEqual([event[0] for event in self.events],['is-active','start','start','launch','enable','start'])
+        self.assertIn('servus-host-update.timer',self.events[-2])
+        self.assertEqual(self.events[-1],('start','servus-host-update.timer'))
+        self.assertFalse((self.install/handoff.MARKER).exists())
+        self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone(),('completed',))
+
+    def test_timer_start_failure_is_reported_after_handoff(self):
+        original=self.service.side_effect
+        def fail_timer(*args,**kwargs):
+            if args==('start','servus-host-update.timer'):return 1,''
+            return original(*args,**kwargs)
+        self.service.side_effect=fail_timer
+        with self.assertRaises(handoff.HandoffError):self.run_handoff()
         self.assertFalse((self.install/handoff.MARKER).exists())
         self.assertEqual(self.journal.db.execute('SELECT status FROM preparations').fetchone(),('completed',))
 

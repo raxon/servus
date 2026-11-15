@@ -1,8 +1,8 @@
 #!/usr/bin/python3 -I
 """Run a root-authorized host update for one completed signed release.
 
-This command is not installed as a service or called by the panel. The caller
-must arrange boot recovery before scheduling it unattended.
+The scheduled entry point runs only after the host recovery service. Explicit
+operation IDs are reserved for a root operator.
 """
 import argparse
 import fcntl

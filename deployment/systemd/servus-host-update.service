@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply the active verified Servus host update
+Requires=servus-host-recovery-finish.service
+After=servus-host-recovery-finish.service
+RequiresMountsFor=/var/lib/servus-updater /usr/local/libexec/servus /opt/servus
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/servus/host-runner.py --activate-current
+NoNewPrivileges=true
+TimeoutStartSec=600

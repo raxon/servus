@@ -55,6 +55,8 @@
 100644 deployment/lifecycle-gate.sh
 100644 deployment/systemd/servus-host-recovery.service
 100644 deployment/systemd/servus-host-recovery-finish.service
+100644 deployment/systemd/servus-host-update.service
+100644 deployment/systemd/servus-host-update.timer
 100644 deployment/systemd/servus-supervisor.service
 100644 deployment/systemd/servus-updater.service
 100644 deployment/systemd/servus-updater-bootstrap.service

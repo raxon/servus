@@ -87,13 +87,16 @@ def handoff(journal, operation, active_env, state_dir, supervisor, daemon, polic
             if row != ('prepared',):raise HandoffError('Initial preparation requires recovery')
             if time.monotonic() >= deadline:raise HandoffError('Initial generation did not become healthy')
             time.sleep(.5)
-        if service('enable','servus-host-recovery.service','servus-host-recovery-finish.service','servus-supervisor.service','servus-updater.service','servus-updater-socket.service',timeout=45)[0] != 0:
+        if service('enable','servus-host-recovery.service','servus-host-recovery-finish.service','servus-host-update.timer','servus-supervisor.service','servus-updater.service','servus-updater-socket.service',timeout=45)[0] != 0:
             raise HandoffError('Host services could not be enabled')
         lock=acquire();verify_marker()
         if daemon.resolve_active_policy(database[2],active_env) != (path,snapshot,approved):raise HandoffError('Active policy changed')
         if journal.db.execute('SELECT status FROM preparations WHERE operation_id=?',(operation,)).fetchone() != ('completed',):
             raise HandoffError('Initial preparation changed')
         os.unlink(MARKER,dir_fd=install);os.fsync(install)
+        os.close(lock);lock=None
+        if service('start','servus-host-update.timer',timeout=45)[0] != 0:
+            raise HandoffError('Host update timer could not be started')
     finally:
         if lock is not None:os.close(lock)
         os.close(install)

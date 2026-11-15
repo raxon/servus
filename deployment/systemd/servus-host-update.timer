@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for an approved Servus host update
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=5s
+Unit=servus-host-update.service
+
+[Install]
+WantedBy=timers.target

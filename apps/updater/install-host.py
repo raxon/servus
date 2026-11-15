@@ -23,7 +23,7 @@ MODULES = (
     'update-coordinator.py','validate-compose.py','verification-executor.py',
     'verification-fence.py','verify-release.py',
 )
-UNITS = ('servus-host-recovery.service','servus-host-recovery-finish.service','servus-supervisor.service','servus-updater.service',
+UNITS = ('servus-host-recovery.service','servus-host-recovery-finish.service','servus-host-update.service','servus-host-update.timer','servus-supervisor.service','servus-updater.service',
          'servus-updater-bootstrap.service','servus-updater-socket.service')
 MAX_FILE = 4 * 1024 * 1024
 LEGACY_VERIFIERS = {
