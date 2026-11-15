@@ -14,13 +14,14 @@ function fixture(script:string){
 const target={containerId:'a'.repeat(64),dockerSocket:'/var/run/docker.sock',kind:'postgres' as const,database:'fixture',user:'fixture'};
 
 it('returns the output only after a successful command and closes the private file',async()=>{
-  const root=fixture('printf "%s\\n" "$@" > "$SERVUS_CAPTURE"; printf "dump-data"');
+  const root=fixture('printf "%s\\n" "$@" > "$SERVUS_CAPTURE"; printf "%s" "$PATH" > "$SERVUS_CAPTURE.path"; printf "dump-data"');
   vi.stubEnv('SERVUS_CAPTURE',join(root,'args'));
   const result=await exportDatabase(target);
   expect(result.size).toBe(9);expect(result.extension).toBe('dump');
   const chunks:Buffer[]=[];for await(const chunk of result.stream())chunks.push(Buffer.from(chunk));
   expect(Buffer.concat(chunks).toString()).toBe('dump-data');
   expect(readFileSync(join(root,'args'),'utf8')).toContain('pg_dump');
+  expect(readFileSync(join(root,'args.path'),'utf8').split(delimiter)).toContain('/usr/local/bin');
   result.close();result.close();expect(()=>result.stream()).toThrow('closed');
 });
 

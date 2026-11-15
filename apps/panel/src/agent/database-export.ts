@@ -33,7 +33,7 @@ export async function exportDatabase(options:{containerId:string;dockerSocket:st
     fd=openSync(path,'wx+',0o600);unlinkSync(path);rmdirSync(directory);
     const command=commands[options.kind];
     const child=spawn('docker',['--host',`unix://${options.dockerSocket}`,'exec',options.containerId,'sh','-c',command.script,'servus-export',options.user,options.database],
-      {stdio:['ignore','pipe','pipe']});
+      {stdio:['ignore','pipe','pipe'],env:{...process.env,PATH:`${process.env.PATH||'/usr/bin:/bin'}:/usr/local/bin`}});
     let size=0,closed=false,nextSpaceCheck=8*1024*1024;
     const limit=new Transform({transform(chunk:Buffer,_encoding,callback){
       size+=chunk.length;

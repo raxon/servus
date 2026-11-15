@@ -37,7 +37,7 @@ export_with_agent() {
     module=/fixture-export.ts; mounts+=(--mount "type=bind,src=$SERVUS_EXPORT_SOURCE,dst=$module,readonly")
   fi
   docker run --rm --network none --user 0 --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
-    "${mounts[@]}" -e "SERVUS_EXPORT_CONTAINER=$container_id" -e "SERVUS_EXPORT_KIND=$kind" -e "SERVUS_EXPORT_MODULE=$module" --entrypoint node "$SERVUS_EXPORT_IMAGE" \
+    "${mounts[@]}" -e PATH=/usr/bin:/bin -e "SERVUS_EXPORT_CONTAINER=$container_id" -e "SERVUS_EXPORT_KIND=$kind" -e "SERVUS_EXPORT_MODULE=$module" --entrypoint /usr/local/bin/node "$SERVUS_EXPORT_IMAGE" \
     --input-type=module -e 'import {pipeline} from "node:stream/promises"; const {exportDatabase}=await import(process.env.SERVUS_EXPORT_MODULE); const result=await exportDatabase({containerId:process.env.SERVUS_EXPORT_CONTAINER,dockerSocket:"/var/run/docker.sock",kind:process.env.SERVUS_EXPORT_KIND,database:"fixture",user:"fixture"}); try {await pipeline(result.stream(),process.stdout,{end:false});} finally {result.close();}' > "$output"
 }
 wait_ready() {
