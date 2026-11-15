@@ -48,8 +48,15 @@ it('persists immutable identity and unresolved phases across restart', () => {
   expect(() => recovered.reserve({ ...request, id: 'd'.repeat(32) })).toThrow('unresolved');
   expect(() => recovered.advance(request.id, 'importing', 'cancelled')).toThrow('transition');
   recovered.advance(request.id, 'importing', 'needs_review');
+  expect(recovered.reviewPhase(request.id)).toBe('importing');
   expect(() => recovered.advance(request.id, 'needs_review', 'completed')).toThrow('transition');
   expect(recovered.hasUnresolved()).toBe(true);
+});
+
+it('does not invent a review reason for an existing legacy record', () => {
+  const {db}=database(),journal=new RestoreJournal(db,()=>false),request=intent();
+  db.prepare("INSERT INTO restore_operations VALUES(?,?,?,?,'needs_review',?)").run(request.id,request.serviceId,request.kind,request.archiveSha256,new Date().toISOString());
+  expect(journal.reviewPhase(request.id)).toBeUndefined();
 });
 
 it('retains the in-progress fence after a process is killed', async () => {

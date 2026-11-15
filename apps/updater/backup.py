@@ -366,11 +366,15 @@ def _agent_schema(db):
     has_switch = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_switch_intents'").fetchone())
     has_retained = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_retained_volumes'").fetchone())
     has_bindings = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_volume_bindings'").fetchone())
-    if (has_switch or has_retained or has_bindings) and not has_restore: raise CaptureError('Unsupported database schema')
+    has_upload_locks = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_upload_locks'").fetchone())
+    has_review_phases = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_review_phases'").fetchone())
+    if (has_switch or has_retained or has_bindings or has_upload_locks or has_review_phases) and not has_restore: raise CaptureError('Unsupported database schema')
     switch_columns={r[1] for r in db.execute('PRAGMA table_info(restore_switch_intents)')} if has_switch else set()
     schema=(AGENT_SWITCH_SCHEMA if 'stage' in switch_columns else AGENT_SWITCH_OLD_SCHEMA) if has_switch else AGENT_RESTORE_SCHEMA if has_restore else AGENT_SCHEMA
     if has_retained: schema={**schema,'restore_retained_volumes':AGENT_RETAINED_COLUMNS}
     if has_bindings: schema={**schema,'restore_volume_bindings':AGENT_BINDING_COLUMNS}
+    if has_upload_locks: schema={**schema,'restore_upload_locks':{'operation_id','lock_id'}}
+    if has_review_phases: schema={**schema,'restore_review_phases':{'operation_id','phase'}}
     _schema(db, schema, 0)
     if not has_restore: return
     for ident, service, kind, digest, phase, updated in db.execute('SELECT id,service_id,kind,archive_sha256,phase,updated_at FROM restore_operations'):
@@ -381,6 +385,16 @@ def _agent_schema(db):
             kind not in ('postgres','mariadb','redis') or not isinstance(digest,str) or not re.fullmatch(r'[a-f0-9]{64}',digest) or
             not isinstance(updated,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',updated)):
             raise CaptureError('Database restore journal is invalid')
+    if has_upload_locks:
+        seen_operations=set();seen_locks=set()
+        for ident,lock_id in db.execute('SELECT operation_id,lock_id FROM restore_upload_locks'):
+            if (not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or ident in seen_operations or
+                not isinstance(lock_id,str) or not re.fullmatch(r'[a-f0-9]{32}',lock_id) or lock_id in seen_locks or
+                not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND kind IN ('postgres','mariadb') AND phase IN ('completed','cancelled')",(ident,)).fetchone()):
+                raise CaptureError('Upload lock journal is invalid')
+            seen_operations.add(ident);seen_locks.add(lock_id)
+    if has_review_phases and db.execute('SELECT 1 FROM restore_review_phases LIMIT 1').fetchone():
+        raise CaptureError('Restore review journal is invalid')
     if has_switch and db.execute('SELECT 1 FROM restore_switch_intents LIMIT 1').fetchone(): raise CaptureError('Unresolved database restore requires recovery')
     if has_retained:
         seen=set();retained_volumes=set()

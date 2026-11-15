@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 import { validateRestoreBinding } from './restore-binding.js';
 
 export type RestorePhase = 'uploading' | 'reserved' | 'discarding' | 'discarding_candidate' | 'importing' | 'prepared' | 'switching' | 'needs_review' | 'completed' | 'cancelled';
+export type RestoreReviewPhase = 'uploading' | 'reserved' | 'discarding' | 'importing' | 'prepared' | 'switching';
 export type RestoreRecord = { id: string; service_id: string; kind: 'postgres' | 'mariadb' | 'redis'; archive_sha256: string; phase: RestorePhase; updated_at: string };
 export type RestoreSwitchStage = 'pending'|'candidate_stop'|'candidate_detached'|'applying'|'applied'|'rolling_back'|'rolled_back';
 export type RestoreSwitchIntent = { id:string; service_id:string; service_version:number; sealed_plan:string; created_at:string; stage:RestoreSwitchStage };
@@ -43,6 +44,7 @@ export class RestoreJournal {
       }
       db.exec("CREATE UNIQUE INDEX IF NOT EXISTS restore_one_active_per_service ON restore_operations(service_id) WHERE phase NOT IN ('completed','cancelled')");
       db.exec('CREATE TABLE IF NOT EXISTS restore_upload_locks (operation_id TEXT PRIMARY KEY, lock_id TEXT NOT NULL UNIQUE)');
+      db.exec("CREATE TABLE IF NOT EXISTS restore_review_phases (operation_id TEXT PRIMARY KEY, phase TEXT NOT NULL CHECK(phase IN ('uploading','reserved','discarding','importing','prepared','switching'))) ");
       const switchSchema="CREATE TABLE restore_switch_intents (id TEXT PRIMARY KEY, service_id TEXT NOT NULL, service_version INTEGER NOT NULL, sealed_plan TEXT NOT NULL, created_at TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'pending' CHECK(stage IN ('pending','candidate_stop','candidate_detached','applying','applied','rolling_back','rolled_back')))";
       const switchTable=db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_switch_intents'").get() as {sql:string}|undefined;
       if(!switchTable)db.exec(switchSchema);
@@ -95,6 +97,13 @@ export class RestoreJournal {
     const row=this.db.prepare('SELECT lock_id FROM restore_upload_locks WHERE operation_id=?').get(id) as {lock_id:unknown}|undefined;
     if(row && (typeof row.lock_id!=='string'||!idPattern.test(row.lock_id)))throw new Error('Invalid restore upload lock identity.');
     return row?.lock_id as string|undefined;
+  }
+  reviewPhase(id:string):RestoreReviewPhase|undefined {
+    if(!idPattern.test(id))throw new Error('Invalid restore identity.');
+    const row=this.db.prepare('SELECT phase FROM restore_review_phases WHERE operation_id=?').get(id) as {phase:unknown}|undefined;
+    if(!row)return undefined;
+    if(typeof row.phase!=='string'||!['uploading','reserved','discarding','importing','prepared','switching'].includes(row.phase))throw new Error('Invalid restore review phase.');
+    return row.phase as RestoreReviewPhase;
   }
   finishUpload(id: string, archiveSha256: string): RestoreRecord {
     if (!idPattern.test(id) || !digestPattern.test(archiveSha256)) throw new Error('Invalid restore upload.');
@@ -164,6 +173,7 @@ export class RestoreJournal {
       const previous = this.get(id);
       if (!previous || previous.phase !== expected) throw new Error('Restore phase does not match the expected state.');
       this.db.prepare('UPDATE restore_operations SET phase=?,updated_at=? WHERE id=? AND phase=?').run(next,new Date().toISOString(),id,expected);
+      if(next==='needs_review')this.db.prepare('INSERT INTO restore_review_phases(operation_id,phase) VALUES(?,?)').run(id,expected);
       return this.get(id)!;
     }).immediate();
   }

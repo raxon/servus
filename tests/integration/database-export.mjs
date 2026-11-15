@@ -31,7 +31,7 @@ await app.listen({host:'127.0.0.1',port});
 let browser;
 try {
   browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});
-  for(const viewport of [{width:1280,height:900},{width:375,height:850}]){
+  for(const viewport of [{width:1440,height:900},{width:768,height:900},{width:375,height:850}]){
     const page=await browser.newPage({viewport,acceptDownloads:true});
     let operation=null,commits=0,uploads=0,badUpload=false,finishSlowUpload;
     await page.route(`**/api/v1/services/${service.id}/database-restore**`,async route=>{
@@ -101,9 +101,19 @@ try {
     await dialog.getByRole('button',{name:'Cancel upload'}).click();
     await dialog.getByText('The restore was cancelled.').waitFor();
     assert.equal(uploads,3);
+    operation={operationId:'a'.repeat(32),kind:'postgres',phase:'needs_review',reviewPhase:'importing'};
+    await dialog.getByRole('button',{name:'Close dialog'}).click();
+    await page.reload();
+    await section.getByRole('button',{name:'Restore',exact:true}).click();
+    await dialog.getByRole('alert').getByText('The temporary database or its import could not be verified.').waitFor();
+    await dialog.getByText('The service is locked for changes. Ask an administrator to review this restore before retrying.').waitFor();
+    await dialog.getByText(operation.operationId).waitFor();
+    assert.equal(await dialog.getByRole('button',{name:'Finish cleanup'}).count(),0);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+    await page.screenshot({path:`/tmp/servus-restore-review-${viewport.width}.png`});
     await dialog.getByRole('button',{name:'Close dialog'}).click();
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
-    if(viewport.width===1280)await page.screenshot({path:'/tmp/servus-database-export-ui.png'});
+    if(viewport.width===1440)await page.screenshot({path:'/tmp/servus-database-export-ui.png'});
     await page.close();
   }
   console.log('PASS database export and restore interface on desktop and mobile');

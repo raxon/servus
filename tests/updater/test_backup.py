@@ -94,6 +94,21 @@ class CgroupHeadroomTest(unittest.TestCase):
             headroom.assert_not_called()
 
 class RestoreJournalSchemaTest(unittest.TestCase):
+    def test_upload_lock_and_review_tables_are_validated(self):
+        schema={**backup.AGENT_RESTORE_SCHEMA,'restore_upload_locks':{'operation_id','lock_id'},'restore_review_phases':{'operation_id','phase'}}
+        with sqlite3.connect(':memory:') as db:
+            for table, columns in schema.items():
+                db.execute('CREATE TABLE ' + table + ' (' + ','.join(column + ' TEXT' for column in columns) + ')')
+            ident='a'*32; now='2026-11-15T00:00:00.000Z'
+            db.execute('INSERT INTO restore_operations(id,service_id,kind,archive_sha256,phase,updated_at) VALUES(?,?,?,?,?,?)',(ident,UUID,'postgres','b'*64,'cancelled',now))
+            db.execute('INSERT INTO restore_upload_locks(operation_id,lock_id) VALUES(?,?)',(ident,'c'*32))
+            backup._agent_schema(db)
+            db.execute("UPDATE restore_upload_locks SET lock_id='bad'")
+            with self.assertRaisesRegex(backup.CaptureError,'Upload lock journal is invalid'): backup._agent_schema(db)
+            db.execute('DELETE FROM restore_upload_locks')
+            db.execute('INSERT INTO restore_review_phases(operation_id,phase) VALUES(?,?)',(ident,'importing'))
+            with self.assertRaises(backup.CaptureError): backup._agent_schema(db)
+
     def test_upload_and_discard_remain_unresolved_for_backup(self):
         with sqlite3.connect(':memory:') as db:
             for table, columns in backup.AGENT_RESTORE_SCHEMA.items():
@@ -620,7 +635,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         self.assertFalse((self.dst/'manifest.json').exists())
 
     def test_legacy_agent_without_restore_table_is_supported(self):
-        for table in ('restore_switch_intents','restore_retained_volumes','restore_volume_bindings','restore_operations'):
+        for table in ('restore_switch_intents','restore_retained_volumes','restore_volume_bindings','restore_upload_locks','restore_review_phases','restore_operations'):
             self.agent.execute(f'DROP TABLE {table}')
         self.agent.commit();self.fix_permissions();self.capture()
         with sqlite3.connect(self.dst/'agent.sqlite') as restored:

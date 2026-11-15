@@ -9,6 +9,7 @@ type RestoreOperation = {
   operationId: string;
   phase: "uploading" | "reserved" | "discarding" | "discarding_candidate" | "importing" | "prepared" | "switching" | "needs_review" | "completed" | "cancelled";
   kind: "postgres" | "mariadb" | "redis";
+  reviewPhase?: "uploading" | "reserved" | "discarding" | "importing" | "prepared" | "switching";
   rolledBack?: true;
 };
 
@@ -96,7 +97,14 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
           <p role="status">The temporary database is being removed. If cleanup was interrupted, try again.</p>
           <button className="button" type="button" disabled={busy} onClick={() => action.mutate({type:"cancel",operationId:operation!.operationId})}>Finish cleanup</button>
         </>}
-        {phase === "needs_review" && <p role="alert">This restore needs attention before another operation can start. Check the server logs.</p>}
+        {phase === "needs_review" && <div role="alert">
+          <p>{operation?.reviewPhase === "uploading" ? "The uploaded archive could not be verified or cleaned up."
+            : operation?.reviewPhase === "importing" ? "The temporary database or its import could not be verified."
+            : operation?.reviewPhase === "discarding" ? "The uploaded archive could not be removed safely."
+            : "The restore state could not be verified."}</p>
+          <p>The service is locked for changes. Ask an administrator to review this restore before retrying.</p>
+          <p>Restore ID: <code>{operation?.operationId}</code></p>
+        </div>}
       </> : <button className="button" type="button" onClick={() => void status.refetch()}>Check status again</button>}
     </div>
   </FeatureModal>;

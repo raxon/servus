@@ -31,6 +31,7 @@ const restoreStatusSchema = z.object({
   phase:z.enum(['uploading','reserved','discarding','discarding_candidate','importing','prepared','switching','needs_review','completed','cancelled']),
   kind:z.enum(['postgres','mariadb','redis']),
   stage:z.enum(['pending','candidate_stop','candidate_detached','applying','applied','rolling_back','rolled_back']).optional(),
+  reviewPhase:z.enum(['uploading','reserved','discarding','importing','prepared','switching']).optional(),
   rolledBack:z.literal(true).optional(),
 }).strict();
 

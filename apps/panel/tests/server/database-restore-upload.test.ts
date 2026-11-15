@@ -11,6 +11,7 @@ import { AgentRequestError } from '../../src/agent/client.js';
 import { createApp } from '../../src/server/app.js';
 import { Store } from '../../src/server/store.js';
 import { hashPassword } from '../../src/server/auth.js';
+import { RestoreJournal } from '../../src/agent/restore-journal.js';
 
 const cleanup:(()=>Promise<void>)[]=[];
 afterEach(async()=>{for(const fn of cleanup.splice(0).reverse())await fn();});
@@ -59,6 +60,20 @@ it('stages, reports and cancels an archive through the authenticated agent',asyn
   expect((await app.inject({method:'POST',url:`${nextPath}/cancel`,headers,payload:{}})).statusCode).toBe(200);
   const events=store.db.prepare('SELECT operation FROM audit_events WHERE resource_id=?').all(service.id) as {operation:string}[];
   expect(events.map(event=>event.operation)).toEqual(expect.arrayContaining(['database.restore.upload.started','database.restore.upload.staged','database.restore.cancelled']));
+});
+
+it('returns a recorded review phase through the authenticated panel status endpoint',async()=>{
+  const {app,store,headers,service,operationId}=await fixture();
+  const db=new Database(join(store.dataDir,'agent.sqlite'));
+  try {
+    const journal=new RestoreJournal(db,()=>false);
+    journal.beginUpload({id:operationId,serviceId:service.id,kind:'postgres'});
+    journal.advance(operationId,'uploading','needs_review');
+    const response=await app.inject({url:`/api/v1/services/${service.id}/database-restore`,headers});
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({operation:{operationId,kind:'postgres',phase:'needs_review',reviewPhase:'uploading'}});
+    expect((await app.inject({url:`/api/v1/services/${service.id}/database-restore`})).statusCode).toBe(401);
+  } finally {db.close();}
 });
 
 it('requires write access and explicit confirmation before starting restore actions',async()=>{

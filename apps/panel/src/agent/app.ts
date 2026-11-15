@@ -157,15 +157,17 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     const record=restores.latestForService(req.params.id);
     if (!record) return {operation:null};
     const stage=record.phase==='switching'?restores.switchIntent(record.id)?.stage:undefined;
+    const reviewPhase=record.phase==='needs_review'?restores.reviewPhase(record.id):undefined;
     const rolledBack=record.phase==='cancelled' && restores.retainedVolume(record.id)?.reason==='rollback_candidate';
-    return {operation:{operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{}),...(rolledBack?{rolledBack:true}:{})}};
+    return {operation:{operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{}),...(reviewPhase?{reviewPhase}:{}),...(rolledBack?{rolledBack:true}:{})}};
   });
   app.get<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId', async (req,reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
     const record = restores.get(req.params.operationId);
     if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
     const stage=record.phase==='switching'?restores.switchIntent(record.id)?.stage:undefined;
-    return {operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{})};
+    const reviewPhase=record.phase==='needs_review'?restores.reviewPhase(record.id):undefined;
+    return {operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{}),...(reviewPhase?{reviewPhase}:{})};
   });
   app.post<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/cancel', async (req,reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
