@@ -20,6 +20,6 @@ if (existsSync(config.socketPath)) {
 const app = await createAgent(config, undefined, maintenance);
 await app.listen({ path: config.socketPath });
 chmodSync(config.socketPath, 0o600);
-const control = startSupervisorControl(controlConfig, 'agent', timeout => maintenance!.drain(timeout));
+const control = startSupervisorControl(controlConfig, 'agent', timeout => maintenance!.drain(timeout), (timeout,id)=>maintenance!.drainForLegacyUpload(timeout,id));
 console.log(`Local agent listening on ${config.socketPath}`);
 for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, async () => { control?.abort(); await app.close(); process.exit(process.exitCode || 0); });

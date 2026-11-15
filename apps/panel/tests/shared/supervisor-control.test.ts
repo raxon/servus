@@ -40,21 +40,21 @@ async function fixture(handler: (socket:Socket) => void) {
   await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(path,resolve);});
   return {socketPath:path,secretPath:secret};
 }
-function peer(socket:Socket, onConfirm:()=>void, received:(value:any)=>void, badProof=false, fragmented=false) {
+function peer(socket:Socket, onConfirm:()=>void, received:(value:any)=>void, badProof=false, fragmented=false, role:'api'|'agent'='api') {
   let pending='',clientChallenge='',phase=0;
   socket.on('data',(data:Buffer)=>{
     pending+=data.toString('utf8');let newline;
     while((newline=pending.indexOf('\n'))!==-1) {
       const line=pending.slice(0,newline);pending=pending.slice(newline+1);const frame=JSON.parse(line);
       if(phase===0) {
-        expect(frame).toEqual({version:1,type:'hello',role:'api',challenge:expect.stringMatching(/^[a-f0-9]{64}$/)});
+        expect(frame).toEqual({version:1,type:'hello',role,challenge:expect.stringMatching(/^[a-f0-9]{64}$/)});
         expect(line).not.toContain(token);clientChallenge=frame.challenge;phase=1;
-        const ack={version:1,type:'hello_ack',role:'api',challenge:serverChallenge,proof:badProof?'0'.repeat(64):mac('server','api',clientChallenge,serverChallenge)};
+        const ack={version:1,type:'hello_ack',role,challenge:serverChallenge,proof:badProof?'0'.repeat(64):mac('server',role,clientChallenge,serverChallenge)};
         if(fragmented) {const text=JSON.stringify(ack)+'\n';socket.write(text.slice(0,19));setTimeout(()=>socket.write(text.slice(19)),5);}
         else write(socket,ack);
       } else if(phase===1) {
-        expect(frame).toEqual({version:1,type:'hello_confirm',proof:mac('client','api',clientChallenge,serverChallenge)});phase=2;
-        write(socket,{version:1,type:'ready',role:'api'});onConfirm();
+        expect(frame).toEqual({version:1,type:'hello_confirm',proof:mac('client',role,clientChallenge,serverChallenge)});phase=2;
+        write(socket,{version:1,type:'ready',role});onConfirm();
       } else received(frame);
     }
   });
@@ -70,6 +70,20 @@ afterEach(async()=>{
 });
 
 describe('supervisor control',()=>{
+  it('routes a scoped legacy upload drain only to an agent handler',async()=>{
+    for(const role of ['agent','api'] as const){
+      const abort=new AbortController(),id='a'.repeat(32);let ordinary=0,scoped=0,result:any;
+      const options=await fixture(socket=>peer(socket,()=>write(socket,{version:1,type:'drain',requestId,timeoutMs:100,legacyUploadId:id}),frame=>{result=frame;abort.abort();},false,false,role));
+      await runSupervisorControl({...options,role,signal:abort.signal,reconnectMs:10,drain:async()=>{ordinary++;return {status:'drained'};},drainLegacyUpload:async(timeout,operation)=>{scoped++;expect(timeout).toBe(100);expect(operation).toBe(id);return {status:'drained'};}});
+      expect(result.status).toBe(role==='agent'?'drained':'uncertain');expect(ordinary).toBe(0);expect(scoped).toBe(role==='agent'?1:0);
+    }
+  });
+  it('does not replay a recovery drain result for a different upload',async()=>{
+    const abort=new AbortController();let calls=0,connections=0,result='';
+    const options=await fixture(socket=>{const id=(++connections===1?'a':'b').repeat(32);peer(socket,()=>write(socket,{version:1,type:'drain',requestId,timeoutMs:100,legacyUploadId:id}),frame=>{result=frame.status;if(connections===2)abort.abort();},false,false,'agent');});
+    await runSupervisorControl({...options,role:'agent',signal:abort.signal,reconnectMs:10,drain:async()=>({status:'drained'}),drainLegacyUpload:async()=>{calls++;return {status:'drained'};}});
+    expect(connections).toBe(2);expect(calls).toBe(1);expect(result).toBe('uncertain');
+  });
   it('authenticates both peers without sending a secret and executes one drain',async()=>{
     const abort=new AbortController();let count=0;let result:any;
     const options=await fixture(socket=>peer(socket,()=>write(socket,{version:1,type:'drain',requestId,timeoutMs:100}),frame=>{result=frame;abort.abort();}));

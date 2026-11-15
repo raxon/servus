@@ -42,10 +42,10 @@ export function supervisorConfig(env: NodeJS.ProcessEnv): ControlConfig | undefi
 }
 
 /** Start the private control client; a stopped connection never proves quiescence. */
-export function startSupervisorControl(config: ControlConfig | undefined, role: SupervisorRole, drain: (timeoutMs: number) => Promise<{ status: SupervisorDrainStatus }>): AbortController | undefined {
+export function startSupervisorControl(config: ControlConfig | undefined, role: SupervisorRole, drain: (timeoutMs: number) => Promise<{ status: SupervisorDrainStatus }>, drainLegacyUpload?: (timeoutMs:number,operationId:string)=>Promise<{status:SupervisorDrainStatus}>): AbortController | undefined {
   if (!config) return undefined;
   const controller = new AbortController();
-  void runSupervisorControl({ ...config, role, drain, signal: controller.signal }).catch(() => {
+  void runSupervisorControl({ ...config, role, drain, drainLegacyUpload, signal: controller.signal }).catch(() => {
     // Do not keep a component running when its control client's initial configuration fails.
     process.exitCode = 1;
     process.kill(process.pid, 'SIGTERM');

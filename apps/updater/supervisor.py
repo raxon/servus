@@ -481,11 +481,12 @@ class DrainHub:
             connection.close()
             raise
 
-    def drain(self, timeout_ms, request_ids):
+    def drain(self, timeout_ms, request_ids, *, legacy_upload_id=None):
         """Drain API, worker, agent in that order; uncertainty is never success."""
         if (self.used or set(self.connections) != set(ROLES) or type(timeout_ms) is not int or not 1 <= timeout_ms <= 60000 or
             not isinstance(request_ids, dict) or set(request_ids) != set(ROLES) or
-            not all(_uuid4(value) for value in request_ids.values()) or len(set(request_ids.values())) != len(ROLES)):
+            not all(_uuid4(value) for value in request_ids.values()) or len(set(request_ids.values())) != len(ROLES) or
+            (legacy_upload_id is not None and (not isinstance(legacy_upload_id,str) or not re.fullmatch(r'[a-f0-9]{32}',legacy_upload_id)))):
             raise SupervisorError('Control channels are not ready')
         # A restart between authentication and drain invalidates all channels.
         if inspect_servus(self.policy) != self.identities:
@@ -495,7 +496,9 @@ class DrainHub:
             request_id = request_ids[role]
             deadline = time.monotonic() + timeout_ms / 1000
             try:
-                _send_message(self.connections[role], {'version': 1, 'type': 'drain', 'requestId': request_id, 'timeoutMs': timeout_ms}, deadline)
+                command={'version': 1, 'type': 'drain', 'requestId': request_id, 'timeoutMs': timeout_ms}
+                if role=='agent' and legacy_upload_id is not None:command['legacyUploadId']=legacy_upload_id
+                _send_message(self.connections[role], command, deadline)
                 result = _read_message(self.connections[role], deadline)
             except (OSError, SupervisorError):
                 print('servus drain failure role=' + role + ' outcome=channel_error', file=sys.stderr, flush=True)
@@ -762,14 +765,15 @@ class MaintenanceSupervisor(ComponentEndpoint):
             fcntl.flock(self.gate_lock, fcntl.LOCK_UN)
 
     @contextmanager
-    def drained_window(self, hub, request_id, timeout_ms=60000, *, policy_binding=None):
+    def drained_window(self, hub, request_id, timeout_ms=60000, *, policy_binding=None, legacy_upload_id=None):
         """Hold the exclusive startup gate after stopping authenticated roles.
 
         Callers must independently prove that every other writer and daemon-side
         operation is quiescent. A held gate alone does not authorize a backup.
         Any exception or uncommitted exit preserves a recovery-required marker.
         """
-        if not isinstance(hub, DrainHub) or not _uuid4(request_id) or type(timeout_ms) is not int or not 1 <= timeout_ms <= 60000:
+        if (not isinstance(hub, DrainHub) or not _uuid4(request_id) or type(timeout_ms) is not int or not 1 <= timeout_ms <= 60000 or
+            (legacy_upload_id is not None and (not isinstance(legacy_upload_id,str) or not re.fullmatch(r'[a-f0-9]{32}',legacy_upload_id)))):
             raise SupervisorError('Invalid maintenance request')
         if policy_binding is not None:
             if (not isinstance(policy_binding, tuple) or len(policy_binding) != 4 or
@@ -789,7 +793,8 @@ class MaintenanceSupervisor(ComponentEndpoint):
             self._start_maintenance()
             self._record(request_id, 'maintenance', request_ids, timeout_ms)
             phase = 'drain'
-            hub.drain(timeout_ms, request_ids)
+            if legacy_upload_id is None: hub.drain(timeout_ms, request_ids)
+            else: hub.drain(timeout_ms, request_ids, legacy_upload_id=legacy_upload_id)
             self._record(request_id, 'drained', request_ids, timeout_ms)
             phase = 'identity'
             if inspect_servus(hub.policy) != hub.identities:

@@ -13,6 +13,7 @@ export interface SupervisorControlOptions {
   socketPath: string;
   secretPath: string;
   drain: (timeoutMs: number) => Promise<{ status: SupervisorDrainStatus }>;
+  drainLegacyUpload?: (timeoutMs:number, operationId:string) => Promise<{status:SupervisorDrainStatus}>;
   signal: AbortSignal;
   reconnectMs?: number;
 }
@@ -23,7 +24,8 @@ const HEX = /^[a-f0-9]{64}$/;
 const roleSchema = z.enum(['api', 'worker', 'agent']);
 const ackSchema = z.strictObject({version:z.literal(1),type:z.literal('hello_ack'),role:roleSchema,challenge:z.string().regex(HEX),proof:z.string().regex(HEX)});
 const readySchema = z.strictObject({version:z.literal(1),type:z.literal('ready'),role:roleSchema});
-const drainSchema = z.strictObject({version:z.literal(1),type:z.literal('drain'),requestId:z.string().regex(UUID),timeoutMs:z.number().int().min(1).max(60000)});
+const drainFields={version:z.literal(1),type:z.literal('drain'),requestId:z.string().regex(UUID),timeoutMs:z.number().int().min(1).max(60000)};
+const drainSchema = z.union([z.strictObject(drainFields),z.strictObject({...drainFields,legacyUploadId:z.string().regex(/^[a-f0-9]{32}$/)})]);
 
 // The root-owned read-only mount and host root are a trust boundary. A node
 // process cannot authenticate a Unix peer with SO_PEERCRED through Node's API.
@@ -170,12 +172,12 @@ function resultOrClosed(socket: Socket, result: Promise<SupervisorDrainStatus>):
     if(socket.destroyed)finish(undefined);
   });
 }
-function startDrain(options: SupervisorControlOptions, timeoutMs: number): Promise<SupervisorDrainStatus> {
+function startDrain(options: SupervisorControlOptions, timeoutMs: number, legacyUploadId?:string): Promise<SupervisorDrainStatus> {
   return new Promise(resolvePromise => {
     let settled=false;
     const finish=(status: SupervisorDrainStatus) => {if(settled)return;settled=true;clearTimeout(timer);resolvePromise(status);};
     const timer=setTimeout(()=>finish('timeout'),timeoutMs);
-    Promise.resolve().then(()=>options.drain(timeoutMs)).then(value=>{
+    Promise.resolve().then(()=>legacyUploadId === undefined ? options.drain(timeoutMs) : options.role==='agent' && options.drainLegacyUpload ? options.drainLegacyUpload(timeoutMs,legacyUploadId) : {status:'uncertain' as const}).then(value=>{
       const status=value?.status;
       if(!['drained','uncertain','timeout','stopped'].includes(status) || (status==='stopped' && options.role!=='worker'))finish('uncertain');
       else finish(status);
@@ -187,7 +189,7 @@ function startDrain(options: SupervisorControlOptions, timeoutMs: number): Promi
 export async function runSupervisorControl(options: SupervisorControlOptions): Promise<void> {
   if (!roleSchema.safeParse(options.role).success || typeof options.drain !== 'function' || !options.signal || !Number.isSafeInteger(options.reconnectMs ?? 1000) || (options.reconnectMs ?? 1000) < 10 || (options.reconnectMs ?? 1000) > 60000) throw new Error('Invalid supervisor configuration');
   const secret = readSecret(options.secretPath);
-  let accepted: {requestId: string; timeoutMs: number; result: Promise<SupervisorDrainStatus>} | undefined;
+  let accepted: {requestId: string; timeoutMs: number; legacyUploadId?:string; result: Promise<SupervisorDrainStatus>} | undefined;
   const checkSecret=()=>{
     const current=readSecret(options.secretPath);
     try {
@@ -219,8 +221,9 @@ export async function runSupervisorControl(options: SupervisorControlOptions): P
           const ready=readySchema.parse(await deadline(reader.next(),remaining(),current));
           if(ready.role!==options.role)throw new Error('Supervisor authentication failed');
           const command=drainSchema.parse(await reader.next());
-          if(!accepted)accepted={requestId:command.requestId,timeoutMs:command.timeoutMs,result:startDrain(options,command.timeoutMs)};
-          const result=accepted.requestId===command.requestId && accepted.timeoutMs===command.timeoutMs
+          const legacyUploadId='legacyUploadId' in command ? command.legacyUploadId : undefined;
+          if(!accepted)accepted={requestId:command.requestId,timeoutMs:command.timeoutMs,legacyUploadId,result:startDrain(options,command.timeoutMs,legacyUploadId)};
+          const result=accepted.requestId===command.requestId && accepted.timeoutMs===command.timeoutMs && accepted.legacyUploadId===legacyUploadId
             ? await resultOrClosed(current,accepted.result) : 'uncertain';
           if(result===undefined)throw new Error('Supervisor disconnected during drain');
           if (reader.hasPending) throw new Error('Unexpected supervisor frame');
