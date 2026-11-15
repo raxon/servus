@@ -171,6 +171,20 @@ class DaemonTest(unittest.TestCase):
                     self.assertEqual(apply.recover_legacy_upload.call_count,1 if scenario=='allowed' else 0)
                 finally:client.close()
 
+    def test_legacy_recovery_status_is_available_without_a_live_hub(self):
+        op=str(uuid.uuid4());restore='a'*32;service=str(uuid.uuid4())
+        for extra in (False,True):
+            server,client=socket.socketpair();listener=SimpleNamespace(accept=lambda:(server,None))
+            request={'version':1,'type':'legacy_recovery_status','operationId':op,'restoreId':restore,'serviceId':service}
+            if extra:request['path']='/untrusted'
+            client.sendall(json.dumps(request).encode()+b'\n')
+            try:
+                with mock.patch.object(daemon,'legacy_recovery_status',return_value='completed') as status:
+                    daemon.handle_command(listener,None,'/install','/gate','/journal','/policy','/approval','/env')
+                self.assertEqual(json.loads(client.recv(4096))['status'],'failed' if extra else 'completed')
+                self.assertEqual(status.call_count,0 if extra else 1)
+            finally:client.close()
+
     def test_resolves_current_policy_generation_and_rejects_drift(self):
         with tempfile.TemporaryDirectory(dir='/root') as temporary:
             path = Path(temporary) / 'journal.sqlite'

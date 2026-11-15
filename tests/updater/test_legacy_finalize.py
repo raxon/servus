@@ -20,7 +20,7 @@ daemon=importlib.util.module_from_spec(spec);spec.loader.exec_module(daemon)
 class LegacyFinalizeTest(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir='/root',prefix='servus-legacy-finalize-');root=Path(self.temp.name)
-        (root/'journal').mkdir(mode=0o700);(root/'gate').mkdir(mode=0o755)
+        (root/'journal').mkdir(mode=0o700);(root/'gate').mkdir(mode=0o755);self.journal_path=str(root/'journal')
         self.journal=os.open(root/'journal',os.O_RDONLY|os.O_DIRECTORY);self.gate=os.open(root/'gate',os.O_RDONLY|os.O_DIRECTORY)
         supervisor._atomic_file(self.gate,'state',b'servus-lifecycle-v1 normal\n',0o644)
         self.operation=SimpleNamespace(journal=self.journal,gate=self.gate);self.op=str(uuid.uuid4());self.restore='a'*32;self.service=str(uuid.uuid4())
@@ -97,6 +97,21 @@ class LegacyFinalizeTest(unittest.TestCase):
             with self.assertRaises(supervisor.SupervisorError):self.finalize()
         self.assertTrue(self.exists('maintenance.json'));self.assertTrue(self.exists('legacy-upload-recovery.json'))
         self.assertTrue(self.exists('legacy-upload-validated-'+self.op+'.json'))
+
+    def test_status_requires_matching_history_and_no_active_recovery(self):
+        status=lambda:daemon.legacy_recovery_status(self.journal_path,self.op,self.restore,self.service)
+        self.assertEqual(status(),'in_progress')
+        self.write('legacy-upload-validated-'+self.op+'.json',{**self.marker,'state':'validated'})
+        self.assertEqual(status(),'in_progress')
+        self.maintenance['state']='recovery_required';self.write('maintenance.json',self.maintenance)
+        self.assertEqual(status(),'recovery_required')
+        self.maintenance['state']='starting';self.write('maintenance.json',self.maintenance)
+        self.assertTrue(self.finalize());self.assertEqual(status(),'completed')
+        with self.assertRaises(supervisor.SupervisorError):daemon.legacy_recovery_status(self.journal_path,self.op,self.restore,str(uuid.uuid4()))
+
+    def test_status_never_infers_success_from_missing_evidence(self):
+        os.unlink('maintenance.json',dir_fd=self.journal);os.unlink('legacy-upload-recovery.json',dir_fd=self.journal)
+        self.assertEqual(daemon.legacy_recovery_status(self.journal_path,self.op,self.restore,self.service),'unknown')
 
 
 if __name__=='__main__':unittest.main()

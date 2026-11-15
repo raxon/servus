@@ -641,6 +641,53 @@ def host_exchange_restored(approval_journal, operation_id):
     except sqlite3.Error:
         return False
 
+def legacy_recovery_status(journal_dir,operation_id,restore_id,service_id):
+    """Read root-owned recovery evidence; absence is never reported as success."""
+    if (not supervisor._uuid4(operation_id) or not isinstance(restore_id,str) or not re.fullmatch(r'[a-f0-9]{32}',restore_id) or
+        not isinstance(service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service_id)):
+        raise supervisor.SupervisorError('Invalid legacy recovery identity')
+    directory=supervisor._trusted_directory(journal_dir,0o700)
+    def read(name):
+        try:fd=supervisor._open_root_file(directory,name,0o600)
+        except FileNotFoundError:return None
+        try:
+            data=os.read(fd,4097)
+            if len(data)>4096:raise supervisor.SupervisorError('Legacy recovery evidence is invalid')
+            return json.loads(data,object_pairs_hook=supervisor._pairs)
+        except (ValueError,UnicodeError,RecursionError) as error:raise supervisor.SupervisorError('Legacy recovery evidence is invalid') from error
+        finally:os.close(fd)
+    def validate_marker(value,states):
+        if (not isinstance(value,dict) or set(value)!={'version','operationId','restoreId','serviceId','state','policyBinding','containerIds'} or
+            type(value['version']) is not int or value['version']!=1 or not supervisor._uuid4(value['operationId']) or
+            not isinstance(value['restoreId'],str) or not re.fullmatch(r'[a-f0-9]{32}',value['restoreId']) or
+            not isinstance(value['serviceId'],str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',value['serviceId']) or
+            value['state'] not in states or not isinstance(value['policyBinding'],list) or len(value['policyBinding'])!=3 or
+            not isinstance(value['policyBinding'][0],str) or not os.path.isabs(value['policyBinding'][0]) or
+            any(not isinstance(item,str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',item) for item in value['policyBinding'][1:]) or
+            not isinstance(value['containerIds'],dict) or set(value['containerIds'])!=set(supervisor.ROLES) or
+            any(not isinstance(item,str) or not supervisor.CONTAINER.fullmatch(item) for item in value['containerIds'].values()) or
+            len(set(value['containerIds'].values()))!=len(supervisor.ROLES)):
+            raise supervisor.SupervisorError('Legacy recovery evidence is invalid')
+    try:
+        active=read('legacy-upload-recovery.json');history=read('legacy-upload-validated-'+operation_id+'.json');maintenance=read('maintenance.json')
+        if active is not None:validate_marker(active,('intent','cleaned','starting'))
+        if history is not None:
+            validate_marker(history,('validated',))
+            if (history['operationId'],history['restoreId'],history['serviceId'])!=(operation_id,restore_id,service_id):raise supervisor.SupervisorError('Legacy recovery evidence does not match')
+        if maintenance is not None and (not isinstance(maintenance,dict) or set(maintenance)!={'version','operationId','state','requestIds','timeoutMs'} or
+            type(maintenance['version']) is not int or maintenance['version']!=1 or not supervisor._uuid4(maintenance['operationId']) or
+            not isinstance(maintenance['state'],str)):
+            raise supervisor.SupervisorError('Maintenance evidence is invalid')
+        if active is not None and active['operationId']==operation_id:
+            if (active['restoreId'],active['serviceId'])!=(restore_id,service_id):raise supervisor.SupervisorError('Legacy recovery evidence does not match')
+            if maintenance is not None and (maintenance['operationId']!=operation_id or maintenance['state']=='recovery_required'):return 'recovery_required'
+            return 'in_progress'
+        if maintenance is not None and maintenance['operationId']==operation_id:
+            return 'recovery_required' if maintenance['state']=='recovery_required' else 'in_progress'
+        return 'completed' if history is not None else 'unknown'
+    finally:os.close(directory)
+
+
 def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env, *, apply=None):
     connection, _ = listener.accept()
     try:
@@ -650,6 +697,10 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
         deadline = time.monotonic() + 5
         request = supervisor._read_message(connection, deadline)
         kind = request.get('type')
+        if kind=='legacy_recovery_status' and set(request)=={'version','type','operationId','restoreId','serviceId'} and type(request.get('version')) is int and request['version']==1:
+            status=legacy_recovery_status(journal_dir,request['operationId'],request['restoreId'],request['serviceId'])
+            supervisor._send_message(connection,{'version':1,'status':status},time.monotonic()+1)
+            return
         if (kind == 'host_status' and set(request) == {'version', 'type', 'operationId'} and
             type(request.get('version')) is int and request['version'] == 1 and supervisor._uuid4(request.get('operationId'))):
             ready = (hub is not None and not hub.used and set(hub.connections) == set(supervisor.ROLES)
