@@ -123,6 +123,32 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
         self.assertEqual(self.observe(),'original')
         self.assertEqual((self.active/'servus'/'version').read_text(),'old')
 
+    def test_reconcile_failed_exchange_when_original_is_present(self):
+        with mock.patch.object(exchange,'exchange',side_effect=OSError('fixture')),self.assertRaises(OSError):self.apply()
+        switch.reconcile_original(self.db,self.op,**self.args())
+        self.assertEqual(self.observe(),'original')
+        self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('rolled_back',))
+        self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('recovery_required',))
+
+    def test_reconcile_refuses_exchanged_runtime_and_changed_identity(self):
+        self.apply()
+        with self.assertRaises(switch.HostSwitchError):switch.reconcile_original(self.db,self.op,**self.args())
+        self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('exchanged',))
+        original=exchange.identity
+        with mock.patch.object(exchange,'identity',side_effect=lambda parent,name:(999,999) if name=='servus' else original(parent,name)):
+            with self.assertRaises(switch.HostSwitchError):switch.reconcile_original(self.db,self.op,**self.args())
+        self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('exchanged',))
+
+    def test_reconcile_after_rollback_journal_failure(self):
+        self.apply()
+        self.db.execute("CREATE TRIGGER deny_host_recovery BEFORE UPDATE ON host_preparations BEGIN SELECT RAISE(ABORT,'fixture'); END")
+        with self.assertRaises(sqlite3.IntegrityError):self.rollback()
+        self.db.execute('DROP TRIGGER deny_host_recovery')
+        switch.reconcile_original(self.db,self.op,**self.args())
+        self.assertEqual(self.observe(),'original')
+        self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('rolled_back',))
+        self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('recovery_required',))
+
     def test_lost_lock_after_swap_preserves_intent_for_recovery(self):
         original=exchange.exchange
         def lose_lock(*args):original(*args);fcntl.flock(self.sl,fcntl.LOCK_UN)
