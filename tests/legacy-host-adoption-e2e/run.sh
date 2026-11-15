@@ -65,6 +65,19 @@ python3 tests/legacy-host-adoption-e2e/pin-discovery.py "$temp_dir/discovery-14.
 guest sudo tee /usr/local/libexec/servus/discover-release.py < "$temp_dir/discovery-14.py" >/dev/null
 guest sudo chmod 644 /usr/local/libexec/servus/discover-release.py
 node tests/signed-update-e2e/browser.mjs "http://127.0.0.1:$port" 0.1.13 0.1.14 "$base"
+old_tag=v0.1.14
+if [ "${SERVUS_TEST_INTERRUPTED_ADOPTION:-0}" = 1 ]; then
+  recovery_commit=$(git rev-parse 'v0.1.19^{commit}')
+  cp "$temp_dir/discovery-original.py" "$temp_dir/discovery-recovery.py"
+  python3 tests/legacy-host-adoption-e2e/pin-discovery.py "$temp_dir/discovery-recovery.py" v0.1.19 "$recovery_commit"
+  guest sudo tee /usr/local/libexec/servus/discover-release.py < "$temp_dir/discovery-recovery.py" >/dev/null
+  guest sudo chmod 644 /usr/local/libexec/servus/discover-release.py
+  guest sudo tee /run/servus-legacy-fixture/upgrade.py < tests/legacy-host-adoption-e2e/upgrade.py >/dev/null
+  guest sudo /usr/bin/python3 -I -B /run/servus-legacy-fixture/upgrade.py 0.1.19 "$port"
+  guest sudo tee /run/servus-legacy-fixture/interrupt.py < tests/legacy-host-adoption-e2e/interrupt.py >/dev/null
+  guest sudo /usr/bin/python3 -I -B /run/servus-legacy-fixture/interrupt.py
+  old_tag=v0.1.19
+fi
 cp "$temp_dir/discovery-original.py" "$temp_dir/discovery-target.py"
 python3 tests/legacy-host-adoption-e2e/pin-discovery.py "$temp_dir/discovery-target.py" "v$target" "$target_commit"
 guest sudo tee /usr/local/libexec/servus/discover-release.py < "$temp_dir/discovery-target.py" >/dev/null
@@ -72,10 +85,10 @@ guest sudo chmod 644 /usr/local/libexec/servus/discover-release.py
 guest sudo tee /run/servus-legacy-fixture/upgrade.py < tests/legacy-host-adoption-e2e/upgrade.py >/dev/null
 printf 'READY legacy host v0.1.14; waiting for signed v%s\n' "$target"
 guest sudo /usr/bin/python3 -I -B /run/servus-legacy-fixture/upgrade.py "$target" "$port"
-guest sudo /usr/bin/python3 -I - "$target" "$port" <<'PY'
+guest sudo /usr/bin/python3 -I - "$target" "$port" "$old_tag" <<'PY'
 import os,sqlite3,subprocess,sys
 target='v'+sys.argv[1];db=sqlite3.connect('/var/lib/servus-updater/journal.sqlite')
-old=db.execute("SELECT o.id FROM operations o JOIN policy_approvals a ON a.operation_id=o.id WHERE o.tag='v0.1.14' AND a.state='superseded'").fetchall()
+old=db.execute("SELECT o.id FROM operations o JOIN policy_approvals a ON a.operation_id=o.id WHERE o.tag=? AND a.state='superseded'",(sys.argv[3],)).fetchall()
 active=db.execute("SELECT o.id,p.staging_path FROM operations o JOIN policy_approvals a ON a.operation_id=o.id JOIN preparations p ON p.operation_id=o.id WHERE o.tag=? AND a.state='active'",(target,)).fetchall()
 assert len(old)==1 and len(active)==1,(old,active)
 entry=os.path.join(active[0][1],'apps/updater/host-adoption.py')
