@@ -39,7 +39,7 @@ def inspect_exchange(db, operation_id, active_parent, candidate_parent, exchange
     if not isinstance(operation_id, str) or not bundle.OPERATION.fullmatch(operation_id):
         raise HostSwitchError('Invalid operation identity')
     row = db.execute('SELECT image_digest,old_dev,old_ino,new_dev,new_ino,phase FROM host_switches WHERE operation_id=?', (operation_id,)).fetchone()
-    if not row or not isinstance(row[0], str) or not bundle.DIGEST.fullmatch(row[0]) or row[5] not in ('intent', 'exchanged', 'rolled_back'):
+    if not row or not isinstance(row[0], str) or not bundle.DIGEST.fullmatch(row[0]) or row[5] not in ('intent', 'exchanged', 'rolled_back', 'completed'):
         raise HostSwitchError('Host exchange journal is unavailable')
     old, new = (row[1], row[2]), (row[3], row[4])
     if any(type(value) is not int or value <= 0 for value in old + new) or old == new:
@@ -70,7 +70,7 @@ def exchange_prepared(db, operation_id, image_digest, modules, cli, pin, *,
     _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, fence)
     db.execute('BEGIN IMMEDIATE')
     try:
-        db.execute("CREATE TABLE IF NOT EXISTS host_switches (operation_id TEXT PRIMARY KEY, image_digest TEXT NOT NULL, old_dev INTEGER NOT NULL, old_ino INTEGER NOT NULL, new_dev INTEGER NOT NULL, new_ino INTEGER NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('intent','exchanged','rolled_back'))) ")
+        db.execute("CREATE TABLE IF NOT EXISTS host_switches (operation_id TEXT PRIMARY KEY, image_digest TEXT NOT NULL, old_dev INTEGER NOT NULL, old_ino INTEGER NOT NULL, new_dev INTEGER NOT NULL, new_ino INTEGER NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('intent','exchanged','rolled_back','completed'))) ")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_switch ON host_switches ((1)) WHERE phase IN ('intent','exchanged')")
         db.execute("INSERT INTO host_switches VALUES(?,?,?,?,?,?,'intent')", (operation_id, image_digest, *old, *new))
         db.execute('COMMIT')
@@ -132,6 +132,38 @@ def reconcile_original(db, operation_id, *, state_fd, install_fd, service_lock, 
             raise HostSwitchError('Host exchange journal changed')
         if db.execute("UPDATE host_preparations SET status='recovery_required' WHERE operation_id=? AND status='prepared'", (operation_id,)).rowcount != 1:
             raise HostSwitchError('Host preparation journal changed')
+        db.execute('COMMIT')
+    except BaseException:
+        if db.in_transaction: db.execute('ROLLBACK')
+        raise
+
+
+def complete_exchange(db, operation_id, *, state_fd, install_fd, service_lock, install_lock,
+                      active_parent, candidate_parent, supervisor, coordinator, bundle, exchange, ready):
+    """Record a healthy exchange only after the caller verifies restored services.
+
+    The caller's readiness check must verify restored unit files, original service
+    states and control-plane health. It must raise on uncertainty and return None.
+    """
+    _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, ready)
+    if inspect_exchange(db, operation_id, active_parent, candidate_parent, exchange, bundle) != 'exchanged':
+        raise HostSwitchError('The new host runtime is not present')
+    row = db.execute('SELECT image_digest,phase FROM host_unit_masks WHERE operation_id=?', (operation_id,)).fetchone()
+    switch = db.execute('SELECT image_digest,phase FROM host_switches WHERE operation_id=?', (operation_id,)).fetchone()
+    preparation = db.execute('SELECT image_digest,status FROM host_preparations WHERE operation_id=?', (operation_id,)).fetchone()
+    if not switch or row != (switch[0], 'restored') or switch[1] != 'exchanged' or preparation != (switch[0], 'prepared'):
+        raise HostSwitchError('Host recovery state is not ready for completion')
+    _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, ready)
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        if inspect_exchange(db, operation_id, active_parent, candidate_parent, exchange, bundle) != 'exchanged':
+            raise HostSwitchError('The host runtime changed during completion')
+        if db.execute("UPDATE host_switches SET phase='completed' WHERE operation_id=? AND image_digest=? AND phase='exchanged'", (operation_id, switch[0])).rowcount != 1:
+            raise HostSwitchError('Host exchange journal changed')
+        if db.execute("UPDATE host_preparations SET status='completed' WHERE operation_id=? AND image_digest=? AND status='prepared'", (operation_id, switch[0])).rowcount != 1:
+            raise HostSwitchError('Host preparation journal changed')
+        if db.execute("SELECT 1 FROM host_unit_masks WHERE operation_id=? AND image_digest=? AND phase='restored'", (operation_id, switch[0])).fetchone() is None:
+            raise HostSwitchError('Host unit recovery journal changed')
         db.execute('COMMIT')
     except BaseException:
         if db.in_transaction: db.execute('ROLLBACK')

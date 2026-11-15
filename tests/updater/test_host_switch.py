@@ -149,6 +149,32 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
         self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('rolled_back',))
         self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('recovery_required',))
 
+    def test_complete_requires_restored_units_and_healthy_services(self):
+        self.apply()
+        self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
+        self.db.execute('INSERT INTO host_unit_masks VALUES(?,?,?)',(self.op,self.digest,'masked'))
+        args=self.args();args.pop('fence');ready=mock.Mock(return_value=None)
+        with self.assertRaises(switch.HostSwitchError):switch.complete_exchange(self.db,self.op,ready=ready,**args)
+        self.db.execute("UPDATE host_unit_masks SET phase='restored'")
+        ready.side_effect=RuntimeError('unhealthy')
+        with self.assertRaises(RuntimeError):switch.complete_exchange(self.db,self.op,ready=ready,**args)
+        self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('exchanged',))
+        ready.side_effect=None
+        switch.complete_exchange(self.db,self.op,ready=ready,**args)
+        self.assertEqual(self.observe(),'exchanged')
+        self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('completed',))
+        self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('completed',))
+
+    def test_complete_is_atomic_if_preparation_update_fails(self):
+        self.apply()
+        self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
+        self.db.execute('INSERT INTO host_unit_masks VALUES(?,?,?)',(self.op,self.digest,'restored'))
+        self.db.execute("CREATE TRIGGER deny_completion BEFORE UPDATE ON host_preparations BEGIN SELECT RAISE(ABORT,'fixture'); END")
+        args=self.args();args.pop('fence')
+        with self.assertRaises(sqlite3.IntegrityError):switch.complete_exchange(self.db,self.op,ready=lambda:None,**args)
+        self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('exchanged',))
+        self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('prepared',))
+
     def test_lost_lock_after_swap_preserves_intent_for_recovery(self):
         original=exchange.exchange
         def lose_lock(*args):original(*args);fcntl.flock(self.sl,fcntl.LOCK_UN)

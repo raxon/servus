@@ -115,7 +115,7 @@ def prepare_completed(db, operation_id, *, state_dir, install_dir, gate_dir,
         _no_pending(db)
         db.execute('BEGIN IMMEDIATE')
         try:
-            db.execute("CREATE TABLE IF NOT EXISTS host_preparations (operation_id TEXT PRIMARY KEY, image_digest TEXT NOT NULL, generation TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('intent','prepared','recovery_required'))) ")
+            db.execute("CREATE TABLE IF NOT EXISTS host_preparations (operation_id TEXT PRIMARY KEY, image_digest TEXT NOT NULL, generation TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('intent','prepared','recovery_required','completed'))) ")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_preparation ON host_preparations ((1)) WHERE status IN ('intent','prepared','recovery_required')")
             db.execute("INSERT INTO host_preparations VALUES(?,?,?,'intent')", (operation_id, digest, 'runtime-' + operation_id))
             db.execute('COMMIT'); inserted = True
