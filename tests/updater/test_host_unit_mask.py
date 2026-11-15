@@ -98,6 +98,28 @@ class HostUnitMaskTest(unittest.TestCase):
                 finally:self.states[name]=previous
             self.assert_originals()
 
+    def test_saved_state_before_updater_stop_is_preserved(self):
+        initial=dict(self.states);self.states['servus-updater.service']='inactive'
+        mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,execute=self.execute,
+                        initial_states=initial,host_lock=self.base.hl,**self.args())
+        originals,recorded=mask.load_verified_backup(self.base.db,self.base.op,self.base.digest,self.base.s)
+        self.assertEqual(originals,self.originals);self.assertEqual(recorded,initial)
+        self.states=initial;self.assertEqual(mask.restore_from_journal(self.base.db,self.base.op,self.base.digest,**self.args()),initial)
+
+    def test_saved_state_rejects_other_changes_and_missing_host_lock(self):
+        initial=dict(self.states);self.states['servus-updater.service']='inactive';self.states['servus-supervisor.service']='inactive'
+        with self.assertRaises(mask.UnitMaskError):
+            mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,execute=self.execute,
+                            initial_states=initial,host_lock=self.base.hl,**self.args())
+        self.states['servus-supervisor.service']='active'
+        fcntl.flock(self.base.hl,fcntl.LOCK_UN)
+        try:
+            with self.assertRaises(fixtures.supervisor.SupervisorError):
+                mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,execute=self.execute,
+                                initial_states=initial,host_lock=self.base.hl,**self.args())
+        finally:fcntl.flock(self.base.hl,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        self.assert_originals()
+
     def test_changed_service_state_aborts_before_masking(self):
         calls=0
         def changing(unit):

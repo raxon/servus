@@ -246,11 +246,24 @@ def _replace_with_original(parent, unit, content):
 
 
 def mask_units(db, operation_id, image_digest, originals, *, state, install, units,
-               service_lock, install_lock, supervisor, coordinator, execute=_systemctl):
+               service_lock, install_lock, supervisor, coordinator, execute=_systemctl,
+               initial_states=None, host_lock=None):
     """Back up expected files, then install persistent masks under journal intent."""
     _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
     _directory(state, 0o700); _directory(install, 0o700); _directory(units, 0o755)
-    service_states = capture_service_states(execute=execute)
+    observed_states = capture_service_states(execute=execute)
+    if initial_states is None:
+        service_states = observed_states
+    else:
+        coordinator._same_lock(supervisor, state, 'host.lock', host_lock)
+        _metadata(operation_id, image_digest, originals, initial_states)
+        expected = dict(initial_states)
+        if any(initial_states[unit] != 'active' for unit in UNITS[:-1]):
+            raise UnitMaskError('The host services were not active before startup')
+        expected['servus-updater.service'] = 'inactive'
+        if observed_states != expected:
+            raise UnitMaskError('Host unit states changed during updater stop')
+        service_states = initial_states
     metadata = _metadata(operation_id, image_digest, originals, service_states)
     row = db.execute('SELECT image_digest,generation,status FROM host_preparations WHERE operation_id=?', (operation_id,)).fetchone()
     if row != (image_digest, 'runtime-' + operation_id, 'prepared'): raise UnitMaskError('Prepared host generation is unavailable')
@@ -272,8 +285,10 @@ def mask_units(db, operation_id, image_digest, originals, *, state, install, uni
         raise UnitMaskError('Unit mask journal changed')
     _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
     for unit in UNITS: _read(units, unit, 0o644, originals[unit])
-    if capture_service_states(execute=execute) != service_states:
+    if capture_service_states(execute=execute) != observed_states:
         raise UnitMaskError('Host unit states changed before masking')
+    if initial_states is not None:
+        coordinator._same_lock(supervisor, state, 'host.lock', host_lock)
     if db.execute("UPDATE host_unit_masks SET phase='masking' WHERE operation_id=? AND phase='backed_up' AND backup_digest=?", (operation_id, digest)).rowcount != 1:
         raise UnitMaskError('Unit mask journal changed')
     for unit in UNITS:
