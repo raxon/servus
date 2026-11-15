@@ -26,9 +26,9 @@ class HostSwitchTest(unittest.TestCase):
         self.state,self.install,self.active,self.candidates=(self.root/name for name in ('state','install','active','candidates'))
         for path in (self.state,self.install,self.candidates):path.mkdir(mode=0o700)
         self.active.mkdir(mode=0o755);(self.active/'servus').mkdir(mode=0o755);(self.active/'servus'/'version').write_text('old')
-        for path in (self.state/'service.lock',self.install/'install.lock'):path.touch(mode=0o600)
-        self.sl=os.open(self.state/'service.lock',os.O_RDONLY);self.il=os.open(self.install/'install.lock',os.O_RDONLY)
-        for fd in (self.sl,self.il):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        for path in (self.state/'service.lock',self.state/'host.lock',self.install/'install.lock'):path.touch(mode=0o600)
+        self.sl=os.open(self.state/'service.lock',os.O_RDONLY);self.hl=os.open(self.state/'host.lock',os.O_RDONLY);self.il=os.open(self.install/'install.lock',os.O_RDONLY)
+        for fd in (self.sl,self.hl,self.il):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         self.s=os.open(self.state,os.O_RDONLY|os.O_DIRECTORY);self.i=os.open(self.install,os.O_RDONLY|os.O_DIRECTORY)
         self.a=os.open(self.active,os.O_RDONLY|os.O_DIRECTORY);self.c=os.open(self.candidates,os.O_RDONLY|os.O_DIRECTORY)
         self.db=sqlite3.connect(self.state/'journal.sqlite',isolation_level=None);(self.state/'journal.sqlite').chmod(0o600)
@@ -41,7 +41,7 @@ class HostSwitchTest(unittest.TestCase):
 
     def tearDown(self):
         self.db.close()
-        for fd in (self.sl,self.il,self.s,self.i,self.a,self.c):os.close(fd)
+        for fd in (self.sl,self.hl,self.il,self.s,self.i,self.a,self.c):os.close(fd)
         self.temp.cleanup()
 
     def args(self):
@@ -153,7 +153,7 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
         self.apply()
         self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
         self.db.execute('INSERT INTO host_unit_masks VALUES(?,?,?)',(self.op,self.digest,'masked'))
-        args=self.args();args.pop('fence');args.update(unit_mask=mock.Mock(unsafe=True), units_fd=self.a);ready=mock.Mock(return_value=None)
+        args=self.args();args.pop('fence');args.pop('service_lock');args.update(host_lock=self.hl,unit_mask=mock.Mock(unsafe=True), units_fd=self.a);ready=mock.Mock(return_value=None)
         with self.assertRaises(switch.HostSwitchError):switch.complete_exchange(self.db,self.op,ready=ready,**args)
         self.db.execute("UPDATE host_unit_masks SET phase='restored'")
         ready.side_effect=RuntimeError('unhealthy')
@@ -165,12 +165,32 @@ switch.exchange_prepared(db,op,digest,{"core.py":(0o644,b"new")},cli,pin,state_f
         self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('completed',))
         self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('completed',))
 
+    def test_completion_uses_host_lock_while_updater_owns_service_lock(self):
+        self.apply()
+        self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
+        self.db.execute('INSERT INTO host_unit_masks VALUES(?,?,?)',(self.op,self.digest,'restored'))
+        fcntl.flock(self.sl,fcntl.LOCK_UN)
+        other=os.open(self.state/'service.lock',os.O_RDONLY)
+        try:
+            fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            args=self.args();args.pop('fence');args.pop('service_lock')
+            args.update(host_lock=self.hl,unit_mask=mock.Mock(unsafe=True),units_fd=self.a)
+            fcntl.flock(self.hl,fcntl.LOCK_UN)
+            with self.assertRaises(supervisor.SupervisorError):
+                switch.complete_exchange(self.db,self.op,ready=lambda:None,**args)
+            fcntl.flock(self.hl,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            switch.complete_exchange(self.db,self.op,ready=lambda:None,**args)
+            self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('completed',))
+        finally:
+            fcntl.flock(other,fcntl.LOCK_UN);os.close(other)
+            fcntl.flock(self.sl,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
     def test_complete_is_atomic_if_preparation_update_fails(self):
         self.apply()
         self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT PRIMARY KEY,image_digest TEXT,phase TEXT)')
         self.db.execute('INSERT INTO host_unit_masks VALUES(?,?,?)',(self.op,self.digest,'restored'))
         self.db.execute("CREATE TRIGGER deny_completion BEFORE UPDATE ON host_preparations BEGIN SELECT RAISE(ABORT,'fixture'); END")
-        args=self.args();args.pop('fence');args.update(unit_mask=mock.Mock(unsafe=True), units_fd=self.a)
+        args=self.args();args.pop('fence');args.pop('service_lock');args.update(host_lock=self.hl,unit_mask=mock.Mock(unsafe=True), units_fd=self.a)
         with self.assertRaises(sqlite3.IntegrityError):switch.complete_exchange(self.db,self.op,ready=lambda:None,**args)
         self.assertEqual(self.db.execute('select phase from host_switches').fetchone(),('exchanged',))
         self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('prepared',))

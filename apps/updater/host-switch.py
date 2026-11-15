@@ -13,13 +13,13 @@ class HostSwitchError(Exception):
     pass
 
 
-def _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, fence):
+def _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, fence, *, lock_name='service.lock'):
     if (sys.platform != 'linux' or os.geteuid() != 0 or not sys.flags.isolated or
         db.in_transaction or db.isolation_level is not None or not callable(fence)):
         raise HostSwitchError('An isolated, fenced root coordinator is required')
     if db.execute('PRAGMA synchronous').fetchone()[0] < 2:
         raise HostSwitchError('The journal must use durable synchronization')
-    coordinator._same_lock(supervisor, state_fd, 'service.lock', service_lock)
+    coordinator._same_lock(supervisor, state_fd, lock_name, service_lock)
     coordinator._same_lock(supervisor, install_fd, 'install.lock', install_lock)
     fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600)
     try:
@@ -138,14 +138,15 @@ def reconcile_original(db, operation_id, *, state_fd, install_fd, service_lock, 
         raise
 
 
-def complete_exchange(db, operation_id, *, state_fd, install_fd, service_lock, install_lock,
+def complete_exchange(db, operation_id, *, state_fd, install_fd, host_lock, install_lock,
                       active_parent, candidate_parent, supervisor, coordinator, bundle, exchange, unit_mask, units_fd, ready):
     """Record a healthy exchange only after the caller verifies restored services.
 
-    The caller's readiness check must verify restored unit files, original service
-    states and control-plane health. It must raise on uncertainty and return None.
+    The caller holds a separate host operation lock across the exchange and
+    restart. The readiness check verifies authenticated control-plane health
+    without acquiring the already-held installation lock; it must return None.
     """
-    _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, ready)
+    _guard(db, state_fd, install_fd, host_lock, install_lock, supervisor, coordinator, ready, lock_name='host.lock')
     if inspect_exchange(db, operation_id, active_parent, candidate_parent, exchange, bundle) != 'exchanged':
         raise HostSwitchError('The new host runtime is not present')
     row = db.execute('SELECT image_digest,phase FROM host_unit_masks WHERE operation_id=?', (operation_id,)).fetchone()
@@ -154,7 +155,7 @@ def complete_exchange(db, operation_id, *, state_fd, install_fd, service_lock, i
     if not switch or row != (switch[0], 'restored') or switch[1] != 'exchanged' or preparation != (switch[0], 'prepared'):
         raise HostSwitchError('Host recovery state is not ready for completion')
     unit_mask.assert_restored(db, operation_id, switch[0], state=state_fd, units=units_fd)
-    _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coordinator, ready)
+    _guard(db, state_fd, install_fd, host_lock, install_lock, supervisor, coordinator, ready, lock_name='host.lock')
     unit_mask.assert_restored(db, operation_id, switch[0], state=state_fd, units=units_fd)
     db.execute('BEGIN IMMEDIATE')
     try:
