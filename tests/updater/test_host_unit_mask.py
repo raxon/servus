@@ -48,6 +48,39 @@ class HostUnitMaskTest(unittest.TestCase):
         for name in mask.UNITS:self.assertEqual(os.readlink(self.units/name),'/dev/null')
         self.restore();self.assertEqual(self.phase(),'restored');self.assert_originals()
 
+    def test_remask_after_partial_restoration_and_interrupted_remask(self):
+        self.apply();original=mask._replace_with_original;calls=0
+        def interrupt_restore(*args):
+            nonlocal calls
+            original(*args);calls+=1
+            if calls==2:raise OSError('fixture')
+        with mock.patch.object(mask,'_replace_with_original',side_effect=interrupt_restore),self.assertRaises(OSError):self.restore()
+        self.assertEqual(self.phase(),'restoring')
+        replace=mask._replace_with_mask;calls=0
+        def interrupt_mask(*args):
+            nonlocal calls
+            replace(*args);calls+=1
+            if calls==1:raise OSError('fixture')
+        with mock.patch.object(mask,'_replace_with_mask',side_effect=interrupt_mask),self.assertRaises(OSError):
+            mask.remask_for_recovery(self.base.db,self.base.op,self.base.digest,host_lock=self.base.hl,**self.args())
+        self.assertEqual(self.phase(),'masking')
+        mask.remask_for_recovery(self.base.db,self.base.op,self.base.digest,host_lock=self.base.hl,**self.args())
+        self.assertEqual(self.phase(),'masked')
+        for name in mask.UNITS:self.assertEqual(os.readlink(self.units/name),'/dev/null')
+        mask.restore_from_journal(self.base.db,self.base.op,self.base.digest,**self.args());self.assert_originals()
+
+    def test_remask_rejects_changed_unit_and_lost_host_lock(self):
+        self.apply();self.restore();path=self.units/mask.UNITS[0];path.write_bytes(b'changed')
+        with self.assertRaises(mask.UnitMaskError):
+            mask.remask_for_recovery(self.base.db,self.base.op,self.base.digest,host_lock=self.base.hl,**self.args())
+        self.assertEqual(self.phase(),'restored');path.write_bytes(self.originals[mask.UNITS[0]])
+        fcntl.flock(self.base.hl,fcntl.LOCK_UN)
+        try:
+            with self.assertRaises(fixtures.supervisor.SupervisorError):
+                mask.remask_for_recovery(self.base.db,self.base.op,self.base.digest,host_lock=self.base.hl,**self.args())
+        finally:fcntl.flock(self.base.hl,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        self.assertEqual(self.phase(),'restored')
+
     def test_masked_stop_checks_locks_and_fences_consumers(self):
         self.apply();run=mock.Mock();fence=mock.Mock(return_value=None)
         mask.stop_masked_units(self.base.db,self.base.op,self.base.digest,host_lock=self.base.hl,fence=fence,run=run,**self.args())

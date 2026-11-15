@@ -300,6 +300,36 @@ def mask_units(db, operation_id, image_digest, originals, *, state, install, uni
 
 
 
+
+def remask_for_recovery(db, operation_id, image_digest, *, state, install, units, host_lock,
+                        service_lock, install_lock, supervisor, coordinator):
+    """Reinstall persistent masks from a verified backup after an interruption.
+
+    The caller owns the host, service and installation locks. No processes are
+    stopped here; the caller must stop and fence them before any exchange.
+    """
+    def guard():
+        _guard(db,state,install,service_lock,install_lock,supervisor,coordinator)
+        coordinator._same_lock(supervisor,state,'host.lock',host_lock)
+        _directory(state,0o700);_directory(install,0o700);_directory(units,0o755)
+    guard()
+    originals,_=load_verified_backup(db,operation_id,image_digest,state)
+    row=db.execute('SELECT image_digest,phase FROM host_unit_masks WHERE operation_id=?',(operation_id,)).fetchone()
+    if not row or row[0]!=image_digest or row[1] not in ('backed_up','masking','masked','restoring','restored'):
+        raise UnitMaskError('Unit recovery cannot be remasked')
+    for name in UNITS:
+        if not _masked(units,name):_read(units,name,0o644,originals[name])
+    guard()
+    if row[1]!='masking' and db.execute("UPDATE host_unit_masks SET phase='masking' WHERE operation_id=? AND image_digest=? AND phase=?",(operation_id,image_digest,row[1])).rowcount!=1:
+        raise UnitMaskError('Unit mask journal changed')
+    for name in UNITS:
+        guard()
+        if not _masked(units,name):
+            _read(units,name,0o644,originals[name]);_replace_with_mask(units,name)
+    if not all(_masked(units,name) for name in UNITS):raise UnitMaskError('Unit masks changed during recovery')
+    if db.execute("UPDATE host_unit_masks SET phase='masked' WHERE operation_id=? AND image_digest=? AND phase='masking'",(operation_id,image_digest)).rowcount!=1:
+        raise UnitMaskError('Unit mask journal changed')
+
 def stop_masked_units(db, operation_id, image_digest, *, state, install, units, host_lock,
                       service_lock, install_lock, supervisor, coordinator, fence, run=subprocess.run):
     """Stop durably masked host units before the caller exchanges runtime files.
