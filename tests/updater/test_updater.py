@@ -211,6 +211,19 @@ m.run(pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[3]),1000,int(sys.argv[4]),
             self.assertEqual(db.execute('SELECT COUNT(*) FROM operations').fetchone()[0], 0)
         self.assertNotIn(b'synthetic-do-not-save', (self.state / 'journal.sqlite').read_bytes())
 
+    def test_backup_schema_observation_requires_authorized_peer(self):
+        request={'version':1,'action':'backup_schema'}
+        try:
+            rejected=self.request(request,as_authorized=False)
+        except subprocess.CalledProcessError:
+            # The helper may close immediately after SO_PEERCRED rejection,
+            # before the client manages to write the request.
+            pass
+        else:
+            self.assertEqual(rejected,{'ok':False,'error':'unauthorized'})
+        self.assertEqual(self.request(request),{'ok':True,'operation':{'backupFileDnsJournalVersion':0}})
+        self.assertEqual(self.request({**request,'extra':True}),{'ok':False,'error':'invalid_request'})
+
     def test_slow_client_cannot_hold_server_by_sending_one_byte_at_a_time(self):
         slow_code = r'''import socket,sys,time
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(sys.argv[1]);s.sendall(b' ');print('ready',flush=True)
