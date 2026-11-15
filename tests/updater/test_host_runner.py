@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -57,6 +58,28 @@ class HostRunnerTest(unittest.TestCase):
         with mock.patch.object(supervisor,'inspect_servus',side_effect=[{'api':'old'},{'api':'changed'}]),self.assertRaises(runner.HostRunnerError):
             runner.activate(self.op,modules=self.modules,paths=self.paths)
         self.coordinator.prepare_completed.assert_not_called()
+
+    def test_snapshot_loader_verifies_all_bytes_before_executing(self):
+        names=('supervisor.py','host-coordinator.py','host-unit-mask.py','host-switch.py','host-bundle.py',
+               'host-exchange.py','host-fence.py','quiescence.py','install-host.py','host-recovery.py')
+        contents={name:(0o644,(ROOT/'apps/updater'/name).read_bytes()) for name in names}
+        parent=os.open(self.paths['candidates'],os.O_RDONLY|os.O_DIRECTORY)
+        db=sqlite3.connect(Path(self.paths['state'])/'journal.sqlite',isolation_level=None);previous=sys.modules.get('supervisor')
+        try:
+            generation=bundle.stage_generation(parent,self.op,self.digest,contents)
+            metadata=(Path(self.paths['candidates'])/generation/'complete.json').read_bytes()
+            db.execute('CREATE TABLE host_recovery_snapshots(operation_id TEXT,image_digest TEXT,metadata_size INTEGER,metadata_digest TEXT,status TEXT)')
+            db.execute("INSERT INTO host_recovery_snapshots VALUES(?,?,?,?,'prepared')",(self.op,self.digest,len(metadata),hashlib.sha256(metadata).hexdigest()))
+            loaded=runner.load_recovery_snapshot(db,self.op,self.digest,parent,bundle=bundle)
+            self.assertTrue(callable(loaded['recovery'].recover));self.assertTrue(callable(loaded['coordinator'].recover_exchange))
+            (Path(self.paths['candidates'])/generation/'host-recovery.py').write_bytes(b'modified')
+            with self.assertRaises(bundle.HostBundleError):runner.load_recovery_snapshot(db,self.op,self.digest,parent,bundle=bundle)
+        finally:
+            if previous is None:sys.modules.pop('supervisor',None)
+            else:sys.modules['supervisor']=previous
+            for key in ('coordinator','unit_mask','switch','bundle','exchange','fence','quiescence','install_host','recovery'):
+                sys.modules.pop('servus_saved_'+key,None)
+            db.close();os.close(parent)
 
     def test_unverified_release_never_stops_updater(self):
         self.bundle.completed_update.side_effect=RuntimeError('unverified')

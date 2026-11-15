@@ -11,6 +11,7 @@ import os
 import sqlite3
 import stat
 import sys
+import types
 
 
 class HostRunnerError(Exception):
@@ -113,6 +114,33 @@ def load_modules():
         return result
     finally:os.close(fd)
 
+
+
+def load_recovery_snapshot(db, operation_id, image_digest, candidate_parent, *, bundle):
+    """Load executable recovery modules only after checking the saved generation."""
+    row=db.execute('SELECT image_digest,metadata_size,metadata_digest,status FROM host_recovery_snapshots WHERE operation_id=?',(operation_id,)).fetchone()
+    if not row or row[0]!=image_digest or row[3] not in ('prepared','abandoned'):
+        raise HostRunnerError('Recovery snapshot is unavailable')
+    names={'supervisor':'supervisor.py','coordinator':'host-coordinator.py','unit_mask':'host-unit-mask.py',
+           'switch':'host-switch.py','bundle':'host-bundle.py','exchange':'host-exchange.py','fence':'host-fence.py',
+           'quiescence':'quiescence.py','install_host':'install-host.py','recovery':'host-recovery.py'}
+    contents=bundle.load_generation(candidate_parent,operation_id,image_digest,row[1],row[2],tuple(names.values()))
+    result={}
+    previous=sys.modules.get('supervisor')
+    try:
+        for key,filename in names.items():
+            name='supervisor' if key=='supervisor' else 'servus_saved_'+key
+            module=types.ModuleType(name);module.__file__='<verified-host-recovery>/' + filename
+            sys.modules[name]=module
+            exec(compile(contents[filename][1],module.__file__,'exec'),module.__dict__)
+            result[key]=module
+        return result
+    except BaseException:
+        if previous is None:sys.modules.pop('supervisor',None)
+        else:sys.modules['supervisor']=previous
+        for key in names:
+            if key!='supervisor':sys.modules.pop('servus_saved_'+key,None)
+        raise
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('operation_id');args=parser.parse_args()
