@@ -72,9 +72,9 @@ it('clears the fence only after ordered recorded transitions', () => {
   const { db } = database(), journal = new RestoreJournal(db, () => false), request = intent();
   journal.reserve(request); journal.advance(request.id, 'reserved', 'importing'); journal.advance(request.id, 'importing', 'prepared');
   expect(journal.hasUnresolved(request.serviceId)).toBe(true);
-  journal.beginSwitch({id:request.id,serviceId:request.serviceId,serviceVersion:1,sealedPlan:`enc:v1:${'a'.repeat(40)}`}); journal.advance(request.id, 'switching', 'completed');
-  expect(journal.hasUnresolved(request.serviceId)).toBe(false);
-  expect(() => journal.advance(request.id, 'switching', 'completed')).toThrow('expected state');
+  journal.beginSwitch({id:request.id,serviceId:request.serviceId,serviceVersion:1,sealedPlan:`enc:v1:${'a'.repeat(40)}`});
+  expect(() => journal.advance(request.id, 'switching', 'completed')).toThrow('transition');
+  expect(journal.hasUnresolved(request.serviceId)).toBe(true);
 });
 
 it('blocks export, deployment, console and maintenance after a restart with an unresolved restore', async () => {

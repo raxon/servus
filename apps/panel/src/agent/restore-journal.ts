@@ -2,7 +2,8 @@ import type Database from 'better-sqlite3';
 
 export type RestorePhase = 'uploading' | 'reserved' | 'discarding' | 'discarding_candidate' | 'importing' | 'prepared' | 'switching' | 'needs_review' | 'completed' | 'cancelled';
 export type RestoreRecord = { id: string; service_id: string; kind: 'postgres' | 'mariadb' | 'redis'; archive_sha256: string; phase: RestorePhase; updated_at: string };
-export type RestoreSwitchIntent = { id:string; service_id:string; service_version:number; sealed_plan:string; created_at:string };
+export type RestoreSwitchStage = 'pending'|'candidate_stop'|'candidate_detached'|'applying'|'applied';
+export type RestoreSwitchIntent = { id:string; service_id:string; service_version:number; sealed_plan:string; created_at:string; stage:RestoreSwitchStage };
 const idPattern = /^[a-f0-9]{32}$/;
 const servicePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
@@ -13,7 +14,7 @@ const transitions: Record<RestorePhase, readonly RestorePhase[]> = {
   discarding_candidate: ['cancelled'],
   importing: ['prepared', 'needs_review'],
   prepared: ['discarding_candidate', 'needs_review'],
-  switching: ['completed', 'needs_review'],
+  switching: ['needs_review'],
   needs_review: [], completed: [], cancelled: [],
 };
 
@@ -38,7 +39,9 @@ export class RestoreJournal {
         db.exec('INSERT INTO restore_operations SELECT * FROM restore_operations_old; DROP TABLE restore_operations_old');
       }
       db.exec("CREATE UNIQUE INDEX IF NOT EXISTS restore_one_active_per_service ON restore_operations(service_id) WHERE phase NOT IN ('completed','cancelled')");
-      db.exec('CREATE TABLE IF NOT EXISTS restore_switch_intents (id TEXT PRIMARY KEY, service_id TEXT NOT NULL, service_version INTEGER NOT NULL, sealed_plan TEXT NOT NULL, created_at TEXT NOT NULL)');
+      db.exec("CREATE TABLE IF NOT EXISTS restore_switch_intents (id TEXT PRIMARY KEY, service_id TEXT NOT NULL, service_version INTEGER NOT NULL, sealed_plan TEXT NOT NULL, created_at TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'pending' CHECK(stage IN ('pending','candidate_stop','candidate_detached','applying','applied')))");
+      const columns=db.prepare('PRAGMA table_info(restore_switch_intents)').all() as {name:string}[];
+      if(!columns.some(column=>column.name==='stage'))db.exec("ALTER TABLE restore_switch_intents ADD COLUMN stage TEXT NOT NULL DEFAULT 'pending' CHECK(stage IN ('pending','candidate_stop','candidate_detached','applying','applied'))");
     }).immediate();
   }
   get(id: string): RestoreRecord | undefined { return this.db.prepare('SELECT * FROM restore_operations WHERE id=?').get(id) as RestoreRecord | undefined; }
@@ -86,6 +89,15 @@ export class RestoreJournal {
       this.db.prepare('INSERT INTO restore_switch_intents(id,service_id,service_version,sealed_plan,created_at) VALUES(?,?,?,?,?)').run(input.id,input.serviceId,input.serviceVersion,input.sealedPlan,timestamp);
       this.db.prepare("UPDATE restore_operations SET phase='switching',updated_at=? WHERE id=? AND phase='prepared'").run(timestamp,input.id);
       return this.get(input.id)!;
+    }).immediate();
+  }
+  advanceSwitchStage(id:string,expected:RestoreSwitchStage,next:RestoreSwitchStage):RestoreSwitchIntent {
+    const stages:Record<RestoreSwitchStage,RestoreSwitchStage|undefined>={pending:'candidate_stop',candidate_stop:'candidate_detached',candidate_detached:'applying',applying:'applied',applied:undefined};
+    if(!idPattern.test(id)||!Object.hasOwn(stages,expected)||stages[expected]!==next)throw new Error('Invalid restore switch stage.');
+    return this.db.transaction(()=>{
+      if(this.get(id)?.phase!=='switching'||this.switchIntent(id)?.stage!==expected)throw new Error('Restore switch stage does not match.');
+      this.db.prepare('UPDATE restore_switch_intents SET stage=? WHERE id=? AND stage=?').run(next,id,expected);
+      return this.switchIntent(id)!;
     }).immediate();
   }
   advance(id: string, expected: RestorePhase, next: RestorePhase): RestoreRecord {

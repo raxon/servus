@@ -3,8 +3,12 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import Docker from '/app/node_modules/dockerode/lib/docker.js';
+import Database from '/app/node_modules/better-sqlite3/lib/index.js';
 import { Store } from '/app/dist/server/store.js';
 import { createAgent } from '/app/dist/agent/app.js';
+import { RestoreJournal } from '/app/dist/agent/restore-journal.js';
+import { prepareRestoreSwitchIntent, readRestoreSwitchIntent } from '/app/dist/agent/restore-switch-intent.js';
+import { applyRestoreSwitch } from '/app/dist/agent/restore-switch-apply.js';
 
 const dataDir = mkdtempSync('/tmp/restore-agent-e2e-'), store = new Store(dataDir);
 const serviceId = process.env.SERVUS_IMPORT_SERVICE_ID || '11111111-1111-4111-8111-111111111111', kind = process.env.SERVUS_IMPORT_KIND;
@@ -28,6 +32,7 @@ const token = 'fixture-agent-token';
 const agent = await createAgent({dataDir,token,socketPath:join(dataDir,'socket'),dockerSocket:'/var/run/docker.sock',ingressPort:18080,ingressImage:'unused'},runtime);
 const headers = {authorization:`Bearer ${token}`};
 const path = `/services/${serviceId}/database-restore/${operationId}`;
+let switchDb, switchPlan;
 try {
   const upload = await agent.inject({method:'POST',url:`/services/${serviceId}/database-restore/upload?operationId=${operationId}&kind=${kind}`,headers:{...headers,'content-type':'application/octet-stream'},payload:readFileSync('/fixture-data')});
   if (upload.statusCode !== 200 || upload.json().phase !== 'reserved') throw new Error(`Upload failed: ${upload.statusCode}`);
@@ -43,8 +48,41 @@ try {
     ? 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"'
     : 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"';
   if (execFileSync('docker',['exec',`panel-restore-${operationId}`,'sh','-c',query],{encoding:'utf8',env:{...process.env,PATH:`${process.env.PATH}:/usr/local/bin`}}).trim() !== 'expected-marker') throw new Error('Candidate data does not match');
-  for (let attempt=0;attempt<2;attempt++) {
-    const cancelled = await agent.inject({method:'POST',url:`${path}/cancel`,headers,payload:{}});
-    if (cancelled.statusCode !== 200 || cancelled.json().phase !== 'cancelled') throw new Error(`Cancellation failed: ${cancelled.statusCode} ${JSON.stringify(cancelled.json())}`);
+  if (process.env.SERVUS_SWITCH_APPLY === '1') {
+    switchDb=new Database(join(dataDir,'agent.sqlite'));const journal=new RestoreJournal(switchDb,()=>false);
+    const options={docker,journal,vault:store.vault,serviceId,operationId};
+    await prepareRestoreSwitchIntent(options);switchPlan=readRestoreSwitchIntent(options);
+    const verifyTarget=async plan=>{
+      for(let attempt=0;attempt<90;attempt++) {
+        const containers=await docker.listContainers({all:true,filters:{volume:[plan.inspection.candidateVolume]}});
+        for(const item of containers) {
+          const info=await docker.getContainer(item.Id).inspect();
+          if(!info.State.Running||info.Config.Labels?.['com.docker.swarm.service.name']!==`panel-app-${serviceId}`)continue;
+          const sourceQuery=kind==='postgres'?'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"':'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"';
+          try {if(execFileSync('docker',['exec',item.Id,'sh','-c',sourceQuery],{encoding:'utf8',stdio:['ignore','pipe','ignore'],env:{...process.env,PATH:`${process.env.PATH}:/usr/local/bin`}}).trim()==='expected-marker')return;}catch{}
+        }
+        await new Promise(resolve=>setTimeout(resolve,1000));
+      }
+      throw new Error('Switched database did not become ready');
+    };
+    await applyRestoreSwitch({...options,verifyTarget});
+    if(journal.switchIntent(operationId)?.stage!=='applied'||!journal.hasUnresolved(serviceId))throw new Error('Switch is not durably fenced');
+  } else {
+    for (let attempt=0;attempt<2;attempt++) {
+      const cancelled = await agent.inject({method:'POST',url:`${path}/cancel`,headers,payload:{}});
+      if (cancelled.statusCode !== 200 || cancelled.json().phase !== 'cancelled') throw new Error(`Cancellation failed: ${cancelled.statusCode} ${JSON.stringify(cancelled.json())}`);
+    }
   }
-} finally { await agent.close(); store.close(); rmSync(dataDir,{recursive:true,force:true}); }
+} finally {
+  if(switchPlan){
+    const service=docker.getService(`panel-app-${serviceId}`),current=await service.inspect();
+    if(current.Spec.Labels?.['panel.restore.operation']===operationId)await service.update({...switchPlan.previousSpec,version:current.Version.Index});
+    for(let attempt=0;attempt<90;attempt++){
+      const active=await docker.listContainers({all:true,filters:{volume:[switchPlan.inspection.sourceVolume]}});
+      if(active.some(item=>item.State==='running'))break;
+      if(attempt===89)throw new Error('Fixture rollback did not become ready');
+      await new Promise(resolve=>setTimeout(resolve,1000));
+    }
+  }
+  switchDb?.close();await agent.close(); store.close(); rmSync(dataDir,{recursive:true,force:true});
+}

@@ -51,23 +51,35 @@ done
 if [[ $kind == postgres ]]; then
   docker exec "$source_id" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -v ON_ERROR_STOP=1 -c "CREATE TABLE items (value text); INSERT INTO items VALUES ('\''expected-marker'\'');"' >/dev/null
   docker exec "$source_id" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h 127.0.0.1 -U fixture --format=custom --no-owner --no-privileges fixture' > "$root/dump"
+  docker exec "$source_id" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -v ON_ERROR_STOP=1 -c "INSERT INTO items VALUES ('\''source-after-backup'\'');"' >/dev/null
 else
   docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -e "CREATE TABLE items (value text); INSERT INTO items VALUES ('\''expected-marker'\'');"'
   docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb-dump -h 127.0.0.1 -u fixture --single-transaction --quick --skip-lock-tables --no-tablespaces fixture' > "$root/dump"
+  docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -e "INSERT INTO items VALUES ('\''source-after-backup'\'');"'
 fi
 runner=$(cd "$(dirname "$0")/../database-import-e2e" && pwd)/agent-runner.mjs
 mounts=()
 if [[ -n ${SERVUS_IMPORT_DIST:-} ]]; then mounts+=(--mount "type=bind,src=$SERVUS_IMPORT_DIST,dst=/app/dist,readonly"); fi
 docker run --rm --network none --user 0 --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock "${mounts[@]}" \
   --mount "type=bind,src=$root/dump,dst=/fixture-data,readonly" --mount "type=bind,src=$root/password,dst=/fixture-password,readonly" --mount "type=bind,src=$runner,dst=/fixture-agent-runner.mjs,readonly" \
-  -e PATH=/usr/bin:/bin -e "SERVUS_IMPORT_SOURCE_ID=$source_id" -e "SERVUS_IMPORT_SERVICE_ID=$service_id" -e "SERVUS_IMPORT_OPERATION=$id" -e "SERVUS_IMPORT_KIND=$kind" -e SERVUS_SWITCH_INSPECT=1 \
+  -e PATH=/usr/bin:/bin -e "SERVUS_IMPORT_SOURCE_ID=$source_id" -e "SERVUS_IMPORT_SERVICE_ID=$service_id" -e "SERVUS_IMPORT_OPERATION=$id" -e "SERVUS_IMPORT_KIND=$kind" -e SERVUS_SWITCH_INSPECT=1 -e SERVUS_SWITCH_APPLY=1 \
   --entrypoint /usr/local/bin/node "$SERVUS_IMPORT_IMAGE" /fixture-agent-runner.mjs
+source_id=$(docker ps -q --no-trunc --filter "label=com.docker.swarm.service.name=$service" --filter "volume=$source_volume" | head -1)
+[[ -n $source_id ]]
+for _ in $(seq 1 90); do if ready; then break; fi; sleep 1; done
+ready
 if [[ $kind == postgres ]]; then
-  source_result=$(docker exec "$source_id" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"')
+  source_result=$(docker exec "$source_id" sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT string_agg(value, '\'','\'' ORDER BY value) FROM items"')
 else
-  source_result=$(docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"')
+  source_result=$(docker exec "$source_id" sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT GROUP_CONCAT(value ORDER BY value SEPARATOR '\'','\'') FROM items"')
 fi
-[[ $source_result == expected-marker ]]
+[[ $source_result == expected-marker,source-after-backup ]]
 ! docker inspect "$candidate" >/dev/null 2>&1
-! docker volume inspect "$candidate" >/dev/null 2>&1
-printf 'PASS %s Swarm service switch inspection and candidate cancellation\n' "$kind"
+for container in $(docker ps -aq --filter "volume=$candidate"); do
+  [[ $(docker inspect --format '{{ index .Config.Labels "servus.test" }}' "$container") == "$id" ]]
+  [[ $(docker inspect --format '{{.State.Running}}' "$container") == false ]]
+  docker rm "$container" >/dev/null
+done
+[[ $(docker volume inspect --format '{{ index .Labels "panel.restore.operation" }}' "$candidate") == "$id" ]]
+docker volume rm "$candidate" >/dev/null
+printf 'PASS %s Swarm switch, target verification and fixture rollback\n' "$kind"
