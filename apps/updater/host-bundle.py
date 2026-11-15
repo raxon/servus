@@ -276,40 +276,41 @@ def install_adoption_guards(host_fd, state_fd, old_modules, new_modules, *, read
         info=os.fstat(fd)
         if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or stat.S_IMODE(info.st_mode)!=mode:
             raise HostBundleError('Unsafe recovery guard directory')
-    for inventory,names in ((old_modules,('install-host.py',)),(new_modules,ADOPTION_GUARDS)):
+    for inventory,names in ((old_modules,tuple(name for name in ADOPTION_GUARDS if name in old_modules)),(new_modules,ADOPTION_GUARDS)):
         for name in names:
             value=inventory[name]
             if (not isinstance(value,tuple) or len(value)!=2 or value[0]!=0o644 or
                 not isinstance(value[1],bytes) or len(value[1])>MAX_MODULE):
                 raise HostBundleError('Invalid recovery guard inventory')
     if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
-    old=old_modules['install-host.py'][1];new=new_modules['install-host.py'][1]
-    current=read_file(host_fd,'install-host.py',0o644)
-    if current not in (old,new):raise HostBundleError('Existing host installer differs')
+    pending=[]
     for name in ADOPTION_GUARDS:
-        if name=='install-host.py':continue
         try:current=read_file(host_fd,name,0o644)
-        except FileNotFoundError:continue
-        if current!=new_modules[name][1]:raise HostBundleError('Existing recovery guard differs')
-    if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
-    publish(state_fd,'adoption-old-install-host.py',old,0o600)
-    for name in ADOPTION_GUARDS:
-        if name=='install-host.py':continue
+        except FileNotFoundError:
+            if name in old_modules:raise HostBundleError('Existing recovery guard is missing') from None
+            pending.append(name);continue
+        if current==new_modules[name][1]:continue
+        if name not in old_modules or current!=old_modules[name][1]:
+            raise HostBundleError('Existing recovery guard differs')
+        pending.append(name)
+    for name in pending:
         if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
-        publish(host_fd,name,new_modules[name][1],0o644)
-    if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
-    current=read_file(host_fd,'install-host.py',0o644)
-    if current==old and old!=new:
+        target=new_modules[name][1]
+        if name not in old_modules:
+            publish(host_fd,name,target,0o644)
+            continue
+        old=old_modules[name][1]
+        publish(state_fd,'adoption-old-'+hashlib.sha256(old).hexdigest()+'-'+name,old,0o600)
+        if read_file(host_fd,name,0o644)!=old:raise HostBundleError('Recovery guard changed')
         temporary='.servus-adopt-'+secrets.token_hex(16)
         try:
-            _write_file(host_fd,temporary,0o644,new);os.fsync(host_fd)
+            _write_file(host_fd,temporary,0o644,target);os.fsync(host_fd)
             if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
-            if read_file(host_fd,'install-host.py',0o644)!=old:raise HostBundleError('Host installer changed')
-            os.replace(temporary,'install-host.py',src_dir_fd=host_fd,dst_dir_fd=host_fd);os.fsync(host_fd)
+            if read_file(host_fd,name,0o644)!=old:raise HostBundleError('Recovery guard changed')
+            os.replace(temporary,name,src_dir_fd=host_fd,dst_dir_fd=host_fd);os.fsync(host_fd)
         finally:
             try:os.unlink(temporary,dir_fd=host_fd)
             except FileNotFoundError:pass
-    elif current!=new:raise HostBundleError('Host installer changed')
     if authorize() is not None:raise HostBundleError('Recovery guard adoption is not authorized')
     if any(read_file(host_fd,name,0o644)!=new_modules[name][1] for name in ADOPTION_GUARDS):
         raise HostBundleError('Recovery guard adoption is incomplete')

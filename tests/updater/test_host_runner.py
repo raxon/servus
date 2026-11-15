@@ -77,6 +77,28 @@ class PendingActivationTest(unittest.TestCase):
         with self.assertRaises(runner.HostRunnerError):self.select()
 
 
+class PolicyRetryTest(unittest.TestCase):
+    def error(self,code):
+        cause=sqlite3.OperationalError('fixture');cause.sqlite_errorcode=code
+        error=supervisor.SupervisorError('unavailable');error.__cause__=cause
+        return error
+
+    def test_retries_transient_sqlite_error_and_returns_verified_binding(self):
+        binding=('/policy','/accepted',object())
+        daemon=SimpleNamespace(resolve_active_policy=mock.Mock(side_effect=[self.error(sqlite3.SQLITE_IOERR),binding]))
+        with mock.patch.object(runner.time,'sleep') as sleep:
+            self.assertEqual(runner.resolve_policy_retry(daemon,supervisor,'/journal','/env'),binding)
+        self.assertEqual(daemon.resolve_active_policy.call_count,2);sleep.assert_called_once()
+
+    def test_does_not_retry_invalid_or_expired_policy_checks(self):
+        daemon=SimpleNamespace(resolve_active_policy=mock.Mock(side_effect=self.error(sqlite3.SQLITE_CORRUPT)))
+        with self.assertRaises(supervisor.SupervisorError):runner.resolve_policy_retry(daemon,supervisor,'/journal','/env')
+        self.assertEqual(daemon.resolve_active_policy.call_count,1)
+        daemon.resolve_active_policy=mock.Mock(side_effect=self.error(sqlite3.SQLITE_IOERR))
+        with self.assertRaises(supervisor.SupervisorError):runner.resolve_policy_retry(daemon,supervisor,'/journal','/env',timeout=0)
+        self.assertEqual(daemon.resolve_active_policy.call_count,1)
+
+
 @unittest.skipUnless(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated,'Requires isolated Linux root')
 class HostRunnerTest(unittest.TestCase):
     def setUp(self):

@@ -11,6 +11,7 @@ import os
 import sqlite3
 import stat
 import sys
+import time
 import types
 
 
@@ -25,6 +26,20 @@ PATHS = {
     'units': '/etc/systemd/system', 'active_env': '/etc/servus/servus.env',
     'socket': '/etc/servus/supervisor-control/command',
 }
+
+
+def resolve_policy_retry(daemon, supervisor, journal_path, active_env, *, timeout=5):
+    """Retry transient SQLite errors while a stopped updater closes its WAL."""
+    deadline=time.monotonic()+timeout
+    while True:
+        try:return daemon.resolve_active_policy(journal_path,active_env)
+        except supervisor.SupervisorError as error:
+            cause=error.__cause__
+            code=getattr(cause,'sqlite_errorcode',None)
+            if (not isinstance(cause,sqlite3.OperationalError) or type(code) is not int or
+                (code & 0xff) not in (sqlite3.SQLITE_IOERR,sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED) or
+                time.monotonic()>=deadline):raise
+            time.sleep(min(0.05,max(0,deadline-time.monotonic())))
 
 
 def activate(operation_id, *, modules, paths=PATHS):
@@ -47,11 +62,11 @@ def activate(operation_id, *, modules, paths=PATHS):
         for fd in (host_lock,install_lock):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         dbpath=paths['state']+'/journal.sqlite';fd=supervisor._open_root_file(state,'journal.sqlite',0o600);os.close(fd)
         db=sqlite3.connect(dbpath,isolation_level=None,timeout=5)
-        policy_path,accepted_env,policy=daemon.resolve_active_policy(dbpath,paths['active_env'])
+        policy_path,accepted_env,policy=resolve_policy_retry(daemon,supervisor,dbpath,paths['active_env'])
         identities=supervisor.inspect_servus(policy)
         digest,stage=bundle.completed_update(db,operation_id,paths['state']+'/staging',policy_path,paths['active_env'],policy.image_reference)
         def authorize():
-            if (daemon.resolve_active_policy(dbpath,paths['active_env']) != (policy_path,accepted_env,policy) or
+            if (resolve_policy_retry(daemon,supervisor,dbpath,paths['active_env']) != (policy_path,accepted_env,policy) or
                 supervisor.inspect_servus(policy) != identities or
                 bundle.completed_update(db,operation_id,paths['state']+'/staging',policy_path,paths['active_env'],policy.image_reference)!=(digest,stage)):
                 raise HostRunnerError('Active update changed')

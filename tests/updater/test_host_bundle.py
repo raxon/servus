@@ -178,13 +178,19 @@ class HostBundleTest(unittest.TestCase):
             with mock.patch.object(bundle.os,'replace',side_effect=OSError('interrupted')):
                 with self.assertRaises(OSError):bundle.install_adoption_guards(fd,state_fd,old,new,**kwargs)
             self.assertEqual(path.read_bytes(),b'old installer')
-            self.assertEqual((state/'adoption-old-install-host.py').read_bytes(),b'old installer')
-            self.assertEqual((state/'adoption-old-install-host.py').stat().st_mode & 0o777,0o600)
+            saved=state/('adoption-old-'+hashlib.sha256(b'old installer').hexdigest()+'-install-host.py')
+            self.assertEqual(saved.read_bytes(),b'old installer')
+            self.assertEqual(saved.stat().st_mode & 0o777,0o600)
             bundle.install_adoption_guards(fd,state_fd,old,new,**kwargs)
             bundle.install_adoption_guards(fd,state_fd,old,new,**kwargs)
             self.assertEqual(path.read_bytes(),new['install-host.py'][1])
+            revised={**new,'host-runner.py':(0o644,b'newer runner')}
+            bundle.install_adoption_guards(fd,state_fd,new,revised,**kwargs)
+            self.assertEqual((host/'host-runner.py').read_bytes(),b'newer runner')
+            prior=state/('adoption-old-'+hashlib.sha256(new['host-runner.py'][1]).hexdigest()+'-host-runner.py')
+            self.assertEqual(prior.read_bytes(),new['host-runner.py'][1])
             (host/'host-runner.py').write_bytes(b'foreign')
-            with self.assertRaises(bundle.HostBundleError):bundle.install_adoption_guards(fd,state_fd,old,new,**kwargs)
+            with self.assertRaises(bundle.HostBundleError):bundle.install_adoption_guards(fd,state_fd,new,revised,**kwargs)
             self.assertEqual((host/'host-runner.py').read_bytes(),b'foreign')
         finally:os.close(fd);os.close(state_fd)
 
