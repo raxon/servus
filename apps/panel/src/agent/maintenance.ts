@@ -1,6 +1,7 @@
 import type Docker from 'dockerode';
 
 export type AgentDrainResult = { status: 'drained' | 'uncertain' | 'timeout' };
+type DrainScope = { legacyUploadId:string } | undefined;
 
 /** Confirm a successfully started exec has exited; a failed inspection remains uncertain. */
 export async function consoleExecStopped(exec: Docker.Exec, containerId: string, timeoutMs = 3000): Promise<boolean> {
@@ -28,11 +29,12 @@ export class AgentMaintenanceGate {
   private draining = false;
   private uncertain = false;
   private active = 0;
-  private journalCheck?: () => boolean;
+  private journalCheck?: (scope:DrainScope) => boolean;
+  private drainScope?: string;
   private readonly closers = new Set<() => void>();
   private readonly waiters = new Set<() => void>();
 
-  bindJournal(check: () => boolean) {
+  bindJournal(check: (scope:DrainScope) => boolean) {
     if (this.journalCheck) throw new Error('Agent maintenance gate already bound');
     this.journalCheck = check;
   }
@@ -58,8 +60,21 @@ export class AgentMaintenanceGate {
   }
 
   async drain(timeoutMs: number): Promise<AgentDrainResult> {
+    return this.drainWithScope(timeoutMs,undefined);
+  }
+
+  /** Local barrier only; host-side process and filesystem checks remain required. */
+  async drainForLegacyUpload(timeoutMs:number,operationId:string):Promise<AgentDrainResult> {
+    if(typeof operationId!=='string'||!/^[a-f0-9]{32}$/.test(operationId))throw new Error('Invalid legacy restore identity');
+    return this.drainWithScope(timeoutMs,{legacyUploadId:operationId});
+  }
+
+  private async drainWithScope(timeoutMs:number,scope:DrainScope):Promise<AgentDrainResult> {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2147483647) throw new Error('Invalid drain timeout');
+    const requestedScope=scope?.legacyUploadId ?? 'ordinary';
+    if(this.draining && this.drainScope!==requestedScope){this.markUncertain();return {status:'uncertain'};}
     this.draining = true;
+    this.drainScope=requestedScope;
     for (const close of [...this.closers]) { try { close(); } catch { this.markUncertain(); } }
     if (this.active) {
       const finished = await new Promise<boolean>(resolve => {
@@ -70,7 +85,7 @@ export class AgentMaintenanceGate {
       if (!finished) return { status: 'timeout' };
     }
     try {
-      if (!this.journalCheck || this.journalCheck()) this.markUncertain();
+      if (!this.journalCheck || this.journalCheck(scope)) this.markUncertain();
     } catch { this.markUncertain(); }
     return { status: this.uncertain ? 'uncertain' : 'drained' };
   }

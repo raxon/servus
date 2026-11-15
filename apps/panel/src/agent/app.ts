@@ -80,7 +80,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
   const locks = new Set<string>();
   const consoles = new Map<string, number>(), uncertainConsoles = new Set<string>();
   const restores = new RestoreJournal(journal, serviceId => locks.has(serviceId) || (consoles.get(serviceId) ?? 0) > 0 || uncertainConsoles.has(serviceId));
-  maintenance?.bindJournal(() => restores.hasUnresolved() || Boolean(journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get()));
+  maintenance?.bindJournal(scope => (scope ? !restores.onlyUnresolvedLegacyUpload(scope.legacyUploadId) : restores.hasUnresolved()) || Boolean(journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get()));
   app.addHook('onRequest', async (req, reply) => {
     const value = req.headers.authorization?.replace(/^Bearer /, '') || '';
     const left = createHash('sha256').update(value).digest();

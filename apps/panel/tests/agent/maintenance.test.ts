@@ -32,6 +32,30 @@ function runtime(apply: (...args:any[])=>Promise<any>) {
 }
 
 describe('agent maintenance barrier', () => {
+  it('permits only the explicitly identified legacy upload during a recovery drain',async()=>{
+    const config=fixture(),gate=new AgentMaintenanceGate(),id='a'.repeat(32),serviceId=randomUUID();
+    const app=await createAgent(config,runtime(async()=>outcome),gate);cleanup.push(()=>app.close());
+    const db=new Database(join(config.dataDir,'agent.sqlite'));
+    db.prepare('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)').run(id,serviceId,'postgres','0'.repeat(64),'uploading',new Date().toISOString());db.close();
+    const release=gate.admit()!;
+    const pending=gate.drainForLegacyUpload(1000,id);
+    expect(gate.admit()).toBeUndefined();
+    release();expect(await pending).toEqual({status:'drained'});
+    expect(await gate.drainForLegacyUpload(100,id)).toEqual({status:'drained'});
+    expect(await gate.drain(100)).toEqual({status:'uncertain'});
+  });
+  it('rejects missing, modern, or additional unresolved operations during a recovery drain',async()=>{
+    for(const scenario of ['missing','modern','additional','running','invalid_service','unsupported_kind','reserved'] as const){
+      const config=fixture(),gate=new AgentMaintenanceGate(),id='b'.repeat(32),serviceId=randomUUID();
+      const app=await createAgent(config,runtime(async()=>outcome),gate);cleanup.push(()=>app.close());
+      const db=new Database(join(config.dataDir,'agent.sqlite'));
+      if(scenario!=='missing')db.prepare('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)').run(id,scenario==='invalid_service'?'invalid':serviceId,scenario==='unsupported_kind'?'redis':'postgres',scenario==='modern'?'c'.repeat(64):'0'.repeat(64),scenario==='reserved'?'reserved':'uploading',new Date().toISOString());
+      if(scenario==='additional')db.prepare('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)').run('d'.repeat(32),randomUUID(),'mariadb','0'.repeat(64),'uploading',new Date().toISOString());
+      if(scenario==='running')db.prepare("INSERT INTO operations(id,request_hash,state,updated_at) VALUES(?,?,'running',?)").run(randomUUID(),'hash',new Date().toISOString());
+      db.close();
+      expect(await gate.drainForLegacyUpload(100,id),scenario).toEqual({status:'uncertain'});
+    }
+  });
   it('waits for an active apply, denies new work and stays in drain mode', async () => {
     const config=fixture(), gate=new AgentMaintenanceGate(), entered=deferred<void>(), complete=deferred<typeof outcome>();
     const engine=runtime(vi.fn(async()=>{entered.resolve(); return complete.promise;}));

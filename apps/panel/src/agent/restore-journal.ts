@@ -68,6 +68,12 @@ export class RestoreJournal {
       ? Boolean(this.db.prepare("SELECT 1 FROM restore_operations WHERE phase NOT IN ('completed','cancelled') LIMIT 1").get())
       : Boolean(this.db.prepare("SELECT 1 FROM restore_operations WHERE service_id=? AND phase NOT IN ('completed','cancelled') LIMIT 1").get(serviceId));
   }
+  onlyUnresolvedLegacyUpload(id:string):boolean {
+    if(typeof id!=='string'||!idPattern.test(id))return false;
+    const target=this.get(id);
+    return !!target && typeof target.service_id==='string' && servicePattern.test(target.service_id) && target.phase==='uploading' && ['postgres','mariadb'].includes(target.kind) && target.archive_sha256==='0'.repeat(64) &&
+      !this.db.prepare("SELECT 1 FROM restore_operations WHERE id<>? AND phase NOT IN ('completed','cancelled') LIMIT 1").get(id);
+  }
   reserve(input: { id: string; serviceId: string; kind: RestoreRecord['kind']; archiveSha256: string }): RestoreRecord {
     if (!idPattern.test(input.id) || !servicePattern.test(input.serviceId) || !digestPattern.test(input.archiveSha256) || !['postgres', 'mariadb', 'redis'].includes(input.kind)) throw new Error('Invalid restore intent.');
     return this.db.transaction(() => {
