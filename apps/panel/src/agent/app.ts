@@ -14,6 +14,7 @@ import { consoleExecStopped, type AgentMaintenanceGate } from './maintenance.js'
 import { DatabaseExportUncertainError, exportDatabase } from './database-export.js';
 import { RestoreJournal } from './restore-journal.js';
 import { uploadRestoreArchive } from './restore-upload.js';
+import { cancelStagedRestore } from './restore-cancel.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -135,6 +136,22 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
         return { operationId, size: result.size, sha256: result.record.archive_sha256, phase: result.record.phase };
       } finally { uploads--; clearTimeout(timeout); req.raw.off('aborted', abort); release?.(); }
     });
+  });
+  app.get<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId', async (req,reply) => {
+    if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
+    const record = restores.get(req.params.operationId);
+    if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
+    return {operationId:record.id,phase:record.phase,kind:record.kind};
+  });
+  app.post<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/cancel', async (req,reply) => {
+    if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
+    const record = restores.get(req.params.operationId);
+    if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
+    if (!['reserved','discarding','cancelled'].includes(record.phase)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be cancelled now.'}});
+    const release = maintenance?.admit();
+    if (maintenance && !release) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    try { const result = cancelStagedRestore({journal:restores,dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId}); return {operationId:result.id,phase:result.phase}; }
+    finally { release?.(); }
   });
   app.get<{Params:{id:string};Querystring:{containerId?:string;shell?:string}}>('/services/:id/console', {websocket:true,preValidation:async(req,reply)=>{
     if(!z.string().uuid().safeParse(req.params.id).success||!['/bin/sh','/bin/bash'].includes(req.query.shell||'/bin/sh')||(req.query.containerId&&!/^[a-f0-9]{12,64}$/.test(req.query.containerId)))return reply.code(400).send({error:{code:'INVALID_CONSOLE',message:'Invalid console target.'}});

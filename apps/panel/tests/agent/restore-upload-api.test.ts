@@ -53,3 +53,18 @@ it('stops and cancels the upload after a real client disconnects', async () => {
     await waitFor('uploading'); outgoing.destroy(); await waitFor('cancelled');
   } finally { outgoing.destroy(); }
 });
+
+it('authorizes status and idempotent cancellation only for the matching service', async () => {
+  const { app, url, serviceId, operationId } = await fixture(), payload = Buffer.from('private archive');
+  const auth = {authorization:'Bearer fixture-token'};
+  expect((await app.inject({method:'POST',url,headers:{...auth,'content-type':'application/octet-stream'},payload})).statusCode).toBe(200);
+  const path = `/services/${serviceId}/database-restore/${operationId}`;
+  expect((await app.inject({method:'GET',url:path})).statusCode).toBe(401);
+  expect((await app.inject({method:'GET',url:path.replace(serviceId,randomUUID()),headers:auth})).statusCode).toBe(404);
+  expect((await app.inject({method:'GET',url:path,headers:auth})).json()).toEqual({operationId,phase:'reserved',kind:'postgres'});
+  for (let i=0;i<2;i++) {
+    const response = await app.inject({method:'POST',url:`${path}/cancel`,headers:auth});
+    expect(response.statusCode).toBe(200); expect(response.json()).toEqual({operationId,phase:'cancelled'});
+  }
+  expect((await app.inject({method:'GET',url:path,headers:auth})).json().phase).toBe('cancelled');
+});

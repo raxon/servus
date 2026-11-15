@@ -64,7 +64,7 @@ it('fences running service operations and rejects concurrent reservations', () =
   const other = new Database(path); cleanup.push(() => other.close()); const second = new RestoreJournal(other, () => false);
   expect(() => second.reserve({ ...request, id: 'c'.repeat(32) })).toThrow('unresolved');
   expect(() => journal.advance(request.id, 'reserved', 'switching')).toThrow('transition');
-  journal.advance(request.id, 'reserved', 'cancelled');
+  journal.advance(request.id, 'reserved', 'discarding'); journal.advance(request.id, 'discarding', 'cancelled');
   expect(second.reserve({ ...request, id: 'c'.repeat(32) }).phase).toBe('reserved');
 });
 

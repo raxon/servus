@@ -93,6 +93,19 @@ class CgroupHeadroomTest(unittest.TestCase):
             with self.assertRaisesRegex(backup.CaptureError,'Cannot verify complete cgroup ancestry'): backup._memory_headroom(1)
             headroom.assert_not_called()
 
+class RestoreJournalSchemaTest(unittest.TestCase):
+    def test_upload_and_discard_remain_unresolved_for_backup(self):
+        with sqlite3.connect(':memory:') as db:
+            for table, columns in backup.AGENT_RESTORE_SCHEMA.items():
+                db.execute('CREATE TABLE ' + table + ' (' + ','.join(column + ' TEXT' for column in columns) + ')')
+            for phase in ('uploading', 'discarding'):
+                with self.subTest(phase=phase):
+                    db.execute('DELETE FROM restore_operations')
+                    db.execute('INSERT INTO restore_operations(id,service_id,kind,archive_sha256,phase,updated_at) VALUES(?,?,?,?,?,?)',
+                        ('a'*32,UUID,'postgres','b'*64,phase,'2026-11-15T00:00:00.000Z'))
+                    with self.assertRaisesRegex(backup.CaptureError,'Unresolved database restore'): backup._agent_schema(db)
+
+
 class OperationHistoryTest(unittest.TestCase):
     def setUp(self):
         self.panel = sqlite3.connect(':memory:')
