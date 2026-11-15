@@ -7,7 +7,7 @@ import { Store } from '/app/dist/server/store.js';
 import { createAgent } from '/app/dist/agent/app.js';
 
 const dataDir = mkdtempSync('/tmp/restore-agent-e2e-'), store = new Store(dataDir);
-const serviceId = '11111111-1111-4111-8111-111111111111', kind = process.env.SERVUS_IMPORT_KIND;
+const serviceId = process.env.SERVUS_IMPORT_SERVICE_ID || '11111111-1111-4111-8111-111111111111', kind = process.env.SERVUS_IMPORT_KIND;
 const operationId = process.env.SERVUS_IMPORT_OPERATION, password = readFileSync('/fixture-password','utf8');
 const actor = store.setup('fixture@example.test','fixture-hash'), project = store.createProject('restore-fixture');
 const now = new Date().toISOString(), actionId = randomUUID(), jobId = randomUUID();
@@ -35,6 +35,10 @@ try {
   if (prepared.statusCode !== 200 || prepared.json().phase !== 'prepared') throw new Error(`Preparation failed: ${prepared.statusCode} ${JSON.stringify(prepared.json())}`);
   const status = await agent.inject({method:'GET',url:path,headers});
   if (status.statusCode !== 200 || status.json().phase !== 'prepared') throw new Error('Prepared state was not recorded');
+  if (process.env.SERVUS_SWITCH_INSPECT === '1') {
+    const inspection = await agent.inject({method:'GET',url:`${path}/switch-inspection`,headers});
+    if (inspection.statusCode !== 200 || inspection.json().sourceContainerId !== process.env.SERVUS_IMPORT_SOURCE_ID || inspection.json().sourceVolume !== `panel-data-${serviceId}-database` || inspection.json().candidateVolume !== `panel-restore-${operationId}`) throw new Error(`Switch inspection failed: ${inspection.statusCode} ${JSON.stringify(inspection.json())}`);
+  }
   const query = kind === 'postgres'
     ? 'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT value FROM items"'
     : 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT value FROM items"';
