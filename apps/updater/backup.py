@@ -69,6 +69,7 @@ AGENT_RESTORE_SCHEMA = {**AGENT_SCHEMA, 'restore_operations': {'id','service_id'
 AGENT_SWITCH_OLD_SCHEMA = {**AGENT_RESTORE_SCHEMA, 'restore_switch_intents': {'id','service_id','service_version','sealed_plan','created_at'}}
 AGENT_SWITCH_SCHEMA = {**AGENT_RESTORE_SCHEMA, 'restore_switch_intents': {'id','service_id','service_version','sealed_plan','created_at','stage'}}
 AGENT_RETAINED_COLUMNS = {'operation_id','service_id','volume_name','reason','created_at'}
+AGENT_BINDING_COLUMNS = {'service_id','operation_id','volume_name','kind','created_at'}
 
 class CaptureError(Exception): pass
 
@@ -364,10 +365,12 @@ def _agent_schema(db):
     has_restore = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_operations'").fetchone())
     has_switch = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_switch_intents'").fetchone())
     has_retained = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_retained_volumes'").fetchone())
-    if (has_switch or has_retained) and not has_restore: raise CaptureError('Unsupported database schema')
+    has_bindings = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_volume_bindings'").fetchone())
+    if (has_switch or has_retained or has_bindings) and not has_restore: raise CaptureError('Unsupported database schema')
     switch_columns={r[1] for r in db.execute('PRAGMA table_info(restore_switch_intents)')} if has_switch else set()
     schema=(AGENT_SWITCH_SCHEMA if 'stage' in switch_columns else AGENT_SWITCH_OLD_SCHEMA) if has_switch else AGENT_RESTORE_SCHEMA if has_restore else AGENT_SCHEMA
     if has_retained: schema={**schema,'restore_retained_volumes':AGENT_RETAINED_COLUMNS}
+    if has_bindings: schema={**schema,'restore_volume_bindings':AGENT_BINDING_COLUMNS}
     _schema(db, schema, 0)
     if not has_restore: return
     for ident, service, kind, digest, phase, updated in db.execute('SELECT id,service_id,kind,archive_sha256,phase,updated_at FROM restore_operations'):
@@ -380,15 +383,31 @@ def _agent_schema(db):
             raise CaptureError('Database restore journal is invalid')
     if has_switch and db.execute('SELECT 1 FROM restore_switch_intents LIMIT 1').fetchone(): raise CaptureError('Unresolved database restore requires recovery')
     if has_retained:
-        seen=set()
+        seen=set();retained_volumes=set()
         for ident,service,volume,reason,created in db.execute('SELECT operation_id,service_id,volume_name,reason,created_at FROM restore_retained_volumes'):
             if (not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or ident in seen or
                 not isinstance(service,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service) or
-                volume!='panel-restore-'+ident or reason!='rollback_candidate' or not isinstance(created,str) or
+                not isinstance(volume,str) or volume in retained_volumes or reason not in ('rollback_candidate','pre_restore_source') or not isinstance(created,str) or
                 not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',created) or
-                not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND service_id=? AND phase='cancelled'",(ident,service)).fetchone()):
+                not db.execute('SELECT 1 FROM restore_operations WHERE id=? AND service_id=? AND phase=?',(ident,service,'cancelled' if reason=='rollback_candidate' else 'completed')).fetchone()):
                 raise CaptureError('Retained database restore volume is invalid')
+            if reason=='rollback_candidate' and volume!='panel-restore-'+ident: raise CaptureError('Retained database restore volume is invalid')
+            if reason=='pre_restore_source' and volume!='panel-data-'+service+'-database':
+                match=re.fullmatch(r'panel-restore-([a-f0-9]{32})',volume)
+                if not match or match.group(1)==ident or not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND service_id=? AND phase='completed'",(match.group(1),service)).fetchone(): raise CaptureError('Retained database restore volume is invalid')
             seen.add(ident)
+            retained_volumes.add(volume)
+    if has_bindings:
+        seen_services=set();seen_operations=set();seen_volumes=set()
+        for service,ident,volume,kind,created in db.execute('SELECT service_id,operation_id,volume_name,kind,created_at FROM restore_volume_bindings'):
+            if (not isinstance(service,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service) or service in seen_services or
+                not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or ident in seen_operations or
+                volume!='panel-restore-'+ident or volume in seen_volumes or kind not in ('postgres','mariadb') or
+                not isinstance(created,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',created) or
+                not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND service_id=? AND kind=? AND phase='completed'",(ident,service,kind)).fetchone() or
+                not has_retained or volume in retained_volumes or not db.execute("SELECT 1 FROM restore_retained_volumes WHERE operation_id=? AND service_id=? AND reason='pre_restore_source'",(ident,service)).fetchone()):
+                raise CaptureError('Database restore volume binding is invalid')
+            seen_services.add(service);seen_operations.add(ident);seen_volumes.add(volume)
 
 def _config_references(config, refs, service_id, owners, purposes=None, git_requirements=None):
     if not isinstance(config,dict): raise CaptureError('Service configuration is invalid')

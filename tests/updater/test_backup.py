@@ -125,6 +125,19 @@ class RestoreJournalSchemaTest(unittest.TestCase):
             db.execute("UPDATE restore_retained_volumes SET volume_name='wrong'")
             with self.assertRaisesRegex(backup.CaptureError,'Retained database restore volume is invalid'): backup._agent_schema(db)
 
+    def test_completed_restore_binding_requires_matching_retained_source(self):
+        with sqlite3.connect(':memory:') as db:
+            schema={**backup.AGENT_SWITCH_SCHEMA,'restore_retained_volumes':backup.AGENT_RETAINED_COLUMNS,'restore_volume_bindings':backup.AGENT_BINDING_COLUMNS}
+            for table, columns in schema.items():
+                db.execute('CREATE TABLE ' + table + ' (' + ','.join(column + ' TEXT' for column in columns) + ')')
+            now='2026-11-15T00:00:00.000Z'; ident='a'*32
+            db.execute('INSERT INTO restore_operations(id,service_id,kind,archive_sha256,phase,updated_at) VALUES(?,?,?,?,?,?)',(ident,UUID,'postgres','b'*64,'completed',now))
+            db.execute('INSERT INTO restore_retained_volumes(operation_id,service_id,volume_name,reason,created_at) VALUES(?,?,?,?,?)',(ident,UUID,'panel-data-'+UUID+'-database','pre_restore_source',now))
+            db.execute('INSERT INTO restore_volume_bindings(service_id,operation_id,volume_name,kind,created_at) VALUES(?,?,?,?,?)',(UUID,ident,'panel-restore-'+ident,'postgres',now))
+            backup._agent_schema(db)
+            db.execute("UPDATE restore_volume_bindings SET kind='mariadb'")
+            with self.assertRaisesRegex(backup.CaptureError,'Database restore volume binding is invalid'): backup._agent_schema(db)
+
 
 class OperationHistoryTest(unittest.TestCase):
     def setUp(self):

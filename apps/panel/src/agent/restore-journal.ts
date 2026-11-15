@@ -4,7 +4,8 @@ export type RestorePhase = 'uploading' | 'reserved' | 'discarding' | 'discarding
 export type RestoreRecord = { id: string; service_id: string; kind: 'postgres' | 'mariadb' | 'redis'; archive_sha256: string; phase: RestorePhase; updated_at: string };
 export type RestoreSwitchStage = 'pending'|'candidate_stop'|'candidate_detached'|'applying'|'applied'|'rolling_back'|'rolled_back';
 export type RestoreSwitchIntent = { id:string; service_id:string; service_version:number; sealed_plan:string; created_at:string; stage:RestoreSwitchStage };
-export type RetainedRestoreVolume = {operation_id:string;service_id:string;volume_name:string;reason:'rollback_candidate';created_at:string};
+export type RetainedRestoreVolume = {operation_id:string;service_id:string;volume_name:string;reason:'rollback_candidate'|'pre_restore_source';created_at:string};
+export type RestoreVolumeBinding = {service_id:string;operation_id:string;volume_name:string;kind:'postgres'|'mariadb';created_at:string};
 const idPattern = /^[a-f0-9]{32}$/;
 const servicePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
@@ -49,7 +50,11 @@ export class RestoreJournal {
         db.exec('ALTER TABLE restore_switch_intents RENAME TO restore_switch_intents_old');db.exec(switchSchema);
         db.exec('INSERT INTO restore_switch_intents SELECT id,service_id,service_version,sealed_plan,created_at,stage FROM restore_switch_intents_old; DROP TABLE restore_switch_intents_old');
       }
-      db.exec("CREATE TABLE IF NOT EXISTS restore_retained_volumes (operation_id TEXT PRIMARY KEY, service_id TEXT NOT NULL, volume_name TEXT NOT NULL UNIQUE, reason TEXT NOT NULL CHECK(reason='rollback_candidate'), created_at TEXT NOT NULL)");
+      const retainedSchema="CREATE TABLE restore_retained_volumes (operation_id TEXT PRIMARY KEY, service_id TEXT NOT NULL, volume_name TEXT NOT NULL UNIQUE, reason TEXT NOT NULL CHECK(reason IN ('rollback_candidate','pre_restore_source')), created_at TEXT NOT NULL)";
+      const retainedTable=db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_retained_volumes'").get() as {sql:string}|undefined;
+      if(!retainedTable)db.exec(retainedSchema);
+      else if(!retainedTable.sql.includes("'pre_restore_source'")){db.exec('ALTER TABLE restore_retained_volumes RENAME TO restore_retained_volumes_old');db.exec(retainedSchema);db.exec('INSERT INTO restore_retained_volumes SELECT * FROM restore_retained_volumes_old; DROP TABLE restore_retained_volumes_old');}
+      db.exec("CREATE TABLE IF NOT EXISTS restore_volume_bindings (service_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, volume_name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(kind IN ('postgres','mariadb')), created_at TEXT NOT NULL)");
     }).immediate();
   }
   get(id: string): RestoreRecord | undefined { return this.db.prepare('SELECT * FROM restore_operations WHERE id=?').get(id) as RestoreRecord | undefined; }
@@ -109,6 +114,24 @@ export class RestoreJournal {
     }).immediate();
   }
   retainedVolume(id:string):RetainedRestoreVolume|undefined { return this.db.prepare('SELECT * FROM restore_retained_volumes WHERE operation_id=?').get(id) as RetainedRestoreVolume|undefined; }
+  volumeBinding(serviceId:string):RestoreVolumeBinding|undefined { return this.db.prepare('SELECT * FROM restore_volume_bindings WHERE service_id=?').get(serviceId) as RestoreVolumeBinding|undefined; }
+  completeSwitch(id:string,serviceId:string,sourceVolume:string):RestoreRecord {
+    if(!idPattern.test(id)||!servicePattern.test(serviceId))throw new Error('Invalid restore switch identity.');
+    return this.db.transaction(()=>{
+      const record=this.get(id),binding=this.volumeBinding(serviceId),target=`panel-restore-${id}`;
+      if(record?.phase==='completed'&&record.service_id===serviceId&&binding?.operation_id===id&&binding.volume_name===target&&this.retainedVolume(id)?.reason==='pre_restore_source'&&this.retainedVolume(id)?.volume_name===sourceVolume)return record;
+      if(!record||record.service_id!==serviceId||record.phase!=='switching'||!['postgres','mariadb'].includes(record.kind)||this.switchIntent(id)?.stage!=='applied'||this.retainedVolume(id))throw new Error('Restore switch is not ready for completion.');
+      if(sourceVolume!==(binding?.volume_name??`panel-data-${serviceId}-database`)||sourceVolume===target)throw new Error('Original database volume binding changed.');
+      const prior=binding?this.get(binding.operation_id):undefined;
+      if(binding&&(binding.kind!==record.kind||binding.volume_name!==`panel-restore-${binding.operation_id}`||prior?.phase!=='completed'||prior.service_id!==serviceId||prior.kind!==record.kind))throw new Error('Previous database volume binding is invalid.');
+      const timestamp=new Date().toISOString();
+      this.db.prepare("INSERT INTO restore_retained_volumes(operation_id,service_id,volume_name,reason,created_at) VALUES(?,?,?,'pre_restore_source',?)").run(id,serviceId,sourceVolume,timestamp);
+      this.db.prepare('INSERT INTO restore_volume_bindings(service_id,operation_id,volume_name,kind,created_at) VALUES(?,?,?,?,?) ON CONFLICT(service_id) DO UPDATE SET operation_id=excluded.operation_id,volume_name=excluded.volume_name,kind=excluded.kind,created_at=excluded.created_at').run(serviceId,id,target,record.kind,timestamp);
+      this.db.prepare('DELETE FROM restore_switch_intents WHERE id=?').run(id);
+      this.db.prepare("UPDATE restore_operations SET phase='completed',updated_at=? WHERE id=? AND phase='switching'").run(timestamp,id);
+      return this.get(id)!;
+    }).immediate();
+  }
   finalizeRollback(id:string,serviceId:string):RestoreRecord {
     if(!idPattern.test(id)||!servicePattern.test(serviceId))throw new Error('Invalid restore rollback identity.');
     return this.db.transaction(()=>{
