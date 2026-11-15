@@ -2,7 +2,7 @@ import Fastify from 'fastify';
 import Database from 'better-sqlite3';
 import websocket from '@fastify/websocket';
 import { Readable, type Duplex } from 'node:stream';
-import type Docker from 'dockerode';
+import Docker from 'dockerode';
 import { SecretVault } from '../shared/secrets.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
@@ -15,6 +15,11 @@ import { DatabaseExportUncertainError, exportDatabase } from './database-export.
 import { RestoreJournal } from './restore-journal.js';
 import { uploadRestoreArchive } from './restore-upload.js';
 import { cancelStagedRestore } from './restore-cancel.js';
+import { loadRestoreSource } from './restore-source.js';
+import { prepareRestoreCandidate } from './restore-preparation.js';
+import { createRestoreCandidate } from './restore-candidate.js';
+import { importDatabaseCandidate } from './database-import.js';
+import { readRestoreArchive } from './restore-archive.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -152,6 +157,26 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (maintenance && !release) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     try { const result = cancelStagedRestore({journal:restores,dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId}); return {operationId:result.id,phase:result.phase}; }
     finally { release?.(); }
+  });
+  app.post<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/prepare', async (req,reply) => {
+    if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
+    const record = restores.get(req.params.operationId);
+    if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
+    if (record.phase !== 'reserved' || !['postgres','mariadb'].includes(record.kind)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be prepared now.'}});
+    const release = maintenance?.admit();
+    if (maintenance && !release) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    try {
+      if (!runtime.consoleContainer) throw new Error('Database restore is unavailable.');
+      const kind = record.kind as 'postgres'|'mariadb';
+      const source = loadRestoreSource({dataDir:config.dataDir,serviceId:req.params.id,kind,vault});
+      const sourceContainer = await runtime.consoleContainer(req.params.id);
+      const result = await prepareRestoreCandidate({journal:restores,operationId:record.id,serviceId:req.params.id,importCandidate:importDatabaseCandidate,
+        allocateTarget:async()=>{
+          const candidate = await createRestoreCandidate({docker:new Docker({socketPath:config.dockerSocket}),dockerSocket:config.dockerSocket,journal:restores,operationId:record.id,serviceId:req.params.id,sourceContainerId:sourceContainer.id,kind,...source});
+          return {containerId:candidate.containerId,dockerSocket:config.dockerSocket,database:source.database,user:source.user,input:()=>readRestoreArchive({dataDir:config.dataDir,operationId:record.id,key:vault.restoreArchiveKey(record.id)})};
+        }});
+      return {operationId:result.id,phase:result.phase};
+    } finally { release?.(); }
   });
   app.get<{Params:{id:string};Querystring:{containerId?:string;shell?:string}}>('/services/:id/console', {websocket:true,preValidation:async(req,reply)=>{
     if(!z.string().uuid().safeParse(req.params.id).success||!['/bin/sh','/bin/bash'].includes(req.query.shell||'/bin/sh')||(req.query.containerId&&!/^[a-f0-9]{12,64}$/.test(req.query.containerId)))return reply.code(400).send({error:{code:'INVALID_CONSOLE',message:'Invalid console target.'}});
