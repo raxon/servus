@@ -24,7 +24,7 @@ it('carries the generated value through manual publication and DNS observation',
   const provider=new ManualDns01Provider();
   const result=await provider.present({operationId:'a'.repeat(32),identifier:'*.example.com',value});
   expect(result.status).toBe('manual_action_required');
-  await expect(observeDns01(result.record,async()=>[[value]])).resolves.toEqual({status:'observed'});
+  await expect(observeDns01(result.record,async()=>[[value]])).resolves.toEqual({...result.record,status:'observed'});
   await expect(provider.remove(result.record)).resolves.toEqual({status:'manual_action_required'});
 });
 it('supports approved EC public keys and rejects private, weak or unsupported keys',()=>{

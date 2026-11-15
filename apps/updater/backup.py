@@ -18,6 +18,7 @@ import base64
 import binascii
 import ctypes
 import hashlib
+import ipaddress
 from contextlib import closing
 import grp
 import json
@@ -66,6 +67,7 @@ PANEL_SCHEMA = {
 }
 AGENT_SCHEMA = {'operations': {'id','request_hash','state','response','updated_at','previous_spec','previous_recorded','target_spec','operation_stage','previous_error','service_id'}}
 AGENT_RESTORE_SCHEMA = {**AGENT_SCHEMA, 'restore_operations': {'id','service_id','kind','archive_sha256','phase','updated_at'}}
+AGENT_DNS_COLUMNS = {'operation_id','identifier','record_name','value','provider','state','record_id','outcome','review_from','updated_at'}
 AGENT_SWITCH_OLD_SCHEMA = {**AGENT_RESTORE_SCHEMA, 'restore_switch_intents': {'id','service_id','service_version','sealed_plan','created_at'}}
 AGENT_SWITCH_SCHEMA = {**AGENT_RESTORE_SCHEMA, 'restore_switch_intents': {'id','service_id','service_version','sealed_plan','created_at','stage'}}
 AGENT_RETAINED_COLUMNS = {'operation_id','service_id','volume_name','reason','created_at'}
@@ -361,6 +363,37 @@ def _schema(db,expected,version):
     for table,cols in expected.items():
         if {r[1] for r in db.execute(f'PRAGMA table_info({table})')}!=cols: raise CaptureError('Unsupported database schema')
 
+def _dns_journal_schema(db):
+    seen=set()
+    for ident,identifier,name,value,provider,state,record_id,outcome,review_from,updated in db.execute(
+        'SELECT operation_id,identifier,record_name,value,provider,state,record_id,outcome,review_from,updated_at FROM acme_dns_challenges'):
+        if state not in ('completed','cancelled'):
+            raise CaptureError('Unresolved DNS challenge requires recovery')
+        host=identifier[2:] if isinstance(identifier,str) and identifier.startswith('*.') else identifier
+        try:
+            valid_ip=bool(ipaddress.ip_address(host))
+        except ValueError:
+            valid_ip=False
+        except TypeError:
+            valid_ip=True
+        try:
+            digest=base64.urlsafe_b64decode(value+'=') if isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9_-]{43}',value) else b''
+            valid_value=len(digest)==32 and base64.urlsafe_b64encode(digest).decode().rstrip('=')==value
+        except (ValueError,binascii.Error):
+            valid_value=False
+        if (not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or ident in seen or
+            not isinstance(host,str) or valid_ip or len(host)>237 or '.' not in host or
+            any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',label) for label in host.split('.')) or
+            name!='_acme-challenge.'+host or not valid_value or provider not in ('manual','cloudflare') or
+            (state=='cancelled' and (record_id is not None or outcome!='cancelled')) or
+            (state=='completed' and (outcome not in ('valid','invalid','cancelled') or
+                (provider=='manual' and record_id is not None) or
+                (provider=='cloudflare' and (not isinstance(record_id,str) or not re.fullmatch(r'[a-f0-9]{32}',record_id))))) or
+            review_from is not None or not isinstance(updated,str) or
+            not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',updated)):
+            raise CaptureError('DNS challenge journal is invalid')
+        seen.add(ident)
+
 def _agent_schema(db):
     has_restore = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_operations'").fetchone())
     has_switch = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_switch_intents'").fetchone())
@@ -368,6 +401,7 @@ def _agent_schema(db):
     has_bindings = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_volume_bindings'").fetchone())
     has_upload_locks = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_upload_locks'").fetchone())
     has_review_phases = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_review_phases'").fetchone())
+    has_dns = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='acme_dns_challenges'").fetchone())
     if (has_switch or has_retained or has_bindings or has_upload_locks or has_review_phases) and not has_restore: raise CaptureError('Unsupported database schema')
     switch_columns={r[1] for r in db.execute('PRAGMA table_info(restore_switch_intents)')} if has_switch else set()
     schema=(AGENT_SWITCH_SCHEMA if 'stage' in switch_columns else AGENT_SWITCH_OLD_SCHEMA) if has_switch else AGENT_RESTORE_SCHEMA if has_restore else AGENT_SCHEMA
@@ -375,7 +409,9 @@ def _agent_schema(db):
     if has_bindings: schema={**schema,'restore_volume_bindings':AGENT_BINDING_COLUMNS}
     if has_upload_locks: schema={**schema,'restore_upload_locks':{'operation_id','lock_id'}}
     if has_review_phases: schema={**schema,'restore_review_phases':{'operation_id','phase'}}
+    if has_dns: schema={**schema,'acme_dns_challenges':AGENT_DNS_COLUMNS}
     _schema(db, schema, 0)
+    if has_dns: _dns_journal_schema(db)
     if not has_restore: return
     for ident, service, kind, digest, phase, updated in db.execute('SELECT id,service_id,kind,archive_sha256,phase,updated_at FROM restore_operations'):
         if phase not in ('completed', 'cancelled'):

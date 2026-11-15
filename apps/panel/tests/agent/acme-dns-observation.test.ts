@@ -8,17 +8,17 @@ const value=Buffer.alloc(32,5).toString('base64url');
 const record={operationId:'a'.repeat(32),name:'_acme-challenge.example.com',value};
 it('observes the exact value, including a DNS TXT split into character strings',async()=>{
   const lookup=vi.fn().mockResolvedValue([['unrelated'],[value.slice(0,20),value.slice(20)]]);
-  await expect(observeDns01(record,lookup)).resolves.toEqual({status:'observed'});
+  await expect(observeDns01(record,lookup)).resolves.toEqual({...record,status:'observed'});
   expect(lookup).toHaveBeenCalledExactlyOnceWith(record.name);
 });
 it('treats absent or different values as pending, not validation success',async()=>{
-  await expect(observeDns01(record,async()=>[['different']])).resolves.toEqual({status:'pending'});
-  await expect(observeDns01(record,async()=>{throw Object.assign(new Error('no record'),{code:'ENOTFOUND'});})).resolves.toEqual({status:'pending'});
-  await expect(observeDns01(record,async()=>{throw Object.assign(new Error('no data'),{code:'ENODATA'});})).resolves.toEqual({status:'pending'});
+  await expect(observeDns01(record,async()=>[['different']])).resolves.toEqual({...record,status:'pending'});
+  await expect(observeDns01(record,async()=>{throw Object.assign(new Error('no record'),{code:'ENOTFOUND'});})).resolves.toEqual({...record,status:'pending'});
+  await expect(observeDns01(record,async()=>{throw Object.assign(new Error('no data'),{code:'ENODATA'});})).resolves.toEqual({...record,status:'pending'});
 });
 it('reports resolver failure or malformed answers as unavailable',async()=>{
-  await expect(observeDns01(record,async()=>{throw new Error('secret in resolver error');})).resolves.toEqual({status:'unavailable'});
-  await expect(observeDns01(record,async()=>[['a'.repeat(256)]])).resolves.toEqual({status:'unavailable'});
+  await expect(observeDns01(record,async()=>{throw new Error('secret in resolver error');})).resolves.toEqual({...record,status:'unavailable'});
+  await expect(observeDns01(record,async()=>[['a'.repeat(256)]])).resolves.toEqual({...record,status:'unavailable'});
   const lookup=vi.fn();
   await expect(observeDns01({...record,name:'_acme-challenge.example.com.'},lookup)).rejects.toMatchObject({code:'invalid_input'});
   expect(lookup).not.toHaveBeenCalled();
@@ -39,6 +39,6 @@ it('reads a split TXT record through a real isolated DNS resolver',async()=>{
   server.bind(0,'127.0.0.1');await once(server,'listening');
   try {
     const resolver=new Resolver({timeout:2000,tries:1});resolver.setServers([`127.0.0.1:${server.address().port}`]);
-    await expect(observeDns01(record,name=>resolver.resolveTxt(name))).resolves.toEqual({status:'observed'});
+    await expect(observeDns01(record,name=>resolver.resolveTxt(name))).resolves.toEqual({...record,status:'observed'});
   } finally {server.close();}
 });
