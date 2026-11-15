@@ -5544,3 +5544,27 @@ select:disabled {
   letter-spacing: 0;
 }
 .service-heading h1 .badge .status-dot { width: 6px; height: 6px; min-width: 6px; }
+
+.sidebar-update {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 14px 12px;
+  padding: 11px 12px;
+  border: 1px solid #dfdfdf;
+  border-radius: 12px;
+  background: #f6f6f6;
+  color: #333;
+  text-decoration: none;
+}
+.sidebar-update:hover { background: #ededed; }
+.sidebar-update > svg { flex-shrink: 0; }
+.sidebar-update > svg:last-child { margin-left: auto; }
+.sidebar-update span { display: grid; gap: 3px; min-width: 0; }
+.sidebar-update strong { font-size: 12px; font-weight: 600; }
+.sidebar-update small { color: #666; font-size: 12px; }
+#updates { scroll-margin-top: 20px; }
+@media (max-width: 800px) {
+  .sidebar-update { justify-content: center; margin: 0 8px 12px; padding: 10px 0; }
+  .sidebar-update span, .sidebar-update > svg:last-child { display: none; }
+}

@@ -70,7 +70,7 @@ import { api, errorMessage, RequestError, setCsrfToken } from "./api.js";
 import { CreateService } from "./ServiceCreate.js";
 import { AccountLinkSettings, CentralAccessSettings, CentralSignIn } from "./CentralAccess.js";
 import { LocalPasswordSettings } from "./LocalPassword.js";
-import { UpdateSettings } from "./UpdateSettings.js";
+import { UpdateSettings, useUpdateDiscovery } from "./UpdateSettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
@@ -309,6 +309,8 @@ function Shell() {
   const sessionClient = useContext(SessionClientContext)!;
   const path = useRouterState({ select: (state) => state.location.pathname });
   const projects = useProjects();
+  const { discovery: updateDiscovery } = useUpdateDiscovery(user.role === "admin");
+  const availableUpdate = !updateDiscovery.isError && updateDiscovery.data?.discovery.status === "candidate" ? updateDiscovery.data.discovery : undefined;
   const serviceId = path.startsWith("/services/") ? path.split("/")[2] : undefined;
   const routeProjectId = path.startsWith("/projects/") ? path.split("/")[2] : undefined;
   const currentService = useQuery({
@@ -343,7 +345,7 @@ function Shell() {
       : path === "/activity"
         ? "Activity"
         : path === "/settings"
-          ? "Instance"
+          ? "Settings"
           : "Overview";
   return (
     <div className="app-layout">
@@ -372,7 +374,7 @@ function Shell() {
             className={`nav-item ${path === "/settings" ? "active" : ""}`}
           >
             <Settings2 size={18} />
-            Instance
+            Settings
           </Link>
         </nav>
         <div className="nav-label project-nav-label">
@@ -396,6 +398,11 @@ function Shell() {
           )}
         </div>
         <div className="sidebar-bottom">
+          {availableUpdate ? <Link to="/settings" hash="updates" className="sidebar-update" aria-label={`Update available: ${availableUpdate.tag}`}>
+            <RefreshCw size={16} aria-hidden="true" />
+            <span><strong>Update available</strong><small>{availableUpdate.tag}</small></span>
+            <ChevronRight size={15} aria-hidden="true" />
+          </Link> : null}
           <div className="sidebar-user">
             <span className="user-avatar">{user.email[0]?.toUpperCase()}</span>
             <span>
@@ -1474,8 +1481,8 @@ function SettingsPage() {
           </div>
         </section>
       </div>
-      <LocalPasswordSettings />
       {user.role === "admin" ? <UpdateSettings /> : null}
+      <LocalPasswordSettings />
       {user.role === "admin" ? <CentralAccessSettings /> : null}
       <AccountLinkSettings />
       {user.role === "admin" ? <ProjectAccess /> : null}

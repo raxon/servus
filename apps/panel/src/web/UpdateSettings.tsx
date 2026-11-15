@@ -32,21 +32,32 @@ function readUpdate(): SavedUpdate | null {
   } catch { return null; }
 }
 
+export function useUpdateDiscovery(enabled: boolean) {
+  const capability = useQuery({
+    queryKey: ["updates"],
+    queryFn: () => api<{ applyAvailable: boolean }>("/updates"),
+    enabled,
+    retry: false,
+    staleTime: 60_000,
+  });
+  const discovery = useQuery({
+    queryKey: ["updates", "discovery"],
+    queryFn: () => api<{ discovery: UpdateDiscovery }>("/updates/discovery"),
+    enabled: enabled && Boolean(capability.data?.applyAvailable),
+    retry: false,
+    staleTime: 60_000,
+    refetchInterval: query => query.state.data?.discovery.status === "checking" ? 5_000 : 6 * 60 * 60 * 1000,
+  });
+  return { capability, discovery };
+}
+
 export function UpdateSettings() {
   const [run, setRun] = useState<SavedUpdate | null>(readUpdate);
   const [message, setMessage] = useState("");
   const [failure, setFailure] = useState("");
   const [completed, setCompleted] = useState(false);
   const [resume, setResume] = useState(0);
-  const [checking, setChecking] = useState(false);
-  const capability = useQuery({ queryKey: ["updates"], queryFn: () => api<{ applyAvailable: boolean }>("/updates"), retry: false });
-  const discovery = useQuery({
-    queryKey: ["updates", "discovery"],
-    queryFn: () => api<{ discovery: UpdateDiscovery }>("/updates/discovery"),
-    enabled: checking && Boolean(capability.data?.applyAvailable),
-    retry: false,
-    refetchInterval: query => query.state.data?.discovery.status === "checking" ? 5000 : false,
-  });
+  const { capability, discovery } = useUpdateDiscovery(true);
 
   useEffect(() => {
     if (!run || (run.stage === "attention" || run.stage === "verification_failed") || !capability.data?.applyAvailable) return;
@@ -98,7 +109,7 @@ export function UpdateSettings() {
           }
           if (operation.status === "completed") {
             try { localStorage.removeItem(storageKey); } catch { throw new StorageError(); }
-            setRun(null); setCompleted(true); setMessage(""); void capability.refetch(); return;
+            setRun(null); setCompleted(true); setMessage(""); void capability.refetch(); void discovery.refetch(); return;
           }
           if (operation.status === "recovery_required") { save({ ...run, stage: "attention" }); setFailure("The update needs attention. Check the server before trying again."); return; }
         }
@@ -129,7 +140,7 @@ export function UpdateSettings() {
     } catch { setFailure("Could not save update progress in this browser. Enable browser storage and try again."); }
   };
   return (
-    <section className="surface details-card central-settings">
+    <section id="updates" className="surface details-card central-settings">
       <div className="card-heading"><RefreshCw size={19} aria-hidden="true" /><h2>Updates</h2></div>
       {capability.isPending ? <p>Checking update settings...</p> : capability.error ? <p role="alert">Could not load update settings.</p> : !capability.data?.applyAvailable ? <p>Updates are not configured on this installation.</p> : run ? (
         <>
@@ -154,7 +165,7 @@ export function UpdateSettings() {
           {candidate?.status === "ahead" ? <p role="status">This installation is newer than the latest release.</p> : null}
           {candidate?.status === "release_pending" ? <p role="status">Release {candidate.tag} is not ready yet.</p> : null}
           {candidate?.status === "candidate" ? <p role="status">Version {candidate.tag} is available. Its signature will be checked before installation.</p> : null}
-          <button type="button" className="button" disabled={discovery.isFetching || candidate?.status === "checking"} onClick={() => { setCompleted(false); if (checking) void discovery.refetch(); else setChecking(true); }}>Check for updates</button>{" "}
+          <button type="button" className="button" disabled={discovery.isFetching || candidate?.status === "checking"} onClick={() => { setCompleted(false); void discovery.refetch(); }}>Check for updates</button>{" "}
           {candidate?.status === "candidate" ? <button type="button" className="button button-primary" onClick={start}>Install update</button> : null}
         </>
       )}
