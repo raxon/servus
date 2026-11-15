@@ -251,7 +251,7 @@ class HostApply:
         coordinator=modules['update-coordinator'];quiescence=modules['quiescence']
         coordinator.preflight_external_containers(hub,supervisor,quiescence,trusted_ingress=ingress)
         self.ownership.assert_held(control_dir)
-        with maintenance.drained_window(hub,operation_id,policy_binding=binding,legacy_upload_id=restore_id) as lease:
+        with maintenance.drained_window(hub,operation_id,policy_binding=binding,legacy_upload_id=restore_id,legacy_service_id=service_id) as lease:
             coordinator.cleanup_stopped_legacy_upload(operation_id,restore_id,service_id,lease,supervisor,quiescence,trusted_ingress=ingress)
             daemon=SimpleNamespace(resolve_active_policy=resolve_active_policy,approved_policy_binding=approved_policy_binding)
             return coordinator.start_cleaned_legacy_upload(operation_id,lease,self.ownership,self.approval_journal,self.active_env,

@@ -39,7 +39,7 @@ class LegacyHostApplyTest(unittest.TestCase):
     def test_preflights_then_drains_cleans_and_starts_under_same_scope(self):
         result=self.invoke()
         self.assertIs(result,self.coordinator.start_cleaned_legacy_upload.return_value)
-        self.maintenance.drained_window.assert_called_once_with(self.hub,self.op,policy_binding=self.binding,legacy_upload_id=self.restore)
+        self.maintenance.drained_window.assert_called_once_with(self.hub,self.op,policy_binding=self.binding,legacy_upload_id=self.restore,legacy_service_id=self.service)
         self.assertEqual([call[0] for call in self.coordinator.method_calls],['preflight_external_containers','cleanup_stopped_legacy_upload','start_cleaned_legacy_upload'])
         self.assertEqual(self.coordinator.cleanup_stopped_legacy_upload.call_args.args[:4],(self.op,self.restore,self.service,self.lease))
 

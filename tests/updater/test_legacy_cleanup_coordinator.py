@@ -23,6 +23,7 @@ class LegacyCleanupCoordinatorTest(unittest.TestCase):
         self.op=str(uuid.uuid4());self.restore='a'*32;self.service=str(uuid.uuid4())
         self.lease=object.__new__(supervisor.DrainLease)
         self.lease._legacy_upload_id=self.restore
+        self.lease._legacy_service_id=self.service
         self.lease._policy_binding=('/root/policy','sha256:'+'1'*64,'sha256:'+'2'*64)
         self.lease._owner=SimpleNamespace(journal=self.directory,_record=mock.Mock())
         self.lease._operation_id=self.op;self.lease._request_ids={role:str(uuid.uuid4()) for role in supervisor.ROLES}
@@ -61,6 +62,9 @@ class LegacyCleanupCoordinatorTest(unittest.TestCase):
 
     def test_wrong_scope_or_failed_quiescence_never_starts_worker(self):
         with self.assertRaises(coordinator.UpdateError):self.invoke('b'*32)
+        self.lease._legacy_service_id=str(uuid.uuid4())
+        with self.assertRaises(coordinator.UpdateError):self.invoke()
+        self.lease._legacy_service_id=self.service
         self.checks.ensure_no_uid_writers.side_effect=RuntimeError('writer')
         with self.assertRaises(RuntimeError):self.invoke()
         self.docker_mock.assert_not_called();self.assertFalse((Path(self.tmp.name)/'legacy-upload-recovery.json').exists())

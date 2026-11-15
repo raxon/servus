@@ -42,7 +42,7 @@ export function supervisorConfig(env: NodeJS.ProcessEnv): ControlConfig | undefi
 }
 
 /** Start the private control client; a stopped connection never proves quiescence. */
-export function startSupervisorControl(config: ControlConfig | undefined, role: SupervisorRole, drain: (timeoutMs: number) => Promise<{ status: SupervisorDrainStatus }>, drainLegacyUpload?: (timeoutMs:number,operationId:string)=>Promise<{status:SupervisorDrainStatus}>): AbortController | undefined {
+export function startSupervisorControl(config: ControlConfig | undefined, role: SupervisorRole, drain: (timeoutMs: number) => Promise<{ status: SupervisorDrainStatus }>, drainLegacyUpload?: (timeoutMs:number,operationId:string,serviceId:string)=>Promise<{status:SupervisorDrainStatus}>): AbortController | undefined {
   if (!config) return undefined;
   const controller = new AbortController();
   void runSupervisorControl({ ...config, role, drain, drainLegacyUpload, signal: controller.signal }).catch(() => {

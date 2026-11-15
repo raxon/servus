@@ -241,20 +241,22 @@ class SupervisorTest(unittest.TestCase):
         hub.connections={role:mock.Mock() for role in supervisor.ROLES}
         ids={role:str(uuid.uuid4()) for role in supervisor.ROLES}
         responses=[{'version':1,'type':'drain_result','requestId':ids[role],'status':'drained'} for role in supervisor.ROLES]
+        service_id=str(uuid.uuid4())
         with mock.patch.object(supervisor,'inspect_servus',return_value=IDENTITIES), \
              mock.patch.object(supervisor,'_send_message') as send, mock.patch.object(supervisor,'_read_message',side_effect=responses):
-            hub.drain(5000,ids,legacy_upload_id='a'*32)
+            hub.drain(5000,ids,legacy_upload_id='a'*32,legacy_service_id=service_id)
         frames=[call.args[1] for call in send.call_args_list]
         self.assertEqual(len(frames),3)
         self.assertNotIn('legacyUploadId',frames[0]);self.assertNotIn('legacyUploadId',frames[1])
-        self.assertEqual(frames[2]['legacyUploadId'],'a'*32)
+        self.assertEqual(frames[2]['legacyUploadId'],'a'*32);self.assertEqual(frames[2]['legacyServiceId'],service_id)
 
     def test_legacy_recovery_rejects_invalid_scope_before_draining(self):
         hub=supervisor.DrainHub(mock.Mock(),TOKENS,1000,POLICY,IDENTITIES)
         hub.connections={role:mock.Mock() for role in supervisor.ROLES}
         ids={role:str(uuid.uuid4()) for role in supervisor.ROLES}
         with mock.patch.object(supervisor,'_send_message') as send:
-            with self.assertRaises(supervisor.SupervisorError):hub.drain(5000,ids,legacy_upload_id='../../invalid')
+            with self.assertRaises(supervisor.SupervisorError):hub.drain(5000,ids,legacy_upload_id='../../invalid',legacy_service_id=str(uuid.uuid4()))
+            with self.assertRaises(supervisor.SupervisorError):hub.drain(5000,ids,legacy_upload_id='a'*32)
             send.assert_not_called()
         self.assertFalse(hub.used)
 

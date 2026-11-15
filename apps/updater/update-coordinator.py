@@ -282,7 +282,7 @@ def cleanup_stopped_legacy_upload(operation_id, restore_id, service_id, lease, s
     if (not isinstance(lease,supervisor.DrainLease) or not supervisor._uuid4(operation_id) or
         not isinstance(restore_id,str) or not re.fullmatch(r'[a-f0-9]{32}',restore_id) or
         not isinstance(service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service_id) or
-        getattr(lease,'_legacy_upload_id',None)!=restore_id):
+        getattr(lease,'_legacy_upload_id',None)!=restore_id or getattr(lease,'_legacy_service_id',None)!=service_id):
         raise UpdateError('Invalid legacy upload recovery scope')
     lease.assert_locked(operation_id,'stopped_unverified')
     hub=lease._hub

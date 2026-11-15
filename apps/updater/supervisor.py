@@ -481,12 +481,14 @@ class DrainHub:
             connection.close()
             raise
 
-    def drain(self, timeout_ms, request_ids, *, legacy_upload_id=None):
+    def drain(self, timeout_ms, request_ids, *, legacy_upload_id=None, legacy_service_id=None):
         """Drain API, worker, agent in that order; uncertainty is never success."""
         if (self.used or set(self.connections) != set(ROLES) or type(timeout_ms) is not int or not 1 <= timeout_ms <= 60000 or
             not isinstance(request_ids, dict) or set(request_ids) != set(ROLES) or
             not all(_uuid4(value) for value in request_ids.values()) or len(set(request_ids.values())) != len(ROLES) or
-            (legacy_upload_id is not None and (not isinstance(legacy_upload_id,str) or not re.fullmatch(r'[a-f0-9]{32}',legacy_upload_id)))):
+            ((legacy_upload_id is None)!=(legacy_service_id is None)) or
+            (legacy_upload_id is not None and (not isinstance(legacy_upload_id,str) or not re.fullmatch(r'[a-f0-9]{32}',legacy_upload_id) or
+             not isinstance(legacy_service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',legacy_service_id)))):
             raise SupervisorError('Control channels are not ready')
         # A restart between authentication and drain invalidates all channels.
         if inspect_servus(self.policy) != self.identities:
@@ -497,7 +499,7 @@ class DrainHub:
             deadline = time.monotonic() + timeout_ms / 1000
             try:
                 command={'version': 1, 'type': 'drain', 'requestId': request_id, 'timeoutMs': timeout_ms}
-                if role=='agent' and legacy_upload_id is not None:command['legacyUploadId']=legacy_upload_id
+                if role=='agent' and legacy_upload_id is not None:command.update({'legacyUploadId':legacy_upload_id,'legacyServiceId':legacy_service_id})
                 _send_message(self.connections[role], command, deadline)
                 result = _read_message(self.connections[role], deadline)
             except (OSError, SupervisorError):
@@ -766,7 +768,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
             fcntl.flock(self.gate_lock, fcntl.LOCK_UN)
 
     @contextmanager
-    def drained_window(self, hub, request_id, timeout_ms=60000, *, policy_binding=None, legacy_upload_id=None):
+    def drained_window(self, hub, request_id, timeout_ms=60000, *, policy_binding=None, legacy_upload_id=None, legacy_service_id=None):
         """Hold the exclusive startup gate after stopping authenticated roles.
 
         Callers must independently prove that every other writer and daemon-side
@@ -774,7 +776,9 @@ class MaintenanceSupervisor(ComponentEndpoint):
         Any exception or uncommitted exit preserves a recovery-required marker.
         """
         if (not isinstance(hub, DrainHub) or not _uuid4(request_id) or type(timeout_ms) is not int or not 1 <= timeout_ms <= 60000 or
-            (legacy_upload_id is not None and (not isinstance(legacy_upload_id,str) or not re.fullmatch(r'[a-f0-9]{32}',legacy_upload_id)))):
+            ((legacy_upload_id is None)!=(legacy_service_id is None)) or
+            (legacy_upload_id is not None and (not isinstance(legacy_upload_id,str) or not re.fullmatch(r'[a-f0-9]{32}',legacy_upload_id) or
+             not isinstance(legacy_service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',legacy_service_id)))):
             raise SupervisorError('Invalid maintenance request')
         if policy_binding is not None:
             if (not isinstance(policy_binding, tuple) or len(policy_binding) != 4 or
@@ -795,7 +799,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
             self._record(request_id, 'maintenance', request_ids, timeout_ms)
             phase = 'drain'
             if legacy_upload_id is None: hub.drain(timeout_ms, request_ids)
-            else: hub.drain(timeout_ms, request_ids, legacy_upload_id=legacy_upload_id)
+            else: hub.drain(timeout_ms, request_ids, legacy_upload_id=legacy_upload_id,legacy_service_id=legacy_service_id)
             self._record(request_id, 'drained', request_ids, timeout_ms)
             phase = 'identity'
             if inspect_servus(hub.policy) != hub.identities:
@@ -817,7 +821,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
             if (by_name.st_dev, by_name.st_ino) != (by_fd.st_dev, by_fd.st_ino):
                 raise SupervisorError('Lifecycle lock changed')
             self._record(request_id, 'stopped_unverified', request_ids, timeout_ms)
-            lease = DrainLease(self, request_id, request_ids, timeout_ms, policy_binding, hub=hub, legacy_upload_id=legacy_upload_id)
+            lease = DrainLease(self, request_id, request_ids, timeout_ms, policy_binding, hub=hub, legacy_upload_id=legacy_upload_id,legacy_service_id=legacy_service_id)
             phase = 'update'
             yield lease
             completed = lease._settled
@@ -849,7 +853,7 @@ class MaintenanceSupervisor(ComponentEndpoint):
 class DrainLease:
     """An exclusive gate lease scoped to one durable maintenance intent."""
 
-    def __init__(self, owner, operation_id, request_ids, timeout_ms, policy_binding=None, *, hub=None, legacy_upload_id=None):
+    def __init__(self, owner, operation_id, request_ids, timeout_ms, policy_binding=None, *, hub=None, legacy_upload_id=None, legacy_service_id=None):
         self._owner = owner
         self._operation_id = operation_id
         self._request_ids = request_ids
@@ -860,6 +864,7 @@ class DrainLease:
         self._policy_binding = policy_binding[:3] if policy_binding is not None else None
         self._hub = hub
         self._legacy_upload_id = legacy_upload_id
+        self._legacy_service_id = legacy_service_id
 
     def assert_locked(self, operation_id, state):
         """Recheck the host lock identities and the still-closed startup gate."""
@@ -930,7 +935,7 @@ class DrainLease:
         except (KeyError,TypeError):raise SupervisorError('Legacy recovery identity is unavailable') from None
         if (not isinstance(marker,dict) or set(marker)!={'version','operationId','restoreId','serviceId','state','policyBinding','containerIds'} or
             type(marker['version']) is not int or marker['version']!=1 or marker['operationId']!=self._operation_id or
-            marker['restoreId']!=self._legacy_upload_id or not isinstance(marker['serviceId'],str) or
+            marker['restoreId']!=self._legacy_upload_id or marker['serviceId']!=self._legacy_service_id or not isinstance(marker['serviceId'],str) or
             not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',marker['serviceId']) or marker['state']!='cleaned' or
             marker['policyBinding']!=list(self._policy_binding) or marker['containerIds']!=identities):
             raise SupervisorError('Legacy recovery marker does not match')

@@ -1,7 +1,7 @@
 import type Docker from 'dockerode';
 
 export type AgentDrainResult = { status: 'drained' | 'uncertain' | 'timeout' };
-type DrainScope = { legacyUploadId:string } | undefined;
+type DrainScope = { legacyUploadId:string;serviceId:string } | undefined;
 
 /** Confirm a successfully started exec has exited; a failed inspection remains uncertain. */
 export async function consoleExecStopped(exec: Docker.Exec, containerId: string, timeoutMs = 3000): Promise<boolean> {
@@ -64,14 +64,14 @@ export class AgentMaintenanceGate {
   }
 
   /** Local barrier only; host-side process and filesystem checks remain required. */
-  async drainForLegacyUpload(timeoutMs:number,operationId:string):Promise<AgentDrainResult> {
-    if(typeof operationId!=='string'||!/^[a-f0-9]{32}$/.test(operationId))throw new Error('Invalid legacy restore identity');
-    return this.drainWithScope(timeoutMs,{legacyUploadId:operationId});
+  async drainForLegacyUpload(timeoutMs:number,operationId:string,serviceId:string):Promise<AgentDrainResult> {
+    if(typeof operationId!=='string'||!/^[a-f0-9]{32}$/.test(operationId)||typeof serviceId!=='string'||!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(serviceId))throw new Error('Invalid legacy restore identity');
+    return this.drainWithScope(timeoutMs,{legacyUploadId:operationId,serviceId});
   }
 
   private async drainWithScope(timeoutMs:number,scope:DrainScope):Promise<AgentDrainResult> {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2147483647) throw new Error('Invalid drain timeout');
-    const requestedScope=scope?.legacyUploadId ?? 'ordinary';
+    const requestedScope=scope ? `${scope.legacyUploadId}:${scope.serviceId}` : 'ordinary';
     if(this.draining && this.drainScope!==requestedScope){this.markUncertain();return {status:'uncertain'};}
     this.draining = true;
     this.drainScope=requestedScope;

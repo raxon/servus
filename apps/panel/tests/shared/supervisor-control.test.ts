@@ -72,15 +72,21 @@ afterEach(async()=>{
 describe('supervisor control',()=>{
   it('routes a scoped legacy upload drain only to an agent handler',async()=>{
     for(const role of ['agent','api'] as const){
-      const abort=new AbortController(),id='a'.repeat(32);let ordinary=0,scoped=0,result:any;
-      const options=await fixture(socket=>peer(socket,()=>write(socket,{version:1,type:'drain',requestId,timeoutMs:100,legacyUploadId:id}),frame=>{result=frame;abort.abort();},false,false,role));
-      await runSupervisorControl({...options,role,signal:abort.signal,reconnectMs:10,drain:async()=>{ordinary++;return {status:'drained'};},drainLegacyUpload:async(timeout,operation)=>{scoped++;expect(timeout).toBe(100);expect(operation).toBe(id);return {status:'drained'};}});
+      const abort=new AbortController(),id='a'.repeat(32),serviceId='12345678-1234-4123-8123-123456789abc';let ordinary=0,scoped=0,result:any;
+      const options=await fixture(socket=>peer(socket,()=>write(socket,{version:1,type:'drain',requestId,timeoutMs:100,legacyUploadId:id,legacyServiceId:serviceId}),frame=>{result=frame;abort.abort();},false,false,role));
+      await runSupervisorControl({...options,role,signal:abort.signal,reconnectMs:10,drain:async()=>{ordinary++;return {status:'drained'};},drainLegacyUpload:async(timeout,operation,service)=>{scoped++;expect(timeout).toBe(100);expect(operation).toBe(id);expect(service).toBe(serviceId);return {status:'drained'};}});
       expect(result.status).toBe(role==='agent'?'drained':'uncertain');expect(ordinary).toBe(0);expect(scoped).toBe(role==='agent'?1:0);
     }
   });
   it('does not replay a recovery drain result for a different upload',async()=>{
     const abort=new AbortController();let calls=0,connections=0,result='';
-    const options=await fixture(socket=>{const id=(++connections===1?'a':'b').repeat(32);peer(socket,()=>write(socket,{version:1,type:'drain',requestId,timeoutMs:100,legacyUploadId:id}),frame=>{result=frame.status;if(connections===2)abort.abort();},false,false,'agent');});
+    const options=await fixture(socket=>{const id=(++connections===1?'a':'b').repeat(32);peer(socket,()=>write(socket,{version:1,type:'drain',requestId,timeoutMs:100,legacyUploadId:id,legacyServiceId:'12345678-1234-4123-8123-123456789abc'}),frame=>{result=frame.status;if(connections===2)abort.abort();},false,false,'agent');});
+    await runSupervisorControl({...options,role:'agent',signal:abort.signal,reconnectMs:10,drain:async()=>({status:'drained'}),drainLegacyUpload:async()=>{calls++;return {status:'drained'};}});
+    expect(connections).toBe(2);expect(calls).toBe(1);expect(result).toBe('uncertain');
+  });
+  it('does not replay a recovery drain result for a different service',async()=>{
+    const abort=new AbortController();let calls=0,connections=0,result='';
+    const options=await fixture(socket=>{const serviceId=++connections===1?'12345678-1234-4123-8123-123456789abc':'12345678-1234-4123-8123-123456789abd';peer(socket,()=>write(socket,{version:1,type:'drain',requestId,timeoutMs:100,legacyUploadId:'a'.repeat(32),legacyServiceId:serviceId}),frame=>{result=frame.status;if(connections===2)abort.abort();},false,false,'agent');});
     await runSupervisorControl({...options,role:'agent',signal:abort.signal,reconnectMs:10,drain:async()=>({status:'drained'}),drainLegacyUpload:async()=>{calls++;return {status:'drained'};}});
     expect(connections).toBe(2);expect(calls).toBe(1);expect(result).toBe('uncertain');
   });
