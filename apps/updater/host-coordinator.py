@@ -106,7 +106,7 @@ def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_l
 
 def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_fd, install_fd, units_fd,
                             host_lock, supervisor, unit_mask, bundle, ready, run=subprocess.run):
-    """Recover a journaled stop before any unit mask or runtime exchange.
+    """Recover a journaled stop before a runtime exchange begins.
 
     The caller holds the host operation lock, supplies independently verified
     original unit bytes, and checks the authenticated control-plane readiness.
@@ -132,10 +132,13 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         row=db.execute('SELECT image_digest,status FROM host_stops WHERE operation_id=?',(operation_id,)).fetchone()
         if not row or row[0]!=image_digest or row[1] not in ('stopping','stopped'):
             raise HostPreparationError('Updater stop is not eligible for recovery')
-        for table in ('host_switches','host_unit_masks'):
-            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
-                if db.execute('SELECT 1 FROM '+table+' WHERE operation_id=?',(operation_id,)).fetchone():
-                    raise HostPreparationError('Host exchange has already begun')
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_switches'").fetchone():
+            if db.execute('SELECT 1 FROM host_switches WHERE operation_id=?',(operation_id,)).fetchone():
+                raise HostPreparationError('Host exchange has already begun')
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_unit_masks'").fetchone():
+            mask=db.execute('SELECT image_digest,phase FROM host_unit_masks WHERE operation_id=?',(operation_id,)).fetchone()
+            if mask and mask != (image_digest,'restored'):
+                raise HostPreparationError('Host unit restoration is incomplete')
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_preparations'").fetchone():
             preparation=db.execute('SELECT image_digest,status FROM host_preparations WHERE operation_id=?',(operation_id,)).fetchone()
             if preparation and (preparation[0]!=image_digest or preparation[1] not in ('intent','prepared','recovery_required')):
@@ -148,6 +151,12 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         except BlockingIOError as error:raise HostPreparationError('Installation lock is still held') from error
         fcntl.flock(fd,fcntl.LOCK_UN)
     finally:os.close(fd)
+    try:
+        _same_lock(supervisor,state_fd,'host.lock',host_lock)
+        run(['/usr/bin/systemctl','daemon-reload'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,cwd='/',
+            env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'},timeout=60,check=True)
+    except (OSError,subprocess.SubprocessError) as error:
+        raise HostPreparationError('Systemd reload requires recovery') from error
     states=unit_mask.capture_service_states()
     if states['servus-updater.service']=='inactive':
         fd=supervisor._open_root_file(state_fd,'service.lock',0o600)
@@ -156,12 +165,15 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
             except BlockingIOError as error:raise HostPreparationError('Updater lock is still held') from error
             fcntl.flock(fd,fcntl.LOCK_UN)
         finally:os.close(fd)
-    for name in unit_mask.UNITS:
-        if name!='servus-updater.service' and states[name]!=expected[name]:
-            raise HostPreparationError('Host service state changed during recovery')
+    if states['servus-updater-bootstrap.service'] != 'inactive':
+        raise HostPreparationError('Bootstrap service is active during recovery')
     try:
-        run(['/usr/bin/systemctl','start','servus-updater.service'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,cwd='/',env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'},timeout=60,check=True)
+        for command in (['/usr/bin/systemctl','start','servus-updater-socket.service'],
+                        ['/usr/bin/systemctl','start','servus-supervisor.service'],
+                        ['/usr/bin/systemctl','start','servus-updater.service']):
+            _same_lock(supervisor,state_fd,'host.lock',host_lock)
+            run(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,cwd='/',
+                env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'},timeout=60,check=True)
     except (OSError,subprocess.SubprocessError) as error:
         raise HostPreparationError('Updater restart requires recovery') from error
     verify()

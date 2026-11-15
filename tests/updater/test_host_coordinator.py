@@ -117,12 +117,17 @@ class HostCoordinatorTest(unittest.TestCase):
             with self.assertRaises(coordinator.HostPreparationError):
                 coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=mock.Mock(),**args)
             self.db.execute('DELETE FROM host_switches')
+            self.db.execute('CREATE TABLE host_unit_masks(operation_id TEXT,image_digest TEXT,phase TEXT)')
+            self.db.execute("INSERT INTO host_unit_masks VALUES(?,?,'masking')",(self.fixture.op,self.fixture.digest))
+            with self.assertRaises(coordinator.HostPreparationError):
+                coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=mock.Mock(),**args)
+            self.db.execute("UPDATE host_unit_masks SET phase='restored'")
             self.db.execute('CREATE TABLE host_preparations(operation_id TEXT,image_digest TEXT,status TEXT)')
             self.db.execute("INSERT INTO host_preparations VALUES(?,?,'prepared')",(self.fixture.op,self.fixture.digest))
             run=mock.Mock()
             fcntl.flock(self.service_lock,fcntl.LOCK_UN)
             coordinator.recover_stopped_updater(self.db,self.fixture.op,self.fixture.digest,originals,run=run,**args)
-            self.assertEqual(run.call_args.args[0],['/usr/bin/systemctl','start','servus-updater.service'])
+            self.assertEqual([call.args[0] for call in run.call_args_list],[['/usr/bin/systemctl','daemon-reload'],['/usr/bin/systemctl','start','servus-updater-socket.service'],['/usr/bin/systemctl','start','servus-supervisor.service'],['/usr/bin/systemctl','start','servus-updater.service']])
             self.assertEqual(self.db.execute('select status from host_stops').fetchone(),('completed',))
             self.assertEqual(self.db.execute('select status from host_preparations').fetchone(),('abandoned',))
         finally:
