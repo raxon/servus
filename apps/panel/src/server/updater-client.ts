@@ -10,6 +10,8 @@ const tag = z.string().max(64).regex(/^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?
 const operationSchema = z.strictObject({ operationId: uuid, commit, digest, tag, status: z.enum(['accepted', 'verifying', 'verified', 'verification_failed', 'recovery_required']), createdAt: z.string().regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/) });
 const preparationSchema = z.strictObject({ operationId: uuid, preparationId: uuid, status: z.enum(['preparing', 'prepared', 'completed', 'recovery_required']) });
 const applySchema = z.strictObject({ operationId: uuid, status: z.enum(['requested', 'dispatching', 'awaiting_completion', 'completed', 'recovery_required']) });
+const legacyIdentitySchema = z.strictObject({ operationId: uuid, restoreId: z.string().regex(/^[a-f0-9]{32}$/), serviceId: z.string().regex(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/) });
+const legacyRecoverySchema = legacyIdentitySchema.extend({ status: z.enum(['requested', 'dispatching', 'awaiting_completion', 'completed', 'recovery_required']) });
 const backupSchemaObservation = z.strictObject({backupFileDnsJournalVersion:z.union([z.literal(0),z.literal(1)])});
 const discoverySchema = z.discriminatedUnion('status', [
   z.strictObject({status: z.literal('checking')}), z.strictObject({status: z.literal('unavailable')}),
@@ -25,6 +27,8 @@ export type UpdateOperation = z.infer<typeof operationSchema>;
 export type UpdateSubmission = z.infer<typeof submitSchema>;
 export type UpdatePreparation = z.infer<typeof preparationSchema>;
 export type UpdateApplication = z.infer<typeof applySchema>;
+export type LegacyRecoveryIdentity = z.infer<typeof legacyIdentitySchema>;
+export type LegacyRecovery = z.infer<typeof legacyRecoverySchema>;
 export type UpdateDiscovery = z.infer<typeof discoverySchema>;
 export type BackupFileSchemaObservation = z.infer<typeof backupSchemaObservation>;
 export type UpdateErrorCode = z.infer<typeof errorCode> | 'invalid_input' | 'connection_failed' | 'invalid_response' | 'timeout';
@@ -76,8 +80,8 @@ function parseUniqueJson(text: string): unknown {
   const parsed = value(0); whitespace(); if (position !== text.length) throw new Error('invalid JSON'); return parsed;
 }
 
-async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'apply' | 'apply_status' | 'discover' | 'backup_schema', input: UpdateSubmission | { operationId: string } | {current: string} | Record<string,never>, options: UpdaterClientOptions): Promise<UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation> {
-  const validInput = action === 'submit' ? submitSchema.safeParse(input) : action === 'discover' ? z.strictObject({current: tag}).safeParse(input) : action === 'backup_schema' ? z.strictObject({}).safeParse(input) : z.strictObject({ operationId: uuid }).safeParse(input);
+async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'apply' | 'apply_status' | 'discover' | 'backup_schema' | 'legacy_recovery' | 'legacy_recovery_status', input: UpdateSubmission | LegacyRecoveryIdentity | { operationId: string } | {current: string} | Record<string,never>, options: UpdaterClientOptions): Promise<UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery> {
+  const validInput = action === 'submit' ? submitSchema.safeParse(input) : action === 'legacy_recovery' ? legacyIdentitySchema.safeParse(input) : action === 'discover' ? z.strictObject({current: tag}).safeParse(input) : action === 'backup_schema' ? z.strictObject({}).safeParse(input) : z.strictObject({ operationId: uuid }).safeParse(input);
   const timeout = options.timeoutMs ?? 5000;
   if (!validInput.success || typeof options.socketPath !== 'string' || !isAbsolute(options.socketPath) || options.socketPath.includes('\0') || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120000) throw new UpdaterClientError('invalid_input', 'definitive');
   const payload = Buffer.from(JSON.stringify({ version: 1, action, ...validInput.data }) + '\n');
@@ -85,7 +89,7 @@ async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'appl
     let dispatched = false, settled = false, length = 0;
     const chunks: Buffer[] = [];
     const socket = createConnection({ path: options.socketPath });
-    const finish = (error?: UpdaterClientError, operation?: UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation) => {
+    const finish = (error?: UpdaterClientError, operation?: UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery) => {
       if (settled) return;
       settled = true; clearTimeout(timer); socket.destroy();
       if (error) reject(error); else resolve(operation!);
@@ -104,7 +108,7 @@ async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'appl
       let data: unknown;
       try { data = parseUniqueJson(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, -1))); }
       catch { fail('invalid_response'); return; }
-      const resultSchema = action === 'discover' ? discoverySchema : action === 'backup_schema' ? backupSchemaObservation : action === 'prepare' ? preparationSchema : action === 'apply' || action === 'apply_status' ? applySchema : operationSchema;
+      const resultSchema = action === 'discover' ? discoverySchema : action === 'backup_schema' ? backupSchemaObservation : action === 'prepare' ? preparationSchema : action === 'legacy_recovery' || action === 'legacy_recovery_status' ? legacyRecoverySchema : action === 'apply' || action === 'apply_status' ? applySchema : operationSchema;
       const responseSchema = z.union([z.strictObject({ ok: z.literal(true), operation: resultSchema }), z.strictObject({ ok: z.literal(false), error: errorCode })]);
       const parsed = responseSchema.safeParse(data);
       if (!parsed.success) { fail('invalid_response'); return; }
@@ -134,3 +138,11 @@ export function applyStatus(operationId: string, options: UpdaterClientOptions):
 export function discoverUpdate(current: string, options: UpdaterClientOptions): Promise<UpdateDiscovery> { return request('discover', {current}, options) as Promise<UpdateDiscovery>; }
 /** Reports one host file only; it does not authorize opening or migrating a journal. */
 export function updaterBackupFileSchema(options: UpdaterClientOptions): Promise<BackupFileSchemaObservation> { return request('backup_schema', {}, options) as Promise<BackupFileSchemaObservation>; }
+async function checkedLegacyRecovery(action: 'legacy_recovery' | 'legacy_recovery_status', identity: LegacyRecoveryIdentity, options: UpdaterClientOptions): Promise<LegacyRecovery> {
+  if (!legacyIdentitySchema.safeParse(identity).success) throw new UpdaterClientError('invalid_input', 'definitive');
+  const result = await request(action, action === 'legacy_recovery' ? identity : {operationId: identity.operationId}, options) as LegacyRecovery;
+  if (result.restoreId !== identity.restoreId || result.serviceId !== identity.serviceId) throw new UpdaterClientError('invalid_response', 'uncertain');
+  return result;
+}
+export function startLegacyRecovery(identity: LegacyRecoveryIdentity, options: UpdaterClientOptions): Promise<LegacyRecovery> { return checkedLegacyRecovery('legacy_recovery', identity, options); }
+export function legacyRecoveryStatus(identity: LegacyRecoveryIdentity, options: UpdaterClientOptions): Promise<LegacyRecovery> { return checkedLegacyRecovery('legacy_recovery_status', identity, options); }

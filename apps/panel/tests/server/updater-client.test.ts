@@ -2,7 +2,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { submitUpdate, updateStatus, retryUpdate, prepareUpdate, applyUpdate, applyStatus, discoverUpdate, updaterBackupFileSchema, UpdaterClientError, type UpdateSubmission } from '../../src/server/updater-client.js';
+import { submitUpdate, updateStatus, retryUpdate, prepareUpdate, applyUpdate, applyStatus, discoverUpdate, updaterBackupFileSchema, startLegacyRecovery, legacyRecoveryStatus, UpdaterClientError, type UpdateSubmission } from '../../src/server/updater-client.js';
 
 const input: UpdateSubmission = { operationId: '12345678-1234-4123-8123-123456789abc', commit: 'a'.repeat(40), digest: `sha256:${'b'.repeat(64)}`, tag: 'v1.2.3' };
 const operation = { ...input, status: 'accepted', createdAt: '2026-11-14 10:00:00' };
@@ -35,6 +35,23 @@ async function failure(promise: Promise<unknown>, code: string, certainty: strin
 }
 
 describe('updater Unix socket client', () => {
+  it('binds legacy recovery responses to the requested restore and service', async () => {
+    const identity = {operationId: input.operationId, restoreId: 'c'.repeat(32), serviceId: '12345678-1234-1234-1234-123456789abc'};
+    for (const action of ['legacy_recovery', 'legacy_recovery_status'] as const) {
+      const endpoint = await fixture((socket, raw) => {
+        expect(JSON.parse(raw)).toEqual({version: 1, action, ...(action === 'legacy_recovery' ? identity : {operationId: identity.operationId})});
+        socket.end(JSON.stringify({ok: true, operation: {...identity, status: 'requested'}}) + '\n');
+      });
+      await expect(action === 'legacy_recovery' ? startLegacyRecovery(identity, endpoint) : legacyRecoveryStatus(identity, endpoint)).resolves.toEqual({...identity, status: 'requested'});
+      for (const wrong of [{restoreId: 'd'.repeat(32)}, {serviceId: '22345678-1234-1234-1234-123456789abc'}, {status: 'finished'}]) {
+        const bad = await fixture(socket => socket.end(JSON.stringify({ok: true, operation: {...identity, status: 'requested', ...wrong}}) + '\n'));
+        await failure(action === 'legacy_recovery' ? startLegacyRecovery(identity, bad) : legacyRecoveryStatus(identity, bad), 'invalid_response', 'uncertain');
+      }
+    }
+    await failure(startLegacyRecovery({...identity, restoreId: 'bad'}, {socketPath: '/tmp/nonexistent'}), 'invalid_input', 'definitive');
+    const old = await fixture(socket => socket.end(JSON.stringify({ok: false, error: 'invalid_request'}) + '\n'));
+    await failure(startLegacyRecovery(identity, old), 'invalid_request', 'definitive');
+  });
   it('accepts only a strict DNS journal compatibility observation',async()=>{
     for(const version of [0,1]){
       const endpoint=await fixture((socket,request)=>{
