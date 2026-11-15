@@ -555,8 +555,9 @@ def _verify_data_directory(path):
         os.close(fd)
 
 
-def _open_root_file(parent, name, mode):
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+def _open_root_file(parent, name, mode, *, path_only=False):
+    flags = (os.O_PATH if path_only else os.O_RDONLY | os.O_NONBLOCK) | os.O_NOFOLLOW
+    fd = os.open(name, flags, dir_fd=parent)
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != mode:
         os.close(fd)

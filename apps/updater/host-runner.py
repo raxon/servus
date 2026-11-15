@@ -60,7 +60,7 @@ def activate(operation_id, *, modules, paths=PATHS):
         host_lock=supervisor._open_root_file(state,'host.lock',0o600)
         install_lock=supervisor._open_root_file(install,'install.lock',0o600)
         for fd in (host_lock,install_lock):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        dbpath=paths['state']+'/journal.sqlite';fd=supervisor._open_root_file(state,'journal.sqlite',0o600);os.close(fd)
+        dbpath=paths['state']+'/journal.sqlite';fd=supervisor._open_root_file(state, 'journal.sqlite', 0o600, path_only=True);os.close(fd)
         db=sqlite3.connect(dbpath,isolation_level=None,timeout=5)
         policy_path,accepted_env,policy=resolve_policy_retry(daemon,supervisor,dbpath,paths['active_env'])
         identities=supervisor.inspect_servus(policy)
@@ -121,7 +121,7 @@ def activate_current(*, modules, paths=PATHS):
     supervisor=modules['supervisor'];daemon=modules['daemon']
     state=supervisor._trusted_directory(paths['state'],0o700)
     try:
-        fd=supervisor._open_root_file(state,'journal.sqlite',0o600)
+        fd=supervisor._open_root_file(state, 'journal.sqlite', 0o600, path_only=True)
         try:
             named=os.stat(paths['state']+'/journal.sqlite',follow_symlinks=False);opened=os.fstat(fd)
             if (named.st_dev,named.st_ino)!=(opened.st_dev,opened.st_ino):raise HostRunnerError('Journal identity differs')
@@ -209,7 +209,7 @@ def recover_pending(*, modules, paths=PATHS, prepare_only):
         raise HostRunnerError('Invalid host recovery context')
     state=supervisor._trusted_directory(paths['state'],0o700);candidates=None;db=None
     try:
-        fd=supervisor._open_root_file(state,'journal.sqlite',0o600)
+        fd=supervisor._open_root_file(state, 'journal.sqlite', 0o600, path_only=True)
         try:
             named=os.stat(paths['state']+'/journal.sqlite',follow_symlinks=False);opened=os.fstat(fd)
             if (named.st_dev,named.st_ino)!=(opened.st_dev,opened.st_ino):raise HostRunnerError('Journal identity differs')

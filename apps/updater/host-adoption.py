@@ -182,7 +182,7 @@ def adopt(old_operation, active_operation, *, modules, paths, service=systemctl)
         candidates=provisioner.child_directory(state,'host-generations')
         if os.fstat(candidates).st_dev!=os.fstat(host).st_dev:
             raise HostAdoptionError('Host generations must share a filesystem')
-        fd=supervisor._open_root_file(state,'journal.sqlite',0o600);os.close(fd)
+        fd=supervisor._open_root_file(state, 'journal.sqlite', 0o600, path_only=True);os.close(fd)
         import sqlite3
         db=sqlite3.connect(os.path.join(paths['state'],'journal.sqlite'),isolation_level=None,timeout=5)
         coordinator.adopt_verified_units(db,old_operation,active_operation,state_dir=paths['state'],active_env=paths['active_env'],

@@ -200,8 +200,7 @@ class HostCoordinatorTest(unittest.TestCase):
 
     def test_unit_adoption_rechecks_signed_releases_locks_and_recovery_guards(self):
         names=('servus-updater.service','servus-supervisor.service','servus-updater-socket.service','servus-updater-bootstrap.service')
-        guards=('host-adoption.py','host-boot-gate.py','host-bundle.py','host-coordinator.py','host-exchange.py','host-fence.py',
-                'host-recovery.py','host-runner.py','host-switch.py','host-unit-mask.py','install-host.py')
+        guards=bundle.ADOPTION_GUARDS
         modules={name:(0o644,b'verified') for name in guards}
         states={name:('inactive' if name.endswith('bootstrap.service') else 'active') for name in names}
         unit_mask=SimpleNamespace(UNITS=names,capture_service_states=mock.Mock(return_value=states))

@@ -29,7 +29,7 @@ def recover(operation_id, image_digest, *, modules, paths, prepare_only):
         candidates=supervisor._trusted_directory(paths['candidates'],0o700)
         host_lock=supervisor._open_root_file(state,'host.lock',0o600);install_lock=supervisor._open_root_file(install,'install.lock',0o600)
         for fd in (host_lock,install_lock):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        journal=supervisor._open_root_file(state,'journal.sqlite',0o600);os.close(journal)
+        journal=supervisor._open_root_file(state, 'journal.sqlite', 0o600, path_only=True);os.close(journal)
         db=sqlite3.connect(paths['state']+'/journal.sqlite',isolation_level=None,timeout=5)
         row=db.execute('SELECT image_digest,status FROM host_stops WHERE operation_id=?',(operation_id,)).fetchone()
         if not row or row[0]!=image_digest or row[1] not in ('stopping','stopped','starting','restarting'):

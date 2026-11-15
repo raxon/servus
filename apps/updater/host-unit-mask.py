@@ -32,7 +32,7 @@ def _guard(db, state, install, service_lock, install_lock, supervisor, coordinat
         raise UnitMaskError('The journal must use durable synchronization')
     coordinator._same_lock(supervisor, state, 'service.lock', service_lock)
     coordinator._same_lock(supervisor, install, 'install.lock', install_lock)
-    fd = supervisor._open_root_file(state, 'journal.sqlite', 0o600)
+    fd = supervisor._open_root_file(state, 'journal.sqlite', 0o600, path_only=True)
     try:
         path = db.execute('PRAGMA database_list').fetchone()[2]
         named, opened = os.stat(path, follow_symlinks=False), os.fstat(fd)

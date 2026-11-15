@@ -23,7 +23,8 @@ MAX_CLI = 64 * 1024 * 1024
 OPERATION = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
 DIGEST = re.compile(r'^sha256:[a-f0-9]{64}$')
 STAGE = re.compile(r'^servus-install-[a-f0-9]{32}$')
-ADOPTION_GUARDS = ('host-adoption.py','host-boot-gate.py','host-bundle.py','host-coordinator.py','host-exchange.py','host-fence.py',
+# Publish the backwards-compatible supervisor API before guards that use it.
+ADOPTION_GUARDS = ('supervisor.py','host-adoption.py','host-boot-gate.py','host-bundle.py','host-coordinator.py','host-exchange.py','host-fence.py',
                    'host-recovery.py','host-runner.py','host-switch.py','host-unit-mask.py','install-host.py')
 
 

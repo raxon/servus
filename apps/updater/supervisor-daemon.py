@@ -101,11 +101,28 @@ def _private_file(path, maximum):
         os.close(directory)
 
 
+def _private_journal(path, maximum):
+    """Validate a journal without releasing another SQLite connection's locks."""
+    if not isinstance(path,str) or not os.path.isabs(path) or os.path.normpath(path)!=path:
+        raise supervisor.SupervisorError('Invalid protected path')
+    parent,name=os.path.split(path)
+    if not name:raise supervisor.SupervisorError('Invalid protected path')
+    directory=supervisor._trusted_directory(parent,0o700)
+    try:
+        fd=supervisor._open_root_file(directory,name,0o600,path_only=True)
+        try:
+            opened=os.fstat(fd);named=os.stat(name,dir_fd=directory,follow_symlinks=False)
+            if opened.st_size>maximum or (opened.st_dev,opened.st_ino)!=(named.st_dev,named.st_ino):
+                raise supervisor.SupervisorError('Protected journal is unsafe')
+        finally:os.close(fd)
+    finally:os.close(directory)
+
+
 def load_approved_policy(path, approval_journal, accepted_env, *, expected_operation_id=None):
     """Require a verified active approval and the unchanged accepted files."""
     config = _private_file(accepted_env, 65536)
     policy_data = _private_file(path, 1048576)
-    _private_file(approval_journal, 64 * 1024 * 1024)
+    _private_journal(approval_journal, 64 * 1024 * 1024)
     try:
         uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=ro'
         with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
@@ -139,7 +156,7 @@ def approved_policy_binding(hub, path, approval_journal, accepted_env):
 
 def resolve_active_policy(approval_journal, active_env):
     """Resolve the approved generation while the caller holds install.lock."""
-    _private_file(approval_journal, 64 * 1024 * 1024)
+    _private_journal(approval_journal, 64 * 1024 * 1024)
     try:
         uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=ro'
         with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
@@ -503,7 +520,7 @@ def host_exchange_restored(approval_journal, operation_id):
     """Read the protected exchange journal for a root-only readiness probe."""
     if not supervisor._uuid4(operation_id):
         return False
-    _private_file(approval_journal, 64 * 1024 * 1024)
+    _private_journal(approval_journal, 64 * 1024 * 1024)
     uri = 'file:' + urllib.parse.quote(approval_journal, safe='/') + '?mode=ro'
     try:
         with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:

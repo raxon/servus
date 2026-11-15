@@ -68,7 +68,7 @@ def _guard(db, state_fd, install_fd, service_lock, install_lock, supervisor, coo
         raise HostSwitchError('The journal must use durable synchronization')
     coordinator._same_lock(supervisor, state_fd, lock_name, service_lock)
     coordinator._same_lock(supervisor, install_fd, 'install.lock', install_lock)
-    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600)
+    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600, path_only=True)
     try:
         db_path = db.execute('PRAGMA database_list').fetchone()[2]
         named = os.stat(db_path, follow_symlinks=False)
@@ -200,7 +200,7 @@ def start_restored(db, operation_id, *, state_fd, install_fd, host_lock, active_
         db.in_transaction or db.isolation_level is not None or db.execute('PRAGMA synchronous').fetchone()[0] < 2):
         raise HostSwitchError('An isolated root coordinator is required')
     coordinator._same_lock(supervisor, state_fd, 'host.lock', host_lock)
-    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600)
+    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600, path_only=True)
     try:
         named = os.stat(db.execute('PRAGMA database_list').fetchone()[2], follow_symlinks=False)
         opened = os.fstat(fd)

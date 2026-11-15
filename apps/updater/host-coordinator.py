@@ -81,7 +81,7 @@ def adopt_verified_units(db, old_operation, active_operation, *, state_dir, acti
     def guard_base():
         _same_lock(supervisor,state_fd,'host.lock',host_lock)
         _same_lock(supervisor,install_fd,'install.lock',install_lock)
-        fd=supervisor._open_root_file(state_fd,'journal.sqlite',0o600)
+        fd=supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600, path_only=True)
         try:
             actual=os.fstat(fd);named=os.stat(db.execute('PRAGMA database_list').fetchone()[2],follow_symlinks=False)
             if (actual.st_dev,actual.st_ino)!=(named.st_dev,named.st_ino):raise HostPreparationError('Journal identity differs')
@@ -113,7 +113,7 @@ def adopt_verified_units(db, old_operation, active_operation, *, state_dir, acti
     identities=supervisor.inspect_servus(policy)
     active_digest,active_stage=bundle.completed_update(db,active_operation,staging_parent,policy_path,active_env,policy.image_reference)
     old_digest,old_stage=bundle.historical_completed_update(db,old_operation,staging_parent,active_env)
-    old_units,old_modules=load_stage(old_stage,unit_mask.UNITS,module_names=('install-host.py',))
+    old_units,old_modules=load_stage(old_stage,unit_mask.UNITS,module_names=('install-host.py','supervisor.py'))
     new_units,modules=load_stage(active_stage,install_host.UNITS,module_names=install_host.MODULES)
     if not set(bundle.ADOPTION_GUARDS).issubset(modules):raise HostPreparationError('Host recovery guards are missing')
     guard_base()
@@ -138,7 +138,7 @@ def stop_updater(db, operation_id, image_digest, *, state_fd, install_fd, host_l
         raise HostPreparationError('Invalid updater stop context')
     _same_lock(supervisor, state_fd, 'host.lock', host_lock)
     _same_lock(supervisor, install_fd, 'install.lock', install_lock)
-    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600)
+    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600, path_only=True)
     try:
         named = os.stat(db.execute('PRAGMA database_list').fetchone()[2], follow_symlinks=False)
         opened = os.fstat(fd)
@@ -200,7 +200,7 @@ def recover_stopped_updater(db, operation_id, image_digest, originals, *, state_
         type(readiness_timeout) not in (int,float) or not 0 <= readiness_timeout <= 300 or type(prepare_only) is not bool):
         raise HostPreparationError('Invalid updater recovery context')
     _same_lock(supervisor, state_fd, 'host.lock', host_lock)
-    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600)
+    fd = supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600, path_only=True)
     try:
         named=os.stat(db.execute('PRAGMA database_list').fetchone()[2],follow_symlinks=False);opened=os.fstat(fd)
         if (named.st_dev,named.st_ino)!=(opened.st_dev,opened.st_ino):
@@ -319,7 +319,7 @@ def prepare_recovery_snapshot(db, operation_id, image_digest, *, state_fd, insta
         _same_lock(supervisor,state_fd,'host.lock',host_lock)
         _same_lock(supervisor,state_fd,'service.lock',service_lock)
         _same_lock(supervisor,install_fd,'install.lock',install_lock)
-        fd=supervisor._open_root_file(state_fd,'journal.sqlite',0o600)
+        fd=supervisor._open_root_file(state_fd, 'journal.sqlite', 0o600, path_only=True)
         try:
             named=os.stat(db.execute('PRAGMA database_list').fetchone()[2],follow_symlinks=False);opened=os.fstat(fd)
             if (named.st_dev,named.st_ino)!=(opened.st_dev,opened.st_ino):raise HostPreparationError('The journal identity differs')
@@ -503,7 +503,7 @@ def prepare_completed(db, operation_id, *, state_dir, install_dir, gate_dir,
         journal_path = os.path.join(state_dir, 'journal.sqlite')
         if not database or os.path.realpath(database[2]) != os.path.realpath(journal_path):
             raise HostPreparationError('The journal identity differs')
-        fd = supervisor._open_root_file(state, 'journal.sqlite', 0o600)
+        fd = supervisor._open_root_file(state, 'journal.sqlite', 0o600, path_only=True)
         os.close(fd)
         maintenance = supervisor._trusted_directory(os.path.join(state_dir, 'maintenance'), 0o700)
         try:

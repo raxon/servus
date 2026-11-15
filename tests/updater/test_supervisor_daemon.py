@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import socket
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,6 +26,34 @@ spec.loader.exec_module(daemon)
 
 @unittest.skipUnless(sys.platform == 'linux' and os.geteuid() == 0, 'Requires isolated Linux root')
 class DaemonTest(unittest.TestCase):
+    def test_journal_validation_preserves_live_sqlite_wal_locks(self):
+        with tempfile.TemporaryDirectory(dir='/root') as temporary:
+            path=Path(temporary)/'journal.sqlite'
+            initial=sqlite3.connect(path);initial.execute('PRAGMA journal_mode=WAL')
+            initial.execute('CREATE TABLE fixture(value)');initial.commit();initial.close();path.chmod(0o600)
+            script=('import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); '
+                    'db.execute("SELECT * FROM fixture").fetchall(); '
+                    'print("ready",flush=True); sys.stdin.readline(); db.close()')
+            peer=subprocess.Popen([sys.executable,'-I','-c',script,str(path)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+            db=None
+            try:
+                self.assertEqual(peer.stdout.readline().strip(),'ready')
+                db=sqlite3.connect(path,isolation_level=None);db.execute('SELECT * FROM fixture').fetchall()
+                daemon._private_journal(str(path),64*1024*1024)
+                directory=supervisor._trusted_directory(temporary,0o700)
+                try:
+                    fd=supervisor._open_root_file(directory,'journal.sqlite',0o600,path_only=True)
+                    os.close(fd)
+                finally:os.close(directory)
+                peer.stdin.write('stop\n');peer.stdin.flush();peer.wait(timeout=10)
+                db.execute('INSERT INTO fixture VALUES(1)')
+                with sqlite3.connect('file:'+str(path)+'?mode=ro',uri=True) as reader:
+                    self.assertEqual(reader.execute('SELECT COUNT(*) FROM fixture').fetchone(),(1,))
+            finally:
+                if db is not None:db.close()
+                if peer.poll() is None:peer.kill();peer.wait()
+                peer.stdin.close();peer.stdout.close()
+
     def test_host_apply_requires_protected_config_and_pinned_node(self):
         with tempfile.TemporaryDirectory(dir='/root') as temporary:
             root = Path(temporary)
