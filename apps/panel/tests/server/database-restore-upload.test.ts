@@ -89,6 +89,14 @@ it('reports an uncertain result without retrying the commit',async()=>{
   expect(requestAgent).toHaveBeenCalledTimes(1);
 });
 
+it('reports a rejected archive after the candidate was safely removed',async()=>{
+  const requestAgent=vi.fn(async()=>{throw new AgentRequestError('private detail','definitive',422,'RESTORE_IMPORT_FAILED');});
+  const {app,headers,path}=await fixture(requestAgent as never);
+  const response=await app.inject({method:'POST',url:`${path}/prepare`,headers,payload:{}});
+  expect(response.statusCode).toBe(422);expect(response.json().error.code).toBe('RESTORE_IMPORT_FAILED');
+  expect(response.body).not.toContain('private detail');
+});
+
 it('streams archives larger than the JSON body limit',async()=>{
   const {app,headers,path}=await fixture(),payload=Buffer.alloc(1024*1024,7);
   const response=await app.inject({method:'POST',url:`${path}/upload`,headers:{...headers,'content-type':'application/octet-stream'},payload});

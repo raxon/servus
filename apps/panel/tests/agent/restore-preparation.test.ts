@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { RestoreJournal } from '../../src/agent/restore-journal.js';
 import { prepareRestoreCandidate } from '../../src/agent/restore-preparation.js';
+import { DatabaseImportError } from '../../src/agent/database-import.js';
 
 const databases: Database.Database[] = [];
 afterEach(() => { for (const db of databases.splice(0)) db.close(); });
@@ -51,6 +52,14 @@ it('keeps a failed or interrupted candidate fenced for review', async () => {
   await expect(prepareRestoreCandidate({ journal, operationId, serviceId, target, importCandidate })).rejects.toThrow('synthetic import failure');
   expect(journal.get(operationId)?.phase).toBe('needs_review'); expect(journal.hasUnresolved(serviceId)).toBe(true);
   await expect(prepareRestoreCandidate({ journal, operationId, serviceId, target, importCandidate })).rejects.toThrow('reserved');
+});
+
+it('fences a failed import for candidate cleanup without touching the source', async () => {
+  const {journal,operationId,serviceId,target}=fixture();
+  const importCandidate=vi.fn(async()=>{throw new DatabaseImportError('invalid archive',true);});
+  await expect(prepareRestoreCandidate({journal,operationId,serviceId,target,importCandidate})).rejects.toThrow('invalid archive');
+  expect(journal.get(operationId)?.phase).toBe('discarding_candidate');
+  expect(journal.hasUnresolved(serviceId)).toBe(true);
 });
 
 it('does not report success if recording the prepared state fails', async () => {

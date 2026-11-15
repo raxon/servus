@@ -357,6 +357,7 @@ export async function createApp(options: AppOptions) {
         store.recordAudit(auth.user.id,`database.restore.${action}.${parsed.data.phase}`,service.id);
         return parsed.data;
       } catch(error) {
+        if(error instanceof AgentRequestError && error.certainty==='definitive' && error.code==='RESTORE_IMPORT_FAILED')throw new AppError('RESTORE_IMPORT_FAILED','The export could not be imported. The current database was not changed.',422);
         if(error instanceof AgentRequestError && error.certainty==='definitive' && error.statusCode===409)throw new AppError('RESTORE_BUSY','The restore cannot continue in its current state',409);
         if(error instanceof AgentRequestError && error.certainty==='uncertain')throw new AppError('RESTORE_UNCERTAIN','The restore outcome is unknown. Check the operation status.',503);
         throw error;

@@ -1,4 +1,4 @@
-import type { importDatabaseCandidate } from './database-import.js';
+import { DatabaseImportError, type importDatabaseCandidate } from './database-import.js';
 import type { RestoreJournal, RestoreRecord } from './restore-journal.js';
 
 type CandidateInput = Parameters<typeof importDatabaseCandidate>[0];
@@ -16,10 +16,15 @@ export async function prepareRestoreCandidate(options: {
   options.journal.advance(record.id, 'reserved', 'importing');
   try {
     const target = options.target ?? await options.allocateTarget!();
-    await options.importCandidate({ ...target, operationId: record.id, kind: record.kind as 'postgres' | 'mariadb', archiveSha256: record.archive_sha256 });
+    try {
+      await options.importCandidate({ ...target, operationId: record.id, kind: record.kind as 'postgres' | 'mariadb', archiveSha256: record.archive_sha256 });
+    } catch(error) {
+      if(error instanceof DatabaseImportError)options.journal.advance(record.id,'importing','discarding_candidate');
+      throw error;
+    }
     return options.journal.advance(record.id, 'importing', 'prepared');
   } catch (error) {
-    try { options.journal.advance(record.id, 'importing', 'needs_review'); } catch { /* The unresolved journal still fences this service. */ }
+    try { if(options.journal.get(record.id)?.phase==='importing')options.journal.advance(record.id, 'importing', 'needs_review'); } catch { /* The unresolved journal still fences this service. */ }
     throw error;
   }
 }

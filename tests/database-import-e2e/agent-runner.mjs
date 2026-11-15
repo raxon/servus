@@ -46,6 +46,20 @@ const headers = {authorization:`Bearer ${token}`};
 const path = `/services/${serviceId}/database-restore/${operationId}`;
 let switchDb, switchPlan, switchOptions, recordedInspection, bindingCompleted=false;
 try {
+  if(process.env.SERVUS_SWITCH_BINDING==='1'){
+    const badId=randomBytes(16).toString('hex'),badPath=`/api/v1/services/${serviceId}/database-restore/${badId}`;
+    const bad=await panel.inject({method:'POST',url:`${badPath}/upload`,headers:{...panelHeaders,'content-type':'application/octet-stream'},payload:Buffer.from(kind==='postgres'?'invalid archive':'INVALID SQL;')});
+    if(bad.statusCode!==200)throw new Error('Invalid fixture upload failed');
+    const rejected=await panel.inject({method:'POST',url:`${badPath}/prepare`,headers:panelHeaders,payload:{}});
+    if(rejected.statusCode!==422||rejected.json().error?.code!=='RESTORE_IMPORT_FAILED')throw new Error(`Invalid export was not safely rejected: ${rejected.statusCode} ${JSON.stringify(rejected.json())}`);
+    const after=await panel.inject({method:'GET',url:badPath,headers:panelHeaders});
+    if(after.statusCode!==200||after.json().phase!=='cancelled')throw new Error('Failed import remains fenced');
+    for(const resource of [docker.getContainer(`panel-restore-${badId}`),docker.getVolume(`panel-restore-${badId}`)]){
+      try{await resource.inspect();throw new Error('Failed import resource was retained');}catch(error){if(error.statusCode!==404)throw error;}
+    }
+    const sql=kind==='postgres'?'PGPASSWORD="$(cat /run/secrets/panel-db-password)" psql -X -h 127.0.0.1 -U fixture -d fixture -tA -c "SELECT count(*) FROM items"':'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" mariadb -h 127.0.0.1 -u fixture fixture -N -e "SELECT count(*) FROM items"';
+    if(execFileSync('docker',['exec',sourceContainerId,'sh','-c',sql],{encoding:'utf8',env:{...process.env,PATH:`${process.env.PATH}:/usr/local/bin`}}).trim()!=='2')throw new Error('Failed import changed the source database');
+  }
   const upload = await panel.inject({method:'POST',url:`${panelPath}/upload`,headers:{...panelHeaders,'content-type':'application/octet-stream'},payload:readFileSync('/fixture-data')});
   if (upload.statusCode !== 200 || upload.json().phase !== 'reserved') throw new Error(`Upload failed: ${upload.statusCode}`);
   const prepared = await panel.inject({method:'POST',url:`${panelPath}/prepare`,headers:panelHeaders,payload:{}});

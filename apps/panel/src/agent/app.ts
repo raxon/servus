@@ -19,7 +19,7 @@ import { cancelPreparedRestore } from './restore-candidate-cancel.js';
 import { loadRestoreSource } from './restore-source.js';
 import { prepareRestoreCandidate } from './restore-preparation.js';
 import { createRestoreCandidate } from './restore-candidate.js';
-import { importDatabaseCandidate } from './database-import.js';
+import { DatabaseImportError, importDatabaseCandidate } from './database-import.js';
 import { readRestoreArchive } from './restore-archive.js';
 import { inspectRestoreSwitch } from './restore-switch-inspect.js';
 import { commitPreparedRestore, RestoreCommitUncertainError } from './restore-commit.js';
@@ -193,6 +193,13 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
           return {containerId:candidate.containerId,dockerSocket:config.dockerSocket,database:source.database,user:source.user,input:()=>readRestoreArchive({dataDir:config.dataDir,operationId:record.id,key:vault.restoreArchiveKey(record.id)})};
         }});
       return {operationId:result.id,phase:result.phase};
+    } catch(error) {
+      if(error instanceof DatabaseImportError && restores.get(record.id)?.phase==='discarding_candidate') {
+        try { await cancelPreparedRestore({journal:restores,docker:new Docker({socketPath:config.dockerSocket}),dataDir:config.dataDir,serviceId:req.params.id,operationId:record.id}); }
+        catch(cause) { throw new RestoreCommitUncertainError('Restore candidate cleanup requires recovery.',{cause}); }
+        return reply.code(422).send({error:{code:'RESTORE_IMPORT_FAILED',message:'The export could not be imported. The current database was not changed.'}});
+      }
+      throw error;
     } finally { cancellingRestores.delete(record.id);release?.(); }
   });
   app.post<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/commit', async (req,reply) => {

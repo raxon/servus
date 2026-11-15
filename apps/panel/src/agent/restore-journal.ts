@@ -15,7 +15,7 @@ const transitions: Record<RestorePhase, readonly RestorePhase[]> = {
   reserved: ['importing', 'discarding', 'needs_review'],
   discarding: ['cancelled', 'needs_review'],
   discarding_candidate: ['cancelled'],
-  importing: ['prepared', 'needs_review'],
+  importing: ['prepared', 'discarding_candidate', 'needs_review'],
   prepared: ['discarding_candidate', 'needs_review'],
   switching: ['needs_review'],
   needs_review: [], completed: [], cancelled: [],

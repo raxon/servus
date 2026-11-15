@@ -5,14 +5,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 
-const mocks=vi.hoisted(()=>({allocate:vi.fn(),importCandidate:vi.fn(),commit:vi.fn()}));
+const mocks=vi.hoisted(()=>({allocate:vi.fn(),importCandidate:vi.fn(),commit:vi.fn(),cancel:vi.fn()}));
 vi.mock('../../src/agent/restore-candidate.js',()=>({createRestoreCandidate:mocks.allocate}));
-vi.mock('../../src/agent/database-import.js',()=>({importDatabaseCandidate:mocks.importCandidate}));
+vi.mock('../../src/agent/database-import.js',async importOriginal=>({...await importOriginal<typeof import('../../src/agent/database-import.js')>(),importDatabaseCandidate:mocks.importCandidate}));
 vi.mock('../../src/agent/restore-commit.js',()=>({commitPreparedRestore:mocks.commit,RestoreCommitUncertainError:class extends Error{}}));
+vi.mock('../../src/agent/restore-candidate-cancel.js',()=>({cancelPreparedRestore:mocks.cancel}));
 import { createAgent } from '../../src/agent/app.js';
 import { createApp } from '../../src/server/app.js';
 import { Store } from '../../src/server/store.js';
 import { RestoreCommitUncertainError } from '../../src/agent/restore-commit.js';
+import { DatabaseImportError } from '../../src/agent/database-import.js';
 
 const cleanup:(()=>Promise<void>)[]=[];
 afterEach(async()=>{for(const remove of cleanup.splice(0).reverse())await remove();vi.resetAllMocks();});
@@ -55,6 +57,23 @@ it('fences failed candidate allocation for review',async()=>{
   const f=await fixture(); mocks.allocate.mockRejectedValue(new Error('synthetic failure'));
   expect((await f.agent.inject({method:'POST',url:`${f.path}/prepare`,headers:f.auth,payload:{}})).statusCode).toBe(422);
   expect((await f.agent.inject({method:'GET',url:f.path,headers:f.auth})).json().phase).toBe('needs_review');
+});
+
+it('cleans a definitively failed import and keeps the current database unchanged',async()=>{
+  const f=await fixture();mocks.allocate.mockResolvedValue({containerId:'d'.repeat(64),volumeName:`panel-restore-${f.operationId}`});
+  mocks.importCandidate.mockRejectedValue(new DatabaseImportError('private detail',true));
+  mocks.cancel.mockImplementation(async opts=>{expect(opts.journal.get(f.operationId).phase).toBe('discarding_candidate');return opts.journal.advance(f.operationId,'discarding_candidate','cancelled');});
+  const response=await f.agent.inject({method:'POST',url:`${f.path}/prepare`,headers:f.auth,payload:{}});
+  expect(response.statusCode).toBe(422);expect(response.json().error.code).toBe('RESTORE_IMPORT_FAILED');expect(response.body).not.toContain('private detail');
+  expect((await f.agent.inject({method:'GET',url:f.path,headers:f.auth})).json().phase).toBe('cancelled');
+});
+
+it('keeps the cleanup fenced when removal is uncertain',async()=>{
+  const f=await fixture();mocks.allocate.mockResolvedValue({containerId:'d'.repeat(64),volumeName:`panel-restore-${f.operationId}`});
+  mocks.importCandidate.mockRejectedValue(new DatabaseImportError('invalid archive',true));mocks.cancel.mockRejectedValue(new Error('private cleanup detail'));
+  const response=await f.agent.inject({method:'POST',url:`${f.path}/prepare`,headers:f.auth,payload:{}});
+  expect(response.statusCode).toBe(503);expect(response.json().error.code).toBe('RESTORE_UNCERTAIN');expect(response.body).not.toContain('private cleanup detail');
+  expect((await f.agent.inject({method:'GET',url:f.path,headers:f.auth})).json().phase).toBe('discarding_candidate');
 });
 
 it('requires authentication and serializes commit and cancellation for the same operation',async()=>{

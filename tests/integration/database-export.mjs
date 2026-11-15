@@ -33,7 +33,7 @@ try {
   browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});
   for(const viewport of [{width:1280,height:900},{width:375,height:850}]){
     const page=await browser.newPage({viewport,acceptDownloads:true});
-    let operation=null,commits=0,uploads=0;
+    let operation=null,commits=0,uploads=0,badUpload=false;
     await page.route(`**/api/v1/services/${service.id}/database-restore**`,async route=>{
       const request=route.request(),path=new URL(request.url()).pathname;
       assert(request.headers()['x-csrf-token']);
@@ -41,11 +41,14 @@ try {
       const operationId=path.split('/').at(-2);
       if(path.endsWith('/upload')){
         uploads++;assert.equal(request.headers()['content-type'],'application/octet-stream');
-        assert.equal(request.postDataBuffer().toString(),'fixture-export');
+        const contents=request.postDataBuffer().toString();assert(['fixture-export','bad-export'].includes(contents));badUpload=contents==='bad-export';
         operation={operationId,kind:'postgres',phase:'reserved'};
         return route.fulfill({json:{operationId,phase:'reserved'}});
       }
-      if(path.endsWith('/prepare')){operation.phase='prepared';return route.fulfill({json:{operationId,phase:'prepared'}});}
+      if(path.endsWith('/prepare')){
+        if(badUpload){operation.phase='cancelled';return route.fulfill({status:422,json:{error:{code:'RESTORE_IMPORT_FAILED',message:'The export could not be imported. The current database was not changed.'}}});}
+        operation.phase='prepared';return route.fulfill({json:{operationId,phase:'prepared'}});
+      }
       if(path.endsWith('/commit')){
         commits++;assert.deepEqual(request.postDataJSON(),{confirm:true});operation.phase='completed';
         if(viewport.width===375)return route.fulfill({status:503,json:{error:{code:'RESTORE_UNCERTAIN',message:'The restore outcome is unknown. Check the operation status.'}}});
@@ -81,6 +84,12 @@ try {
     await dialog.getByText('The database was restored.').waitFor();
     if(viewport.width===375)await dialog.getByText('The restore outcome is unknown. Check the operation status.').waitFor();
     assert.equal(uploads,1);assert.equal(commits,1);
+    await dialog.getByLabel('Export file').setInputFiles({name:'bad.dump',mimeType:'application/octet-stream',buffer:Buffer.from('bad-export')});
+    await dialog.getByRole('button',{name:'Upload export'}).click();
+    await dialog.getByRole('button',{name:'Prepare restore'}).click();
+    await dialog.getByText('The export could not be imported. The current database was not changed.').waitFor();
+    await dialog.getByText('The restore was cancelled.').waitFor();
+    assert.equal(uploads,2);assert.equal(commits,1);
     await dialog.getByRole('button',{name:'Close dialog'}).click();
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
     if(viewport.width===1280)await page.screenshot({path:'/tmp/servus-database-export-ui.png'});

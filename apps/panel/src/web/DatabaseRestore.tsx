@@ -80,7 +80,11 @@ function RestoreDialog({ service, onClose }: { service: Service; onClose: () => 
           <button className="button button-danger" type="button" disabled={busy || !confirmed} onClick={() => action.mutate({type:"commit",operationId:operation!.operationId})}>{busy ? <FeatureLoading label="Restoring" /> : phase === "prepared" ? "Restore database" : "Resume restore"}</button>
         </>}
         {(phase === "reserved" || phase === "prepared") && <button className="button" type="button" disabled={busy} onClick={() => action.mutate({type:"cancel",operationId:operation!.operationId})}>Cancel restore</button>}
-        {phase && ["uploading", "importing", "discarding", "discarding_candidate"].includes(phase) && <FeatureLoading label="Restore in progress" />}
+        {phase && ["uploading", "importing", "discarding"].includes(phase) && <FeatureLoading label="Restore in progress" />}
+        {phase === "discarding_candidate" && <>
+          <p role="status">The temporary database is being removed. If cleanup was interrupted, try again.</p>
+          <button className="button" type="button" disabled={busy} onClick={() => action.mutate({type:"cancel",operationId:operation!.operationId})}>Finish cleanup</button>
+        </>}
         {phase === "needs_review" && <p role="alert">This restore needs attention before another operation can start. Check the server logs.</p>}
       </> : <button className="button" type="button" onClick={() => void status.refetch()}>Check status again</button>}
     </div>
