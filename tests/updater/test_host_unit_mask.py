@@ -30,7 +30,13 @@ class HostUnitMaskTest(unittest.TestCase):
         return dict(state=self.base.s,install=self.base.i,units=self.fd,service_lock=self.base.sl,
                     install_lock=self.base.il,supervisor=fixtures.supervisor,coordinator=fixtures.coordinator)
 
-    def apply(self):mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,self.states,**self.args())
+    def execute(self, unit):
+        state=self.states[unit]
+        sub='dead' if state=='inactive' else ('exited' if unit=='servus-updater-socket.service' else 'running')
+        file_state='static' if unit=='servus-updater-bootstrap.service' else 'enabled'
+        return f'LoadState=loaded\nActiveState={state}\nSubState={sub}\nUnitFileState={file_state}\n'
+
+    def apply(self):mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,execute=self.execute,**self.args())
     def restore(self):mask.restore_units(self.base.db,self.base.op,self.base.digest,self.originals,self.states,**self.args())
     def phase(self):return self.base.db.execute('select phase from host_unit_masks').fetchone()[0]
     def assert_originals(self):
@@ -59,12 +65,26 @@ class HostUnitMaskTest(unittest.TestCase):
         for name in mask.UNITS:self.assertEqual(os.readlink(self.units/name),'/dev/null')
 
     def test_rejects_invalid_or_active_bootstrap_before_masking(self):
-        for states in ({**self.states, 'servus-updater-bootstrap.service':'active'},
-                       {**self.states, 'servus-updater.service':'activating'},
-                       {name:'active' for name in mask.UNITS[:-1]}):
-            with self.subTest(states=states), self.assertRaises(mask.UnitMaskError):
-                mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,states,**self.args())
+        for name,state in (('servus-updater-bootstrap.service','active'),
+                           ('servus-updater.service','activating')):
+            with self.subTest(name=name), self.assertRaises(mask.UnitMaskError):
+                previous=self.states[name];self.states[name]=state
+                try:self.apply()
+                finally:self.states[name]=previous
             self.assert_originals()
+
+    def test_changed_service_state_aborts_before_masking(self):
+        calls=0
+        def changing(unit):
+            nonlocal calls
+            calls+=1
+            if calls > len(mask.UNITS) and unit=='servus-updater.service':
+                return 'LoadState=loaded\nActiveState=inactive\nSubState=dead\nUnitFileState=enabled\n'
+            return self.execute(unit)
+        with self.assertRaises(mask.UnitMaskError):
+            mask.mask_units(self.base.db,self.base.op,self.base.digest,self.originals,execute=changing,**self.args())
+        self.assertEqual(self.phase(),'backed_up');self.assert_originals()
+        mask.restore_from_journal(self.base.db,self.base.op,self.base.digest,**self.args())
 
     def test_changed_unit_rejected_before_journal_or_mask(self):
         (self.units/mask.UNITS[0]).write_bytes(b'changed')
@@ -130,7 +150,10 @@ def crash(*args):
  if count==2:os._exit(73)
 mask._replace_with_mask=crash
 states={name:("inactive" if name=="servus-updater-bootstrap.service" else "active") for name in mask.UNITS}
-mask.mask_units(db,op,digest,originals,states,state=state,install=install,units=units,service_lock=sl,install_lock=il,supervisor=supervisor,coordinator=coordinator);os._exit(99)
+def execute(unit):
+ state=states[unit];sub="dead" if state=="inactive" else "running";file_state="static" if unit=="servus-updater-bootstrap.service" else "enabled"
+ return "LoadState=loaded\\nActiveState="+state+"\\nSubState="+sub+"\\nUnitFileState="+file_state+"\\n"
+mask.mask_units(db,op,digest,originals,execute=execute,state=state,install=install,units=units,service_lock=sl,install_lock=il,supervisor=supervisor,coordinator=coordinator);os._exit(99)
 '''
         try:
             result=subprocess.run([sys.executable,'-I','-c',script,str(self.base.root),str(ROOT/'apps/updater')],check=False)

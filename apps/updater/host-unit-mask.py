@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 import sys
 
 UNITS = ('servus-updater.service', 'servus-supervisor.service',
@@ -39,6 +40,41 @@ def _guard(db, state, install, service_lock, install_lock, supervisor, coordinat
             raise UnitMaskError('The journal identity differs')
     finally: os.close(fd)
 
+
+
+def _systemctl(unit):
+    try:
+        result = subprocess.run(['/usr/bin/systemctl', 'show', unit, '--property=LoadState',
+                                 '--property=ActiveState', '--property=SubState', '--property=UnitFileState'],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                cwd='/', env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C'},
+                                timeout=10, check=True)
+        if len(result.stdout) > 16384:
+            raise UnitMaskError('Systemd unit state is too large')
+        return result.stdout.decode('utf-8', 'strict')
+    except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+        raise UnitMaskError('Systemd unit state is unavailable') from error
+
+
+def capture_service_states(*, execute=_systemctl):
+    """Read stable unit states before masking; never restart the bootstrap unit."""
+    states = {}
+    for unit in UNITS:
+        properties = {}
+        for line in execute(unit).splitlines():
+            key, separator, value = line.partition('=')
+            if not separator or key in properties:
+                raise UnitMaskError('Systemd unit state is invalid')
+            properties[key] = value
+        if (set(properties) != {'LoadState', 'ActiveState', 'SubState', 'UnitFileState'} or
+            properties['LoadState'] != 'loaded' or
+            properties['UnitFileState'] not in ('enabled', 'static') or
+            (properties['ActiveState'], properties['SubState']) not in
+            (('active', 'running'), ('active', 'exited'), ('inactive', 'dead')) or
+            (unit == 'servus-updater-bootstrap.service' and properties['ActiveState'] != 'inactive')):
+            raise UnitMaskError('A host unit is not in a stable, unmasked state')
+        states[unit] = properties['ActiveState']
+    return states
 
 def _metadata(operation_id, image_digest, originals, service_states):
     if (not isinstance(operation_id, str) or not OPERATION.fullmatch(operation_id) or
@@ -209,11 +245,12 @@ def _replace_with_original(parent, unit, content):
         except FileNotFoundError: pass
 
 
-def mask_units(db, operation_id, image_digest, originals, service_states, *, state, install, units,
-               service_lock, install_lock, supervisor, coordinator):
+def mask_units(db, operation_id, image_digest, originals, *, state, install, units,
+               service_lock, install_lock, supervisor, coordinator, execute=_systemctl):
     """Back up expected files, then install persistent masks under journal intent."""
     _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
     _directory(state, 0o700); _directory(install, 0o700); _directory(units, 0o755)
+    service_states = capture_service_states(execute=execute)
     metadata = _metadata(operation_id, image_digest, originals, service_states)
     row = db.execute('SELECT image_digest,generation,status FROM host_preparations WHERE operation_id=?', (operation_id,)).fetchone()
     if row != (image_digest, 'runtime-' + operation_id, 'prepared'): raise UnitMaskError('Prepared host generation is unavailable')
@@ -235,6 +272,8 @@ def mask_units(db, operation_id, image_digest, originals, service_states, *, sta
         raise UnitMaskError('Unit mask journal changed')
     _guard(db, state, install, service_lock, install_lock, supervisor, coordinator)
     for unit in UNITS: _read(units, unit, 0o644, originals[unit])
+    if capture_service_states(execute=execute) != service_states:
+        raise UnitMaskError('Host unit states changed before masking')
     if db.execute("UPDATE host_unit_masks SET phase='masking' WHERE operation_id=? AND phase='backed_up' AND backup_digest=?", (operation_id, digest)).rowcount != 1:
         raise UnitMaskError('Unit mask journal changed')
     for unit in UNITS:
