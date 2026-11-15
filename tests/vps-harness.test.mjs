@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
-import { parseArgs, readCredentials, runHarness, probeIngress, terminal, wordpressRequest } from '../scripts/test-vps.mjs';
+import { parseArgs, readCredentials, runHarness, probeIngress, terminal, wordpressRequest, verifyDatabaseExport } from '../scripts/test-vps.mjs';
 
 const args=['--confirm-vps-test','--url','http://localhost:4180','--credentials','/tmp/file','--ingress-url','http://127.0.0.1:18080'];
 test('requires consent, explicit URL, credentials and loopback ingress', () => {
@@ -46,6 +46,29 @@ test('credentials require a regular owned file with exactly mode 0600', () => {
     const getuid=process.getuid;try {process.getuid=()=>getuid()+1;assert.throws(()=>readCredentials(path),/owned by the current user/);} finally {process.getuid=getuid;}
     writeFileSync(path,'not-json synthetic-secret');assert.throws(()=>readCredentials(path),error=>error.message==='Credentials file is not valid JSON');
   } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('database export verification rejects redirected, invalid, oversized and reusable downloads',async()=>{
+  const serviceId='33333333-3333-4333-8333-333333333333',base='https://panel.example.test',path=`/api/v1/services/${serviceId}/database-export/download`;
+  const args={base,serviceId,kind:'redis',cookie:'panel_session=secret-session',csrf:'secret-csrf',timeoutMs:5000};
+  const run=async({downloadUrl=path,body='REDIS0009fixture',replayStatus=404,ticket='a'.repeat(64)}={})=>{
+    const calls=[];
+    const fetcher=async(url,options)=>{
+      calls.push({url:String(url),options});
+      if(calls.length===1)return new Response(JSON.stringify({downloadUrl}),{headers:{'set-cookie':`panel_export=${ticket}; HttpOnly`}});
+      if(calls.length===2)return new Response(body);
+      return new Response(null,{status:replayStatus});
+    };
+    await verifyDatabaseExport({...args,fetcher});
+    assert.equal(calls.length,3);assert(calls.every(call=>new URL(call.url).origin===base));
+    assert.equal(calls[1].options.redirect,'error');assert.match(calls[1].options.headers.cookie,/^panel_session=secret-session; panel_export=/);
+  };
+  await run();
+  await assert.rejects(run({downloadUrl:'https://attacker.example/download'}),/ticket is invalid/);
+  await assert.rejects(run({ticket:'malicious'}),/ticket is invalid/);
+  await assert.rejects(run({body:'not-a-redis-backup'}),/content is invalid/);
+  await assert.rejects(run({body:'x'.repeat(1024*1024+1)}),/too large/);
+  await assert.rejects(run({replayStatus:200}),/ticket was reused/);
 });
 
 test('WordPress fixture installs, authenticates and checks persisted post and media after both restarts',async()=>{
@@ -105,7 +128,7 @@ test('WordPress installation failure removes only fixture services and does not 
 });
 function fakeApi({ failAction=false, badService=false, unrelatedService=false, incorrectNginx=false, oversizedNginx=false, incorrectMarker=false, databaseHasRoute=false, ingressStatuses=[] }={}) {
   const projectId='11111111-1111-4111-8111-111111111111', nginx='22222222-2222-4222-8222-222222222222', redis='33333333-3333-4333-8333-333333333333', postgres='44444444-4444-4444-8444-444444444444', mariadb='55555555-5555-4555-8555-555555555555';
-  const actionId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', requests=[],services=new Map();let projectName='';
+  const actionId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', requests=[],services=new Map(),tickets=new Set();let projectName='';
   const response=(value,status=200,headers={})=>new Response(JSON.stringify(value),{status,headers:{'content-type':'application/json',...headers}});
   const fetcher=async(url,options={})=>{
     const u=new URL(url),method=options.method??'GET',body=options.body?JSON.parse(options.body):undefined;
@@ -134,6 +157,12 @@ function fakeApi({ failAction=false, badService=false, unrelatedService=false, i
       if(path===`/services/${id}`&&method==='DELETE'){services.delete(id);return response({id:actionId});}
       if(path===`/services/${id}/containers`)return response([{id:'a'.repeat(64),state:'running'}]);
       if(path===`/services/${id}/console-ticket`)return response({ticket:'b'.repeat(64)});
+      if(path===`/services/${id}/database-export`&&method==='POST'){tickets.add(id);return response({downloadUrl:`/api/v1${path}/download`},200,{'set-cookie':`panel_export=${'c'.repeat(64)}; Path=/; HttpOnly`});}
+      if(path===`/services/${id}/database-export/download`&&method==='GET'){
+        if(!tickets.delete(id))return response({error:'expired'},404);
+        const content=({redis:'REDIS0009fixture',postgres:'PGDMPfixture',mariadb:'CREATE TABLE servus_marker'})[services.get(id)?.kind];
+        return new Response(content,{status:200});
+      }
       if(path.startsWith(`/services/${id}/`)&&method==='POST')return response({id:actionId});
     }
     throw new Error('Unexpected mocked endpoint');
@@ -274,6 +303,10 @@ test('optional databases run one at a time with password checks and persistent m
   const create=kind=>mock.requests.findIndex(request=>request.method==='POST'&&request.body?.kind===kind);
   const stop=id=>mock.requests.findIndex(request=>request.path===`/api/v1/services/${id}/stop`);
   assert(stop(mock.redis)<create('postgres'));assert(stop(mock.postgres)<create('mariadb'));
+  for(const id of [mock.redis,mock.postgres,mock.mariadb]) {
+    assert.equal(mock.requests.filter(request=>request.path===`/api/v1/services/${id}/database-export`&&request.method==='POST').length,1);
+    assert.equal(mock.requests.filter(request=>request.path===`/api/v1/services/${id}/database-export/download`&&request.method==='GET').length,2);
+  }
   for(const [kind,id] of [['POSTGRES',mock.postgres],['MARIADB',mock.mariadb]]) {
     const messages=commands.filter(item=>item.serviceId===id);
     assert.equal(messages.length,4);

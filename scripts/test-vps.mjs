@@ -102,6 +102,32 @@ export function wordpressRequest({base,path,hostname,method='GET',headers={},bod
   });
 }
 
+// Check a bounded fixture export without recording credentials, tickets, or data.
+export async function verifyDatabaseExport({base,serviceId,kind,cookie,csrf,timeoutMs,fetcher=fetch}) {
+  requireId(serviceId);
+  if(!['redis','postgres','mariadb'].includes(kind))throw new Error('Invalid database fixture kind');
+  const root=`/api/v1/services/${serviceId}/database-export`, downloadPath=`${root}/download`;
+  const signal=AbortSignal.timeout(timeoutMs);
+  const prepared=await fetcher(new URL(root,base),{method:'POST',headers:{cookie,origin:base,'x-csrf-token':csrf,'content-type':'application/json'},body:'{}',redirect:'error',signal});
+  if(!prepared.ok)throw new Error(`${kind} export preparation failed (HTTP ${prepared.status})`);
+  const cookies=prepared.headers.getSetCookie?.() ?? [prepared.headers.get('set-cookie')||''];
+  const matches=cookies.map(value=>value.match(/^panel_export=([a-f0-9]{64})(?:;|$)/)).filter(Boolean);
+  const response=await prepared.json();
+  if(matches.length!==1 || response?.downloadUrl!==downloadPath)throw new Error(`${kind} export ticket is invalid`);
+  const headers={cookie:`${cookie}; panel_export=${matches[0][1]}`,origin:base};
+  const downloaded=await fetcher(new URL(downloadPath,base),{headers,redirect:'error',signal});
+  if(!downloaded.ok || !downloaded.body)throw new Error(`${kind} export download failed (HTTP ${downloaded.status})`);
+  const chunks=[];let size=0;const reader=downloaded.body.getReader();
+  try {
+    for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>1024*1024)throw new Error(`${kind} fixture export is too large`);chunks.push(value);}
+  } finally {await reader.cancel().catch(()=>{});}
+  const data=Buffer.concat(chunks),valid=kind==='postgres'?data.subarray(0,5).equals(Buffer.from('PGDMP')):kind==='redis'?data.subarray(0,5).equals(Buffer.from('REDIS')):data.includes(Buffer.from('servus_marker'));
+  if(data.length<10||!valid)throw new Error(`${kind} fixture export content is invalid`);
+  const replay=await fetcher(new URL(downloadPath,base),{headers,redirect:'error',signal});
+  if(replay.status!==404)throw new Error(`${kind} export ticket was reused`);
+  await replay.body?.cancel();
+}
+
 export async function terminal({ base, serviceId, ticket, cookie, command, marker, timeoutMs }) {
   const url=new URL(`/api/v1/services/${serviceId}/console`,base);url.protocol=url.protocol==='https:'?'wss:':'ws:';
   return new Promise((resolve,reject)=>{
@@ -211,6 +237,8 @@ export async function runHarness(options, credentials, overrides = {}) {
       await serviceCommand(redisId,`${cli} SET ${key} ${value} >/dev/null && printf '\\n${marker}\\n'`,marker);
       await action(redisId,'restart');
       await serviceCommand(redisId,`[ "$(${cli} GET ${key})" = '${value}' ] && printf '\\n${marker}\\n'`,marker);
+      remaining();await verifyDatabaseExport({base:options.url,serviceId:redisId,kind:'redis',cookie,csrf,timeoutMs:Math.min(deadline-Date.now(),180000),fetcher});
+      log('PASS Redis export and single-use download');
       await action(redisId,'stop');log('PASS Redis rejects missing and invalid credentials, accepts valid credentials and retains data after restart');
       log('Redis API exposes no HTTP domains; host-port isolation requires independent Docker inspection.');
     }
@@ -240,6 +268,8 @@ export async function runHarness(options, credentials, overrides = {}) {
         await action(id,'restart');
         await serviceCommand(id,`result=$(${valid} -e '${select}') && [ "$result" = '${value}' ] && printf '\\n${marker}\\n'`,marker);
       }
+      remaining();await verifyDatabaseExport({base:options.url,serviceId:id,kind,cookie,csrf,timeoutMs:Math.min(deadline-Date.now(),180000),fetcher});
+      log(`PASS ${kind} export and single-use download`);
       await action(id,'stop');log(`PASS ${kind} rejects missing and invalid credentials, accepts valid credentials and retains data after restart`);
       log(`${kind} API exposes no HTTP domains; host-port isolation requires independent Docker inspection.`);
     }
