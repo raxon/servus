@@ -183,7 +183,13 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       if(upload){upload.controller.abort();await upload.done;}
       else if(record.phase==='uploading'){
         let unlock:()=>void;
-        try{unlock=acquireRestoreUploadLock(config.dataDir,record.id,false,restores.uploadLockId(record.id));}
+        try{
+          const lockId=restores.uploadLockId(record.id);
+          // A legacy path alone is not bound to the journal entry: it may have
+          // been left by a different attempt before this upload began.
+          if(!lockId)throw new Error('Restore upload lock identity is unavailable.');
+          unlock=acquireRestoreUploadLock(config.dataDir,record.id,false,lockId);
+        }
         catch{return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'The interrupted upload requires recovery.'}});}
         try{
           const current=restores.get(record.id);

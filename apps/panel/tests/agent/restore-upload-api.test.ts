@@ -96,6 +96,18 @@ it('does not mistake an unregistered new-format lock for proof that a legacy wri
   } finally { db.close(); }
 });
 
+it('does not trust an unregistered legacy-format lock as proof that a legacy writer stopped',async()=>{
+  const {app,dataDir,serviceId,operationId}=await fixture();
+  const unlock=acquireRestoreUploadLock(dataDir,operationId,true);unlock();
+  const db=new Database(join(dataDir,'agent.sqlite'));
+  try {
+    db.prepare('INSERT INTO restore_operations VALUES(?,?,?,?,?,?)').run(operationId,serviceId,'postgres','0'.repeat(64),'uploading',new Date().toISOString());
+    const response=await app.inject({method:'POST',url:`/services/${serviceId}/database-restore/${operationId}/cancel`,headers:{authorization:'Bearer fixture-token'}});
+    expect(response.statusCode).toBe(409);
+    expect((db.prepare('SELECT phase FROM restore_operations WHERE id=?').get(operationId) as {phase:string}).phase).toBe('uploading');
+  } finally { db.close(); }
+});
+
 it('keeps an interrupted upload fenced if its recorded lock identity is malformed',async()=>{
   const {app,dataDir,serviceId,operationId}=await fixture();
   const db=new Database(join(dataDir,'agent.sqlite'));
