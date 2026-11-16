@@ -62,6 +62,7 @@ def recover(args):
         if info.st_uid != 0 or info.st_mode & 0o022 or path.is_symlink():
             raise RuntimeError('Recovery tools are not protected')
     sys.path.insert(0, '/usr/local/libexec/servus')
+    sys.path.insert(0, str(base))
     import supervisor as sup
     daemon = load('recovery_daemon', '/usr/local/libexec/servus/supervisor-daemon.py')
     journal = load('recovery_journal', base / 'reconcile-policy-journal.py')
@@ -121,7 +122,10 @@ def recover(args):
                 fence.assert_no_probe_resources(db, operation)
                 binding = daemon.resolve_active_policy(JOURNAL, ENV)
                 policy = binding[2]
-                identities = sup.inspect_servus(policy)
+                try:
+                    identities = sup.inspect_servus(policy)
+                except sup.SupervisorError:
+                    identities = sup.inspect_servus(policy, stopped=True)
                 ids = [identities[role]['id'] for role in sup.ROLES]
                 if daemon._private_file(str(marker_path), 4096) != raw:
                     raise RuntimeError('Maintenance evidence changed')

@@ -347,9 +347,9 @@ class RuntimePolicy:
         return set(entries)
 
 
-def inspect_servus(policy, *, created=False):
+def inspect_servus(policy, *, created=False, stopped=False):
     """Inspect exactly one approved running or never-started container per role."""
-    if not isinstance(policy, RuntimePolicy) or type(created) is not bool:
+    if not isinstance(policy, RuntimePolicy) or type(created) is not bool or type(stopped) is not bool or (created and stopped):
         raise SupervisorError('Verified runtime policy is required')
     _verify_data_directory(policy.data_dir)
     try:
@@ -380,6 +380,11 @@ def inspect_servus(policy, *, created=False):
                 state.get('Dead') is not False or type(pid) is not int or pid != 0 or
                 state.get('StartedAt') != '0001-01-01T00:00:00Z'):
                 raise SupervisorError('A candidate container has already started')
+        elif stopped:
+            if (state.get('Status') != 'exited' or state.get('Running') is not False or
+                state.get('Paused') is not False or state.get('Restarting') is not False or
+                state.get('Dead') is not False or type(pid) is not int or pid != 0):
+                raise SupervisorError('A previous container is not safely stopped')
         elif state.get('Running') is not True or type(pid) is not int or pid <= 1:
             raise SupervisorError('Unexpected Servus container set')
         expected_command = ['dist/' + ('server' if role == 'api' else role) + '/index.js']
@@ -411,7 +416,7 @@ def inspect_servus(policy, *, created=False):
             actual.append((mount.get('Type'), mount.get('Source'), mount.get('Destination'), mount['RW']))
         if len(actual) != len(policy.mounts_for(role)) or set(actual) != policy.mounts_for(role):
             raise SupervisorError('Servus runtime mounts are not trusted')
-        if created:
+        if created or stopped:
             output[role] = {'id': cid}
         else:
             cgroup = _cgroup(pid)

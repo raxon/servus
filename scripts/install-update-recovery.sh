@@ -5,7 +5,7 @@ set -eu
 source_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 target=/usr/local/libexec/servus-recovery
 install -d -m 0700 "$target"
-for name in recover-pre-switch.py reconcile-policy-journal.py reconcile-policy-fence.py; do
+for name in recover-pre-switch.py reconcile-policy-journal.py reconcile-policy-fence.py supervisor.py; do
   install -m 0600 "$source_root/apps/updater/$name" "$target/$name"
 done
 for name in servus-update-recovery.service servus-update-recovery.timer; do
