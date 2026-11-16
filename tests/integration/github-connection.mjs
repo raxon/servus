@@ -59,8 +59,9 @@ try {
     assert.equal(value.service.source.sharedGithub,true);
     assert.equal(value.service.source.credential.token,undefined);
     await page.getByRole('tab',{name:'Source',exact:true}).click();
-    await page.getByLabel('Use shared GitHub connection',{exact:false}).waitFor();
-    assert.equal(await page.getByLabel('Use shared GitHub connection',{exact:false}).isChecked(),true);
+    const sourceForm=page.getByRole('form',{name:'Application source'});
+    await sourceForm.getByText('GitHub connection configured',{exact:true}).waitFor();
+    assert.equal(await sourceForm.getByRole('radio',{name:'GitHub',exact:true}).isChecked(),true);
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   }
   await page.goto(`${origin}/settings`);

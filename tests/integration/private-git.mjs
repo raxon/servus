@@ -32,8 +32,12 @@ try {
   await dialog.getByRole('button',{name:'Create & deploy'}).click();const response=await created;assert.equal(response.status(),202);const value=await response.json();
   assert.equal(value.service.source.repository,'https://github.com/example/private.git');
   assert.equal(value.service.source.credential.username,'git-user');assert.equal(value.service.source.credential.token,undefined);assert.ok(value.service.source.credential.secretRef);
-  await page.getByRole('tab',{name:'Source',exact:true}).click();await page.getByLabel('Access token').waitFor();assert.equal(await page.getByLabel('Access token').inputValue(),'');
-  await page.getByLabel('Access token').fill('test-rotated-token');const saved=page.waitForResponse(response=>response.url().endsWith(`/services/${value.service.id}`)&&response.request().method()==='PATCH');
+  await page.getByRole('tab',{name:'Source',exact:true}).click();
+  const sourceForm=page.getByRole('form',{name:'Application source'});
+  await sourceForm.getByRole('radio',{name:'Git',exact:true}).locator('..').click();
+  const token=sourceForm.locator('input[name="git-token"]');
+  await token.waitFor();assert.equal(await token.inputValue(),'');
+  await token.fill('test-rotated-token');const saved=page.waitForResponse(response=>response.url().endsWith(`/services/${value.service.id}`)&&response.request().method()==='PATCH');
   await page.getByRole('button',{name:'Save configuration'}).click();const update=await saved;assert.equal(update.status(),200);const rotated=await update.json();assert.notEqual(rotated.source.credential.secretRef,value.service.source.credential.secretRef);assert.equal(rotated.source.credential.token,undefined);
   await page.waitForFunction(()=>document.documentElement.scrollWidth<=window.innerWidth);
   console.log('Private Git form created and rotated credentials on a disposable panel.');
