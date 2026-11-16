@@ -14,7 +14,7 @@ export class HttpsMigrationJournal {
   constructor(private readonly db:Database.Database, private readonly seal:(value:string)=>string, private readonly open:(value:string)=>string) {}
 
   load():IngressIntent|undefined {
-    const row=this.db.prepare('SELECT request_hash,state,previous_spec,target_spec,previous_recorded,operation_stage FROM operations WHERE id=?').get(ID) as Row|undefined;
+    const row=this.db.prepare('SELECT * FROM operations WHERE id=?').get(ID) as Row|undefined;
     if(!row)return undefined;
     if(row.request_hash!==HASH)throw new Error('Ingress migration journal identity conflict.');
     if(row.state==='succeeded')return undefined;

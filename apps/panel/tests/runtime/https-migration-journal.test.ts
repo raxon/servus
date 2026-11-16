@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SecretVault } from '../../src/shared/secrets.js';
-import { HttpsMigrationJournal } from '../../src/agent/https-migration-journal.js';
+import { HttpsMigrationJournal, HTTPS_MIGRATION_OPERATION_ID } from '../../src/agent/https-migration-journal.js';
 import { applyHttpsMigration, recoverHttpsMigration, type IngressMigrationDriver } from '../../src/agent/https-migration.js';
 
 const dirs:string[]=[];
@@ -22,6 +22,16 @@ const previous={Name:'panel-ingress',Labels:{owner:'private-value'}};
 const target={Name:'panel-ingress',Labels:{owner:'private-value',https:'enabled'}};
 
 describe('HTTPS ingress migration journal',()=>{
+  it('allows an empty legacy journal but rejects an unverifiable reserved entry',()=>{
+    const db=new Database(':memory:');
+    try {
+      db.exec('CREATE TABLE operations (id TEXT PRIMARY KEY,service_id TEXT,state TEXT)');
+      const journal=new HttpsMigrationJournal(db,value=>value,value=>value);
+      expect(journal.load()).toBeUndefined();
+      db.prepare('INSERT INTO operations(id,state) VALUES(?,?)').run(HTTPS_MIGRATION_OPERATION_ID,'running');
+      expect(()=>journal.load()).toThrow('identity conflict');
+    } finally {db.close();}
+  });
   it('persists encrypted intent across restarts and fences concurrent attempts',()=>{
     const {db,connect,journal}=setup();
     journal(db).begin(previous,target);
