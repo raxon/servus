@@ -247,7 +247,7 @@ class HostApply:
         policy_path,accepted_env,policy=resolve_active_policy(self.approval_journal,self.active_env)
         if policy!=hub.policy:raise supervisor.SupervisorError('Active recovery policy changed')
         binding=approved_policy_binding(hub,policy_path,self.approval_journal,accepted_env)
-        ingress=self._current_ingress(modules['provision-host'],modules['runtime-policy'])
+        ingress=self._current_ingress(modules['provision-host'],modules['runtime-policy'],hub.policy.data_dir)
         coordinator=modules['update-coordinator'];quiescence=modules['quiescence']
         coordinator.preflight_external_containers(hub,supervisor,quiescence,trusted_ingress=ingress)
         self.ownership.assert_held(control_dir)
@@ -257,9 +257,10 @@ class HostApply:
             return coordinator.start_cleaned_legacy_upload(operation_id,lease,self.ownership,self.approval_journal,self.active_env,
                                                             supervisor,daemon,quiescence,trusted_ingress=ingress)
 
-    def _current_ingress(self, provision, runtime):
+    def _current_ingress(self, provision, runtime, data_dir=None):
         """Resolve the pinned ingress identity immediately before maintenance."""
-        current = provision.trusted_ingress(self.config['dockerConfig'], runtime)
+        current = (provision.trusted_ingress(self.config['dockerConfig'], runtime) if data_dir is None else
+                   provision.trusted_ingress(self.config['dockerConfig'], runtime, data_dir=data_dir))
         previous = self.config['trustedIngress']
         if current is None:
             return None
@@ -278,7 +279,7 @@ class HostApply:
             os.close(state_fd)
             journal = modules['servus-updater'].Journal(state)
             daemon = SimpleNamespace(resolve_active_policy=resolve_active_policy, approved_policy_binding=approved_policy_binding)
-            ingress = self._current_ingress(modules['provision-host'], modules['runtime-policy'])
+            ingress = self._current_ingress(modules['provision-host'], modules['runtime-policy'], hub.policy.data_dir)
             def resolve_child(root, config):
                 verifier = modules['verify-release']
                 registry = verifier.Registry(time.monotonic() + verifier.TOTAL_SECONDS)

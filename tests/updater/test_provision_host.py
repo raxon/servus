@@ -183,7 +183,7 @@ class HostProvisioningTest(unittest.TestCase):
             path=secrets/role;path.write_text(digit*64+'\n');os.chown(path,0,1000);path.chmod(0o640)
         node=self.root/'node';node.write_bytes(b'test executable');node.chmod(0o755)
         policies=self.state/'policies';policy=str(policies/'policy.json');snapshot=str(policies/'env.env')
-        approved=SimpleNamespace(install_dir=str(install),gate_dir=str(gate),control_dir=str(control),
+        approved=SimpleNamespace(install_dir=str(install),gate_dir=str(gate),control_dir=str(control),data_dir=str(self.root/"data"),
                                  secret_sources={role:str(secrets/role) for role in supervisor.ROLES},updater_dir='/run/servus-updater/control')
         daemon=SimpleNamespace(resolve_active_policy=mock.Mock(return_value=(policy,snapshot,approved)))
         backup=SimpleNamespace(_verify_node=mock.Mock())
@@ -269,6 +269,40 @@ class HostProvisioningTest(unittest.TestCase):
             if change=='extra_mount': bad['Mounts'].append({'Source':'/tmp','Destination':'/etc/traefik','RW':False})
             runtime=SimpleNamespace(_docker=mock.Mock(side_effect=[(identifier+'\n').encode(),json.dumps([bad]).encode()]),_json=json.loads)
             with self.subTest(change=change), self.assertRaises(module.ProvisionError): module.trusted_ingress('/root/docker',runtime)
+
+    def test_managed_https_ingress_is_bound_to_owned_volume_and_approved_host_data(self):
+        identifier='a'*64;image=next(iter(module.TRUSTED_INGRESS_IMAGE_IDS))
+        args=list(module.TRUSTED_INGRESS_ARGS)+['--entrypoints.websecure.address=:8443',
+            '--certificatesresolvers.servus.acme.email=admin@example.test',
+            '--certificatesresolvers.servus.acme.storage=/letsencrypt/acme.json',
+            '--certificatesresolvers.servus.acme.httpchallenge.entrypoint=web',
+            '--providers.file.directory=/servus-host/dynamic','--providers.file.watch=true']
+        volume={'Name':'servus-acme','Driver':'local','Options':None,'Mountpoint':'/var/lib/docker/volumes/servus-acme/_data',
+                'Labels':{'panel.owner':'self-hosted-panel','panel.purpose':'acme'}}
+        entry={'Id':identifier,'Image':image,'State':{'Running':True},
+            'Config':{'Image':'traefik:3.7.13','Labels':{'com.docker.swarm.service.name':'panel-ingress'},
+                      'Entrypoint':['/entrypoint.sh'],'Cmd':args,'Env':['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'],'User':''},
+            'HostConfig':{'Privileged':False,'PidMode':'','CapAdd':None,'Devices':None,'DeviceRequests':None},
+            'Mounts':[{'Type':'bind','Source':'/var/run/docker.sock','Destination':'/var/run/docker.sock','RW':False},
+                      {'Type':'volume','Name':'servus-acme','Source':volume['Mountpoint'],'Destination':'/letsencrypt','RW':True},
+                      {'Type':'bind','Source':'/var/lib/servus/host-domain','Destination':'/servus-host','RW':False}]}
+        def check(item=entry,storage=volume,data='/var/lib/servus'):
+            runtime=SimpleNamespace(_docker=mock.Mock(side_effect=[(identifier+'\n').encode(),json.dumps([item]).encode(),json.dumps([storage]).encode()]),_json=json.loads)
+            return module.trusted_ingress('/root/docker',runtime,data_dir=data)
+        self.assertEqual(check(),[identifier,'panel-ingress','traefik:3.7.13',image])
+        staging=json.loads(json.dumps(entry));staging['Config']['Cmd'].insert(-2,'--certificatesresolvers.servus.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory')
+        self.assertEqual(check(staging),[identifier,'panel-ingress','traefik:3.7.13',image])
+        for change in ('writable_projection','wrong_projection','missing_approval','custom_provider','extra_argument','foreign_volume','remote_volume','volume_alias'):
+            bad=json.loads(json.dumps(entry));storage=json.loads(json.dumps(volume));data='/var/lib/servus'
+            if change=='writable_projection':bad['Mounts'][2]['RW']=True
+            if change=='wrong_projection':bad['Mounts'][2]['Source']='/var/lib/servus/secrets'
+            if change=='missing_approval':data=None
+            if change=='custom_provider':bad['Config']['Cmd'][-2]='--providers.file.directory=/other'
+            if change=='extra_argument':bad['Config']['Cmd'].append('--api.insecure=true')
+            if change=='foreign_volume':storage['Labels']['panel.owner']='other'
+            if change=='remote_volume':storage['Options']={'type':'nfs','device':'remote:/volume'}
+            if change=='volume_alias':bad['Mounts'][1]['Source']='/elsewhere'
+            with self.subTest(change=change),self.assertRaises(module.ProvisionError):check(bad,storage,data)
 
     def test_overlapping_or_invalid_paths_are_rejected(self):
         for config,state in ((str(self.config),str(self.config/'nested')),(str(self.config),'/root/../etc'),(str(self.config)+'\t','/root/state')):

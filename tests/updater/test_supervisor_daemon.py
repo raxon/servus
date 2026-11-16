@@ -92,7 +92,7 @@ class DaemonTest(unittest.TestCase):
                        'provision-host': SimpleNamespace(trusted_ingress=mock.Mock(return_value=None))}
             def load(_module_name, filename, mode):
                 return modules[filename.removesuffix('.py')]
-            operation = str(uuid.uuid4()); hub = object(); maintenance = object()
+            operation = str(uuid.uuid4()); hub = SimpleNamespace(policy=SimpleNamespace(data_dir="/root/panel-data")); maintenance = object()
             with mock.patch.object(runner, '_load', side_effect=load):
                 self.assertEqual(runner(operation, hub, maintenance), {'fixture': True})
             self.assertEqual(apply.call_args.args[1:4], (operation, hub, maintenance))
@@ -109,6 +109,8 @@ class DaemonTest(unittest.TestCase):
         runner.config={'dockerConfig':'/root/docker','trustedIngress':None}
         self.assertEqual(runner._current_ingress(provision,runtime),tuple(current))
         provision.trusted_ingress.assert_called_with('/root/docker',runtime)
+        self.assertEqual(runner._current_ingress(provision,runtime,'/root/panel-data'),tuple(current))
+        provision.trusted_ingress.assert_called_with('/root/docker',runtime,data_dir='/root/panel-data')
         runner.config['trustedIngress']=['b'*64,*current[1:]]
         self.assertEqual(runner._current_ingress(provision,runtime),tuple(current))
         runner.config['trustedIngress']=['b'*64,current[1],current[2],'sha256:'+'c'*64]

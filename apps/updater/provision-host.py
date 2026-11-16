@@ -284,7 +284,48 @@ def prepare_runtime(config_dir, install_dir, supervisor, *, inherited_lock=None,
 
 
 
-def trusted_ingress(docker_config, runtime):
+def managed_ingress_mounts(config, mounts, docker_config, runtime, data_dir):
+    """Recognize only the managed HTTPS extension of the pinned stock ingress."""
+    args = config.get('Cmd')
+    if not isinstance(args, list) or args[:len(TRUSTED_INGRESS_ARGS)] != TRUSTED_INGRESS_ARGS:
+        return False
+    extra = args[len(TRUSTED_INGRESS_ARGS):]
+    if (len(extra) < 4 or extra[0] != '--entrypoints.websecure.address=:8443' or
+            not isinstance(extra[1], str) or not extra[1].startswith('--certificatesresolvers.servus.acme.email=') or
+            not re.fullmatch(r'[^@\s=]{1,128}@[^@\s=]{1,128}\.[^@\s=]{1,63}', extra[1].partition('=')[2]) or
+            extra[2:4] != ['--certificatesresolvers.servus.acme.storage=/letsencrypt/acme.json',
+                           '--certificatesresolvers.servus.acme.httpchallenge.entrypoint=web']):
+        return False
+    extra = extra[4:]
+    staging = '--certificatesresolvers.servus.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory'
+    if extra[:1] == [staging]: extra = extra[1:]
+    provider = ['--providers.file.directory=/servus-host/dynamic', '--providers.file.watch=true']
+    if extra not in ([], provider): return False
+    projection = extra == provider
+    if len(mounts) != (3 if projection else 2): return False
+    acme = [m for m in mounts if m.get('Destination') == '/letsencrypt']
+    if len(acme) != 1 or acme[0].get('Type') != 'volume' or acme[0].get('Name') != 'servus-acme' or acme[0].get('RW') is not True:
+        return False
+    volumes = runtime._json(runtime._docker(docker_config, 'volume', 'inspect', 'servus-acme', limit=65536))
+    if (not isinstance(volumes, list) or len(volumes) != 1 or not isinstance(volumes[0], dict)):
+        return False
+    volume = volumes[0]
+    if (volume.get('Name') != 'servus-acme' or volume.get('Driver') != 'local' or volume.get('Options') not in (None, {}) or
+            volume.get('Labels') != {'panel.owner': 'self-hosted-panel', 'panel.purpose': 'acme'} or
+            volume.get('Mountpoint') != acme[0].get('Source')):
+        return False
+    if projection:
+        if (not isinstance(data_dir, str) or not data_dir.startswith('/') or data_dir == '/' or os.path.normpath(data_dir) != data_dir):
+            return False
+        host = [m for m in mounts if m.get('Destination') == '/servus-host']
+        if (len(host) != 1 or host[0].get('Type') != 'bind' or host[0].get('RW') is not False or
+                host[0].get('Source') != data_dir + '/host-domain' or
+                os.path.realpath(host[0]['Source']) != os.path.realpath(data_dir) + '/host-domain'):
+            return False
+    return True
+
+
+def trusted_ingress(docker_config, runtime, *, data_dir=None):
     raw = runtime._docker(docker_config, 'ps', '--no-trunc', '--filter', 'label=com.docker.swarm.service.name=panel-ingress', '--format', '{{.ID}}', limit=8192)
     try: ids = raw.decode('ascii').splitlines()
     except UnicodeError as error: raise ProvisionError('Invalid ingress inventory') from error
@@ -296,15 +337,18 @@ def trusted_ingress(docker_config, runtime):
     mounts = item.get('Mounts'); image = item.get('Image'); state = item.get('State') or {}
     if (item.get('Id') != ids[0] or labels.get('com.docker.swarm.service.name') != 'panel-ingress' or
         config.get('Image') != 'traefik:3.7.13' or not isinstance(image, str) or image not in TRUSTED_INGRESS_IMAGE_IDS or
-        config.get('Entrypoint') != ['/entrypoint.sh'] or config.get('Cmd') != TRUSTED_INGRESS_ARGS or
+        config.get('Entrypoint') != ['/entrypoint.sh'] or
         config.get('Env') != ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'] or config.get('User') not in ('', None) or
         state.get('Running') is not True or host.get('Privileged') is not False or host.get('PidMode') == 'host' or
         host.get('CapAdd') not in (None, []) or host.get('Devices') not in (None, []) or host.get('DeviceRequests') not in (None, []) or
-        not isinstance(mounts, list)):
+        not isinstance(mounts, list) or any(not isinstance(mount, dict) for mount in mounts)):
         raise ProvisionError('Untrusted ingress identity')
     socket_path = os.path.realpath('/var/run/docker.sock')
     matching = [mount for mount in mounts if isinstance(mount, dict) and isinstance(mount.get('Source'), str) and os.path.realpath(mount['Source']) == socket_path]
-    if (len(mounts) != 1 or len(matching) != 1 or matching[0].get('RW') is not False or
+    managed = config.get('Cmd') != TRUSTED_INGRESS_ARGS
+    if managed and not managed_ingress_mounts(config, mounts, docker_config, runtime, data_dir):
+        raise ProvisionError('Untrusted managed ingress configuration')
+    if ((not managed and len(mounts) != 1) or len(matching) != 1 or matching[0].get('RW') is not False or
         matching[0].get('Destination') != '/var/run/docker.sock'):
         raise ProvisionError('Untrusted ingress socket')
     return [ids[0], 'panel-ingress', config['Image'], image]
@@ -353,7 +397,7 @@ def finalize(config_dir, state_dir, install_dir, node_path, supervisor, daemon, 
             while chunk := os.read(node, 65536): digest.update(chunk)
             os.lseek(node, 0, os.SEEK_SET)
             backup._verify_node(node, '0' * 64, [{'value':'AAAAAAAAAAAAAAAAAPE7Iln+jhkZLh/RZ/oXyrXa','json':True}])
-            ingress = trusted_ingress(docker_config, runtime)
+            ingress = trusted_ingress(docker_config, runtime, data_dir=approved.data_dir)
             settings = {'backupRoot':backup_root,'policyRoot':policy_root,'dockerConfig':docker_config,
                         'nodePath':node_path,'nodeSha256':digest.hexdigest(),'trustedIngress':ingress}
             config = directory(config_dir, 0o700)
