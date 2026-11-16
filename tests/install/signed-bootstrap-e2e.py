@@ -36,7 +36,8 @@ root=pathlib.Path(os.environ['FIXTURE_ROOT'])
 with open(root/'trace','a') as stream: stream.write(pathlib.Path(__file__).name + ' ' + ' '.join(sys.argv[1:]) + '\\n')
 '''
 for name in ('install-gh.py', 'provision-host.py', 'provision-verifier-group.py'):
-    (root / name).write_text(common)
+    runtime = "\nif '--runtime' in sys.argv: pathlib.Path('/etc/servus/lifecycle').mkdir(mode=0o755, exist_ok=True)\n" if name == 'provision-host.py' else ''
+    (root / name).write_text(common + runtime)
 (root / 'bootstrap-initial.py').write_text(common + '''
 import fcntl, json, stat
 fd=9
@@ -105,6 +106,8 @@ result=run(valid)
 assert result.returncode == 0, (result.stdout,result.stderr)
 assert 'SERVUS_HOST_DOMAINS_API_URL=https://api.servus.run\n' in Path('/etc/servus/servus.env').read_text()
 assert 'SERVUS_HOST_DOMAINS_AUTOMATIC=true\n' in Path('/etc/servus/servus.env').read_text()
+assert json.loads(Path('/etc/servus/lifecycle/host-domains.json').read_text()) == {'apiOrigin':'https://api.servus.run','automatic':True}
+assert Path('/etc/servus/lifecycle/host-domains.json').stat().st_mode & 0o777 == 0o644
 assert 'PASS signed bootstrap bridge' in result.stdout
 lines=trace.read_text().splitlines()
 assert [line.split()[0] for line in lines] == ['install-host','install-gh.py','provision-host.py','provision-host.py','provision-verifier-group.py','bootstrap-initial.py'], lines

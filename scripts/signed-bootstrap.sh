@@ -52,7 +52,7 @@ PYCANDIDATE
   if [[ -n $proxy_secret ]]; then printf 'SERVUS_TRUSTED_PROXY_SECRET=%s\n' "$proxy_secret" >> "$next_env"; fi
   printf 'SERVUS_HOST_DOMAINS_API_URL=%s\nSERVUS_HOST_DOMAINS_AUTOMATIC=%s\n' "${host_domain_api-https://api.servus.run}" "${host_domain_automatic-true}" >> "$next_env"
   /usr/bin/python3 -I - "$next_env" "$config_dir" <<'PYCONFIG'
-import os, secrets, stat, sys
+import json, os, secrets, stat, sys
 source, directory = sys.argv[1:]
 parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 try:
@@ -71,6 +71,20 @@ try:
         os.fchown(out, 0, 0); os.fchmod(out, 0o600)
         with os.fdopen(out, 'wb', closefd=False) as stream:
             stream.write(data); stream.flush(); os.fsync(out)
+        values = dict(line.split('=', 1) for line in data.decode('utf-8').splitlines() if '=' in line)
+        host_settings = json.dumps({'apiOrigin': values['SERVUS_HOST_DOMAINS_API_URL'], 'automatic': values['SERVUS_HOST_DOMAINS_AUTOMATIC'] == 'true'}).encode() + b'\n'
+        lifecycle = os.open('lifecycle', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            info = os.fstat(lifecycle)
+            if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o755): raise ValueError('Unsafe lifecycle directory')
+            config = os.open('host-domains.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=lifecycle)
+            try:
+                os.fchown(config, 0, 0); os.fchmod(config, 0o644)
+                with os.fdopen(config, 'wb', closefd=False) as stream:
+                    stream.write(host_settings); stream.flush(); os.fsync(stream.fileno())
+                os.fsync(lifecycle)
+            finally: os.close(config)
+        finally: os.close(lifecycle)
         os.link(temp, 'servus.env', src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
         os.fsync(parent)
     finally:

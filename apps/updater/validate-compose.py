@@ -72,7 +72,7 @@ try:
             environment.update({"PANEL_HOST": "0.0.0.0", "PANEL_PORT": "4180", "PANEL_ALLOWED_ORIGINS": origins, "PANEL_SECURE_COOKIES": cookies, "PANEL_TRUSTED_PROXY_SECRET": secret})
             actual_env = service.get('environment', {})
             host_keys = {'PANEL_HOST_DOMAINS_API_URL', 'PANEL_HOST_DOMAINS_AUTOMATIC'}
-            if host_api or host_keys.intersection(actual_env):
+            if host_keys.intersection(actual_env):
                 environment.update({'PANEL_HOST_DOMAINS_API_URL': expected_env.get('SERVUS_HOST_DOMAINS_API_URL', 'https://api.servus.run'), 'PANEL_HOST_DOMAINS_AUTOMATIC': host_automatic})
             if updater_dir is not None: environment.update({"PANEL_UPDATER_SOCKET": "/run/servus-updater/updater.sock", "PANEL_UPDATER_APPLY_ENABLED": "true"})
         if service.get("environment") != environment: raise ValueError()

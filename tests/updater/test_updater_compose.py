@@ -65,6 +65,11 @@ class UpdateSocketComposeTest(unittest.TestCase):
         api_env.update(PANEL_HOST_DOMAINS_API_URL='', PANEL_HOST_DOMAINS_AUTOMATIC='false')
         self.assertEqual(self.check(env, document).returncode, 0)
 
+    def test_protected_settings_do_not_require_new_compose_environment_fields(self):
+        env, document = fixture(True)
+        env.update(SERVUS_HOST_DOMAINS_API_URL='https://api.servus.run', SERVUS_HOST_DOMAINS_AUTOMATIC='false')
+        self.assertEqual(self.check(env, document).returncode, 0)
+
     def test_older_compose_omits_false_bind_option(self):
         env, document = fixture(True)
         for service in document['services'].values():
