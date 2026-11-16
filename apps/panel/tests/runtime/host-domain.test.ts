@@ -26,9 +26,11 @@ it('installs a complete TLS pair and reports its wildcard coverage without expos
   expect(inspectHostCertificate(dir,'custom.example.test')).toBeUndefined();
   const key=readdirSync(join(dir,'host-domain','tls')).find(name=>name.endsWith('.key'))!;
   expect(statSync(join(dir,'host-domain','tls',key)).mode&0o777).toBe(0o600);
-  const previous=readFileSync(join(dir,'host-domain','dynamic','host.json'),'utf8');
+  const previous=readFileSync(join(dir,'host-domain','dynamic','host.yaml'),'utf8');
+  expect(readdirSync(join(dir,'host-domain','dynamic'))).toEqual(['host.yaml']);
+  expect(JSON.parse(previous)).toEqual(hostRoutingConfiguration(host,new X509Certificate(certificate.certificate).fingerprint256.replaceAll(':','').toLowerCase()));
   expect(()=>installHostCertificateFiles(dir,{...certificate,hostname:'abcdef1234567890.host.servus.run'})).toThrow();
-  expect(readFileSync(join(dir,'host-domain','dynamic','host.json'),'utf8')).toBe(previous);
+  expect(readFileSync(join(dir,'host-domain','dynamic','host.yaml'),'utf8')).toBe(previous);
 });
 it('rejects a symlinked certificate directory before writing through it',()=>{
   const dir=temporary(),external=temporary();symlinkSync(external,join(dir,'host-domain'));

@@ -69,7 +69,8 @@ export function installHostCertificateFiles(dataDir:string,value:HostCertificate
   atomic(join(root,'tls',`${fingerprint}.crt`),value.certificate);
   atomic(join(root,'tls',`${fingerprint}.key`),value.privateKey);
   // The provider sees one atomic document referencing a complete immutable pair.
-  atomic(join(root,'dynamic','host.json'),JSON.stringify(hostRoutingConfiguration(value.hostname,fingerprint)));
+  // JSON is a YAML subset; the extension must be recognized by Traefik's file provider.
+  atomic(join(root,'dynamic','host.yaml'),JSON.stringify(hostRoutingConfiguration(value.hostname,fingerprint)));
   atomic(join(root,'active.json'),JSON.stringify({hostname:value.hostname,fingerprint,staging:value.staging}));
 }
 

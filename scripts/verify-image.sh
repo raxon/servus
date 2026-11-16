@@ -68,3 +68,6 @@ if value.get('user', {}).get('email') != 'image-smoke@example.test':
     raise SystemExit('Image did not persist the setup session')
 PY
 printf 'Verified amd64 image startup, frontend, first setup and session.\n'
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SERVUS_HOST_IMAGE="$image" python3 "$script_dir/../tests/host-domains/provider-e2e.py"
