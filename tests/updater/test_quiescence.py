@@ -97,6 +97,21 @@ class DockerInventoryTest(unittest.TestCase):
         self.ingress['Mounts'].append({'Source': '/var/lib/servus/secrets', 'RW': False})
         with self.assertRaises(module.QuiescenceError): self.check()
 
+    def test_allows_only_the_exact_readonly_host_projection_on_trusted_ingress(self):
+        mount = {'Type': 'bind', 'Source': '/var/lib/servus/host-domain', 'Destination': '/servus-host', 'RW': False}
+        self.ingress['Mounts'].append(mount)
+        self.check()
+        for key, value in (('RW', True), ('Type', 'volume'), ('Destination', '/other'),
+                           ('Source', '/var/lib/servus'), ('Source', '/var/lib/servus/secrets'),
+                           ('Source', '/var/lib/servus/host-domain/tls')):
+            with self.subTest(key=key, value=value):
+                previous = mount[key]; mount[key] = value
+                with self.assertRaises(module.QuiescenceError): self.check()
+                mount[key] = previous
+        self.ingress['Id'] = 'f' * 64
+        self.docker.call.return_value = ('\n'.join(item['Id'] for item in self.items) + '\n').encode()
+        with self.assertRaises(module.QuiescenceError): self.check()
+
     def test_rejects_active_or_changed_role_and_incomplete_inventory(self):
         self.items[0]['State']['Running'] = True
         with self.assertRaises(module.QuiescenceError): self.check()

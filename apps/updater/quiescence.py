@@ -100,12 +100,15 @@ def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=N
                 state.get('Paused') is not False or state.get('Restarting') is not False or
                 sum(os.path.realpath(mount['Source']) == data and mount.get('RW') is True for mount in mounts) != 1):
                 raise QuiescenceError('Control-plane container is not stopped or changed')
+        trusted_external = False
         if item['Id'] not in expected:
             host = item.get('HostConfig') or {}; config = item.get('Config') or {}; labels = config.get('Labels') or {}
             if (host.get('Privileged') is not False or host.get('PidMode') == 'host' or
                 host.get('CapAdd') not in (None, []) or host.get('Devices') not in (None, []) or
                 host.get('DeviceRequests') not in (None, [])):
                 raise QuiescenceError('Unsupported external container privileges')
+            identity = (item['Id'], labels.get('com.docker.swarm.service.name'), config.get('Image'), item.get('Image'))
+            trusted_external = trusted_ingress is not None and identity == trusted_ingress
             for mount in mounts:
                 source = mount.get('Source')
                 if not isinstance(source, str) or not source:
@@ -121,7 +124,13 @@ def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=N
                 continue
             source = os.path.realpath(source)
             if _overlap(source, data) and (item['Id'] not in expected or source != data or mount.get('RW') is not True):
-                raise QuiescenceError('Unexpected container can access panel data')
+                # The root-approved ingress may read its exact certificate projection.
+                # No external process receives writable or parent-directory access.
+                host_projection = (trusted_external and mount.get('Type') == 'bind' and
+                                   source == data + '/host-domain' and
+                                   mount.get('Destination') == '/servus-host' and mount.get('RW') is False)
+                if not host_projection:
+                    raise QuiescenceError('Unexpected container can access panel data')
 
 
 def ensure_no_mount_aliases(docker, data_dir):
