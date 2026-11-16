@@ -10,8 +10,7 @@ const controlConfig = supervisorConfig(process.env);
 const maintenance = controlConfig ? new MaintenanceGate(lifecycleAllowsWork) : undefined;
 const dataDir = resolve(process.env.PANEL_DATA_DIR ?? '.data');
 const hostDomainApi = process.env.PANEL_HOST_DOMAINS_API_URL ?? 'https://api.servus.run';
-const automaticHostDomains = process.env.PANEL_HOST_DOMAINS_AUTOMATIC === undefined
-  ? process.env.NODE_ENV === 'production' : process.env.PANEL_HOST_DOMAINS_AUTOMATIC === 'true';
+const automaticHostDomains = process.env.PANEL_HOST_DOMAINS_AUTOMATIC === 'true';
 const app = await createApp({
   dataDir,
   webDir: resolve(process.env.PANEL_WEB_DIR || resolve(import.meta.dirname, '../../dist/web')),

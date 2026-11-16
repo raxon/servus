@@ -73,6 +73,7 @@ export function CreateService({
   const [repository, setRepository] = useState("");
   const [githubRepository, setGithubRepository] = useState("");
   const [privateGit, setPrivateGit] = useState(false);
+  const [sharedGithub, setSharedGithub] = useState(false);
   const github = useGithubConnection(admin);
   const hostDomain=useHostDomain();
   const automaticDomain=hostDomain.data?.ready===true;
@@ -88,7 +89,7 @@ export function CreateService({
     mutationFn: () => {
       const source: SourceConfig =
         kind === "app" && sourceType !== "image"
-          ? { type: "git", repository: sourceType === "github" ? githubRepositoryUrl(githubRepository) : repository, branch, context, dockerfile, ...(sourceType === "github" && github.data?.connected ? {sharedGithub: true} : sourceType === "git" && privateGit ? { credential: { username: gitUsername, token: gitToken } } : {}) }
+          ? { type: "git", repository: sourceType === "github" ? githubRepositoryUrl(githubRepository) : repository, branch, context, dockerfile, ...(sourceType === "github" && sharedGithub ? {sharedGithub: true} : privateGit ? { credential: { username: gitUsername, token: gitToken } } : {}) }
           : { type: "image" };
       const body: Omit<ServiceInput,'hostname'> & {hostname?:string} = {
         name,
@@ -135,7 +136,6 @@ export function CreateService({
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          if (sourceType === "github" && admin && !github.isSuccess) return;
           mutation.mutate();
         }}
       >
@@ -143,7 +143,6 @@ export function CreateService({
           className="service-create-fields"
           disabled={mutation.isPending}
         >
-          {sourceType === "github" && admin && github.isError ? <FeatureError error={github.error} /> : null}
           <div className="service-kind-grid">
             {kinds.map((item) => (
               <button
@@ -205,22 +204,22 @@ export function CreateService({
             <>
               {sourceType === "github" ? <label>
                 GitHub repository
-                <input name="github-repository" aria-describedby="github-repository-help" value={githubRepository} onChange={(event) => setGithubRepository(event.target.value)} pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" placeholder="organization/repository" autoCapitalize="none" spellCheck={false} required />
+                <input name="github-repository" value={githubRepository} onChange={(event) => setGithubRepository(event.target.value)} pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" placeholder="organization/repository" autoCapitalize="none" spellCheck={false} required />
                 <small>Enter the owner and repository name, for example organization/app.</small>
               </label> : <label>
                 Repository URL
                 <input name="repository" type="url" value={repository} onChange={(event) => setRepository(event.target.value)} required placeholder="https://github.com/organization/application.git" />
               </label>}
-              {sourceType === "github" ? <small id="github-repository-help">Private GitHub repositories require a token in {admin ? <a href="/settings#github-connection">Settings under GitHub connection</a> : "Settings under GitHub connection; ask an administrator to configure it"}. {github.data?.connected ? "The saved connection will be used automatically." : null}</small> : <>
-                <label className="checkbox-label">
-                  <input type="checkbox" checked={privateGit} onChange={(event) => setPrivateGit(event.target.checked)} />
-                  Private repository
-                </label>
-                {privateGit ? <>
-                  <label>Git username<input value={gitUsername} onChange={(event) => setGitUsername(event.target.value)} autoComplete="off" required /></label>
-                  <label>Access token<input type="password" value={gitToken} onChange={(event) => setGitToken(event.target.value)} autoComplete="new-password" required /><small>The token is encrypted on this installation.</small></label>
-                </> : null}
-              </>}
+              {sourceType === "github" && github.data?.connected ? <label className="checkbox-label"><input type="checkbox" checked={sharedGithub} onChange={event => setSharedGithub(event.target.checked)} /> Use shared GitHub connection ({github.data.username})</label> : null}
+              {sourceType === "github" && admin && github.isSuccess && !github.data.connected ? <small>To reuse a token across projects, add it in Settings under GitHub connection.</small> : null}
+              {!sharedGithub || sourceType !== "github" ? <label className="checkbox-label">
+                <input type="checkbox" checked={privateGit} onChange={(event) => setPrivateGit(event.target.checked)} />
+                Private repository
+              </label> : null}
+              {privateGit && (!sharedGithub || sourceType !== "github") ? <>
+                <label>Git username<input value={gitUsername} onChange={(event) => setGitUsername(event.target.value)} autoComplete="off" required /></label>
+                <label>Access token<input type="password" value={gitToken} onChange={(event) => setGitToken(event.target.value)} autoComplete="new-password" required /><small>The token is encrypted on this installation.</small></label>
+              </> : null}
               <label>
                 Branch or ref
                 <input

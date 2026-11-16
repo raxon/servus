@@ -103,6 +103,8 @@ for candidate in invalid:
 valid=json.dumps({'status':'candidate','verified':False,'tag':'v0.1.6','commit':'a'*40,'digest':'sha256:'+'b'*64})
 result=run(valid)
 assert result.returncode == 0, (result.stdout,result.stderr)
+assert 'SERVUS_HOST_DOMAINS_API_URL=https://api.servus.run\n' in Path('/etc/servus/servus.env').read_text()
+assert 'SERVUS_HOST_DOMAINS_AUTOMATIC=true\n' in Path('/etc/servus/servus.env').read_text()
 assert 'PASS signed bootstrap bridge' in result.stdout
 lines=trace.read_text().splitlines()
 assert [line.split()[0] for line in lines] == ['install-host','install-gh.py','provision-host.py','provision-host.py','provision-verifier-group.py','bootstrap-initial.py'], lines
