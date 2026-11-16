@@ -13,7 +13,7 @@ import type { ActionType, RuntimeStatus, User } from '../shared/types.js';
 import { hashPassword, verifyPassword } from './auth.js';
 import { AppError } from './errors.js';
 import { Store } from './store.js';
-import { nameSchema, normalizeServiceInput, parseServicePatch } from './configuration.js';
+import { nameSchema, normalizeServiceInput, parseServicePatch, validateConfiguration } from './configuration.js';
 import { agentRequest as defaultAgentRequest, agentDatabaseExport, agentDatabaseUpload, AgentRequestError } from '../agent/client.js';
 import { registerConsole } from './console.js';
 import { registerCentralAuth } from './central-auth.js';
@@ -250,6 +250,24 @@ export async function createApp(options: AppOptions) {
     return reply.code(202).send(result);
   });
   app.get<{Params:{id:string}}>(`${prefix}/services/:id`, async req => serviceAccess(req,req.params.id).service);
+  app.post<{Params:{id:string}}>(`${prefix}/services/:id/check-source`, async req => {
+    const {auth,service}=serviceAccess(req,req.params.id,true);
+    if(service.source?.type!=='git')throw new AppError('GIT_SOURCE','Save a Git source before checking it',400);
+    if(service.source.sharedGithub && auth.user.role!=='admin')throw new AppError('FORBIDDEN','Only administrators can check the shared GitHub connection',403);
+    const raw=req.body && typeof req.body==='object' && Object.keys(req.body).length===0 ? undefined : req.body;
+    const changes=z.object({repository:z.string().url().max(1000),branch:z.string().min(1).max(128),context:z.string().max(255),dockerfile:z.string().max(255)}).strict().optional().parse(raw);
+    const candidate=changes ? {...service.source,...changes} : service.source;
+    if (service.source.credential && !service.source.sharedGithub && candidate.repository!==service.source.repository) throw new AppError('SECRET_REFERENCE','Save a separate credential for this repository before checking it',403);
+    const parsed=parseServicePatch({expectedRevision:service.revision,source:candidate});
+    validateConfiguration({kind:service.kind,source:parsed.source});
+    let result:unknown;
+    try { result=await runtimeRequest('/services/check-source',{service:{...service,source:parsed.source},sharedGithub:!!service.source.sharedGithub},{...options.agentConnection,timeoutMs:150_000}); }
+    catch(error) { if(error instanceof AgentRequestError && error.certainty==='definitive')throw new AppError(error.code??'SOURCE_CHECK_FAILED',store.vault.redact(error.message),error.statusCode??422); throw error; }
+    const checked=z.object({commit:z.string().regex(/^[a-f0-9]{40,64}$/)}).strict().safeParse(result);
+    if(!checked.success)throw new AppError('RUNTIME_UNAVAILABLE','The source check returned an invalid response',503);
+    return checked.data;
+  });
+
   app.patch<{Params:{id:string}}>(`${prefix}/services/:id`, async req => {
     const {auth,service}=serviceAccess(req,req.params.id,true);
     const input=parseServicePatch(req.body);

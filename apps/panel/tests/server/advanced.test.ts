@@ -388,3 +388,26 @@ describe('v1 to v2 migration',()=>{
     expect(store.updateService('service',{expectedRevision:1,environment:[{name:'TOKEN',secret:true,value:'migration-secret-123'}]}).environment![0]!.secretRef).toBeTruthy();
   });
 });
+
+it('checks a saved Git source only for authorized editors and never returns credentials',async()=>{
+  const commit='a'.repeat(40), received:unknown[]=[];
+  const runtime:typeof agentRequest=async<T>(path:string,body?:unknown)=>{
+    expect(path).toBe('/services/check-source');received.push(body);return {commit} as T;
+  };
+  const {app,headers,create,store}=await fixture({agentRequest:runtime});
+  const source={type:'git',repository:'https://github.com/example/private.git',branch:'main',context:'.',dockerfile:'Dockerfile',credential:{username:'git-user',token:'private-token-123'}};
+  const {service}=(await create({...appInput,source})).json();
+  const url=`/api/v1/services/${service.id}/check-source`;
+  expect((await app.inject({method:'POST',url,headers:{cookie:headers.cookie},payload:{}})).statusCode).toBe(403);
+  const viewer=store.createUser('source-viewer@example.test',await hashPassword('viewer-testing-password'));store.addMember(service.projectId,viewer.id,'viewer');const session=store.createSession(viewer.id);
+  expect((await app.inject({method:'POST',url,headers:{cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken},payload:{}})).statusCode).toBe(404);
+  const result=await app.inject({method:'POST',url,headers,payload:{}});
+  expect(result.statusCode).toBe(200);expect(result.json()).toEqual({commit});
+  expect(JSON.stringify(received)).not.toContain('private-token-123');expect(result.body).not.toContain('private-token-123');
+  const candidate={repository:source.repository,branch:'feature',context:'web',dockerfile:'Dockerfile'};
+  const preview=await app.inject({method:'POST',url,headers,payload:candidate});expect(preview.statusCode).toBe(200);
+  expect((received.at(-1) as {service:{source:{branch:string}}}).service.source.branch).toBe('feature');
+  expect(store.getService(service.id)?.source).toMatchObject({branch:'main',context:'.'});
+  expect((await app.inject({method:'POST',url,headers,payload:{...candidate,context:'../escape'}})).statusCode).toBe(400);
+  expect((await app.inject({method:'POST',url,headers,payload:{...candidate,repository:'https://github.com/other/repo.git'}})).statusCode).toBe(403);
+});

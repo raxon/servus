@@ -13,7 +13,6 @@ import {
   EyeOff,
   FileCode2,
   Folder,
-  GitBranch,
   Globe2,
   HardDrive,
   Plus,
@@ -36,11 +35,9 @@ import type {
   Service,
   ServiceLogs,
   ServiceMetrics,
-  SourceConfig,
 } from "../shared/types.js";
 import { api, errorMessage } from "./api.js";
-import { useGithubConnection } from "./GithubSettings.js";
-import { SourceChoiceFields, githubRepositoryName, githubRepositoryUrl, initialSourceChoice, type SourceChoice } from "./source-choice.js";
+import { SourcePanel } from "./SourcePanel.js";
 import { DatabaseRestore } from "./DatabaseRestore.js";
 import { combineEnvironment, formatEnvironment } from "./environment.js";
 import { TerminalBoundary } from "./TerminalBoundary.js";
@@ -108,144 +105,6 @@ export function ServiceConfigurationPanel({
   return null;
 }
 
-function SourcePanel({ service, admin }: { service: Service; admin: boolean }) {
-  const current = service.source ?? { type: "image" };
-  const [type, setType] = useState<SourceChoice>(initialSourceChoice(current));
-  const [image, setImage] = useState(service.image);
-  const [repository, setRepository] = useState(
-    current.type === "git" ? current.repository : "",
-  );
-  const [githubRepository, setGithubRepository] = useState(current.type === "git" ? githubRepositoryName(current.repository) : "");
-  const selectedRepository = type === "github" ? githubRepositoryUrl(githubRepository) : repository;
-  const existingCredential = current.type === "git" ? current.credential : undefined;
-  const [privateGit, setPrivateGit] = useState(Boolean(existingCredential));
-  const [sharedGithub, setSharedGithub] = useState(current.type === "git" && Boolean(current.sharedGithub));
-  const github = useGithubConnection(admin);
-  const sharedManagedByAdmin = !admin && current.type === "git" && Boolean(current.sharedGithub);
-  const [gitUsername, setGitUsername] = useState(existingCredential?.username ?? "");
-  const [gitToken, setGitToken] = useState("");
-  const [branch, setBranch] = useState(
-    current.type === "git" ? current.branch : "main",
-  );
-  const [context, setContext] = useState(
-    current.type === "git" ? current.context : ".",
-  );
-  const [dockerfile, setDockerfile] = useState(
-    current.type === "git" ? current.dockerfile : "Dockerfile",
-  );
-  const save = useServiceSave(service);
-  const isDatabase = service.kind && service.kind !== "app";
-  return (
-    <form
-      className="surface configuration-card"
-      onChange={() => save.reset()}
-      onSubmit={(event) => {
-        event.preventDefault();
-        save.mutate({
-          image,
-          source:
-            type === "image"
-              ? { type }
-              : { type: "git", repository: selectedRepository, branch, context, dockerfile, ...(type === "github" && sharedGithub ? {sharedGithub:true} : privateGit ? { credential: gitToken ? {username:gitUsername,token:gitToken} : {username:gitUsername,secretRef:existingCredential?.secretRef} } : {}) },
-        }, { onSuccess: () => setGitToken("") });
-      }}
-    >
-      <div className="configuration-intro">
-        <div className="card-heading">
-          <GitBranch size={19} />
-          <h2>Application source</h2>
-        </div>
-        <p>
-          Choose an image or build a Dockerfile from a Git repository.
-        </p>
-      </div>
-      {sharedManagedByAdmin ? <p>Only an administrator can change a source using the shared GitHub connection.</p> : null}
-      <fieldset className="configuration-fields" disabled={save.isPending || sharedManagedByAdmin}>
-        <SourceChoiceFields value={type} onChange={setType} disabled={!!isDatabase} />
-        {type === "image" ? (
-          <label>
-            Docker image
-            <input
-              className="mono"
-              value={image}
-              onChange={(event) => setImage(event.target.value)}
-              required
-              placeholder="nginx:alpine"
-            />
-            <small>
-              Use a version tag or immutable digest for reproducible
-              deployments.
-            </small>
-          </label>
-        ) : (
-          <>
-            {type === "github" ? <label>
-              GitHub repository
-              <input name="github-repository" value={githubRepository} onChange={(event) => setGithubRepository(event.target.value)} pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" placeholder="organization/repository" autoCapitalize="none" spellCheck={false} required />
-              <small>Enter the owner and repository name, for example organization/app.</small>
-            </label> : <label>
-              Repository URL
-              <input name="repository" type="url" value={repository} onChange={(event) => setRepository(event.target.value)} placeholder="https://github.com/organization/application.git" required />
-              <small>Use an HTTPS URL without credentials.</small>
-            </label>}
-            {type === "github" && (github.data?.connected || sharedGithub) ? <label className="checkbox-label"><input type="checkbox" checked={sharedGithub} onChange={event => setSharedGithub(event.target.checked)} /> Use shared GitHub connection{github.data?.username ? ` (${github.data.username})` : ""}</label> : null}
-            {type === "github" && admin && github.isSuccess && !github.data.connected ? <small>To reuse a token across projects, add it in Settings under GitHub connection.</small> : null}
-            {!sharedGithub || type !== "github" ? <label className="checkbox-label">
-              <input type="checkbox" checked={privateGit} onChange={(event) => setPrivateGit(event.target.checked)} />
-              Private repository
-            </label> : null}
-            {privateGit && (!sharedGithub || type !== "github") ? <>
-              <label>Git username<input value={gitUsername} onChange={(event) => setGitUsername(event.target.value)} autoComplete="off" required /></label>
-              <label>Access token<input type="password" value={gitToken} onChange={(event) => setGitToken(event.target.value)} autoComplete="new-password" required={!existingCredential?.secretRef || (current.type === "git" && (current.sharedGithub || selectedRepository !== current.repository || gitUsername !== existingCredential.username))} /><small>{existingCredential?.secretRef ? "Leave empty to keep the saved token." : "The token is encrypted on this installation."}</small></label>
-            </> : null}
-            <label>
-              Branch or ref
-              <input
-                value={branch}
-                onChange={(event) => setBranch(event.target.value)}
-                required
-                placeholder="main"
-              />
-            </label>
-            <div className="form-grid">
-              <label>
-                Build context
-                <input
-                  className="mono"
-                  value={context}
-                  onChange={(event) => setContext(event.target.value)}
-                  required
-                  placeholder="."
-                />
-                <small>Relative to the repository root.</small>
-              </label>
-              <label>
-                Dockerfile
-                <input
-                  className="mono"
-                  value={dockerfile}
-                  onChange={(event) => setDockerfile(event.target.value)}
-                  required
-                  placeholder="Dockerfile"
-                />
-                <small>Relative to the build context.</small>
-              </label>
-            </div>
-            <div className="info-notice">
-              <FileCode2 size={17} />
-              <span>
-                Each deployment resolves the ref, checks out its commit and
-                builds a new image. Build output appears in Deployments.
-              </span>
-            </div>
-          </>
-        )}
-        <FeatureError error={save.error} />
-      </fieldset>
-      <SaveFooter pending={save.isPending} saved={save.isSuccess} disabled={sharedManagedByAdmin} />
-    </form>
-  );
-}
 
 interface SecretRow {
   id: string;

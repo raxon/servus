@@ -145,6 +145,7 @@ jobs:
         if: matrix.suite == 'browser'
         run: |
           npx playwright install --with-deps chromium
+          node tests/source/browser.test.mjs
           node tests/integration/session-races.mjs
           node tests/integration/private-git.mjs
           node tests/integration/database-export.mjs

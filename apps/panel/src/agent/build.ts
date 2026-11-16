@@ -1,11 +1,15 @@
 import { spawn } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { SecretVault } from '../shared/secrets.js';
 import type { Service } from '../shared/types.js';
 import { gitCredentials } from './git-credentials.js';
+
+export class SourceCheckError extends Error {
+  constructor(readonly code:'SOURCE_REPOSITORY_OR_BRANCH'|'SOURCE_CONTEXT'|'SOURCE_DOCKERFILE',message:string) {super(message);this.name='SourceCheckError';}
+}
 
 const deniedV4 = new BlockList();
 for (const [address,prefix] of [['0.0.0.0',8],['10.0.0.0',8],['100.64.0.0',10],['127.0.0.0',8],
@@ -89,12 +93,12 @@ async function run(command: string, args: string[], cwd: string, log: string, va
   });
 }
 
-export async function buildSource(service: Service, operationId: string, dataDir: string, dockerSocket: string, vault: SecretVault): Promise<{ image: string; sourceCommit: string }> {
+export async function buildSource(service: Service, operationId: string, dataDir: string, dockerSocket: string, vault: SecretVault, options: { checkOnly?: boolean; sharedGithub?: boolean } = {}): Promise<{ image: string; sourceCommit: string }> {
   if (service.source?.type !== 'git') throw new Error('A Git source is required.');
   const source = service.source;
   const resolved=await resolveRepository(source.repository),repository=resolved.url;
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/.test(source.branch) || source.branch.includes('..') || source.branch.endsWith('/')) throw new Error('Invalid Git branch.');
-  const credentials = (service.environment || []).filter(item => item.secretRef).map(item => vault.getServiceSecret(item.secretRef!,service.id,'environment'));
+  const credentials = options.checkOnly ? [] : (service.environment || []).filter(item => item.secretRef).map(item => vault.getServiceSecret(item.secretRef!,service.id,'environment'));
   const directory = join(dataDir, 'builds'); mkdirSync(directory, { recursive: true, mode: 0o700 });
   const workspace = mkdtempSync(join(directory, `${operationId}-`));
   const log = buildLogPath(dataDir, service.id, operationId);
@@ -107,7 +111,14 @@ export async function buildSource(service: Service, operationId: string, dataDir
   if(testHosts.includes(repository.hostname)&&process.env.PANEL_GIT_TEST_CA)gitEnv.GIT_SSL_CAINFO=process.env.PANEL_GIT_TEST_CA;
   let helper:Awaited<ReturnType<typeof gitCredentials>>|undefined;
   try {
-    if(source.credential){
+    if (options.sharedGithub) {
+      if (!options.checkOnly || repository.protocol !== 'https:' || repository.host.toLowerCase() !== 'github.com') throw new Error('Invalid shared GitHub connection.');
+      const connection = vault.githubConnection();
+      if (!connection) throw new Error('Configure the GitHub connection in Settings.');
+      credentials.push(connection.token,encodeURIComponent(connection.token),Buffer.from(connection.token).toString('base64'),Buffer.from(`${connection.username}:${connection.token}`).toString('base64'));
+      helper=await gitCredentials(workspace,repository,connection.username,connection.token);
+      gitEnv.SERVUS_GIT_SOCKET=helper.socket;addGitConfig('credential.useHttpPath','true');addGitConfig('credential.helper',helper.helper);
+    } else if(source.credential){
       if(repository.protocol!=='https:'||!source.credential.secretRef||source.credential.token!==undefined)throw new Error('Invalid private Git credential.');
       let record:unknown;
       try{record=JSON.parse(vault.getServiceSecret(source.credential.secretRef,service.id,'git'));}catch{throw new Error('Invalid private Git credential.');}
@@ -120,7 +131,7 @@ export async function buildSource(service: Service, operationId: string, dataDir
     const revisions = join(dataDir, 'source-revisions'); mkdirSync(revisions, { recursive: true, mode: 0o700 });
     const revisionPath = join(revisions, operationId);
     let sourceCommit: string;
-    if (existsSync(revisionPath)) {
+    if (!options.checkOnly && existsSync(revisionPath)) {
       const previous = JSON.parse(readFileSync(revisionPath, 'utf8'));
       if (previous.repository !== source.repository || previous.branch !== source.branch || previous.serviceId !== service.id || !/^[a-f0-9]{40,64}$/.test(previous.commit)) throw new Error('The source revision record does not match this operation.');
       sourceCommit = previous.commit;
@@ -131,14 +142,19 @@ export async function buildSource(service: Service, operationId: string, dataDir
       await run('git', ['checkout', '--detach', sourceCommit], checkout, log, vault, credentials, 10000,gitEnv,!!helper);
     } else {
       const shallow = new URL(source.repository).protocol === 'https:' ? ['--depth', '1'] : [];
-      await run('git', ['clone', '--single-branch', ...shallow, '--branch', source.branch, '--', source.repository, checkout], workspace, log, vault, credentials, 120000,gitEnv,!!helper);
+      try {await run('git', ['clone', '--single-branch', ...shallow, '--branch', source.branch, '--', source.repository, checkout], workspace, log, vault, credentials, 120000,gitEnv,!!helper);}
+      catch(error){if(options.checkOnly)throw new SourceCheckError('SOURCE_REPOSITORY_OR_BRANCH','Could not access the repository and branch. Check the address, branch and credentials.');throw error;}
       sourceCommit = await run('git', ['rev-parse', 'HEAD'], checkout, log, vault, credentials, 10000,gitEnv,!!helper);
       if(!/^[a-f0-9]{40,64}$/.test(sourceCommit))throw new Error('Invalid Git revision.');
-      writeFileSync(revisionPath, JSON.stringify({ repository: source.repository, branch: source.branch, serviceId: service.id, commit: sourceCommit }), { flag: 'wx', mode: 0o600 });
+      if (!options.checkOnly) writeFileSync(revisionPath, JSON.stringify({ repository: source.repository, branch: source.branch, serviceId: service.id, commit: sourceCommit }), { flag: 'wx', mode: 0o600 });
     }
     if(helper){await helper.close();helper=undefined;delete gitEnv.SERVUS_GIT_SOCKET;}
-    const context = confined(checkout, source.context || '.');
-    const dockerfile = confined(context, source.dockerfile || 'Dockerfile');
+    let context:string,dockerfile:string;
+    try {context=confined(checkout,source.context || '.');if(!statSync(context).isDirectory())throw new Error('The build context must be a directory.');}
+    catch(error){if(options.checkOnly)throw new SourceCheckError('SOURCE_CONTEXT','The build context is missing, inaccessible or outside the repository.');throw error;}
+    try {dockerfile=confined(context,source.dockerfile || 'Dockerfile');if(!statSync(dockerfile).isFile())throw new Error('The Dockerfile must be a regular file.');}
+    catch(error){if(options.checkOnly)throw new SourceCheckError('SOURCE_DOCKERFILE','The Dockerfile is missing, inaccessible or outside the build context.');throw error;}
+    if (options.checkOnly) return { image: '', sourceCommit };
     const image = `panel-build:${operationId}`;
     const args = ['--host', `unix://${dockerSocket}`, 'buildx', 'build', '--load', '--progress=plain', '--label', 'panel.owner=self-hosted-panel', '--label', `panel.service=${service.id}`, '-t', image, '-f', dockerfile];
     for (const item of service.environment || []) {
@@ -152,5 +168,5 @@ export async function buildSource(service: Service, operationId: string, dataDir
     await run('docker', args, checkout, log, vault, credentials, 600000, { ...process.env, DOCKER_BUILDKIT: '1' });
     appendFileSync(log, `${new Date().toISOString()} Build completed\n`);
     return { image, sourceCommit };
-  } finally { if(helper)await helper.close();rmSync(workspace, { recursive: true, force: true }); }
+  } finally { if(helper)await helper.close();rmSync(workspace, { recursive: true, force: true });if(options.checkOnly)rmSync(log,{force:true}); }
 }

@@ -49,6 +49,11 @@ it('clones and retries a private HTTPS repository without persisting credentials
   await expect(buildSource(exposed,randomUUID(),data,'/unused',vault)).rejects.toThrow('not valid for this purpose');
   expect(()=>vault.getServiceSecret(secretRef,id,'database')).toThrow('not valid for this purpose');
   expect(()=>vault.getDatabaseRootSecret(secretRef)).toThrow('Database root secret is invalid');
+  const checked=await buildSource(service,randomUUID(),data,'/unused',vault,{checkOnly:true});
+  expect(checked.sourceCommit).toBe(first);
+  validAuth.delete(auth);
+  await expect(buildSource(service,randomUUID(),data,'/unused',vault,{checkOnly:true})).rejects.toMatchObject({code:'SOURCE_REPOSITORY_OR_BRANCH'});
+  validAuth.add(auth);
   const result=await buildSource(service,operationId,data,'/unused',vault);expect(result.sourceCommit).toBe(first);
   const rotatedRef=vault.put(JSON.stringify({kind:'git-credential-v1',serviceId:id,repository,username,token:replacement}));
   metadata.prepare('INSERT INTO service_secret_refs VALUES (?,?,?)').run(rotatedRef,id,'git');

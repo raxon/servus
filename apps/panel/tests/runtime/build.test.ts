@@ -2,10 +2,11 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, existsSync } from 'node:fs';
 import { join, resolve, sep, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
 import { buildSource, buildLogPath } from '../../src/agent/build.js';
+import { createAgent } from '../../src/agent/app.js';
 import { SecretVault } from '../../src/shared/secrets.js';
 import type { Service } from '../../src/shared/types.js';
 import Database from 'better-sqlite3';
@@ -34,6 +35,24 @@ it('pins Git source across retries, passes commit metadata and never persists st
   const service:Service={id:randomUUID(),projectId:randomUUID(),name:'git',image:'unused',hostname:'git.localhost',port:80,replicas:1,revision:1,deployedRevision:null,state:'pending',createdAt:'now',updatedAt:'now',lastError:null,
     source:{type:'git',repository:`http://127.0.0.1:${port}/control.git`,branch:'main',context:'.',dockerfile:'Dockerfile'},environment:[{name:'BUILD_SECRET',secret:true,secretRef:reference}]};
   const metadata=new Database(join(dataDir,'panel.sqlite'));metadata.exec('CREATE TABLE service_secret_refs(reference TEXT PRIMARY KEY,service_id TEXT NOT NULL,purpose TEXT NOT NULL); PRAGMA user_version=5');metadata.prepare('INSERT INTO service_secret_refs VALUES (?,?,?)').run(reference,service.id,'environment');cleanup.push(()=>metadata.close());
+  const agent=await createAgent({dataDir,token:'fixture-agent-token',socketPath:join(root,'agent.sock'),dockerSocket:'/unused',ingressPort:18080,ingressImage:'unused'},{} as never);
+  cleanup.push(()=>agent.close());
+  const denied=await agent.inject({method:'POST',url:'/services/check-source',payload:{service}});
+  expect(denied.statusCode).toBe(401);
+  const request=await agent.inject({method:'POST',url:'/services/check-source',headers:{authorization:'Bearer fixture-agent-token'},payload:{service}});
+  expect(request.statusCode).toBe(200);expect(request.json()).toEqual({commit:first});expect(existsSync(calls)).toBe(false);
+  const checkId=randomUUID();
+  const checked=await buildSource(service,checkId,dataDir,'/unused',vault,{checkOnly:true});
+  expect(checked.sourceCommit).toBe(first);
+  expect(existsSync(calls)).toBe(false);
+  expect(existsSync(join(dataDir,'source-revisions',checkId))).toBe(false);
+  expect(existsSync(buildLogPath(dataDir,service.id,checkId))).toBe(false);
+  const missing={...service,source:{...service.source!,type:'git' as const,repository:`http://127.0.0.1:${port}/control.git`,branch:'main',context:'.',dockerfile:'missing'}};
+  await expect(buildSource(missing,randomUUID(),dataDir,'/unused',vault,{checkOnly:true})).rejects.toMatchObject({code:'SOURCE_DOCKERFILE'});
+  for(const [source,code] of [[missing.source,'SOURCE_DOCKERFILE'],[{...missing.source,context:'missing'},'SOURCE_CONTEXT'],[{...missing.source,branch:'missing',dockerfile:'Dockerfile'},'SOURCE_REPOSITORY_OR_BRANCH']] as const){
+    const result=await agent.inject({method:'POST',url:'/services/check-source',headers:{authorization:'Bearer fixture-agent-token'},payload:{service:{...service,source}}});
+    expect(result.statusCode).toBe(422);expect(result.json().error.code).toBe(code);expect(result.body).not.toContain(root);
+  }
   const built=await buildSource(service,operationId,dataDir,'/unused',vault);expect(built.sourceCommit).toBe(first);
   const logs=readFileSync(buildLogPath(dataDir,service.id,operationId),'utf8');expect(logs).toContain('[REDACTED]');expect(logs).not.toContain(secret);
   writeFileSync(join(source,'new-file'),'second');git(['add','.']);git(['-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-m','second']);git(['--git-dir',bare,'fetch',source,'main:main'],root);git(['--git-dir',bare,'update-server-info'],root);

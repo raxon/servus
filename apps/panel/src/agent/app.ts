@@ -4,10 +4,11 @@ import websocket from '@fastify/websocket';
 import { Readable, type Duplex } from 'node:stream';
 import Docker from 'dockerode';
 import { SecretVault } from '../shared/secrets.js';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { agentConfig } from './config.js';
+import { buildSource, SourceCheckError } from './build.js';
 import { DockerRuntime, message, isUncertainRuntimeError, type RecoveryContext } from './runtime.js';
 import type { Service } from '../shared/types.js';
 import { consoleExecStopped, type AgentMaintenanceGate } from './maintenance.js';
@@ -310,6 +311,24 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (!row) return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Operation is not recorded.' } });
     const response = row.response ? JSON.parse(row.response) : undefined;
     return { state: row.state, ...(row.state === 'succeeded' ? { result: response } : row.state === 'failed' ? { error: response.error } : {}) };
+  });
+  let sourceChecks = 0;
+  app.post('/services/check-source', async (req, reply) => {
+    const release=maintenance?.admit();
+    if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    try {
+      const parsed=z.object({service:input.shape.service,sharedGithub:z.boolean().default(false)}).strict().safeParse(req.body);
+      if(!parsed.success || parsed.data.service.source?.type!=='git')return reply.code(400).send({error:{code:'INVALID_SPEC',message:'A valid Git source is required.'}});
+      if(sourceChecks>=2)return reply.code(429).send({error:{code:'SOURCE_BUSY',message:'Too many source checks are running.'}});
+      sourceChecks++;
+      try {
+        const result=await buildSource(parsed.data.service as Service,randomUUID(),config.dataDir,config.dockerSocket,vault,{checkOnly:true,sharedGithub:parsed.data.sharedGithub});
+        return {commit:result.sourceCommit};
+      } catch(error) {
+        const message=error instanceof Error ? vault.redact(error.message).slice(0,500) : 'Source check failed.';
+        return reply.code(422).send({error:{code:error instanceof SourceCheckError?error.code:'SOURCE_CHECK_FAILED',message}});
+      } finally {sourceChecks--;}
+    } finally {release?.();}
   });
   app.post('/services/apply', async (req, reply) => {
     const release=maintenance?.admit();
