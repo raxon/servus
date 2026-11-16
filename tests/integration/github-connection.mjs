@@ -34,12 +34,11 @@ try {
   await page.getByLabel('Password',{exact:true}).fill('testing-password');
   await page.getByRole('button',{name:'Sign in',exact:true}).click();
   const connection=page.locator('#github-connection');
-  await connection.getByLabel('GitHub username').fill('example-user');
   await connection.getByLabel('Access token').fill('synthetic-github-token');
   const saveResponse=page.waitForResponse(response=>response.url().endsWith('/integrations/github') && response.request().method()==='PUT');
   await connection.getByRole('button',{name:'Save connection'}).click();
   const saved=await saveResponse; assert.equal(saved.status(),200); assert.ok(!(await saved.text()).includes('synthetic-github-token'));
-  await connection.getByText('Token saved for example-user.',{exact:false}).waitFor();
+  await connection.getByText('GitHub token saved.',{exact:false}).waitFor();
   assert.equal(await connection.getByLabel('Access token').inputValue(),'');
   for (const width of [375,768,1440]) {
     await page.setViewportSize({width,height:850});
@@ -65,7 +64,6 @@ try {
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   }
   await page.goto(`${origin}/settings`);
-  await connection.getByLabel('GitHub username').fill('example-user');
   await connection.getByLabel('Access token').fill('synthetic-replacement-token');
   await connection.getByRole('button',{name:'Replace token'}).click();
   await connection.getByText('Connection saved.',{exact:false}).waitFor();

@@ -27,9 +27,9 @@ it('protects the shared connection and binds each deployment to the token at que
   expect((await app.inject({url:endpoint,headers:editor})).statusCode).toBe(403);
   expect((await app.inject({method:'PUT',url:endpoint,headers:editor,payload:{username:'git-user',token:secret1}})).statusCode).toBe(403);
   expect((await app.inject({method:'PUT',url:endpoint,headers:{cookie:admin.cookie},payload:{username:'git-user',token:secret1}})).statusCode).toBe(403);
-  const saved = await app.inject({method:'PUT',url:endpoint,headers:admin,payload:{username:'git-user',token:secret1}});
+  const saved = await app.inject({method:'PUT',url:endpoint,headers:admin,payload:{token:secret1}});
   expect(saved.statusCode).toBe(200); expect(saved.body).not.toContain(secret1);
-  expect((await app.inject({url:endpoint,headers:admin})).json()).toEqual({connected:true,username:'git-user'});
+  expect((await app.inject({url:endpoint,headers:admin})).json()).toEqual({connected:true,username:'x-access-token'});
   for (const file of readdirSync(join(dir,'secrets'))) expect(readFileSync(join(dir,'secrets',file),'utf8')).not.toContain(secret1);
   expect(store.vault.redact(`token=${secret1}`)).not.toContain(secret1);
   const body=(name:string,repository:string)=>({name,hostname:`${name}.test`,source:{type:'git',repository,branch:'main',context:'.',dockerfile:'Dockerfile',sharedGithub:true}});
@@ -47,6 +47,8 @@ it('protects the shared connection and binds each deployment to the token at que
     return JSON.parse(store.vault.getServiceSecret(service.source.credential.secretRef,service.id,'git')).token as string;
   };
   expect(tokenOf(job(one.json().action.id))).toBe(secret1);
+  const firstSource=job(one.json().action.id).source;
+  expect(firstSource?.type === 'git' && firstSource.credential?.username).toBe('x-access-token');
   expect((await app.inject({method:'PATCH',url:`/api/v1/services/${first.id}`,headers:editor,payload:{expectedRevision:first.revision,source:{type:'git',repository:'https://github.com/org/first',branch:'other',context:'.',dockerfile:'Dockerfile'}}})).statusCode).toBe(403);
   if (first.source?.type !== 'git') throw Error('Expected Git source');
   expect((await app.inject({method:'PATCH',url:`/api/v1/services/${first.id}`,headers:admin,payload:{expectedRevision:first.revision,source:{...first.source,sharedGithub:false}}})).statusCode).toBe(403);

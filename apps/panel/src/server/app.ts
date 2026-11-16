@@ -188,7 +188,7 @@ export async function createApp(options: AppOptions) {
   });
   app.put(`${prefix}/integrations/github`,async req=>{
     const actor=administrator(req,true);
-    const input=z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/)}).strict().parse(req.body);
+    const input=z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/).default('x-access-token'),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/)}).strict().parse(req.body);
     store.vault.setGithubConnection(input.username,input.token);
     store.recordAudit(actor.id,'integration.github.set','github');
     return {connected:true,username:input.username};

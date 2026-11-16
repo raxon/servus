@@ -1,3 +1,4 @@
+import { Skeleton } from "./Skeleton.js";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -902,7 +903,7 @@ export function ServiceMetricsPanel({ service }: { service: Service }) {
           Metrics are available when the service is running.
         </p>
       ) : metrics.isPending ? (
-        <FeatureLoading label="Reading container metrics" />
+        <Skeleton kind="metrics" label="Reading container metrics" />
       ) : metrics.data ? (
         <div className="service-metrics-grid">
           <div>

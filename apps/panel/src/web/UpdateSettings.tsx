@@ -105,6 +105,7 @@ export function UpdateSettings() {
   const [run, setRun] = useState<SavedUpdate | null>(readUpdate);
   const [message, setMessage] = useState("");
   const [failure, setFailure] = useState("");
+  const [missingOperation, setMissingOperation] = useState(false);
   const [completed, setCompleted] = useState(false);
   const [resume, setResume] = useState(0);
   const { capability, discovery } = useUpdateDiscovery(true);
@@ -174,6 +175,11 @@ export function UpdateSettings() {
           timer = setTimeout(tick, error instanceof RequestError && error.status === 429 ? 60000 : 15000);
           return;
         }
+        if (error instanceof RequestError && error.status === 404) {
+          setMissingOperation(true);
+          setFailure("This update operation is no longer available. Clear the saved browser progress, then check the update status before starting again.");
+          return;
+        }
         setFailure(error.message);
       }
     };
@@ -197,13 +203,17 @@ export function UpdateSettings() {
       {capability.isPending ? <p>Checking update settings...</p> : capability.error ? <p role="alert">Could not load update settings.</p> : !capability.data?.applyAvailable ? <p>Updates are not configured on this installation.</p> : run ? (
         <>
           <p>Update {run.tag}</p>
-          <p role="status" aria-live="polite">{run.stage === "attention" ? "Update needs attention." : run.stage === "verification_failed" ? "Release verification failed." : message || "Checking update progress..."}</p>
+          <p role="status" aria-live="polite">{missingOperation ? "Update status unavailable." : run.stage === "attention" ? "Update needs attention." : run.stage === "verification_failed" ? "Release verification failed." : message || "Checking update progress..."}</p>
           {failure ? <div className="error-notice" role="alert">{failure}</div> : null}
           {run.stage === "verification_failed" ? <button type="button" className="button" onClick={() => {
             try { const next = { ...run, stage: "retry_verification" as const }; localStorage.setItem(storageKey, JSON.stringify(next)); setFailure(""); setRun(next); }
             catch { setFailure("Could not save update progress in this browser. Enable browser storage and try again."); }
           }}>Retry verification</button> : null}
-          {failure && run.stage !== "attention" && run.stage !== "verification_failed" ? <button type="button" className="button" onClick={() => { setFailure(""); setResume(value => value + 1); }}>Check again</button> : null}
+          {missingOperation ? <button type="button" className="button" onClick={() => {
+            try { localStorage.removeItem(storageKey); setRun(null); setMissingOperation(false); setFailure(""); setMessage(""); void discovery.refetch(); }
+            catch { setFailure("Could not clear update progress in this browser."); }
+          }}>Clear saved progress</button> : null}
+          {failure && !missingOperation && run.stage !== "attention" && run.stage !== "verification_failed" ? <button type="button" className="button" onClick={() => { setFailure(""); setResume(value => value + 1); }}>Check again</button> : null}
         </>
       ) : (
         <>

@@ -1,3 +1,4 @@
+import { Skeleton } from "./Skeleton.js";
 import React, {
   createContext,
   useContext,
@@ -309,6 +310,14 @@ function Shell() {
   const client = useQueryClient();
   const sessionClient = useContext(SessionClientContext)!;
   const path = useRouterState({ select: (state) => state.location.pathname });
+  const previousPath = useRef(path);
+  const mainRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (previousPath.current !== path) {
+      previousPath.current = path;
+      mainRef.current?.focus({ preventScroll: true });
+    }
+  }, [path]);
   const projects = useProjects();
   const { discovery: updateDiscovery } = useUpdateDiscovery(user.role === "admin");
   const availableUpdate = !updateDiscovery.isError && updateDiscovery.data?.discovery.status === "candidate" ? updateDiscovery.data.discovery : undefined;
@@ -382,7 +391,11 @@ function Shell() {
           PROJECTS<span>{projects.data?.length ?? ""}</span>
         </div>
         <div className="sidebar-projects">
-          {projects.data?.length ? (
+          {projects.isPending ? (
+            <div className="sidebar-project-skeleton" role="status" aria-label="Loading projects"><span className="sr-only">Loading projects</span><span aria-hidden="true" className="skeleton-block skeleton-title" /><span aria-hidden="true" className="skeleton-block skeleton-project-title" /><span aria-hidden="true" className="skeleton-block skeleton-title" /></div>
+          ) : projects.error ? (
+            <p className="sidebar-hint">Projects unavailable.</p>
+          ) : projects.data?.length ? (
             projects.data.map((project) => (
               <Link
                 key={project.id}
@@ -441,7 +454,7 @@ function Shell() {
             </div> : null}
           </div>
         </header>
-        <main id="main-content" className="content">
+        <main id="main-content" className="content" ref={mainRef} tabIndex={-1}>
           <ProjectSearchContext.Provider value={projectSearch}><Outlet /></ProjectSearchContext.Provider>
         </main>
       </div>
@@ -633,9 +646,7 @@ function Dashboard() {
           </div>
           <ErrorNotice error={projects.error} />
           {projects.isPending ? (
-            <div className="surface loading-surface">
-              <Spinner label="Loading projects" />
-            </div>
+            <Skeleton kind="projects" label="Loading projects" />
           ) : projects.error ? null : projects.data?.length ? (
             <div className="dashboard-project-list">
               {visible.map((project) => (
@@ -692,7 +703,7 @@ function DashboardProject({ project }: { project: Project }) {
         </Link>
         <span>{project.serviceCount} {project.serviceCount === 1 ? "service" : "services"}</span>
       </div>
-      {services.isPending ? <div className="dashboard-services-message"><Spinner label="Loading services" /></div>
+      {services.isPending ? <Skeleton kind="services" label="Loading services" />
         : services.error ? <div className="dashboard-services-message"><ErrorNotice error={services.error} /><button className="text-link" onClick={() => void services.refetch()}>Try again</button></div>
         : services.data?.length ? <div className="dashboard-services-grid">
           {services.data.map((service) => <Link key={service.id} to="/services/$serviceId" params={{ serviceId: service.id }} className="dashboard-service-card">
@@ -781,9 +792,7 @@ function ProjectPage() {
       </div>
       <ErrorNotice error={services.error} />
       {services.isPending ? (
-        <div className="surface loading-surface">
-          <Spinner label="Loading services" />
-        </div>
+        <Skeleton kind="table" label="Loading services" />
       ) : services.error ? null : services.data?.length ? (
         <div className="services-table surface">
           <div className="service-table-head">
@@ -887,9 +896,7 @@ function ActionsTable({
 }) {
   if (loading)
     return (
-      <div className="surface loading-surface">
-        <Spinner label="Loading activity" />
-      </div>
+      <Skeleton kind="table" label="Loading activity" />
     );
   if (!actions.length)
     return (
@@ -1000,9 +1007,7 @@ function ServicePage() {
   });
   if (serviceQuery.isPending)
     return (
-      <div className="surface loading-surface">
-        <Spinner label="Loading service" />
-      </div>
+      <Skeleton kind="service" label="Loading service" />
     );
   if (!serviceQuery.data)
     return (
@@ -1539,6 +1544,7 @@ const router = createRouter({
     settingsRoute,
   ]),
   defaultPreload: "intent",
+  defaultViewTransition: true,
 });
 declare module "@tanstack/react-router" {
   interface Register {

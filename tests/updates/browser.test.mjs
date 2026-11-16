@@ -54,5 +54,21 @@ try{
  await page.waitForFunction(()=>localStorage.getItem('servus.update.operation.v1')!==null);
  await page.getByText('Checking the release signature...').waitFor();
  assert.equal(submitted,1);assert.deepEqual(errors,[]);
+ const stale=await browser.newPage();
+ await stale.addInitScript(()=>localStorage.setItem('servus.update.operation.v1',JSON.stringify({operationId:'12345678-1234-4123-8123-123456789abc',tag:'v1.0.1',commit:'a'.repeat(40),digest:'sha256:'+'b'.repeat(64),stage:'applying'})));
+ let retries=0;
+ await stale.route('**/api/v1/**',async route=>{
+   const path=new URL(route.request().url()).pathname;
+   if(path.endsWith('/apply')){if(route.request().method()==='POST')retries++;await route.fulfill({status:404,contentType:'application/json',body:JSON.stringify({error:{code:'NOT_FOUND',message:'Update operation not found'}})});return;}
+   const body=path.endsWith('/preferences')?{preferences}:path.endsWith('/discovery')?{discovery:{status:'candidate',tag:'v1.0.1',commit:'a'.repeat(40),digest:'sha256:'+'b'.repeat(64)}}: {applyAvailable:true};
+   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(body)});
+ });
+ await stale.goto(`http://127.0.0.1:${server.httpServer.address().port}/__updates`);
+ await stale.getByRole('button',{name:'Clear saved progress'}).waitFor();
+ assert.equal(retries,1);
+ await stale.getByRole('button',{name:'Clear saved progress'}).click();
+ await stale.getByRole('button',{name:'Install update',exact:true}).waitFor();
+ assert.equal(await stale.evaluate(()=>localStorage.getItem('servus.update.operation.v1')),null);
+ await stale.close();
  console.log('PASS: defaults, save automatic/channel/time, responsive layouts, working switch polyfill, modal cancellation and explicit confirmation, no JS errors');
 }finally{await browser.close();await server.close();}
