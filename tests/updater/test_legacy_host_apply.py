@@ -24,7 +24,7 @@ class LegacyHostApplyTest(unittest.TestCase):
         self.coordinator=mock.Mock();self.quiescence=mock.Mock()
         modules={'update-coordinator':self.coordinator,'quiescence':self.quiescence,'provision-host':mock.Mock(),'runtime-policy':mock.Mock()}
         self.runner._load=mock.Mock(side_effect=lambda _name,filename:modules[filename[:-3]])
-        self.hub=mock.create_autospec(supervisor.DrainHub,instance=True);self.hub.policy=object()
+        self.hub=mock.create_autospec(supervisor.DrainHub,instance=True);self.hub.policy=SimpleNamespace(data_dir="/root/panel-data")
         self.maintenance=mock.create_autospec(supervisor.MaintenanceSupervisor,instance=True)
         self.lease=object();self.maintenance.drained_window.return_value=nullcontext(self.lease)
         self.op=str(uuid.uuid4());self.restore='a'*32;self.service=str(uuid.uuid4())
@@ -38,6 +38,7 @@ class LegacyHostApplyTest(unittest.TestCase):
 
     def test_preflights_then_drains_cleans_and_starts_under_same_scope(self):
         result=self.invoke()
+        self.assertEqual(self.runner._current_ingress.call_args.args[2],"/root/panel-data")
         self.assertIs(result,self.coordinator.start_cleaned_legacy_upload.return_value)
         self.maintenance.drained_window.assert_called_once_with(self.hub,self.op,policy_binding=self.binding,legacy_upload_id=self.restore,legacy_service_id=self.service)
         self.assertEqual([call[0] for call in self.coordinator.method_calls],['preflight_external_containers','cleanup_stopped_legacy_upload','start_cleaned_legacy_upload'])
