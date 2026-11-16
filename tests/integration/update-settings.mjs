@@ -42,6 +42,7 @@ try {
     const method = route.request().method();
     const ok = data => route.fulfill({ status: 200, json: data });
     if (path.endsWith('/updates') && method === 'GET') return ok({ applyAvailable: true });
+    if (path.endsWith('/preferences')) return ok({ preferences: { automatic: false, channel: 'production', installTime: '02:00', timeZone: 'Europe/Warsaw', lastAutomaticUpdate: null } });
     if (path.endsWith('/discovery')) return ok({ discovery: ++discovered === 1 ? { status: 'checking' } : candidate });
     if (path.endsWith('/updates') && method === 'POST') {
       operationId = route.request().postDataJSON().operationId;
@@ -67,6 +68,7 @@ try {
   assert.ok(discovered >= 2);
   await page.getByRole('link', { name: 'Update available: v0.1.6' }).waitFor();
   await page.getByRole('button', { name: 'Install update' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm installation' }).click();
   await page.getByText('Release verification failed.').waitFor();
   await page.reload();
   await page.getByRole('button', { name: 'Retry verification' }).click();
