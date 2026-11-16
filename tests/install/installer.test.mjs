@@ -51,6 +51,39 @@ test('success instructions cover first setup and reruns without exposing a token
 test('help works without touching installation directories', () => {
   const f=fixture();const r=run(f,['main','--help']);succeeds(r);assert.match(r.stdout,/--dry-run/);assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
 });
+test('host domain settings accept only HTTPS origins and explicit booleans', () => {
+  const f=fixture();
+  succeeds(run(f,['validate_host_domain_settings','https://api.servus.run','true']));
+  succeeds(run(f,['validate_host_domain_settings','','false']));
+  fails(run(f,['validate_host_domain_settings','http://api.servus.run','true']),/must use HTTPS/);
+  fails(run(f,['validate_host_domain_settings','https://api.servus.run/path','true']),/without a path/);
+  fails(run(f,['validate_host_domain_settings','https://api.servus.run','yes']),/must be true or false/);
+});
+test('new installations use the live host registry by default and allow an explicit opt-out', () => {
+  const f=fixture();
+  delete f.env.SERVUS_HOST_DOMAINS_API_URL;delete f.env.SERVUS_HOST_DOMAINS_AUTOMATIC;
+  const automatic=run(f,['main','--dry-run']);succeeds(automatic);
+  assert.match(automatic.stdout,/New installation host domain API: https:\/\/api\.servus\.run/);
+  assert.match(automatic.stdout,/Automatic host registration: true/);
+  Object.assign(f.env,{SERVUS_HOST_DOMAINS_API_URL:'',SERVUS_HOST_DOMAINS_AUTOMATIC:'false'});
+  const disabled=run(f,['main','--dry-run']);succeeds(disabled);
+  assert.match(disabled.stdout,/New installation host domain API: disabled/);
+  assert.match(disabled.stdout,/Automatic host registration: false/);
+  assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
+});
+test('reruns preserve a stored host registry, including an explicitly empty one', () => {
+  for(const api of ['', 'https://registry.example.test']) {
+    const f=fixture();for(const p of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(p);
+    writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
+    const env=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://localhost:4180\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_IMAGE=previous-image\nSERVUS_HOST_DOMAINS_API_URL=${api}\nSERVUS_HOST_DOMAINS_AUTOMATIC=false\n`;
+    writeFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),env);
+    f.env.SERVUS_HOST_DOMAINS_API_URL='https://api.servus.run';
+    const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; validate_host_domain_settings() { printf "host-registry=[%s] automatic=[%s]\\n" "$1" "$2"; }; main "$@"');
+    fails(result,/intentional build failure/);
+    assert.ok(result.stdout.includes(`host-registry=[${api}] automatic=[false]`));
+    assert.equal(readFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),'utf8'),env);
+  }
+});
 test('dry run validates a supported arm64 checkout without mutating the host', () => {
   const f=fixture();const r=run(f,['main','--dry-run','--source',f.source,'--port','4280','--ingress-port','28080']);succeeds(r);assert.match(r.stdout,/ubuntu 24.04 \(arm64\)/);assert.match(r.stdout,/Panel port: 4280/);assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
 });

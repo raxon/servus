@@ -4,12 +4,12 @@ export type ActionStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canc
 
 export interface User { id: string; email: string; role: 'admin' | 'member'; createdAt: string }
 export interface SessionResponse { user: User; csrfToken: string }
-export interface Project { id: string; name: string; description: string; createdAt: string; serviceCount: number }
+export interface Project { id: string; name: string; description: string; createdAt: string; serviceCount: number; canWrite?: boolean }
 export type ServiceKind = 'app' | 'postgres' | 'redis' | 'mariadb';
 export interface GitCredential { username: string; token?: string; secretRef?: string }
 export type SourceConfig = { type: 'image' } | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string; credential?: GitCredential; sharedGithub?: boolean };
 export interface EnvironmentVariable { name: string; value?: string; secret?: boolean; secretRef?: string }
-export interface DomainConfig { hostname: string; port: number; primary?: boolean }
+export interface DomainConfig { hostname: string; port: number; primary?: boolean; https?: boolean; redirectHttps?: boolean }
 export interface MountConfig { type: 'volume' | 'file' | 'bind'; name: string; target: string; readOnly?: boolean; content?: string; source?: string }
 export interface ResourceConfig { cpu: number; memoryMb: number }
 export interface DatabaseConfig { database: string; user: string; password?: string; passwordSecretRef?: string }
@@ -23,6 +23,7 @@ export interface Service extends ServiceConfiguration {
   createdAt: string; updatedAt: string; lastError: string | null;
   deletedAt?: string | null;
   sourceCommit?: string | null; imageDigest?: string | null;
+  rollbackImage?: string; rollbackCommit?: string;
 }
 export interface Action {
   id: string; projectId: string; serviceId: string; type: ActionType; status: ActionStatus;
@@ -33,7 +34,7 @@ export interface ActionEvent {
 }
 export interface RuntimeStatus {
   online: boolean; engineVersion?: string; cpus?: number; memoryBytes?: number; swarmState?: string;
-  ingressPort?: number; error?: string;
+  ingressPort?: number; httpsConfigured?: boolean; httpsAccess?: 'direct'|'external'; ingressRecoveryRequired?: boolean; ingressBusy?: boolean; error?: string;
 }
 export interface ActionDetail { action: Action; events: ActionEvent[] }
 export interface ApiError { error: { code: string; message: string } }

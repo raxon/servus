@@ -8,6 +8,7 @@ import { AppError } from './errors.js';
 import * as schema from './schema.js';
 import { SecretVault } from '../shared/secrets.js';
 import { configurationOf, validateConfiguration } from './configuration.js';
+import { assertHostDomainOwnership } from './host-domain.js';
 
 const now = () => new Date().toISOString();
 const startupPause = new Int32Array(new SharedArrayBuffer(4));
@@ -263,6 +264,7 @@ export class Store {
       }
       const service: Service = { id: randomUUID(), projectId, ...input, replicas: input.replicas ?? 1, revision: 1, deployedRevision: null, state: 'pending', lastError: null, createdAt: now(), updatedAt: now() };
       validateConfiguration(service);
+      assertHostDomainOwnership(this,service);
       if(service.kind&&service.kind!=='app')service.hostname=`${service.id}.internal`;
       if(service.domains?.length===0)service.hostname=`${service.id}.internal`;
       try { this.db.prepare('INSERT INTO services(id,project_id,name,image,port,hostname,replicas,revision,deployed_revision,state,last_error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(service.id,projectId,service.name,service.image,service.port,service.hostname,service.replicas,1,null,service.state,null,service.createdAt,service.updatedAt); }
@@ -292,6 +294,7 @@ export class Store {
         if(patch.database.password!==undefined||patch.database.database!==current?.database||patch.database.user!==current?.user||patch.database.passwordSecretRef!==current?.passwordSecretRef)throw new AppError('DATABASE_CREDENTIALS_IMMUTABLE','Managed database names and credentials cannot be changed through configuration. Use a dedicated migration or credential-rotation operation.',409);
       }
       validateConfiguration(next);
+      assertHostDomainOwnership(this,next);
       if(next.domains?.length) {const primary=next.domains.find(domain=>domain.primary)??next.domains[0]!;next.hostname=primary.hostname;next.port=primary.port;}
       else if(next.domains?.length===0)next.hostname=`${id}.internal`;
       const protectedConfig=this.protectConfiguration(id,next);

@@ -3,6 +3,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import type { ServiceConfiguration, ServiceInput, ServicePatch } from '../shared/types.js';
 import { AppError } from './errors.js';
+import { canonicalDnsName } from '../agent/acme/dns01.js';
 
 export const nameSchema = z.string().min(1).max(63).regex(/^[a-z0-9][a-z0-9-]*$/, 'Use lowercase letters, numbers and hyphens');
 const imageSchema = z.string().min(1).max(300).regex(/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$/,'Enter a valid image reference');
@@ -14,7 +15,7 @@ const sourceSchema = z.discriminatedUnion('type',[
   z.object({type:z.literal('git'),repository:z.string().url().max(1000),branch:z.string().min(1).max(200).regex(/^[^\s\x00-\x1f~^:?*\[\\]+$/),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),sharedGithub:z.boolean().optional(),credential:z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),secretRef:z.string().uuid().optional()}).strict().refine(v=>Boolean(v.token)!==Boolean(v.secretRef)).optional()}).strict(),
 ]);
 const envSchema = z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32000).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).strict();
-const domainSchema = z.object({hostname:hostnameSchema,port:z.number().int().min(1).max(65535),primary:z.boolean().optional()}).strict();
+const domainSchema = z.object({hostname:hostnameSchema,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional()}).strict();
 const mountSchema = z.object({type:z.enum(['volume','file','bind']),name:nameSchema,target:targetSchema,readOnly:z.boolean().optional(),content:z.string().max(32000).optional(),source:z.string().max(1000).optional()}).strict();
 const resourcesSchema = z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).strict();
 const databaseSchema = z.object({database:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),user:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),password:z.string().min(12).max(128).optional(),passwordSecretRef:z.string().uuid().optional()}).strict();
@@ -44,6 +45,8 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
   unique((config.mounts??[]).map(item=>item.name),'Mount names');
   unique((config.mounts??[]).map(item=>item.target),'Mount target paths');
   if((config.domains??[]).filter(domain=>domain.primary).length>1)throw new AppError('MULTIPLE_PRIMARY_DOMAINS','Only one domain can be primary');
+  if((config.domains??[]).some(domain=>domain.redirectHttps&&!domain.https))throw new AppError('HTTPS_REDIRECT_REQUIRES_HTTPS','HTTP redirects require automatic HTTPS for the same domain');
+  for(const domain of config.domains??[]) if(domain.https) { try { if(canonicalDnsName(domain.hostname)!==domain.hostname || domain.hostname.endsWith('.localhost'))throw new Error(); } catch { throw new AppError('INVALID_HTTPS_DOMAIN','Automatic HTTPS requires a valid public hostname',400); } }
   if(kind!=='app'&&(config.replicas??1)!==1)throw new AppError('STATEFUL_REPLICAS','Database services require exactly one replica');
   if((config.replicas??1)>1&&(config.mounts??[]).some(mount=>!(mount.readOnly??(mount.type==='file'))))throw new AppError('STATEFUL_REPLICAS','Writable mounts require exactly one replica');
   if(kind!=='app'&&config.domains?.length)throw new AppError('DATABASE_ROUTING','Database services do not expose HTTP domains');

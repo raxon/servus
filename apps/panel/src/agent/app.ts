@@ -25,6 +25,16 @@ import { createRestoreCandidate } from './restore-candidate.js';
 import { DatabaseImportError, importDatabaseCandidate } from './database-import.js';
 import { inspectRestoreSwitch } from './restore-switch-inspect.js';
 import { commitPreparedRestore, RestoreCommitUncertainError } from './restore-commit.js';
+import { HttpsMigrationJournal, HTTPS_MIGRATION_OPERATION_ID } from './https-migration-journal.js';
+import { dockerIngressMigrationDriver } from './https-migration-docker.js';
+import { recoverHttpsMigration } from './https-migration.js';
+import { migrateManagedHttps } from './https-migration-run.js';
+import { inspectManagedCertificate } from './managed-certificate.js';
+import { inspectAcmeFailure } from './managed-certificate-events.js';
+import { CertificateRetryError, planCertificateRetry } from './certificate-retry.js';
+import { configureHostDomain } from './host-domain.js';
+import { inspectHostCertificate } from './host-certificate.js';
+import { hostCertificateSchema } from '../shared/host-domain.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -40,7 +50,7 @@ const input = z.object({
     kind: z.enum(['app','postgres','redis','mariadb']).optional(),
     source: z.discriminatedUnion('type', [z.object({type:z.literal('image')}), z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256),credential:z.object({username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().optional()})]).optional(),
     environment: z.array(z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32768).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).refine(value=>!value.secret||Boolean(value.secretRef)&&value.value===undefined)).max(100).optional(),
-    domains: z.array(z.object({hostname,port:z.number().int().min(1).max(65535),primary:z.boolean().optional()})).max(20).optional(),
+    domains: z.array(z.object({hostname,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional()})).max(20).optional(),
     mounts: z.array(z.object({type:z.enum(['volume','file','bind']),name:z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/),target:z.string().startsWith('/').max(256),readOnly:z.boolean().optional(),content:z.string().max(32768).optional(),source:z.string().max(512).optional()})).max(20).optional(),
     resources: z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).optional(),
     database: z.object({database:z.string().min(1).max(63),user:z.string().min(1).max(63),passwordSecretRef:z.string().uuid().optional()}).strict().optional(),
@@ -81,14 +91,121 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
   const locks = new Set<string>();
   const consoles = new Map<string, number>(), uncertainConsoles = new Set<string>();
   const restores = new RestoreJournal(journal, serviceId => locks.has(serviceId) || (consoles.get(serviceId) ?? 0) > 0 || uncertainConsoles.has(serviceId));
+  const ingressJournal=new HttpsMigrationJournal(journal,value=>vault.seal(value),value=>vault.open(value));
+  let ingressRecoveryError=false;
+  let ingressBusy=false;
+  let ingressTask:Promise<unknown>|undefined;
+  try {
+    if(ingressJournal.load()) {
+      if(!(runtime instanceof DockerRuntime))throw new Error('Ingress recovery driver is unavailable.');
+      await recoverHttpsMigration(ingressJournal,dockerIngressMigrationDriver(runtime.docker,'panel-ingress'));
+    }
+  } catch { ingressRecoveryError=true; }
   maintenance?.bindJournal(scope => (scope ? !restores.onlyUnresolvedLegacyUpload(scope.legacyUploadId) || restores.get(scope.legacyUploadId)?.service_id!==scope.serviceId : restores.hasUnresolved()) || Boolean(journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get()));
   app.addHook('onRequest', async (req, reply) => {
     const value = req.headers.authorization?.replace(/^Bearer /, '') || '';
     const left = createHash('sha256').update(value).digest();
     const right = createHash('sha256').update(config.token).digest();
     if (!timingSafeEqual(left, right)) return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Agent authentication required.' } });
+    if(req.method==='POST' && !req.url.startsWith('/https/ingress/')) {
+      try {
+        if(ingressBusy || ingressRecoveryError || ingressJournal.load())return reply.code(503).send({error:{code:'INGRESS_RECOVERY_REQUIRED',message:'The ingress is changing or requires recovery before service changes can continue.'}});
+      } catch {return reply.code(503).send({error:{code:'INGRESS_RECOVERY_REQUIRED',message:'The ingress requires recovery before service changes can continue.'}});}
+    }
   });
-  app.get('/runtime', () => runtime.status());
+  for(const action of ['migrate','migrate-external','recover'] as const) app.post(`/https/ingress/${action}`,async(req,reply)=>{
+    if(!z.object({}).strict().safeParse(req.body??{}).success)return reply.code(400).send({error:{code:'INVALID_REQUEST',message:'Invalid ingress request.'}});
+    if(!(runtime instanceof DockerRuntime))return reply.code(503).send({error:{code:'INGRESS_UNAVAILABLE',message:'Managed ingress is unavailable.'}});
+    const release=maintenance?.admit();
+    if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    if(ingressBusy){release?.();return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'An ingress operation is already running.'}});}
+    ingressBusy=true;
+    const quiescent=()=>{
+      if(active.size||locks.size||restores.hasUnresolved()||journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get())throw new Error('Another operation must finish before changing the ingress.');
+    };
+    const task=(async()=>{
+      if(action!=='recover') {
+        if(ingressRecoveryError||ingressJournal.load())throw new Error('Recover the previous ingress operation first.');
+        quiescent();
+        await migrateManagedHttps(runtime,ingressJournal,quiescent,undefined,action==='migrate-external'?'external':'direct');
+      } else {
+        await recoverHttpsMigration(ingressJournal,dockerIngressMigrationDriver(runtime.docker,'panel-ingress'));
+        ingressRecoveryError=false;
+      }
+    })();
+    ingressTask=task;
+    try {await task;return {ok:true};}
+    catch(error) {
+      try {ingressRecoveryError=Boolean(ingressJournal.load());}catch {ingressRecoveryError=true;}
+      const code=ingressRecoveryError?'INGRESS_RECOVERY_REQUIRED':'INGRESS_MIGRATION_FAILED';
+      return reply.code(ingressRecoveryError?503:422).send({error:{code,message:vault.redact(message(error))}});
+    } finally {ingressTask=undefined;ingressBusy=false;release?.();}
+  });
+  app.get('/runtime', async () => {
+    let unresolved=ingressRecoveryError;
+    try {unresolved ||= Boolean(ingressJournal.load());}catch {unresolved=true;}
+    return {...await runtime.status(),ingressRecoveryRequired:unresolved,ingressBusy};
+  });
+  app.post('/host-domain/configure',async(req,reply)=>{
+    const parsed=hostCertificateSchema.safeParse(req.body);
+    if(!parsed.success)return reply.code(400).send({error:{code:'INVALID_HOST_CERTIFICATE',message:'Invalid host certificate request.'}});
+    if(!(runtime instanceof DockerRuntime))return reply.code(503).send({error:{code:'INGRESS_UNAVAILABLE',message:'Managed ingress is unavailable.'}});
+    const release=maintenance?.admit();
+    if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    if(ingressBusy){release?.();return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'An ingress operation is already running.'}});}
+    ingressBusy=true;
+    const quiescent=()=>{if(active.size||locks.size||restores.hasUnresolved()||journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get())throw new Error('Another operation must finish before changing the host ingress.');};
+    const task=configureHostDomain(runtime,ingressJournal,quiescent,parsed.data);ingressTask=task;
+    try {await task;return {ok:true};}
+    catch(error){try{ingressRecoveryError=Boolean(ingressJournal.load());}catch{ingressRecoveryError=true;}return reply.code(ingressRecoveryError?503:422).send({error:{code:ingressRecoveryError?'INGRESS_RECOVERY_REQUIRED':'HOST_INGRESS_FAILED',message:vault.redact(message(error))}});}
+    finally{ingressTask=undefined;ingressBusy=false;release?.();}
+  });
+  let certificateChecks=0;
+  app.post('/certificates/managed',async(req,reply)=>{
+    const parsed=z.object({hostname:hostname}).strict().safeParse(req.body);
+    if(!parsed.success)return reply.code(400).send({error:{code:'INVALID_DOMAIN',message:'Invalid certificate hostname.'}});
+    if(!(runtime instanceof DockerRuntime))return reply.code(503).send({error:{code:'CERTIFICATE_UNAVAILABLE',message:'Managed certificate status is unavailable.'}});
+    const release=maintenance?.admit();
+    if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    if(certificateChecks>=2){release?.();return reply.code(429).send({error:{code:'CERTIFICATE_BUSY',message:'Too many certificate checks are running.'}});}
+    certificateChecks++;
+    try {
+      if(!(await runtime.status()).httpsConfigured)return reply.code(409).send({error:{code:'HTTPS_NOT_CONFIGURED',message:'Managed HTTPS ingress is not configured.'}});
+      const hostCertificate=inspectHostCertificate(config.dataDir,parsed.data.hostname);
+      if(hostCertificate)return {...hostCertificate,eventsAvailable:false};
+      const certificate=await inspectManagedCertificate(runtime.docker,parsed.data.hostname);
+      const events=await inspectAcmeFailure(runtime.docker,parsed.data.hostname);
+      return {...certificate,eventsAvailable:events.available,...(events.failure?{lastFailure:events.failure}:{})};
+    } catch {return reply.code(503).send({error:{code:'CERTIFICATE_UNAVAILABLE',message:'Managed certificate status is unavailable. Try again.'}});}
+    finally {certificateChecks--;release?.();}
+  });
+  app.post('/certificates/retry',async(req,reply)=>{
+    const parsed=z.object({serviceId:z.string().uuid(),hostname}).strict().safeParse(req.body);
+    if(!parsed.success)return reply.code(400).send({error:{code:'INVALID_DOMAIN',message:'Invalid certificate retry request.'}});
+    if(!(runtime instanceof DockerRuntime))return reply.code(503).send({error:{code:'CERTIFICATE_UNAVAILABLE',message:'Managed certificate retry is unavailable.'}});
+    const release=maintenance?.admit();
+    if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    const {serviceId,hostname:host}=parsed.data;
+    if(locks.has(serviceId)||restores.hasUnresolved(serviceId)||journal.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(serviceId)) {
+      release?.();return reply.code(409).send({error:{code:'RETRY_BUSY',message:'Another operation is changing this service.'}});
+    }
+    locks.add(serviceId);
+    try {
+      if(!(await runtime.status()).httpsConfigured)throw new CertificateRetryError('RETRY_UNAVAILABLE','Managed HTTPS ingress is not configured.');
+      const service=runtime.docker.getService(`panel-app-${serviceId}`),current=await service.inspect();
+      const target=planCertificateRetry(current.Spec,serviceId,host);
+      const certificate=await inspectManagedCertificate(runtime.docker,host);
+      if(certificate.status!=='not_found')throw new CertificateRetryError('RETRY_UNAVAILABLE','A managed certificate already exists. Renewal is handled automatically by the HTTPS ingress.');
+      await service.update({...target,version:current.Version.Index});
+      const key=Object.keys(target.Labels??{}).find(value=>value.startsWith('panel.acme-retry-') && target.Labels?.[value]!==current.Spec.Labels?.[value]);
+      if(!key || !target.Labels?.[key])throw new Error('Retry timestamp could not be recorded.');
+      return {accepted:true,requestedAt:target.Labels[key]};
+    } catch(error) {
+      if(error instanceof CertificateRetryError)return reply.code(409).send({error:{code:error.code,message:error.message}});
+      if(isUncertainRuntimeError(error))return reply.code(503).send({error:{code:'RETRY_UNCERTAIN',message:'The retry result is unknown. Check certificate status before trying again.'}});
+      return reply.code(503).send({error:{code:'RETRY_UNAVAILABLE',message:'The certificate retry could not be confirmed. Check certificate status before trying again.'}});
+    } finally {locks.delete(serviceId);release?.();}
+  });
   app.get<{Params:{id:string}}>('/services/:id/state', (req, reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success) return reply.code(400).send({ error: { code: 'INVALID_ID', message: 'Invalid service identity.' } });
     return runtime.inspectService(req.params.id);
@@ -337,6 +454,10 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     const parsed = input.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: { code: 'INVALID_SPEC', message: 'Invalid service operation.' } });
     const body = parsed.data;
+    if(body.operationId===HTTPS_MIGRATION_OPERATION_ID)return reply.code(400).send({error:{code:'INVALID_OPERATION',message:'Reserved operation identity.'}});
+    try {
+      if(ingressRecoveryError || ingressJournal.load())return reply.code(503).send({error:{code:'INGRESS_RECOVERY_REQUIRED',message:'The ingress requires recovery before service changes can continue.'}});
+    } catch {return reply.code(503).send({error:{code:'INGRESS_RECOVERY_REQUIRED',message:'The ingress requires recovery before service changes can continue.'}});}
     const hash = createHash('sha256').update(JSON.stringify(body)).digest('hex');
     const previous = journal.prepare('SELECT * FROM operations WHERE id = ?').get(body.operationId) as JournalRow | undefined;
     if (previous && previous.request_hash !== hash) return reply.code(409).send({ error: { code: 'OPERATION_CONFLICT', message: 'Operation identity was reused with different input.' } });
@@ -388,6 +509,6 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (isUncertainRuntimeError(error)) return reply.code(503).send({ error: { code: 'OPERATION_UNCERTAIN', message: 'Docker connection interrupted. Reconcile the same operation before making another change.' } });
     return reply.code(422).send({ error: { code: 'RUNTIME_FAILED', message: vault.redact(message(error)) } });
   });
-  app.addHook('onClose', async () => { await Promise.allSettled(active.values()); journal.close(); });
+  app.addHook('onClose', async () => { await Promise.allSettled([...active.values(),...(ingressTask?[ingressTask]:[])]); journal.close(); });
   return app;
 }

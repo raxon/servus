@@ -9,6 +9,9 @@ import { lifecycleAllowsWork } from '../shared/lifecycle-gate.js';
 const controlConfig = supervisorConfig(process.env);
 const maintenance = controlConfig ? new MaintenanceGate(lifecycleAllowsWork) : undefined;
 const dataDir = resolve(process.env.PANEL_DATA_DIR ?? '.data');
+const hostDomainApi = process.env.PANEL_HOST_DOMAINS_API_URL ?? 'https://api.servus.run';
+const automaticHostDomains = process.env.PANEL_HOST_DOMAINS_AUTOMATIC === undefined
+  ? process.env.NODE_ENV === 'production' : process.env.PANEL_HOST_DOMAINS_AUTOMATIC === 'true';
 const app = await createApp({
   dataDir,
   webDir: resolve(process.env.PANEL_WEB_DIR || resolve(import.meta.dirname, '../../dist/web')),
@@ -20,6 +23,7 @@ const app = await createApp({
   maintenance,
   updaterSocketPath: process.env.PANEL_UPDATER_SOCKET,
   updaterApplyEnabled: process.env.PANEL_UPDATER_APPLY_ENABLED === 'true',
+  hostDomains:hostDomainApi?{apiOrigin:hostDomainApi,automatic:automaticHostDomains}:undefined,
 });
 await app.listen({host:process.env.PANEL_HOST ?? '127.0.0.1',port:Number(process.env.PANEL_PORT ?? 4180)});
 const control = startSupervisorControl(controlConfig, 'api', async timeout => {

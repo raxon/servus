@@ -5792,3 +5792,11 @@ select:disabled {
 .skeleton-inline-metrics { margin-top: 20px; }
 
 .sidebar-project-skeleton { display: grid; gap: 24px; padding: 16px 14px; }
+
+.https-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.https-environment { border: 0; padding: 0; margin: 16px 0; display: grid; gap: 8px; }
+.https-environment legend { font-weight: 600; margin-bottom: 8px; }
+.https-environment label { display: flex; align-items: center; gap: 8px; }
+.https-environment small { color: #626662; }
+.detail-row.host-domain-address { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.host-domain-address > :is(a, strong) { max-width: 100%; text-align: start; overflow-wrap: anywhere; }

@@ -70,6 +70,13 @@ validate_origin() {
   validate_host "$host"
   [[ -z $port ]] || validate_port "$port"
 }
+validate_host_domain_settings() {
+  [[ $2 == true || $2 == false ]] || fail 'SERVUS_HOST_DOMAINS_AUTOMATIC must be true or false.'
+  if [[ -n $1 ]]; then
+    [[ $1 == https://* ]] || fail 'SERVUS_HOST_DOMAINS_API_URL must use HTTPS.'
+    validate_origin "$1"
+  fi
+}
 normalize_origin() {
   validate_origin "$1"
   local value=${1,,} scheme authority port
@@ -97,6 +104,7 @@ detect_platform() {
   [[ $os_codename =~ ^[a-z]+$ ]] || fail 'Missing or invalid distribution codename.'
   case "$(uname -m)" in x86_64|amd64) architecture=amd64;; aarch64|arm64) architecture=arm64;; *) fail 'Use an amd64 or arm64 VPS.';; esac
 }
+has_setting() { awk -F= -v key="$1" '$1 == key {found=1; exit} END {exit !found}' "$config_file"; }
 read_setting() { awk -F= -v key="$1" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$config_file"; }
 canonical_saved_origin() {
   local value=${1,,} scheme host port octet a b c d
@@ -265,6 +273,7 @@ main() {
   local dry_run=0 source_dir= hostname= image_ref= swarm_advertise_addr= ref_explicit=0 ref=${SERVUS_REF:-main} port=4180 ingress_port=80
   local install_dir=${SERVUS_INSTALL_DIR:-/opt/servus} config_dir=${SERVUS_CONFIG_DIR:-/etc/servus} data_dir=${SERVUS_DATA_DIR:-/var/lib/servus}
   local public_url=${SERVUS_PUBLIC_URL:-} bind_address=${SERVUS_BIND_ADDRESS:-127.0.0.1}
+  local host_domain_api=${SERVUS_HOST_DOMAINS_API_URL-https://api.servus.run} host_domain_automatic=${SERVUS_HOST_DOMAINS_AUTOMATIC:-true}
   while (( $# )); do
     case "$1" in
       --help|-h) usage; return 0;;
@@ -276,6 +285,7 @@ main() {
       *) fail "Unknown option: $1";;
     esac
   done
+  validate_host_domain_settings "$host_domain_api" "$host_domain_automatic"
   validate_port "$port"; validate_port "$ingress_port"
   port=$((10#$port)); ingress_port=$((10#$ingress_port))
   [[ $port != "$ingress_port" ]] || fail 'Panel and application ingress need different ports.'
@@ -314,6 +324,7 @@ main() {
   if (( dry_run )); then
     printf 'Servus install plan\nOS: %s %s (%s)\nSource: %s\nInstall: %s\nConfig: %s\nData: %s\nPanel port: %s\nApplication ingress port: %s\n' "$os_id" "$os_version" "$architecture" "${source_dir:-https://github.com/raxon/servus/archive/$ref.tar.gz}" "$install_dir" "$config_dir" "$data_dir" "$port" "$ingress_port"
     printf 'Management bind address: %s\n' "$bind_address"
+    printf 'New installation host domain API: %s\nAutomatic host registration: %s\n' "${host_domain_api:-disabled}" "$host_domain_automatic"
     if [[ -n $image_ref ]]; then printf 'Image: %s\n' "$image_ref"; fi
     if [[ -n $swarm_advertise_addr ]]; then printf 'Swarm advertise address: %s\n' "$swarm_advertise_addr"; fi
     return 0
@@ -366,6 +377,9 @@ main() {
   if [[ -f $config_file ]]; then
     [[ $(read_setting SERVUS_PORT) == "$port" && $(read_setting SERVUS_INGRESS_PORT) == "$ingress_port" && $(read_setting SERVUS_DATA_DIR) == "$data_dir" ]] || fail 'Existing install uses different ports or data directory. Keep the original arguments when rerunning.'
     public_url=$(read_setting SERVUS_PUBLIC_URL)
+    if has_setting SERVUS_HOST_DOMAINS_API_URL; then host_domain_api=$(read_setting SERVUS_HOST_DOMAINS_API_URL); fi
+    if has_setting SERVUS_HOST_DOMAINS_AUTOMATIC; then host_domain_automatic=$(read_setting SERVUS_HOST_DOMAINS_AUTOMATIC); fi
+    validate_host_domain_settings "$host_domain_api" "$host_domain_automatic"
     bind_address=$(read_setting SERVUS_BIND_ADDRESS)
     validate_origin "$public_url"
     [[ $bind_address == 0.0.0.0 || $bind_address == 127.0.0.1 ]] || fail 'Invalid stored bind address.'
@@ -438,6 +452,7 @@ main() {
   [[ $(stat -c '%u' "$data_dir") == 1000 ]] || fail 'The data directory must belong to container UID 1000. Existing ownership was left unchanged.'
   local next_env=$staging/servus.env
   printf 'SERVUS_IMAGE=%s\nSERVUS_DATA_DIR=%s\nSERVUS_PORT=%s\nSERVUS_INGRESS_PORT=%s\nSERVUS_DOCKER_GID=%s\nSERVUS_BIND_ADDRESS=%s\nSERVUS_PUBLIC_URL=%s\nSERVUS_ALLOWED_ORIGINS=%s\nSERVUS_SECURE_COOKIES=%s\nSERVUS_SOURCE_REF=%s\n' "$image" "$data_dir" "$port" "$ingress_port" "$socket_gid" "$bind_address" "$public_url" "$allowed_origins" "$secure_cookies" "$ref" > "$next_env"
+  printf 'SERVUS_HOST_DOMAINS_API_URL=%s\nSERVUS_HOST_DOMAINS_AUTOMATIC=%s\n' "$host_domain_api" "$host_domain_automatic" >> "$next_env"
   if [[ -n $proxy_secret ]]; then printf 'SERVUS_TRUSTED_PROXY_SECRET=%s\n' "$proxy_secret" >> "$next_env"; fi
   docker compose --env-file "$next_env" -f "$source/deployment/compose.yaml" -p servus config --quiet
   if [[ -f $config_file ]]; then

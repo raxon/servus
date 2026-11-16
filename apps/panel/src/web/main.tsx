@@ -73,6 +73,8 @@ import { AccountLinkSettings, CentralAccessSettings, CentralSignIn } from "./Cen
 import { LocalPasswordSettings } from "./LocalPassword.js";
 import { GithubSettings } from "./GithubSettings.js";
 import { UpdateSettings, useUpdateDiscovery } from "./UpdateSettings.js";
+import { HostDomainSettings } from "./HostDomainSettings.js";
+import { HttpsSettings } from "./HttpsSettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
@@ -1489,6 +1491,8 @@ function SettingsPage() {
         </section>
       </div>
       {user.role === "admin" ? <UpdateSettings /> : null}
+      {user.role === "admin" ? <HostDomainSettings /> : null}
+      {user.role === "admin" ? <HttpsSettings configured={runtime.data?.httpsConfigured === true} access={runtime.data?.httpsAccess} recoveryRequired={runtime.data?.ingressRecoveryRequired === true} busy={runtime.data?.ingressBusy === true} /> : null}
       {user.role === "admin" ? <GithubSettings /> : null}
       <LocalPasswordSettings />
       {user.role === "admin" ? <CentralAccessSettings /> : null}

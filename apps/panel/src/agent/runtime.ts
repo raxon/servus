@@ -4,6 +4,12 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { SecretVault } from '../shared/secrets.js';
 import { buildSource } from './build.js';
+import { httpsRouteLabels, httpsRedirectLabels, supportsManagedHttps, httpsIngressOptions } from './https-routing.js';
+import { LOCAL_TLS_FORWARDER, verifyLocalTlsForwarder } from './https-local-forwarder.js';
+import { inspectManagedCertificate } from './managed-certificate.js';
+import { inspectHostCertificate } from './host-certificate.js';
+import { isHostApplication } from '../shared/host-domain.js';
+import { verifyRedirectEndpoints, verifyPublicHttpsRoute } from '../server/domain-tls.js';
 import { compileConfiguration, databaseKind, stateful, decodeDockerLogs, postgresScramVersion, verifyRestoredVolume } from './configuration.js';
 import { readRestoreBinding } from './restore-binding.js';
 import type { RestoreVolumeBinding } from './restore-journal.js';
@@ -62,9 +68,24 @@ export class DockerRuntime {
   async status(): Promise<RuntimeStatus> {
     try {
       const info = await this.docker.info();
+      const httpsAccess=await this.managedHttpsConfigured(info.Swarm?.NodeID);
       return { online: true, engineVersion: info.ServerVersion, cpus: info.NCPU, memoryBytes: info.MemTotal,
-        swarmState: info.Swarm?.LocalNodeState, ingressPort: this.ingressPort };
+        swarmState: info.Swarm?.LocalNodeState, ingressPort: this.ingressPort, httpsConfigured: Boolean(httpsAccess), ...(httpsAccess?{httpsAccess}:{} ) };
     } catch { return { online: false, error: 'Docker Engine is unavailable.', ingressPort: this.ingressPort }; }
+  }
+
+  private async managedHttpsConfigured(nodeId?:string):Promise<'direct'|'external'|undefined> {
+    if(!nodeId || !/^[a-z0-9]{25}$/.test(nodeId))return undefined;
+    try {
+      const ingress=await this.docker.getService(INGRESS_SERVICE).inspect();
+      const volume=await this.docker.getVolume('servus-acme').inspect();
+      if(!supportsManagedHttps(ingress.Spec) || ingress.Spec.TaskTemplate?.Placement?.Constraints?.includes(`node.id==${nodeId}`)!==true || volume.Driver!=='local' || volume.Labels?.['panel.owner']!==OWNER || volume.Labels?.['panel.purpose']!=='acme')return undefined;
+      if(ingress.Spec.Labels?.['panel.https-access']==='loopback-forwarder-v1') {
+        const network=await this.docker.getNetwork(INGRESS_NETWORK).inspect(),container=this.docker.getContainer(LOCAL_TLS_FORWARDER),inspection=await container.inspect();
+        return network.Labels?.['panel.owner']===OWNER && network.Driver==='overlay' && network.Attachable===true && await verifyLocalTlsForwarder(container,network.Id,inspection.Image) ? 'external' : undefined;
+      }
+      return 'direct';
+    } catch { return undefined; }
   }
 
   async ensureInfrastructure(): Promise<void> {
@@ -90,15 +111,36 @@ export class DockerRuntime {
       }
       return;
     }
+    const https=this.vault.httpsIngress() ?? httpsIngressOptions(process.env);
+    let nodeId:string|undefined;
+    if(https) {
+      if(this.ingressPort!==80)throw new Error('Automatic HTTPS requires public HTTP ingress on port 80.');
+      nodeId=(await this.docker.info()).Swarm?.NodeID;
+      if(!nodeId || !/^[a-z0-9]{25}$/.test(nodeId))throw new Error('A stable Swarm manager node is required for HTTPS.');
+      let volume;
+      try {volume=await this.docker.getVolume('servus-acme').inspect();}
+      catch(error) {
+        if(!isNotFound(error))throw error;
+        await this.docker.createVolume({Name:'servus-acme',Labels:{'panel.owner':OWNER,'panel.purpose':'acme'}});
+        volume=await this.docker.getVolume('servus-acme').inspect();
+      }
+      if(volume.Labels?.['panel.owner']!==OWNER || volume.Labels?.['panel.purpose']!=='acme' || volume.Driver!=='local')throw new Error('HTTPS certificate storage belongs to another installation or uses an unsupported driver.');
+    }
     await this.pull(this.ingressImage);
-    await this.docker.createService({ Name: INGRESS_SERVICE, Labels: { 'panel.owner': OWNER },
+    const args=['--providers.swarm.endpoint=unix:///var/run/docker.sock', '--providers.swarm.exposedbydefault=false',
+      `--providers.swarm.network=${INGRESS_NETWORK}`, '--entrypoints.web.address=:8080', '--api.dashboard=false', '--log.level=WARN'];
+    if(https)args.push('--entrypoints.websecure.address=:8443',`--certificatesresolvers.servus.acme.email=${https.email}`,
+      '--certificatesresolvers.servus.acme.storage=/letsencrypt/acme.json','--certificatesresolvers.servus.acme.httpchallenge.entrypoint=web',
+      ...(https.staging ? ['--certificatesresolvers.servus.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory'] : []));
+    await this.docker.createService({ Name: INGRESS_SERVICE, Labels: { 'panel.owner': OWNER,...(https?{'panel.https':'servus-acme-v1'}:{}) },
       TaskTemplate: { ContainerSpec: { Image: this.ingressImage,
-        Args: ['--providers.swarm.endpoint=unix:///var/run/docker.sock', '--providers.swarm.exposedbydefault=false',
-          `--providers.swarm.network=${INGRESS_NETWORK}`, '--entrypoints.web.address=:8080', '--api.dashboard=false', '--log.level=WARN'],
-        Mounts: [{ Type: 'bind', Source: '/var/run/docker.sock', Target: '/var/run/docker.sock', ReadOnly: true }] },
-        Networks: [{ Target: INGRESS_NETWORK }], Placement: { Constraints: ['node.role==manager'] }, RestartPolicy: { Condition: 'any' } },
+        Args:args,
+        Mounts: [{ Type: 'bind', Source: '/var/run/docker.sock', Target: '/var/run/docker.sock', ReadOnly: true },
+          ...(https ? [{Type:'volume' as const,Source:'servus-acme',Target:'/letsencrypt',ReadOnly:false}] : [])] },
+        Networks: [{ Target: INGRESS_NETWORK }], Placement: { Constraints: [nodeId?`node.id==${nodeId}`:'node.role==manager'] }, RestartPolicy: { Condition: 'any' } },
       Mode: { Replicated: { Replicas: 1 } },
-      EndpointSpec: { Ports: [{ Protocol: 'tcp', PublishedPort: this.ingressPort, TargetPort: 8080, PublishMode: 'host' }] } });
+      EndpointSpec: { Ports: [{ Protocol: 'tcp', PublishedPort: this.ingressPort, TargetPort: 8080, PublishMode: 'host' },
+        ...(https ? [{Protocol:'tcp' as const,PublishedPort:443,TargetPort:8443,PublishMode:'host' as const}] : [])] } });
   }
 
   async pull(image: string): Promise<string> {
@@ -153,10 +195,31 @@ export class DockerRuntime {
       return { state: 'stopped', deployedRevision: service.deployedRevision || service.revision, messages: ['Runtime service and routes removed. Persistent volumes were preserved.'] };
     }
     await this.ensureInfrastructure();
+    if(type==='deploy' && service.domains?.some(domain=>domain.https)) {
+      const nodeId=(await this.docker.info()).Swarm?.NodeID;
+      if(!await this.managedHttpsConfigured(nodeId))throw new Error('Automatic HTTPS ingress is not configured. Existing application routes were not changed.');
+      const host=this.vault.hostConnection()?.hostname;
+      for(const domain of service.domains??[])if(domain.https && host && isHostApplication(domain.hostname,host) && inspectHostCertificate(this.dataDir,domain.hostname)?.status!=='active')throw new Error('The Servus host certificate is not active. Synchronize the host domain before deploying.');
+    }
     const messages: string[] = [];
     const existing = await this.inspect(name);
     if(binding&&!existing)throw new Error('The restored database service is missing; recover its saved configuration before continuing.');
     if (existing && existing.Spec.Labels?.['panel.owner'] !== OWNER) throw new Error('Service ownership check failed.');
+    // A journaled target may have been recorded before Docker received it. Recheck
+    // the live certificate before applying such a target after a restart, but do
+    // not obstruct rollback or recovery of an operation already applied.
+    if(type==='deploy' && recovery?.stage!=='rolling_back' && existing?.Spec.Labels?.['panel.operation']!==operationId) {
+      for(const domain of service.domains??[]) {
+        if(!domain.redirectHttps)continue;
+        if(!domain.https)throw new Error('HTTP redirect requires HTTPS. Existing application routes were not changed.');
+        const labels=existing?.Spec.Labels??{};
+        const prefix=`traefik.http.routers.${service.id.replaceAll('-','')}-`;
+        const existingRoute=Object.entries(labels).some(([key,value])=>key.startsWith(prefix) && key.endsWith('-https.rule') && value===`Host(\`${domain.hostname}\`)`);
+        if(!existingRoute)throw new Error(`Deploy HTTPS for ${domain.hostname} and verify the certificate before enabling its redirect.`);
+        const cert=inspectHostCertificate(this.dataDir,domain.hostname)??await inspectManagedCertificate(this.docker,domain.hostname);
+        if(cert.status!=='active' || !await verifyRedirectEndpoints(domain.hostname,cert.fingerprint))throw new Error(`The managed certificate for ${domain.hostname} is not active and publicly served at every DNS address. Existing application routes were not changed.`);
+      }
+    }
     if (!existing && type !== 'deploy') throw new Error('No deployed service exists. Deploy the saved configuration before starting or restarting it.');
     const previousSpec = recovery?.previousRecorded ? recovery.previousSpec : existing?.Spec ?? null;
     await verifyBinding(existing?.Spec,previousSpec,recovery?.targetSpec);
@@ -216,6 +279,9 @@ export class DockerRuntime {
           Object.assign(labels, { 'traefik.enable': 'true', [`traefik.http.routers.${route}.rule`]: `Host(\`${domain.hostname}\`)`,
             [`traefik.http.routers.${route}.entrypoints`]: 'web', [`traefik.http.routers.${route}.service`]: route,
             [`traefik.http.services.${route}.loadbalancer.server.port`]: String(domain.port) });
+          const host=this.vault.hostConnection()?.hostname;
+          if ('https' in domain && domain.https) Object.assign(labels,httpsRouteLabels(service.id,index,domain.hostname,domain.port,Boolean(host&&isHostApplication(domain.hostname,host))));
+          if ('redirectHttps' in domain && domain.redirectHttps) Object.assign(labels,httpsRedirectLabels(service.id,index,domain.hostname,domain.port));
         });
         const limits = service.resources || { cpu: 1, memoryMb: 256 };
         let placement;
@@ -417,21 +483,24 @@ export class DockerRuntime {
     throw new Error('Timed out stopping application tasks.');
   }
 
-  private async probeRoute(hostname: string): Promise<void> {
+  private async probeRoute(hostname: string,https = false): Promise<void> {
     for (let attempt = 0; attempt < 30; attempt++) {
       try {
-        const containers = await this.docker.listContainers({ filters: { label: [`com.docker.swarm.service.name=${INGRESS_SERVICE}`] } });
-        const target = containers[0];
-        if (!target) throw new Error('Ingress is starting.');
-        const status = await ingressStatus(this.docker, target.Id, hostname);
-        if (status >= 200 && status < 400) return;
+        if(https) {if(await verifyPublicHttpsRoute(hostname))return;}
+        else {
+          const containers = await this.docker.listContainers({ filters: { label: [`com.docker.swarm.service.name=${INGRESS_SERVICE}`] } });
+          const target = containers[0];
+          if (!target) throw new Error('Ingress is starting.');
+          const status = await ingressStatus(this.docker, target.Id, hostname);
+          if (status >= 200 && status < 400) return;
+        }
       } catch (error) {
         if (isUncertainRuntimeError(error)) throw error;
         // The proxy may not have loaded the new service yet.
       }
       await delay(1000);
     }
-    throw new Error('The application did not return a successful HTTP response through ingress.');
+    throw new Error(`The application did not return a successful ${https?'HTTPS':'HTTP'} response through ingress.`);
   }
 
   private async waitDestroyed(serviceId: string, hostnames: string[]): Promise<void> {
@@ -468,7 +537,16 @@ function matchesTask(task: RuntimeTask, expected: Docker.ServiceSpec): boolean {
 }
 
 function routeHostnames(spec: Docker.ServiceSpec): string[] {
-  return Object.entries(spec.Labels || {}).filter(([key]) => key.startsWith('traefik.http.routers.') && key.endsWith('.rule')).map(([,rule]) => rule.match(/^Host\(`([^`]+)`\)$/)?.[1]).filter((host): host is string => Boolean(host));
+  return [...new Set(Object.entries(spec.Labels || {}).filter(([key]) => key.startsWith('traefik.http.routers.') && key.endsWith('.rule')).map(([,rule]) => rule.match(/^Host\(`([^`]+)`\)$/)?.[1]).filter((host): host is string => Boolean(host)))];
+}
+function redirectedRouteHostnames(spec:Docker.ServiceSpec):Set<string> {
+  const labels=spec.Labels??{},hosts=new Set<string>();
+  for(const [key,value] of Object.entries(labels)) {
+    if(!key.startsWith('traefik.http.routers.')||!key.endsWith('.middlewares'))continue;
+    const prefix=key.slice(0,-'.middlewares'.length),host=labels[`${prefix}.rule`]?.match(/^Host\(`([^`]+)`\)$/)?.[1];
+    if(host && value.split(',').some(name=>labels[`traefik.http.middlewares.${name}.redirectscheme.scheme`]==='https'))hosts.add(host);
+  }
+  return hosts;
 }
 function isNotFound(error: unknown) { return (error as { statusCode?: number })?.statusCode === 404; }
 export function message(error: unknown) { return error instanceof Error ? error.message : 'Unexpected runtime error'; }

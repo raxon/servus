@@ -13,10 +13,15 @@ import type { ActionType, RuntimeStatus, User } from '../shared/types.js';
 import { hashPassword, verifyPassword } from './auth.js';
 import { AppError } from './errors.js';
 import { Store } from './store.js';
+import { inspectDomainDns } from './domain-dns.js';
+import { inspectDomainTls } from './domain-tls.js';
+import { canonicalDnsName } from '../agent/acme/dns01.js';
 import { nameSchema, normalizeServiceInput, parseServicePatch, validateConfiguration } from './configuration.js';
 import { agentRequest as defaultAgentRequest, agentDatabaseExport, agentDatabaseUpload, AgentRequestError } from '../agent/client.js';
 import { registerConsole } from './console.js';
 import { registerCentralAuth } from './central-auth.js';
+import { HostDomainManager, registerHostDomainRoutes, withAutomaticHostDomain, type HostDomainOptions } from './host-domain.js';
+import { isHostApplication } from '../shared/host-domain.js';
 import { BUILD_INFO } from './generated-build-info.js';
 import { clientAddress, normalizeClientAddress, trustedProxyRequest } from './proxy-address.js';
 import { MaintenanceGate } from './maintenance.js';
@@ -47,6 +52,7 @@ export interface AppOptions {
   updaterSocketPath?: string;
   updaterApplyEnabled?: boolean;
   updaterCurrentVersion?: string;
+  hostDomains?:HostDomainOptions;
 }
 export async function createApp(options: AppOptions) {
   if(options.trustedProxySecret!==undefined && !/^[a-f0-9]{64}$/.test(options.trustedProxySecret))throw new Error('Invalid trusted proxy secret configuration');
@@ -95,6 +101,7 @@ export async function createApp(options: AppOptions) {
     app.addHook('onResponse',async req=>{requestReleases.get(req)?.();});
   }
   const allowedOrigins = new Set(options.allowedOrigins ?? ['http://localhost:4180','http://127.0.0.1:4180','http://localhost:4181','http://127.0.0.1:4181']);
+  const hostDomains=new HostDomainManager(store,options.hostDomains,(path,input,requestOptions)=>runtimeRequest(path,input,{...options.agentConnection,...requestOptions}),origin=>allowedOrigins.add(origin),maintenance?()=>maintenance.admit():undefined);
   app.addHook('onRequest', async (req, reply) => {
     reply.header('X-Content-Type-Options','nosniff');
     reply.header('Referrer-Policy','same-origin');
@@ -115,6 +122,10 @@ export async function createApp(options: AppOptions) {
     return reply.code(500).send({error:{code:'INTERNAL_ERROR',message:'The operation could not be completed'}});
   });
   if (!options.store) app.addHook('onClose', async () => store.close());
+  let hostDomainTimer:ReturnType<typeof setInterval>|undefined;
+  const tickHostDomain=async()=>{try{await hostDomains.tick();}catch{app.log.warn('Host domain synchronization could not start');}};
+  app.addHook('onReady',async()=>{hostDomainTimer=setInterval(()=>{void tickHostDomain();},60_000);hostDomainTimer.unref();try{hostDomains.start();}catch{app.log.warn('Host domain synchronization could not start');}});
+  app.addHook('onClose',async()=>{if(hostDomainTimer)clearInterval(hostDomainTimer);await hostDomains.drain();});
 
   function session(req: FastifyRequest, mutation = false) {
     const result = req.cookies[cookieName] ? store.getSession(req.cookies[cookieName]!) : null;
@@ -135,10 +146,12 @@ export async function createApp(options: AppOptions) {
       throw new AppError('FORBIDDEN','Only instance administrators can configure host bind mounts',403);
     }
   }
-  function setSession(reply: FastifyReply, user: User, central = false, expectedHash?: string) {
+  function setSession(reply: FastifyReply, user: User, central = false, expectedHash?: string, request?:FastifyRequest) {
     const created = expectedHash === undefined ? store.createSession(user.id,central) : store.createLocalSession(user.id,expectedHash);
     if(!created)throw new AppError('INVALID_CREDENTIALS','Email or password is incorrect',401);
-    reply.setCookie(cookieName,created.token,{path:'/',httpOnly:true,sameSite:'strict',secure:central || (options.secureCookies ?? false),maxAge:central ? 900 : 30*86_400});
+    const host=store.vault.hostConnection()?.hostname;
+    const managedHost=Boolean(host && request?.headers.host?.toLowerCase().split(':',1)[0]===host);
+    reply.setCookie(cookieName,created.token,{path:'/',httpOnly:true,sameSite:'strict',secure:central || managedHost || (options.secureCookies ?? false),maxAge:central ? 900 : 30*86_400});
     return {user,csrfToken:created.csrfToken};
   }
 
@@ -149,12 +162,13 @@ export async function createApp(options: AppOptions) {
     const input = credentials.strict().parse(req.body);
     const user = store.setup(input.email,await hashPassword(input.password));
     store.removeLegacyBootstrapToken();
-    return setSession(reply,user);
+    void tickHostDomain();
+    return setSession(reply,user,false,undefined,req);
   });
   app.post(`${prefix}/auth/login`, {config:{rateLimit:{max:10,timeWindow:'1 minute'}}}, async (req,reply) => {
     const input = credentials.parse(req.body), user = store.findUser(input.email);
     if (!user || !await verifyPassword(input.password,user.passwordHash)) throw new AppError('INVALID_CREDENTIALS','Email or password is incorrect',401);
-    return setSession(reply,{id:user.id,email:user.email,role:user.role,createdAt:user.createdAt},false,user.passwordHash);
+    return setSession(reply,{id:user.id,email:user.email,role:user.role,createdAt:user.createdAt},false,user.passwordHash,req);
   });
   app.get(`${prefix}/auth/session`, async req => session(req));
   app.post(`${prefix}/auth/logout`, async (req,reply) => { session(req,true);store.deleteSession(req.cookies[cookieName]!);reply.clearCookie(cookieName,{path:'/'});return {success:true}; });
@@ -174,6 +188,7 @@ export async function createApp(options: AppOptions) {
     return {success:true};
   });
   registerCentralAuth(app,{store,allowedOrigins,secureCookies:options.secureCookies??false,session,setSession});
+  registerHostDomainRoutes(app,hostDomains,session);
 
   function administrator(req:FastifyRequest,mutation=false) {
     const auth=session(req,mutation);
@@ -202,6 +217,31 @@ export async function createApp(options: AppOptions) {
   function approveSharedGithub(user:User, configuration:{source?: import('../shared/types.js').SourceConfig}) {
     if (configuration.source?.type === 'git' && configuration.source.sharedGithub && user.role !== 'admin') throw new AppError('FORBIDDEN','Only administrators can configure the shared GitHub connection',403);
   }
+  app.get(`${prefix}/settings/https`,async req=>{
+    administrator(req);return {settings:store.vault.httpsIngress()};
+  });
+  app.put(`${prefix}/settings/https`,{config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async req=>{
+    const actor=administrator(req,true);
+    const input=z.object({email:z.string().email().max(254),staging:z.boolean()}).strict().parse(req.body);
+    try {store.vault.setHttpsIngress(input.email,input.staging);} catch {throw new AppError('INVALID_HTTPS_SETTINGS','Enter a valid ACME contact email',400);}
+    store.recordAudit(actor.id,'settings.https.set','https');
+    return {settings:store.vault.httpsIngress()};
+  });
+  for(const action of ['migrate','migrate-external','recover'] as const) app.post(`${prefix}/settings/https/${action}`,{config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async req=>{
+    const actor=administrator(req,true);
+    z.object({confirm:z.literal(true)}).strict().parse(req.body);
+    store.recordAudit(actor.id,`settings.https.${action}.started`,'https');
+    try {
+      const result=await runtimeRequest(`/https/ingress/${action}`,{}, {...options.agentConnection,timeoutMs:400_000});
+      if(!z.object({ok:z.literal(true)}).strict().safeParse(result).success)throw new AppError('INGRESS_RECOVERY_REQUIRED','The ingress outcome could not be verified. Check its status before retrying.',503);
+      store.recordAudit(actor.id,`settings.https.${action}.completed`,'https');
+      return {ok:true};
+    } catch(error) {
+      store.recordAudit(actor.id,`settings.https.${action}.failed`,'https');
+      if(error instanceof AgentRequestError && error.certainty==='definitive')throw new AppError(error.code??'INGRESS_MIGRATION_FAILED',store.vault.redact(error.message),error.statusCode??422);
+      throw error;
+    }
+  });
   app.get(`${prefix}/users`,async req=>{
     administrator(req);
     return {users:store.db.prepare('SELECT id,email,role,created_at AS createdAt FROM users ORDER BY email').all()};
@@ -243,13 +283,70 @@ export async function createApp(options: AppOptions) {
   app.post<{Params:{id:string}}>(`${prefix}/projects/:id/services`, async (req,reply) => {
     const {user}=session(req,true);projectAccess(user,req.params.id,true);
     const key=z.string().min(1).max(128).parse(req.headers['idempotency-key']);
-    const input=normalizeServiceInput(req.body);
+    const input=normalizeServiceInput(withAutomaticHostDomain(store,req.params.id,req.body));
     approveBindMounts(user,input);
     approveSharedGithub(user,input);
     const result=store.createService(req.params.id,input,user.id,key);
     return reply.code(202).send(result);
   });
   app.get<{Params:{id:string}}>(`${prefix}/services/:id`, async req => serviceAccess(req,req.params.id).service);
+  app.post<{Params:{id:string}}>(`${prefix}/services/:id/check-managed-certificate`,{config:{rateLimit:{max:20,timeWindow:'1 minute'}}},async req=>{
+    const {service}=serviceAccess(req,req.params.id,true);
+    const {hostname}=z.object({hostname:z.string().min(1).max(253)}).strict().parse(req.body);
+    let canonical:string;
+    try {canonical=canonicalDnsName(hostname);}catch {throw new AppError('INVALID_DOMAIN','Enter a valid public hostname',400);}
+    if(!service.domains?.some(domain=>domain.hostname===canonical && domain.https))throw new AppError('CERTIFICATE_DOMAIN','Save automatic HTTPS for this service domain before checking its managed certificate',400);
+    const value=await runtimeRequest('/certificates/managed',{hostname:canonical},{...options.agentConnection,timeoutMs:25_000});
+    const events={eventsAvailable:z.boolean(),lastFailure:z.object({observedAt:z.string().datetime(),operation:z.enum(['issuance','renewal']),category:z.enum(['dns','rate_limit','contact','challenge','other'])}).strict().optional()};
+    const certificate=z.discriminatedUnion('status',[
+      z.object({status:z.literal('not_found'),...events}).strict(),
+      z.object({status:z.enum(['active','expired','not_yet_valid']),notBefore:z.string().datetime(),expiresAt:z.string().datetime(),fingerprint:z.string().regex(/^(?:[A-F0-9]{2}:){31}[A-F0-9]{2}$/),...events}).strict(),
+    ]).safeParse(value);
+    if(!certificate.success)throw new AppError('CERTIFICATE_UNAVAILABLE','Managed certificate status could not be verified',503);
+    return {hostname:canonical,checkedAt:new Date().toISOString(),...certificate.data};
+  });
+  app.post<{Params:{id:string}}>(`${prefix}/services/:id/retry-certificate`,{config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async req=>{
+    const {auth,service}=serviceAccess(req,req.params.id,true);
+    const {hostname}=z.object({hostname:z.string().min(1).max(253)}).strict().parse(req.body);
+    let canonical:string;
+    try {canonical=canonicalDnsName(hostname);}catch {throw new AppError('INVALID_DOMAIN','Enter a valid public hostname',400);}
+    if(!service.domains?.some(domain=>domain.hostname===canonical && domain.https))throw new AppError('CERTIFICATE_DOMAIN','Save automatic HTTPS for this service domain before retrying',400);
+    const host=store.vault.hostConnection()?.hostname;
+    if(host && isHostApplication(canonical,host)) {
+      if(auth.user.role!=='admin')throw new AppError('FORBIDDEN','Ask an administrator to synchronize the host certificate',403);
+      hostDomains.start(true);return {accepted:true,requestedAt:new Date().toISOString()};
+    }
+    store.recordAudit(auth.user.id,'certificate.retry.started',service.id);
+    try {
+      const value=await runtimeRequest('/certificates/retry',{serviceId:service.id,hostname:canonical},{...options.agentConnection,timeoutMs:30_000});
+      const result=z.object({accepted:z.literal(true),requestedAt:z.string().datetime()}).strict().safeParse(value);
+      if(!result.success)throw new AppError('RETRY_UNCERTAIN','The retry outcome is unknown. Check certificate status.',503);
+      store.recordAudit(auth.user.id,'certificate.retry.accepted',service.id);
+      return result.data;
+    } catch(error) {
+      store.recordAudit(auth.user.id,'certificate.retry.failed',service.id);
+      if(error instanceof AgentRequestError && error.certainty==='definitive')throw new AppError(error.code??'RETRY_UNAVAILABLE',store.vault.redact(error.message),error.statusCode??409);
+      throw error;
+    }
+  });
+  app.post<{Params:{id:string}}>(`${prefix}/services/:id/check-domain-tls`,{config:{rateLimit:{max:20,timeWindow:'1 minute'}}},async req=>{
+    const {service}=serviceAccess(req,req.params.id,true);
+    if(service.kind && service.kind!=='app')throw new AppError('DATABASE_ROUTING','Database services do not expose HTTP domains',400);
+    const {hostname}=z.object({hostname:z.string().min(1).max(253)}).strict().parse(req.body);
+    let canonical:string;
+    try {canonical=canonicalDnsName(hostname);} catch {throw new AppError('INVALID_DOMAIN','Enter a public hostname without a protocol or port',400);}
+    return inspectDomainTls(canonical);
+  });
+
+  app.post<{Params:{id:string}}>(`${prefix}/services/:id/check-domain-dns`,{config:{rateLimit:{max:20,timeWindow:'1 minute'}}},async req=>{
+    const {service}=serviceAccess(req,req.params.id,true);
+    if(service.kind && service.kind!=='app')throw new AppError('DATABASE_ROUTING','Database services do not expose HTTP domains',400);
+    const {hostname}=z.object({hostname:z.string().min(1).max(253)}).strict().parse(req.body);
+    let canonical:string;
+    try {canonical=canonicalDnsName(hostname);} catch {throw new AppError('INVALID_DOMAIN','Enter a public hostname without a protocol or port',400);}
+    return inspectDomainDns(canonical);
+  });
+
   app.post<{Params:{id:string}}>(`${prefix}/services/:id/check-source`, async req => {
     const {auth,service}=serviceAccess(req,req.params.id,true);
     if(service.source?.type!=='git')throw new AppError('GIT_SOURCE','Save a Git source before checking it',400);

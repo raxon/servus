@@ -50,6 +50,7 @@ PYCANDIDATE
   next_env=$staging/servus.env
   printf 'SERVUS_IMAGE=%s\nSERVUS_DATA_DIR=%s\nSERVUS_PORT=%s\nSERVUS_INGRESS_PORT=%s\nSERVUS_DOCKER_GID=%s\nSERVUS_BIND_ADDRESS=%s\nSERVUS_PUBLIC_URL=%s\nSERVUS_ALLOWED_ORIGINS=%s\nSERVUS_SECURE_COOKIES=%s\nSERVUS_SOURCE_REF=%s\nSERVUS_LIFECYCLE_DIR=%s\nSERVUS_SUPERVISOR_CONTROL_DIR=%s\nSERVUS_SUPERVISOR_SECRET_DIR=%s\nSERVUS_UPDATER_SOCKET_DIR=/run/servus-updater/control\n' "$image" "$data_dir" "$port" "$ingress_port" "$socket_gid" "$bind_address" "$public_url" "$allowed_origins" "$secure_cookies" "$tag" "$config_dir/lifecycle" "$config_dir/supervisor-control" "$config_dir/supervisor-secrets" > "$next_env"
   if [[ -n $proxy_secret ]]; then printf 'SERVUS_TRUSTED_PROXY_SECRET=%s\n' "$proxy_secret" >> "$next_env"; fi
+  printf 'SERVUS_HOST_DOMAINS_API_URL=%s\nSERVUS_HOST_DOMAINS_AUTOMATIC=%s\n' "$host_domain_api" "$host_domain_automatic" >> "$next_env"
   /usr/bin/python3 -I - "$next_env" "$config_dir" <<'PYCONFIG'
 import os, secrets, stat, sys
 source, directory = sys.argv[1:]

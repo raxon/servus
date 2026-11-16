@@ -1,6 +1,6 @@
 #!/usr/bin/python3 -I
 """Validate an effective Servus Compose configuration and save a snapshot."""
-import json, os, posixpath, re, sys
+import json, os, posixpath, re, sys, urllib.parse
 try:
     data_dir = sys.argv[3]
     if not data_dir.startswith("/") or data_dir == "/" or posixpath.normpath(data_dir) != data_dir: raise ValueError()
@@ -18,7 +18,7 @@ try:
             key, value = line.split("=", 1)
             if key in expected_env: raise ValueError()
             expected_env[key] = value
-    allowed_keys = {"SERVUS_IMAGE", "SERVUS_DATA_DIR", "SERVUS_PORT", "SERVUS_INGRESS_PORT", "SERVUS_DOCKER_GID", "SERVUS_BIND_ADDRESS", "SERVUS_PUBLIC_URL", "SERVUS_ALLOWED_ORIGINS", "SERVUS_SECURE_COOKIES", "SERVUS_SOURCE_REF", "SERVUS_LIFECYCLE_DIR", "SERVUS_TRUSTED_PROXY_SECRET", "SERVUS_SUPERVISOR_CONTROL_DIR", "SERVUS_SUPERVISOR_SECRET_DIR", "SERVUS_UPDATER_SOCKET_DIR"}
+    allowed_keys = {"SERVUS_IMAGE", "SERVUS_DATA_DIR", "SERVUS_PORT", "SERVUS_INGRESS_PORT", "SERVUS_DOCKER_GID", "SERVUS_BIND_ADDRESS", "SERVUS_PUBLIC_URL", "SERVUS_ALLOWED_ORIGINS", "SERVUS_SECURE_COOKIES", "SERVUS_SOURCE_REF", "SERVUS_LIFECYCLE_DIR", "SERVUS_TRUSTED_PROXY_SECRET", "SERVUS_SUPERVISOR_CONTROL_DIR", "SERVUS_SUPERVISOR_SECRET_DIR", "SERVUS_UPDATER_SOCKET_DIR", "SERVUS_HOST_DOMAINS_API_URL", "SERVUS_HOST_DOMAINS_AUTOMATIC"}
     if set(expected_env) - allowed_keys or expected_env.get("SERVUS_IMAGE") != sys.argv[2] or expected_env.get("SERVUS_DATA_DIR") != data_dir or expected_env.get("SERVUS_LIFECYCLE_DIR") != sys.argv[1] or expected_env.get("SERVUS_SUPERVISOR_CONTROL_DIR") != sys.argv[6] or expected_env.get("SERVUS_SUPERVISOR_SECRET_DIR") != sys.argv[7]: raise ValueError()
     updater_dir = expected_env.get("SERVUS_UPDATER_SOCKET_DIR")
     if updater_dir is not None and updater_dir != "/run/servus-updater/control": raise ValueError()
@@ -26,6 +26,13 @@ try:
     origins = expected_env["SERVUS_ALLOWED_ORIGINS"]
     cookies = expected_env.get("SERVUS_SECURE_COOKIES", "false")
     secret = expected_env.get("SERVUS_TRUSTED_PROXY_SECRET", "")
+    host_api = expected_env.get("SERVUS_HOST_DOMAINS_API_URL", "")
+    host_automatic = expected_env.get("SERVUS_HOST_DOMAINS_AUTOMATIC", "true")
+    if host_automatic not in ("true", "false"): raise ValueError()
+    if host_api:
+        origin = urllib.parse.urlsplit(host_api)
+        if origin.scheme != 'https' or not origin.hostname or origin.username or origin.password or origin.path or origin.query or origin.fragment or not re.fullmatch(r'https://[a-zA-Z0-9.-]+(?::[0-9]{1,5})?', host_api): raise ValueError()
+        if origin.port is not None and not 1 <= origin.port <= 65535: raise ValueError()
     bind_address = expected_env.get("SERVUS_BIND_ADDRESS", "0.0.0.0")
     published_port = expected_env.get("SERVUS_PORT", "4180")
     docker_gid = expected_env["SERVUS_DOCKER_GID"]
@@ -63,6 +70,10 @@ try:
         environment = {"PANEL_DATA_DIR": data_dir, "PANEL_INGRESS_PORT": ingress, "PANEL_SUPERVISOR_SOCKET": "/run/servus-supervisor/socket", "PANEL_SUPERVISOR_SECRET_FILE": "/run/servus-control/token"}
         if name == "api":
             environment.update({"PANEL_HOST": "0.0.0.0", "PANEL_PORT": "4180", "PANEL_ALLOWED_ORIGINS": origins, "PANEL_SECURE_COOKIES": cookies, "PANEL_TRUSTED_PROXY_SECRET": secret})
+            actual_env = service.get('environment', {})
+            host_keys = {'PANEL_HOST_DOMAINS_API_URL', 'PANEL_HOST_DOMAINS_AUTOMATIC'}
+            if host_api or host_keys.intersection(actual_env):
+                environment.update({'PANEL_HOST_DOMAINS_API_URL': expected_env.get('SERVUS_HOST_DOMAINS_API_URL', 'https://api.servus.run'), 'PANEL_HOST_DOMAINS_AUTOMATIC': host_automatic})
             if updater_dir is not None: environment.update({"PANEL_UPDATER_SOCKET": "/run/servus-updater/updater.sock", "PANEL_UPDATER_APPLY_ENABLED": "true"})
         if service.get("environment") != environment: raise ValueError()
         effective = dict(image_environment)

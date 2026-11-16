@@ -56,6 +56,15 @@ class UpdateSocketComposeTest(unittest.TestCase):
             with self.subTest(enabled=enabled):
                 self.assertEqual(self.check(*fixture(enabled)).returncode, 0)
 
+    def test_registry_defaults_on_upgrade_and_preserves_explicit_opt_out(self):
+        env, document = fixture(True)
+        api_env = document['services']['api']['environment']
+        api_env.update(PANEL_HOST_DOMAINS_API_URL='https://api.servus.run', PANEL_HOST_DOMAINS_AUTOMATIC='true')
+        self.assertEqual(self.check(env, document).returncode, 0)
+        env.update(SERVUS_HOST_DOMAINS_API_URL='', SERVUS_HOST_DOMAINS_AUTOMATIC='false')
+        api_env.update(PANEL_HOST_DOMAINS_API_URL='', PANEL_HOST_DOMAINS_AUTOMATIC='false')
+        self.assertEqual(self.check(env, document).returncode, 0)
+
     def test_older_compose_omits_false_bind_option(self):
         env, document = fixture(True)
         for service in document['services'].values():
@@ -63,6 +72,18 @@ class UpdateSocketComposeTest(unittest.TestCase):
                 if mount.get('bind', {}).get('create_host_path') is False:
                     mount['bind'] = {}
         self.assertEqual(self.check(env, document).returncode, 0)
+
+    def test_host_registry_configuration_matches_the_saved_origin(self):
+        env, document = fixture(True)
+        env.update(SERVUS_HOST_DOMAINS_API_URL='https://api.servus.run', SERVUS_HOST_DOMAINS_AUTOMATIC='true')
+        api_env = document['services']['api']['environment']
+        api_env.update(PANEL_HOST_DOMAINS_API_URL='https://api.servus.run', PANEL_HOST_DOMAINS_AUTOMATIC='true')
+        self.assertEqual(self.check(env, document).returncode, 0)
+        api_env['PANEL_HOST_DOMAINS_API_URL'] = 'https://other.example.test'
+        self.assertNotEqual(self.check(env, document).returncode, 0)
+        api_env['PANEL_HOST_DOMAINS_API_URL'] = 'https://api.servus.run'
+        env['SERVUS_HOST_DOMAINS_API_URL'] = 'http://api.servus.run'
+        self.assertNotEqual(self.check(env, document).returncode, 0)
 
     def test_socket_mount_and_access_must_be_exact(self):
         env, document = fixture(True)
