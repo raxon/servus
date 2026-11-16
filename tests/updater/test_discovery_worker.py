@@ -14,7 +14,7 @@ updater = importlib.util.module_from_spec(spec); spec.loader.exec_module(updater
 
 class DiscoveryWorkerTest(unittest.TestCase):
     def worker(self, output):
-        def launch(_current):
+        def launch(_current, _channel):
             return subprocess.Popen([sys.executable, '-c', 'import sys;sys.stdout.write(sys.argv[1])', output], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         return updater.DiscoveryWorker(launch)
 
@@ -47,7 +47,7 @@ class DiscoveryWorkerTest(unittest.TestCase):
         with self.assertRaises(updater.ProtocolError): updater.process(None, {'version':1,'action':'discover','current':'v1.0.0'})
 
     def test_timed_out_discovery_is_terminated_and_does_not_block_retry(self):
-        worker = updater.DiscoveryWorker(lambda _: subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(60)'], stdout=subprocess.PIPE))
+        worker = updater.DiscoveryWorker(lambda _, channel: subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(60)'], stdout=subprocess.PIPE))
         worker.request('v1.0.0')
         worker.started -= 51
         worker.tick()

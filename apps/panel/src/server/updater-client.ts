@@ -21,6 +21,13 @@ const discoverySchema = z.discriminatedUnion('status', [
 ]);
 const errorCode = z.enum(['invalid_request', 'unauthorized', 'idempotency_conflict', 'operation_in_progress', 'not_found', 'recovery_required', 'unavailable']);
 const submitSchema = z.strictObject({ operationId: uuid, commit, digest, tag });
+const preferencesSchema = z.strictObject({
+  automatic: z.boolean(), channel: z.enum(['production', 'beta']),
+  installTime: z.string().regex(/^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/), timeZone: z.string().min(1).max(128),
+  lastAutomaticUpdate: z.strictObject({operationId: uuid, tag, stage: z.enum(['selected','verifying','preparing','applying','completed','attention'])}).nullable(),
+});
+const preferencesInput = preferencesSchema.pick({automatic: true, channel: true, installTime: true, timeZone: true});
+export type UpdatePreferences = z.infer<typeof preferencesSchema>;
 const maxResponseBytes = 4096;
 
 export type UpdateOperation = z.infer<typeof operationSchema>;
@@ -80,8 +87,8 @@ function parseUniqueJson(text: string): unknown {
   const parsed = value(0); whitespace(); if (position !== text.length) throw new Error('invalid JSON'); return parsed;
 }
 
-async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'apply' | 'apply_status' | 'discover' | 'backup_schema' | 'legacy_recovery' | 'legacy_recovery_status', input: UpdateSubmission | LegacyRecoveryIdentity | { operationId: string } | {current: string} | Record<string,never>, options: UpdaterClientOptions): Promise<UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery> {
-  const validInput = action === 'submit' ? submitSchema.safeParse(input) : action === 'legacy_recovery' ? legacyIdentitySchema.safeParse(input) : action === 'discover' ? z.strictObject({current: tag}).safeParse(input) : action === 'backup_schema' ? z.strictObject({}).safeParse(input) : z.strictObject({ operationId: uuid }).safeParse(input);
+async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'apply' | 'apply_status' | 'discover' | 'backup_schema' | 'legacy_recovery' | 'legacy_recovery_status' | 'preferences' | 'set_preferences', input: UpdateSubmission | LegacyRecoveryIdentity | { operationId: string } | {current: string} | Record<string,never> | Pick<UpdatePreferences, 'automatic' | 'channel' | 'installTime' | 'timeZone'>, options: UpdaterClientOptions): Promise<UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery | UpdatePreferences> {
+  const validInput = action === 'set_preferences' ? preferencesInput.safeParse(input) : action === 'preferences' ? z.strictObject({}).safeParse(input) : action === 'submit' ? submitSchema.safeParse(input) : action === 'legacy_recovery' ? legacyIdentitySchema.safeParse(input) : action === 'discover' ? z.strictObject({current: tag}).safeParse(input) : action === 'backup_schema' ? z.strictObject({}).safeParse(input) : z.strictObject({ operationId: uuid }).safeParse(input);
   const timeout = options.timeoutMs ?? 5000;
   if (!validInput.success || typeof options.socketPath !== 'string' || !isAbsolute(options.socketPath) || options.socketPath.includes('\0') || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120000) throw new UpdaterClientError('invalid_input', 'definitive');
   const payload = Buffer.from(JSON.stringify({ version: 1, action, ...validInput.data }) + '\n');
@@ -89,7 +96,7 @@ async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'appl
     let dispatched = false, settled = false, length = 0;
     const chunks: Buffer[] = [];
     const socket = createConnection({ path: options.socketPath });
-    const finish = (error?: UpdaterClientError, operation?: UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery) => {
+    const finish = (error?: UpdaterClientError, operation?: UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery | UpdatePreferences) => {
       if (settled) return;
       settled = true; clearTimeout(timer); socket.destroy();
       if (error) reject(error); else resolve(operation!);
@@ -108,7 +115,7 @@ async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'appl
       let data: unknown;
       try { data = parseUniqueJson(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, -1))); }
       catch { fail('invalid_response'); return; }
-      const resultSchema = action === 'discover' ? discoverySchema : action === 'backup_schema' ? backupSchemaObservation : action === 'prepare' ? preparationSchema : action === 'legacy_recovery' || action === 'legacy_recovery_status' ? legacyRecoverySchema : action === 'apply' || action === 'apply_status' ? applySchema : operationSchema;
+      const resultSchema = action === 'preferences' || action === 'set_preferences' ? preferencesSchema : action === 'discover' ? discoverySchema : action === 'backup_schema' ? backupSchemaObservation : action === 'prepare' ? preparationSchema : action === 'legacy_recovery' || action === 'legacy_recovery_status' ? legacyRecoverySchema : action === 'apply' || action === 'apply_status' ? applySchema : operationSchema;
       const responseSchema = z.union([z.strictObject({ ok: z.literal(true), operation: resultSchema }), z.strictObject({ ok: z.literal(false), error: errorCode })]);
       const parsed = responseSchema.safeParse(data);
       if (!parsed.success) { fail('invalid_response'); return; }
@@ -117,8 +124,8 @@ async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'appl
         finish(new UpdaterClientError(parsed.data.error, certainty)); return;
       }
       const operation = parsed.data.operation;
-      if (action === 'backup_schema') {
-        // The result is only a compatibility observation; no journal is opened here.
+      if (action === 'backup_schema' || action === 'preferences' || action === 'set_preferences') {
+        // These responses have no operation identity to correlate.
       } else if (action === 'discover') {
         if ('current' in operation && operation.current !== (validInput.data as {current: string}).current) { fail('invalid_response'); return; }
       } else if (!('operationId' in operation) || operation.operationId !== (validInput.data as {operationId: string}).operationId || (action === 'submit' && (!('commit' in operation) || operation.commit !== (validInput.data as UpdateSubmission).commit || operation.digest !== (validInput.data as UpdateSubmission).digest || operation.tag !== (validInput.data as UpdateSubmission).tag))) { fail('invalid_response'); return; }
@@ -146,3 +153,6 @@ async function checkedLegacyRecovery(action: 'legacy_recovery' | 'legacy_recover
 }
 export function startLegacyRecovery(identity: LegacyRecoveryIdentity, options: UpdaterClientOptions): Promise<LegacyRecovery> { return checkedLegacyRecovery('legacy_recovery', identity, options); }
 export function legacyRecoveryStatus(identity: LegacyRecoveryIdentity, options: UpdaterClientOptions): Promise<LegacyRecovery> { return checkedLegacyRecovery('legacy_recovery_status', identity, options); }
+
+export function getUpdatePreferences(options: UpdaterClientOptions): Promise<UpdatePreferences> { return request('preferences', {}, options) as Promise<UpdatePreferences>; }
+export function setUpdatePreferences(input: Pick<UpdatePreferences, 'automatic' | 'channel' | 'installTime' | 'timeZone'>, options: UpdaterClientOptions): Promise<UpdatePreferences> { return request('set_preferences', input, options) as Promise<UpdatePreferences>; }

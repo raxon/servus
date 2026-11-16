@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 import { z } from "zod";
+import { FeatureModal } from "./feature-ui.js";
 import { api, RequestError } from "./api.js";
 type UpdateDiscovery =
   | { status: "checking" | "unavailable" }
@@ -51,13 +52,63 @@ export function useUpdateDiscovery(enabled: boolean) {
   return { capability, discovery };
 }
 
+type Preferences = {
+  automatic: boolean;
+  installTime: string;
+  timeZone: string;
+  channel: "production" | "beta";
+  lastAutomaticUpdate: {operationId: string; tag: string; stage: string} | null;
+};
+function UpdatePolicySettings() {
+  const client = useQueryClient();
+  const [draft, setDraft] = useState<Pick<Preferences, "automatic" | "channel" | "installTime" | "timeZone"> | null>(null);
+  const [saved, setSaved] = useState(false);
+  const query = useQuery({queryKey: ["updates", "preferences"], queryFn: () => api<{preferences: Preferences}>("/updates/preferences"), retry: false, refetchInterval: 15000});
+  const mutation = useMutation({
+    mutationFn: (body: Pick<Preferences, "automatic" | "channel" | "installTime" | "timeZone">) => api<{preferences: Preferences}>("/updates/preferences", {method: "PUT", body}),
+    onSuccess: data => {
+      client.setQueryData(["updates", "preferences"], data);
+      setDraft(null); setSaved(true);
+      void client.invalidateQueries({queryKey: ["updates", "discovery"]});
+    },
+  });
+  useEffect(() => {
+    if (!("switch" in HTMLInputElement.prototype)) void import("input-switch-polyfill");
+  }, []);
+  const value = draft ?? query.data?.preferences;
+  if (!value) return <p role="status">{query.error ? "Update preferences are unavailable. The host update service may need to be upgraded." : "Loading update preferences..."}</p>;
+  const change = (next: Pick<Preferences, "automatic" | "channel" | "installTime" | "timeZone">) => {setDraft(next); setSaved(false); mutation.reset();};
+  const automatic = query.data?.preferences.lastAutomaticUpdate;
+  return <form className="update-policy" onSubmit={event => {event.preventDefault(); mutation.mutate({automatic: value.automatic, channel: value.channel, installTime: value.installTime, timeZone: value.timeZone});}}>
+    <fieldset disabled={mutation.isPending}>
+      <legend className="sr-only">Update preferences</legend>
+      <label className="update-policy-toggle">
+        <span><strong>Automatic updates</strong><small>Check and install new versions from the selected channel at the scheduled time. Turning this off does not interrupt an update already started.</small></span>
+        <input type="checkbox" {...({switch: ""} as Record<string, string>)} checked={value.automatic} onChange={event => change({...value, automatic: event.target.checked})} />
+      </label>
+      <fieldset className="update-channels">
+        <legend>Release channel</legend>
+        <label><input type="radio" name="update-channel" value="production" checked={value.channel === "production"} onChange={() => change({...value, channel: "production"})} /><span><strong>Production</strong><small>Published GitHub releases only. Drafts and prereleases are excluded.</small></span></label>
+        <label><input type="radio" name="update-channel" value="beta" checked={value.channel === "beta"} onChange={() => change({...value, channel: "beta"})} /><span><strong>Beta</strong><small>Every new version tag, including builds without a production release. Signatures are verified before installation.</small></span></label>
+      </fieldset>
+      <label className="update-install-time">Installation time ({value.timeZone})<input type="time" required value={value.installTime} onChange={event => change({...value, installTime: event.target.value})} /><small>Default: 02:00. Automatic installation starts within five minutes of this time. Manual installation is always available.</small></label>
+      <button type="submit" className="button" disabled={!draft || mutation.isPending}>{mutation.isPending ? "Saving..." : "Save preferences"}</button>
+    </fieldset>
+    {saved ? <p role="status">Update preferences saved.</p> : null}
+    {mutation.error ? <p role="alert" className="error-notice">Could not save update preferences. Try again.</p> : null}
+    {automatic ? <p role="status">Automatic update {automatic.tag}: {automatic.stage === "attention" ? "needs attention. Check the update service logs; this version will not be retried automatically." : automatic.stage}.</p> : null}
+  </form>;
+}
+
 export function UpdateSettings() {
+  const [confirmation, setConfirmation] = useState<{tag: string; commit: string; digest: string; channel: string} | null>(null);
   const [run, setRun] = useState<SavedUpdate | null>(readUpdate);
   const [message, setMessage] = useState("");
   const [failure, setFailure] = useState("");
   const [completed, setCompleted] = useState(false);
   const [resume, setResume] = useState(0);
   const { capability, discovery } = useUpdateDiscovery(true);
+  const policy = useQuery({queryKey: ["updates", "preferences"], queryFn: () => api<{preferences: Preferences}>("/updates/preferences"), enabled: Boolean(capability.data?.applyAvailable), retry: false});
 
   useEffect(() => {
     if (!run || (run.stage === "attention" || run.stage === "verification_failed") || !capability.data?.applyAvailable) return;
@@ -132,16 +183,17 @@ export function UpdateSettings() {
 
   const candidate = completed || discovery.isFetching ? undefined : discovery.data?.discovery;
   const start = () => {
-    if (!candidate || candidate.status !== "candidate") return;
+    if (!confirmation) return;
     try {
-      const next: SavedUpdate = { operationId: crypto.randomUUID(), tag: candidate.tag, commit: candidate.commit, digest: candidate.digest, stage: "submit" };
+      const next: SavedUpdate = { operationId: crypto.randomUUID(), tag: confirmation.tag, commit: confirmation.commit, digest: confirmation.digest, stage: "submit" };
       localStorage.setItem(storageKey, JSON.stringify(next));
-      setFailure(""); setCompleted(false); setRun(next);
+      setFailure(""); setCompleted(false); setConfirmation(null); setRun(next);
     } catch { setFailure("Could not save update progress in this browser. Enable browser storage and try again."); }
   };
   return (
     <section id="updates" className="surface details-card central-settings">
       <div className="card-heading"><RefreshCw size={19} aria-hidden="true" /><h2>Updates</h2></div>
+      {capability.data?.applyAvailable ? <UpdatePolicySettings /> : null}
       {capability.isPending ? <p>Checking update settings...</p> : capability.error ? <p role="alert">Could not load update settings.</p> : !capability.data?.applyAvailable ? <p>Updates are not configured on this installation.</p> : run ? (
         <>
           <p>Update {run.tag}</p>
@@ -166,9 +218,14 @@ export function UpdateSettings() {
           {candidate?.status === "release_pending" ? <p role="status">Release {candidate.tag} is not ready yet.</p> : null}
           {candidate?.status === "candidate" ? <p role="status">Version {candidate.tag} is available. Its signature will be checked before installation.</p> : null}
           <button type="button" className="button" disabled={discovery.isFetching || candidate?.status === "checking"} onClick={() => { setCompleted(false); void discovery.refetch(); }}>Check for updates</button>{" "}
-          {candidate?.status === "candidate" ? <button type="button" className="button button-primary" onClick={start}>Install update</button> : null}
+          {candidate?.status === "candidate" ? <button type="button" className="button button-primary" onClick={() => { if (candidate?.status === "candidate") setConfirmation({...candidate, channel: policy.data?.preferences.channel ?? "production"}); }}>Install update</button> : null}
         </>
       )}
+      {confirmation ? <FeatureModal title={`Install ${confirmation.tag}?`} description="The panel may briefly disconnect during installation. Keep this tab open to follow its progress." onClose={() => setConfirmation(null)}>
+        <div className="update-confirm-body"><p>Version: <strong>{confirmation.tag}</strong> · Channel: <strong>{confirmation.channel === "beta" ? "Beta" : "Production"}</strong></p>
+        <p>The release signature will be verified before installation. Install now, independently of the automatic update schedule?</p>
+        <div className="update-confirm-actions"><button type="button" className="button" autoFocus onClick={() => setConfirmation(null)}>Cancel</button><button type="button" className="button button-primary" onClick={start}>Confirm installation</button></div></div>
+      </FeatureModal> : null}
     </section>
   );
 }

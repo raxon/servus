@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { AppError } from './errors.js';
-import { updateStatus, submitUpdate, retryUpdate, prepareUpdate, applyUpdate, applyStatus, discoverUpdate, UpdaterClientError } from './updater-client.js';
+import { updateStatus, submitUpdate, retryUpdate, prepareUpdate, applyUpdate, applyStatus, discoverUpdate, getUpdatePreferences, setUpdatePreferences, UpdaterClientError } from './updater-client.js';
 
 const operationId = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const submission = z.strictObject({
@@ -55,6 +55,17 @@ export function registerUpdates(app: FastifyInstance, options: UpdateRoutesOptio
   app.get('/api/v1/updates', { config: { rateLimit } }, async request => {
     options.administrator(request);
     return { applyAvailable: enabled, verificationStatusConfigured: Boolean(options.socketPath) };
+  });
+  app.get('/api/v1/updates/preferences', { config: { rateLimit } }, async request => {
+    options.administrator(request);
+    const endpoint = socket();
+    try { return {preferences: await getUpdatePreferences(endpoint)}; } catch (error) { updateError(error); }
+  });
+  app.put('/api/v1/updates/preferences', { config: { rateLimit } }, async request => {
+    options.administrator(request, true);
+    const input = z.strictObject({automatic: z.boolean(), channel: z.enum(['production', 'beta']), installTime: z.string().regex(/^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/), timeZone: z.string().min(1).max(128)}).parse(request.body);
+    const endpoint = socket();
+    try { return {preferences: await setUpdatePreferences(input, endpoint)}; } catch (error) { updateError(error); }
   });
   app.get('/api/v1/updates/discovery', { config: { rateLimit } }, async request => {
     options.administrator(request);

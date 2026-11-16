@@ -144,8 +144,26 @@ def _check_identity(transport):
         raise DiscoveryError('Repository identity mismatch')
 
 
-def _find_latest(transport):
+def _published_tags(transport):
+    tags = set()
+    for page in range(1, MAX_PAGES + 1):
+        raw, _ = transport.get(f'{GITHUB}/repos/{REPOSITORY}/releases?per_page=100&page={page}', limit=MAX_JSON, accept='application/vnd.github+json')
+        items = decode_json(raw)
+        if not isinstance(items, list) or len(items) > 100:
+            raise DiscoveryError('Invalid release listing')
+        for item in items:
+            if not isinstance(item, dict) or type(item.get('draft')) is not bool or type(item.get('prerelease')) is not bool:
+                raise DiscoveryError('Invalid release listing')
+            if not item['draft'] and not item['prerelease'] and isinstance(item.get('published_at'), str) and item['published_at'] and parse_tag(item.get('tag_name')):
+                tags.add(item['tag_name'])
+        if len(items) < 100:
+            return tags
+    raise DiscoveryError('Release listing exceeds page limit')
+
+
+def _find_latest(transport, channel='beta'):
     _check_identity(transport)
+    published = _published_tags(transport) if channel == 'production' else None
     seen, latest = set(), None
     for page in range(1, MAX_PAGES + 1):
         data, _ = transport.get(f'{GITHUB}/repos/{REPOSITORY}/tags?per_page=100&page={page}', limit=MAX_JSON, accept='application/vnd.github+json')
@@ -160,7 +178,7 @@ def _find_latest(transport):
                 raise DiscoveryError('Ambiguous duplicate tag')
             seen.add(name)
             version = parse_tag(name)
-            if version is None:
+            if version is None or (published is not None and name not in published):
                 continue
             commit = item.get('commit')
             sha = commit.get('sha') if isinstance(commit, dict) else None
@@ -178,11 +196,13 @@ def _find_latest(transport):
     return latest
 
 
-def _discover(transport, current, *, initial=False):
+def _discover(transport, current, *, initial=False, channel='beta'):
+    if channel not in ('production', 'beta'):
+        raise DiscoveryError('Invalid update channel')
     current_version = None if initial else parse_tag(current)
     if not initial and current_version is None:
         raise DiscoveryError('Current version must be a stable vMAJOR.MINOR.PATCH tag')
-    version, tag, commit = _find_latest(transport)
+    version, tag, commit = _find_latest(transport, channel)
     if current_version is not None and version <= current_version:
         status = 'no_newer_version' if version == current_version else 'ahead'
         return {'status': status, 'current': current, 'latest': tag}
@@ -227,12 +247,12 @@ def total_deadline(seconds):
         signal.signal(signal.SIGALRM, previous)
 
 
-def discover(transport, current, *, timeout_seconds=TIMEOUT):
+def discover(transport, current, *, timeout_seconds=TIMEOUT, channel='beta'):
     if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or not 0 < timeout_seconds <= TIMEOUT:
         raise DiscoveryError('Invalid discovery deadline')
     # The public entry point always owns the process deadline, including for library callers.
     with total_deadline(timeout_seconds):
-        return _discover(transport, current)
+        return _discover(transport, current, channel=channel)
 
 
 def discover_initial(transport, *, timeout_seconds=TIMEOUT):
@@ -248,10 +268,11 @@ def main():
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument('--current', help='Currently installed stable version, such as v0.1.3')
     selection.add_argument('--initial', action='store_true', help='Find the latest candidate for a fresh installation')
+    parser.add_argument('--channel', choices=['production', 'beta'], default='production')
     args = parser.parse_args()
     try:
         transport = Transport(time.monotonic() + TIMEOUT)
-        result = discover_initial(transport) if args.initial else discover(transport, args.current)
+        result = discover_initial(transport) if args.initial else discover(transport, args.current, channel=args.channel)
     except (DiscoveryError, OSError):
         print('Release discovery failed.', file=sys.stderr)
         return 1

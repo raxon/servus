@@ -5578,3 +5578,28 @@ select:disabled {
 .source-choice-option input:checked + span { background: #292929; border-color: #292929; color: #fff; }
 .source-choice-option input:focus-visible + span { outline: 2px solid #555; outline-offset: 3px; }
 .source-choice-group:disabled { opacity: .6; }
+
+.update-policy { margin: 20px 0 28px; padding-bottom: 24px; border-bottom: 1px solid var(--border, #e5e5e5); }
+.update-policy fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.update-policy .update-policy-toggle { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
+.update-policy strong { display: block; font-size: 14px; }
+.update-policy small { display: block; max-width: 620px; color: var(--text-muted, #666); font-size: 13px; line-height: 1.6; margin-top: 4px; }
+.update-policy input[type="checkbox"][switch] { accent-color: #242424; margin: 0; width: 44px; height: 24px; min-height: 0; min-width: 0; padding: 0; flex: 0 0 44px; font-size: 22px; }
+.update-policy input:focus-visible { outline: 2px solid #555; outline-offset: 4px; }
+.update-policy .update-channels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+.update-channels legend { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+.update-channels label { display: flex; align-items: flex-start; gap: 12px; border: 1px solid #dedede; border-radius: 14px; padding: 16px; cursor: pointer; }
+.update-channels label:has(input:checked) { border-color: #555; background: #f7f7f7; }
+.update-channels input[type="radio"] { width: 16px; height: 16px; flex-shrink: 0; margin: 3px 0 0; accent-color: #242424; }
+.update-policy fieldset:disabled { opacity: .65; }
+@media(max-width: 600px) { .update-policy .update-channels { grid-template-columns: 1fr; } }
+
+.update-install-time { display: grid; gap: 8px; margin-bottom: 20px; font-size: 14px; }
+.update-install-time input { width: 150px; min-height: 44px; }
+.update-confirm-actions { display: flex; gap: 12px; justify-content: flex-end; flex-wrap: wrap; margin-top: 24px; }
+.modal:modal { overscroll-behavior: contain; }
+.modal::backdrop { overflow: hidden; overscroll-behavior: contain; }
+.update-policy-toggle > span { flex: 1; min-width: 0; }
+.update-channels input[type="radio"] { min-height: 0; padding: 0; }
+
+.update-confirm-body { padding: 24px 28px; }

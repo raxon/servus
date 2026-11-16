@@ -14,6 +14,8 @@ import pwd
 import re
 import secrets
 import uuid
+from datetime import datetime, time as wall_time, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import signal
 import socket
 import sqlite3
@@ -1172,6 +1174,115 @@ class LegacyRecoveryWorker:
         if self.task=='dispatch' and self.row is not None:self.journal.finish_dispatch(self.row[0],False)
 
 
+class UpdatePreferences:
+    """Host-owned policy and at-most-once automatic attempts, independent of the browser."""
+    def __init__(self, state):
+        fd = private_file(state, 'update-preferences.sqlite')
+        os.close(fd)
+        self.db = sqlite3.connect(state / 'update-preferences.sqlite', isolation_level=None)
+        self.db.execute("CREATE TABLE IF NOT EXISTS policy (id INTEGER PRIMARY KEY CHECK(id=1), automatic INTEGER NOT NULL CHECK(automatic IN (0,1)), channel TEXT NOT NULL CHECK(channel IN ('production','beta')), install_time TEXT NOT NULL, time_zone TEXT NOT NULL)")
+        self.db.execute("INSERT OR IGNORE INTO policy VALUES(1,0,'production','02:00','Europe/Warsaw')")
+        self.db.execute("CREATE TABLE IF NOT EXISTS automatic_attempts (operation_id TEXT PRIMARY KEY, tag TEXT NOT NULL UNIQUE, commit_sha TEXT NOT NULL, digest TEXT NOT NULL, stage TEXT NOT NULL, run_date TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+
+    def get(self):
+        automatic, channel, install_time, time_zone = self.db.execute('SELECT automatic,channel,install_time,time_zone FROM policy WHERE id=1').fetchone()
+        row = self.db.execute('SELECT operation_id,tag,stage FROM automatic_attempts ORDER BY rowid DESC LIMIT 1').fetchone()
+        return {'automatic': bool(automatic), 'channel': channel, 'installTime': install_time, 'timeZone': time_zone, 'lastAutomaticUpdate':
+            {'operationId': row[0], 'tag': row[1], 'stage': row[2]} if row else None}
+
+    def set(self, automatic, channel, install_time, time_zone):
+        if type(automatic) is not bool or channel not in ('production', 'beta'):
+            raise ProtocolError('invalid_request')
+        if not isinstance(install_time, str) or not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]', install_time) or not isinstance(time_zone, str) or len(time_zone) > 128:
+            raise ProtocolError('invalid_request')
+        try: ZoneInfo(time_zone)
+        except (ValueError, ZoneInfoNotFoundError): raise ProtocolError('invalid_request') from None
+        self.db.execute('UPDATE policy SET automatic=?,channel=?,install_time=?,time_zone=? WHERE id=1', (int(automatic), channel, install_time, time_zone))
+        return self.get()
+
+    def close(self):
+        self.db.close()
+
+
+class AutomaticUpdates:
+    """Advance the existing signed verification/preparation/apply pipeline on the host."""
+    def __init__(self, preferences, journal, discovery):
+        self.preferences, self.journal, self.discovery = preferences, journal, discovery
+        self.next_check = 0
+        self.next_tick = 0
+        self.last_policy = None
+
+    @staticmethod
+    def scheduled_date(policy, now=None):
+        now = now or datetime.now(timezone.utc)
+        zone = ZoneInfo(policy['timeZone'])
+        local = now.astimezone(zone)
+        hour, minute = map(int, policy['installTime'].split(':'))
+        # Normalize nonexistent spring-forward wall times to the next real time.
+        scheduled = datetime.combine(local.date(), wall_time(hour, minute), tzinfo=zone).timestamp()
+        return str(local.date()) if 0 <= now.timestamp() - scheduled < 300 else None
+
+    def tick(self):
+        now = time.monotonic()
+        if now < self.next_tick:
+            return
+        self.next_tick = now + 5
+        db = self.preferences.db
+        active = db.execute("SELECT operation_id,tag,commit_sha,digest,stage FROM automatic_attempts WHERE stage NOT IN ('completed','attention') ORDER BY rowid LIMIT 1").fetchone()
+        try:
+            if active:
+                op, tag, commit, digest, stage = active
+                next_stage = stage
+                if stage == 'selected':
+                    self.journal.submit(op, commit, digest, tag)
+                    next_stage = 'verifying'
+                elif stage == 'verifying':
+                    status = self.journal.status(op)['status']
+                    if status == 'verified': next_stage = 'preparing'
+                    elif status in ('verification_failed', 'recovery_required'): next_stage = 'attention'
+                elif stage == 'preparing':
+                    status = self.journal.preparation_status(op)
+                    if status is None:
+                        self.journal.claim_preparation(op)
+                    elif status['status'] in ('prepared', 'completed'): next_stage = 'applying'
+                    elif status['status'] == 'recovery_required': next_stage = 'attention'
+                elif stage == 'applying':
+                    status = self.journal.request_apply(op)['status']
+                    if status == 'completed': next_stage = 'completed'
+                    elif status == 'recovery_required': next_stage = 'attention'
+                db.execute('UPDATE automatic_attempts SET stage=? WHERE operation_id=?', (next_stage, op))
+                return
+            policy = self.preferences.get()
+            key = (policy['automatic'], policy['channel'], policy['installTime'], policy['timeZone'])
+            if key != self.last_policy:
+                self.last_policy, self.next_check = key, 0
+            if not policy['automatic'] or now < self.next_check or LegacyRecoveryJournal.update_busy(self.journal):
+                return
+            run_date = self.scheduled_date(policy)
+            if run_date is None or db.execute('SELECT 1 FROM automatic_attempts WHERE run_date=?', (run_date,)).fetchone():
+                return
+            # Resolve the installed version from the verified active host policy.
+            row = self.journal.db.execute("SELECT o.tag FROM policy_approvals a JOIN operations o ON o.id=a.operation_id WHERE a.state='active' AND o.status='verified'").fetchall()
+            if len(row) != 1 or not TAG_PATTERN.fullmatch(row[0][0]):
+                return
+            current = row[0][0]
+            candidate = self.discovery.request(current, policy['channel'])
+            if candidate['status'] == 'checking':
+                return
+            self.next_check = now + (300 if candidate['status'] in ('unavailable','release_pending') else 6 * 60 * 60)
+            if candidate['status'] != 'candidate':
+                return
+            target = tuple(map(int, candidate['tag'][1:].split('.')))
+            if target <= tuple(map(int, current[1:].split('.'))):
+                return
+            db.execute("INSERT OR IGNORE INTO automatic_attempts(operation_id,tag,commit_sha,digest,stage,run_date) VALUES(?,?,?,?,'selected',?)",
+                (str(uuid.uuid4()), candidate['tag'], candidate['commit'], candidate['digest'], run_date))
+        except (ProtocolError, sqlite3.Error, ValueError, KeyError, TypeError):
+            if active:
+                db.execute("UPDATE automatic_attempts SET stage='attention' WHERE operation_id=?", (active[0],))
+            self.next_check = now + 300
+
+
 class DiscoveryWorker:
     """Run bounded release discovery without blocking updater requests."""
 
@@ -1179,28 +1290,29 @@ class DiscoveryWorker:
         self.launcher = launcher or self._launch
         self.process = None
         self.current = None
+        self.channel = None
         self.started = 0.0
         self.result = None
         self.finished = 0.0
 
     @staticmethod
-    def _launch(current):
+    def _launch(current, channel):
         trusted_root_file(DISCOVERY_EXECUTOR)
         python = pathlib.Path(PYTHON).resolve(strict=True)
         trusted_root_file(python)
-        return subprocess.Popen([str(python), '-I', '-B', str(DISCOVERY_EXECUTOR), '--current', current],
+        return subprocess.Popen([str(python), '-I', '-B', str(DISCOVERY_EXECUTOR), '--current', current, '--channel', channel],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd='/', env=CLEAN_ENV, close_fds=True)
 
-    def request(self, current):
-        if not isinstance(current, str) or len(current) > 64 or not TAG_PATTERN.fullmatch(current):
+    def request(self, current, channel='production'):
+        if channel not in ('production', 'beta') or not isinstance(current, str) or len(current) > 64 or not TAG_PATTERN.fullmatch(current):
             raise ProtocolError('invalid_request')
         if self.process is not None:
             return {'status': 'checking'}
-        if self.current == current and self.result is not None and time.monotonic() - self.finished < 30:
+        if self.current == current and self.channel == channel and self.result is not None and time.monotonic() - self.finished < 30:
             return self.result
-        self.current, self.result, self.started = current, None, time.monotonic()
+        self.current, self.channel, self.result, self.started = current, channel, None, time.monotonic()
         try:
-            self.process = self.launcher(current)
+            self.process = self.launcher(current, channel)
         except (OSError, RuntimeError, ValueError):
             self.result, self.finished = {'status': 'unavailable'}, time.monotonic()
             return self.result
@@ -1273,7 +1385,7 @@ def dns_journal_backup_supported():
         if fd is not None: os.close(fd)
 
 
-def process(journal, request, *, allow_apply=False, discovery=None, recovery=None):
+def process(journal, request, *, allow_apply=False, discovery=None, recovery=None, preferences=None):
     if not isinstance(request, dict) or request.get('version') != 1 or type(request.get('version')) is not int:
         raise ProtocolError('invalid_request')
     action = request.get('action')
@@ -1287,9 +1399,15 @@ def process(journal, request, *, allow_apply=False, discovery=None, recovery=Non
         raise ProtocolError('operation_in_progress')
     if action == 'backup_schema' and set(request) == {'version', 'action'}:
         return {'backupFileDnsJournalVersion': 1 if allow_apply and dns_journal_backup_supported() else 0}
+    if action == 'preferences' and set(request) == {'version', 'action'}:
+        if preferences is None: raise ProtocolError('unavailable')
+        return preferences.get()
+    if action == 'set_preferences' and set(request) == {'version', 'action', 'automatic', 'channel', 'installTime', 'timeZone'}:
+        if not allow_apply or preferences is None: raise ProtocolError('unavailable')
+        return preferences.set(request['automatic'], request['channel'], request['installTime'], request['timeZone'])
     if action == 'discover' and set(request) == {'version', 'action', 'current'}:
         if discovery is None: raise ProtocolError('unavailable')
-        return discovery.request(request['current'])
+        return discovery.request(request['current'], preferences.get()['channel']) if preferences is not None else discovery.request(request['current'])
     if action == 'submit' and set(request) == {'version', 'action', 'operationId', 'commit', 'digest', 'tag'}:
         operation_id, commit, digest, tag = request['operationId'], request['commit'], request['digest'], request['tag']
         if not valid_uuid(operation_id) or not isinstance(commit, str) or not COMMIT_PATTERN.fullmatch(commit) or not isinstance(digest, str) or not DIGEST_PATTERN.fullmatch(digest) or not isinstance(tag, str) or len(tag) > 64 or not TAG_PATTERN.fullmatch(tag):
@@ -1369,6 +1487,8 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
         preparation_worker = PreparationWorker(journal, state)
         apply_worker = ApplyWorker(journal, supervisor_socket) if supervisor_socket is not None else None
         discovery_worker = DiscoveryWorker() if supervisor_socket is not None else None
+        preferences = UpdatePreferences(state) if supervisor_socket is not None else None
+        automatic_updates = AutomaticUpdates(preferences, journal, discovery_worker) if preferences is not None else None
         recovery_journal = LegacyRecoveryJournal(state) if supervisor_socket is not None else None
         if recovery_journal is not None:recovery_journal.recover()
         recovery_worker = LegacyRecoveryWorker(recovery_journal,journal,supervisor_socket) if recovery_journal is not None else None
@@ -1414,6 +1534,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
                 if apply_worker is not None: apply_worker.tick()
                 if discovery_worker is not None: discovery_worker.tick()
                 if recovery_worker is not None: recovery_worker.tick()
+                if automatic_updates is not None and not recovery_journal.active(): automatic_updates.tick()
                 try:
                     client, _ = server.accept()
                 except TimeoutError:
@@ -1424,7 +1545,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
                         _pid, uid, _gid = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
                         if uid != allowed_uid:
                             raise ProtocolError('unauthorized')
-                        value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None, discovery=discovery_worker,recovery=recovery_journal)
+                        value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None, discovery=discovery_worker,recovery=recovery_journal,preferences=preferences)
                         response = {'ok': True, 'operation': value}
                     except ProtocolError as error:
                         response = {'ok': False, 'error': error.code}
@@ -1441,6 +1562,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
             if discovery_worker is not None: discovery_worker.close()
             if recovery_worker is not None: recovery_worker.close()
             if recovery_journal is not None: recovery_journal.close()
+            if preferences is not None: preferences.close()
             server.close()
             try:
                 info = socket_path.lstat()

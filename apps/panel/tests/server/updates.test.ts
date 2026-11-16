@@ -32,6 +32,19 @@ async function serve(path:string, response:unknown, requests:string[]):Promise<v
 }
 
 describe('update management API',()=>{
+  it('persists preferences through the host socket and enforces administrator and CSRF checks',async()=>{
+    const {app,headers,member,socketPath}=await fixture(true,true),requests:string[]=[];
+    const preferences={automatic:true,channel:'beta',installTime:'02:00',timeZone:'Europe/Warsaw',lastAutomaticUpdate:null};
+    await serve(socketPath,{ok:true,operation:preferences},requests);
+    expect((await app.inject({url:'/api/v1/updates/preferences',headers:member})).statusCode).toBe(403);
+    const payload={automatic:true,channel:'beta',installTime:'02:00',timeZone:'Europe/Warsaw'};
+    expect((await app.inject({method:'PUT',url:'/api/v1/updates/preferences',headers:{cookie:headers.cookie},payload})).statusCode).toBe(403);
+    expect((await app.inject({method:'PUT',url:'/api/v1/updates/preferences',headers,payload:{...payload,installTime:'26:00'}})).statusCode).toBe(400);
+    expect(requests).toHaveLength(0);
+    expect((await app.inject({method:'PUT',url:'/api/v1/updates/preferences',headers,payload})).json().preferences).toEqual(preferences);
+    expect(JSON.parse(requests[0]!)).toEqual({version:1,action:'set_preferences',...payload});
+    expect((await app.inject({url:'/api/v1/updates/preferences',headers})).json().preferences).toEqual(preferences);
+  });
   it('sends each update stage only for an authorized administrator when explicitly enabled',async()=>{
     const {app,headers,member,socketPath}=await fixture(true,true),requests:Record<string,unknown>[]=[];
     const server=createServer(socket=>{let input='';socket.on('data',chunk=>{input+=chunk.toString();if(!input.includes('\n'))return;

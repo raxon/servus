@@ -24,6 +24,7 @@ class FakeServer:
     def __init__(self):
         self.seen = []
         self.body = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}'
+        self.releases = []
         self.tags = [{'name': 'v0.1.4', 'commit': {'sha': 'a' * 40}}, {'name': 'v0.1.3', 'commit': {'sha': 'b' * 40}}]
         self.invalid_owner = False
         self.redirect = False
@@ -42,6 +43,9 @@ class FakeServer:
                     time.sleep(outer.delay)
                 if self.path == '/repos/raxon/servus':
                     data = json.dumps({'id': discovery.REPOSITORY_ID, 'full_name': 'raxon/servus', 'owner': {'id': 1 if outer.invalid_owner else discovery.OWNER_ID, 'login': 'raxon'}}).encode()
+                    kind = 'application/json'
+                elif self.path.startswith('/repos/raxon/servus/releases?'):
+                    data = json.dumps(outer.releases).encode()
                     kind = 'application/json'
                 elif self.path.startswith('/repos/raxon/servus/tags?'):
                     page = int(self.path.rsplit('=', 1)[-1])
@@ -102,6 +106,22 @@ class DiscoveryTest(unittest.TestCase):
     def setUp(self):
         self.server = FakeServer()
         self.addCleanup(self.server.close)
+
+    def test_production_excludes_tags_drafts_and_prereleases(self):
+        self.server.releases = [
+            {'tag_name': 'v0.1.3', 'draft': False, 'prerelease': False, 'published_at': '2026-11-15T12:00:00Z'},
+            {'tag_name': 'v0.1.4', 'draft': False, 'prerelease': True, 'published_at': '2026-11-15T12:00:00Z'},
+            {'tag_name': 'v0.1.4', 'draft': True, 'prerelease': False, 'published_at': None},
+        ]
+        production = discovery.discover(self.server.transport(), 'v0.1.2', channel='production')
+        beta = discovery.discover(self.server.transport(), 'v0.1.2', channel='beta')
+        self.assertEqual(production['tag'], 'v0.1.3')
+        self.assertEqual(production['commit'], 'b' * 40)
+        self.assertEqual(beta['tag'], 'v0.1.4')
+
+    def test_production_never_falls_back_to_unreleased_tags(self):
+        with self.assertRaises(discovery.DiscoveryError):
+            discovery.discover(self.server.transport(), 'v0.1.2', channel='production')
 
     def test_candidate_hashes_exact_bytes_and_never_claims_verification(self):
         result = discovery.discover(self.server.transport(), 'v0.1.3')
