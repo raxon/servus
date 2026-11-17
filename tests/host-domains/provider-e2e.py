@@ -5,7 +5,7 @@ from pathlib import Path
 image=os.environ['SERVUS_HOST_IMAGE']
 run_id=uuid.uuid4().hex
 network='servus-host-test-'+run_id
-host='1234567890abcdef.host.servus.run'
+host='abc123.host.servus.run'
 containers=[]
 def run(args,**kwargs):
     return subprocess.check_output(args,text=True,**kwargs).strip()
@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix='servus-host-provider-') as temporary:
     subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(root/'key.pem'),'-out',str(root/'cert.pem'),'-days','2','-subj','/CN='+host,'-addext','subjectAltName=DNS:'+host+',DNS:*.'+host],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     cert=(root/'cert.pem').read_text()
     expected=hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert)).hexdigest()
-    program="""import {readFileSync} from 'node:fs';import{X509Certificate}from'node:crypto';import{installHostCertificateFiles}from'./dist/agent/host-domain.js';const certificate=readFileSync('/fixture/cert.pem','utf8');installHostCertificateFiles('/fixture',{hostname:'1234567890abcdef.host.servus.run',certificate,privateKey:readFileSync('/fixture/key.pem','utf8'),expiresAt:new Date(new X509Certificate(certificate).validTo).toISOString(),staging:false});"""
+    program="""import {readFileSync} from 'node:fs';import{X509Certificate}from'node:crypto';import{installHostCertificateFiles}from'./dist/agent/host-domain.js';const certificate=readFileSync('/fixture/cert.pem','utf8');installHostCertificateFiles('/fixture',{hostname:'abc123.host.servus.run',certificate,privateKey:readFileSync('/fixture/key.pem','utf8'),expiresAt:new Date(new X509Certificate(certificate).validTo).toISOString(),staging:false});"""
     docker('run','--rm','--network','none','--user',str(os.getuid())+':'+str(os.getgid()),'--mount','type=bind,source='+temporary+',target=/fixture','--entrypoint','node',image,'--input-type=module','-e',program)
     try:
         docker('network','create','--label','servus.host-test='+run_id,network)

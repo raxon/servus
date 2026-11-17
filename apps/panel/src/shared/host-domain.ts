@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const hostDomainPattern = /^[a-z0-9]{16}\.host\.servus\.run$/;
+export const hostDomainPattern = /^(?:[a-z0-9]{6}|[a-z0-9]{16})\.host\.servus\.run$/;
 export const hostConnectionSchema = z.object({
   kind:z.literal('servus-host-v1'),machineId:z.string().uuid(),token:z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   apiOrigin:z.string().url(),enabled:z.boolean(),ready:z.boolean(),

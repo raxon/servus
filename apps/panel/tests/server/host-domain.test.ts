@@ -8,9 +8,9 @@ import { Store } from '../../src/server/store.js';
 import { createApp } from '../../src/server/app.js';
 import { HostDomainManager, generatedApplicationHostname } from '../../src/server/host-domain.js';
 import { hashPassword } from '../../src/server/auth.js';
-import type { HostCertificate, HostConnection } from '../../src/shared/host-domain.js';
+import { hostDomainPattern, hostConnectionSchema, isHostApplication, type HostCertificate, type HostConnection } from '../../src/shared/host-domain.js';
 
-const host='1234567890abcdef.host.servus.run',password='host-domain-test-password';
+const host='abc123.host.servus.run',password='host-domain-test-password';
 const cleanup:(()=>Promise<void>|void)[]=[];
 afterEach(async()=>{for(const fn of cleanup.splice(0).reverse())await fn();});
 let certificate:HostCertificate;
@@ -30,6 +30,17 @@ async function fixture(registered=false) {
   if(registered)store.vault.setHostConnection(connection);
   return {dir,store,admin,connection,headers:{cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken}};
 }
+
+it('accepts six-character host names and persisted legacy names while rejecting other label lengths',async()=>{
+  const {connection}=await fixture();
+  for(const label of ['abc123','1234567890abcdef']) {
+    const hostname=`${label}.host.servus.run`;
+    expect(hostDomainPattern.test(hostname)).toBe(true);
+    expect(hostConnectionSchema.parse({...connection,hostname}).hostname).toBe(hostname);
+    expect(isHostApplication(`project-web.${hostname}`,hostname)).toBe(true);
+  }
+  for(const label of ['abc12','abc1234','abc123456789012','abc12345678901234'])expect(hostDomainPattern.test(`${label}.host.servus.run`)).toBe(false);
+});
 
 describe('host domain synchronization',()=>{
   it('persists credentials before sending and retries a lost registration response with the same identity',async()=>{
