@@ -1,3 +1,4 @@
+import { randomUuid } from "./random-uuid.js";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
@@ -241,7 +242,7 @@ export function UpdateSettings() {
   const start = () => {
     if (!confirmation) return;
     try {
-      const next: SavedUpdate = { operationId: crypto.randomUUID(), tag: confirmation.tag, commit: confirmation.commit, digest: confirmation.digest, stage: "submit" };
+      const next: SavedUpdate = { operationId: randomUuid(), tag: confirmation.tag, commit: confirmation.commit, digest: confirmation.digest, stage: "submit" };
       localStorage.setItem(storageKey, JSON.stringify(next));
       setFailure(""); setCompleted(false); setAlreadyCurrent(null); setConfirmation(null); setRun(next);
     } catch { setFailure("Could not save update progress in this browser. Enable browser storage and try again."); }

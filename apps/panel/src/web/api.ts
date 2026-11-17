@@ -1,3 +1,4 @@
+import { randomUuid } from "./random-uuid.js";
 let csrfToken = "";
 let sessionEpoch = 0;
 
@@ -28,7 +29,7 @@ export async function api<T>(
   if (options.binary !== undefined) headers["Content-Type"] = "application/octet-stream";
   else if (options.body !== undefined) headers["Content-Type"] = "application/json";
   if ((method !== "GET" || options.csrf) && csrfToken) headers["X-CSRF-Token"] = csrfToken;
-  if (options.idempotent) headers["Idempotency-Key"] = crypto.randomUUID();
+  if (options.idempotent) headers["Idempotency-Key"] = randomUuid();
   const response = await fetch(`/api/v1${path}`, {
     method,
     headers,

@@ -1,3 +1,4 @@
+import { randomUuid } from "./random-uuid.js";
 import { Skeleton } from "./Skeleton.js";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -124,7 +125,7 @@ const secretRows = (variables: EnvironmentVariable[] = []): SecretRow[] =>
   variables
     .filter((entry) => entry.secret || entry.secretRef)
     .map((entry) => ({
-      id: crypto.randomUUID(),
+      id: randomUuid(),
       name: entry.name,
       secretRef: entry.secretRef,
       value: "",
@@ -224,7 +225,7 @@ function EnvironmentPanel({ service }: { service: Service }) {
             onClick={() =>
               setSecrets((rows) => [
                 ...rows,
-                { id: crypto.randomUUID(), name: "", value: "", replace: true },
+                { id: randomUuid(), name: "", value: "", replace: true },
               ])
             }
           >
@@ -320,7 +321,7 @@ function DomainsPanel({ service }: { service: Service }) {
         service.domains ?? [
           { hostname: service.hostname, port: service.port, primary: true },
         ]
-      ).map((domain) => ({ ...domain, rowId: crypto.randomUUID() })),
+      ).map((domain) => ({ ...domain, rowId: randomUuid() })),
   );
   const save = useServiceSave(service);
   const runtime = useQuery({queryKey:["runtime"],queryFn:()=>api<{online:boolean;httpsConfigured?:boolean;httpsAccess?:'direct'|'external'}>("/runtime"),refetchInterval:15_000});
@@ -427,7 +428,7 @@ function DomainsPanel({ service }: { service: Service }) {
             setDomains((rows) => [
               ...rows,
               {
-                rowId: crypto.randomUUID(),
+                rowId: randomUuid(),
                 hostname: "",
                 port: service.port,
                 primary: rows.length === 0,
@@ -529,7 +530,7 @@ function StoragePanel({
     () =>
       (service.mounts ?? []).map((mount) => ({
         ...mount,
-        rowId: crypto.randomUUID(),
+        rowId: randomUuid(),
       })),
   );
   const save = useServiceSave(service);
@@ -699,7 +700,7 @@ function StoragePanel({
             setMounts((rows) => [
               ...rows,
               {
-                rowId: crypto.randomUUID(),
+                rowId: randomUuid(),
                 type: "volume",
                 name: "",
                 target: "",

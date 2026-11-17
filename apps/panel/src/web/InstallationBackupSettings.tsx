@@ -1,3 +1,4 @@
+import { randomUuid } from "./random-uuid.js";
 import {useEffect,useId,useRef,useState} from 'react';
 import {useQuery} from '@tanstack/react-query';
 import {Archive} from 'lucide-react';
@@ -32,7 +33,7 @@ export function InstallationBackupSettings({userId}:{userId:string}){
   const available=capability.data?.available===true,needsName=!!operationId&&!operation&&(missing||!!failure);
   async function submit(event:React.FormEvent){
     event.preventDefault();if(submitLock.current)return;const requestedName=submittedName.current??name;if(!validName(requestedName)){setInvalid(true);nameRef.current?.focus();return;}
-    const current=operationId??crypto.randomUUID();
+    const current=operationId??randomUuid();
     if(!operationId){try{localStorage.setItem(key,current);}catch{setFailure('Browser storage is unavailable. Allow local storage before starting a backup so its operation ID survives a restart.');return;}setOperationId(current);}
     submitLock.current=true;submittedName.current=requestedName;setSubmitting(true);setFailure('');setInvalid(false);
     try{const result=await api<{operation:InstallationBackupOperation}>('/installation-backups',{method:'POST',body:{operationId:current,name:requestedName}});setOperation(result.operation);setMissing(false);statusRef.current?.focus();}

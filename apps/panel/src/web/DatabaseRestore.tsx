@@ -1,3 +1,4 @@
+import { randomUuid } from "./random-uuid.js";
 import { useId, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Upload } from "lucide-react";
@@ -52,7 +53,7 @@ function RestoreDialog({ service, admin, onClose }: { service: Service; admin: b
   const action = useMutation({
     mutationFn: async (input: {type: "upload"; file: File} | {type: "prepare" | "commit" | "cancel" | "rollback" | "recover"; operationId: string}) => {
       if (input.type === "upload") {
-        const id = crypto.randomUUID().replaceAll("-", "");
+        const id = randomUuid().replaceAll("-", "");
         return api(`${base}/${id}/upload`, {method:"POST", binary:input.file});
       }
       return api(`${base}/${input.operationId}/${input.type}`, {method:"POST", body:input.type === "commit" || input.type === "rollback" ? {confirm:true} : {}});

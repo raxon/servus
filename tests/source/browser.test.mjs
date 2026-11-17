@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
 import { chromium, expect } from '@playwright/test';
 import ssh2 from 'ssh2';
+import '../integration/http-uuid.mjs';
 
 const root = fileURLToPath(new URL('../../apps/panel', import.meta.url));
 const server = await createServer({ root, server: { port: 0 } });
