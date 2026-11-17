@@ -97,30 +97,31 @@ try {
     if(project.id===first.id)firstService=value.service;
     assert.equal(value.service.source.sharedGithub,true);
     assert.equal(value.service.source.credential.token,undefined);
-    await page.getByRole('tab',{name:'Source',exact:true}).click();
-    await page.getByText('The saved connection will be used automatically.',{exact:false}).waitFor();
+    await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Source',exact:true}).click();
+    await page.getByText('The shared token will be used for this repository.',{exact:false}).waitFor();
     assert.equal(await page.getByLabel('Private repository').count(),0);
+    await page.getByLabel('Branch or ref').fill('fixture-ref');
     const updateRequest=page.waitForResponse(response=>response.url().endsWith(`/services/${value.service.id}`) && response.request().method()==='PATCH');
     await page.getByRole('button',{name:'Save configuration'}).click();
     assert.equal((await (await updateRequest).json()).source.sharedGithub,true);
     await page.route(`**/api/v1/services/${value.service.id}/check-source`, route => route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({commit:'a'.repeat(40)})}));
     const check=page.getByRole('button',{name:'Check source'});
     await check.click();
-    await page.getByText('Repository, branch, build context and Dockerfile are accessible.',{exact:false}).waitFor();
+    await page.getByText('Source is accessible. Repository, ref and build paths checked.',{exact:false}).waitFor();
     await page.unroute(`**/api/v1/services/${value.service.id}/check-source`);
     await page.route(`**/api/v1/services/${value.service.id}/check-source`, route => route.fulfill({status:422,contentType:'application/json',body:JSON.stringify({error:{code:'SOURCE_DOCKERFILE',message:'The Dockerfile is missing, inaccessible or outside the build context.'}})}));
     await check.click();
-    await page.getByText('The Dockerfile is missing, inaccessible or outside the build context.').waitFor();
+    await page.locator('.source-field-error').filter({hasText:'The Dockerfile is missing, inaccessible or outside the build context.'}).waitFor();
     assert.equal(await page.getByLabel('Dockerfile').getAttribute('aria-invalid'),'true');
     await page.getByLabel('Dockerfile').fill('Containerfile');
     assert.equal(await page.getByText('The Dockerfile is missing, inaccessible or outside the build context.').count(),0);
     await page.getByLabel('Branch or ref').fill('other');
     assert.equal(await check.isDisabled(),false);
-    assert.equal(await page.getByText('Repository, branch, build context and Dockerfile are accessible.',{exact:false}).count(),0);
+    assert.equal(await page.getByText('Source is accessible. Repository, ref and build paths checked.',{exact:false}).count(),0);
     await page.unroute(`**/api/v1/services/${value.service.id}/check-source`);
     await page.route(`**/api/v1/services/${value.service.id}/check-source`, route => route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({commit:'a'.repeat(40)})}));
     await check.click();
-    await page.getByText('Repository, branch, build context and Dockerfile are accessible.',{exact:false}).waitFor();
+    await page.getByText('Source is accessible. Repository, ref and build paths checked.',{exact:false}).waitFor();
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
     const currentService=await (await page.request.get(`${origin}/api/v1/services/${value.service.id}`)).json();
     await page.route(`**/api/v1/services/${value.service.id}`,route=>route.request().method()==='GET'
@@ -138,7 +139,7 @@ try {
     await page.unroute(`**/api/v1/services/${value.service.id}`);
     await page.unroute(`**/api/v1/services/${value.service.id}/configuration-changes`);
     await page.reload();
-    await page.getByRole('tab',{name:'Domains',exact:true}).click();
+    await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Domains',exact:true}).click();
     assert.equal(await page.getByLabel('Automatic HTTPS').isDisabled(),true);
     await page.getByLabel('Hostname').fill('app.example.com');
     await page.route(`**/api/v1/services/${value.service.id}/check-domain-dns`, route => route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({hostname:'app.example.com',checkedAt:'2026-01-01T00:00:00.000Z',ipv4:['8.8.8.8'],ipv6:[],status:'resolved'})}));
@@ -152,7 +153,7 @@ try {
     assert.equal(await page.getByText('A: 8.8.8.8; AAAA: none.',{exact:false}).count(),0);
     await page.route('**/api/v1/runtime',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({online:true,httpsConfigured:true,httpsAccess:'direct'})}));
     await page.reload();
-    await page.getByRole('tab',{name:'Domains',exact:true}).click();
+    await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Domains',exact:true}).click();
     await page.getByLabel('Hostname').fill(`${name}.example.com`);
     await page.getByLabel('Automatic HTTPS').check();
     const domainSaved=page.waitForResponse(response=>response.url().endsWith(`/services/${value.service.id}`) && response.request().method()==='PATCH');
@@ -198,7 +199,7 @@ try {
     await page.route(`**/api/v1/actions/${historicalId}/build-log`, route => route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({available:true,text:'fetch source\ncompile app\n'+Array.from({length:80},(_,i)=>`build step ${i}`).join('\n'),truncated:false})}));
     await page.route(`**/api/v1/services/${value.service.id}/deployments/${historicalId}/redeploy`, route => route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({...oldAction,id:'22222222-2222-4222-8222-222222222222',status:'queued'})}));
     await page.reload();
-    await page.getByRole('tab',{name:'Deployments',exact:false}).click();
+    await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Deployments',exact:false}).click();
     await page.getByText('Duration: 0m 0s').waitFor();
     await page.getByText('Build output',{exact:false}).click();
     const buildOutput=page.locator('.build-log-details pre');
@@ -233,14 +234,19 @@ try {
   await search.fill('does-not-exist');
   await page.getByText('No projects or services match the current filters.').waitFor();
   await search.fill('');
-  await page.getByRole('button',{name:'Collapse all'}).click();
+  for(const name of ['First','Second'])await page.getByRole('button',{name:`Collapse ${name}`,exact:true}).click();
   assert.equal(await page.getByRole('link',{name:/web-one/}).count(),0);
   await page.reload();
-  await page.getByRole('button',{name:'Expand all'}).waitFor();
-  await page.getByRole('button',{name:'Expand all'}).click();
+  for(const name of ['First','Second']){
+    await page.getByRole('button',{name:`Expand ${name}`,exact:true}).waitFor();
+    await page.getByRole('button',{name:`Expand ${name}`,exact:true}).click();
+  }
   await page.getByRole('link',{name:/web-one/}).waitFor();
-  await page.getByLabel('Filter services by status').selectOption('running');
+  // The current dashboard exposes text filtering rather than a status select.
+  await search.fill('no-matching-service');
   await page.getByText('No projects or services match the current filters.').waitFor();
+  await search.fill('');
+  await page.getByRole('link',{name:/web-one/}).waitFor();
   const activeService={...firstService,state:'running',revision:1,deployedRevision:1,domains:[{hostname:'app.example.com',port:3000,https:true,primary:true}]};
   let queued=false,finished=false;
   await page.route(`**/api/v1/projects/${first.id}/services`,route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify([activeService])}));
@@ -273,7 +279,7 @@ try {
   finished=true;
   await page.waitForFunction(id=>{const root=document.getElementById(`service-actions-${id}`);const button=Array.from(root?.querySelectorAll('button')??[]).find(item=>item.textContent==='Restart');return button && !button.disabled;},activeService.id);
   await page.getByRole('menu',{name:'Actions for web-one'}).getByRole('menuitem',{name:'Logs'}).click();
-  await page.getByRole('tab',{name:'Logs',selected:true}).waitFor();
+  await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Logs',exact:true}).and(page.locator('[aria-current="page"]')).waitFor();
   await page.unroute(`**/api/v1/projects/${first.id}/services`);
   await page.unroute(`**/api/v1/services/${activeService.id}/actions`);
   await page.unroute(`**/api/v1/services/${activeService.id}/restart`);

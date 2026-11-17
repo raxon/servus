@@ -22,9 +22,11 @@ The isolated Linux backup suite currently has 92 tests. No test was skipped in
 the recorded schema 8 run. This is capture/validation evidence, not signed-release
 upgrade acceptance.
 
-Before releasing, run the signed installer/updater path from a published schema
-7 image to the final candidate and test failure recovery using the pre-upgrade
-snapshot. Replacing only the image with schema 7 code after schema 8 has opened
+Before a stable release, run the signed installer/updater path from the actual
+published baseline to the final candidate and record its database schema rather
+than assuming schema 7. The published v0.1.52 Store accepts schemas through 5;
+the frozen local schema 7 fixture is separate compatibility evidence. Test failure
+recovery using the pre-upgrade snapshot. Replacing only the image with schema 7 code after schema 8 has opened
 the data is unsupported. Preserve the complete database, vault key and encrypted
 files together, and keep application database contents outside panel snapshot
 rollback semantics.
@@ -33,6 +35,7 @@ The full P0-P3 parity goal remains open. The standalone installation backup has
 administrator API authorization, a protected host queue, Settings controls and
 explicit root recovery for interrupted operations. Earlier frozen-runtime host
 fixtures passed capture/restart/isolated restore and recovery of an unverified
-capture. Current-code reproduction and a wider interruption matrix remain open,
+capture. The current-code host fixture also passed capability, cancellation,
+capture/restart and isolated restore. A wider interruption matrix remains open,
 along with history, retention and signed-release acceptance. See
 `installation-backup-acceptance.md` for evidence and outstanding checks.

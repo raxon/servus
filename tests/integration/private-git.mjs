@@ -31,7 +31,7 @@ try {
   await dialog.getByRole('button',{name:'Create & deploy'}).click();const response=await created;assert.equal(response.status(),202);const value=await response.json();
   assert.equal(value.service.source.repository,'https://git.example.com/team/app.git');
   assert.equal(value.service.source.credential.username,'git-user');assert.equal(value.service.source.credential.token,undefined);assert.ok(value.service.source.credential.secretRef);
-  await page.getByRole('tab',{name:'Source',exact:true}).click();
+  await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Source',exact:true}).click();
   const sourceForm=page.getByRole('form',{name:'Application source'});
   await sourceForm.getByRole('radio',{name:'Git',exact:true}).locator('..').click();
   const token=sourceForm.locator('input[name="git-token"]');
