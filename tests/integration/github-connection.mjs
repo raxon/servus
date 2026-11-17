@@ -201,7 +201,7 @@ try {
     await page.reload();
     await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Deployments',exact:false}).click();
     await page.getByText('Duration: 0m 0s').waitFor();
-    await page.getByText('Build output',{exact:false}).click();
+    await page.locator('.build-log-details summary').getByText('Build output',{exact:true}).click();
     const buildOutput=page.locator('.build-log-details pre');
     await buildOutput.waitFor();
     assert.equal(await buildOutput.evaluate(node=>node.scrollHeight>node.clientHeight),true);
