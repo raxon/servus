@@ -54,6 +54,9 @@ values=dict(line.split('=',1) for line in path.read_text().splitlines())
 assert values['SERVUS_IMAGE']=='ghcr.io/raxon/servus@sha256:'+'b'*64
 assert values['SERVUS_SOURCE_REF']=='v0.1.6'
 assert values['SERVUS_DATA_DIR']==str(root/'data')
+assert values['SERVUS_BIND_ADDRESS']=='0.0.0.0'
+assert values['SERVUS_PUBLIC_URL']=='http://203.0.113.42:4180'
+assert values['SERVUS_ALLOWED_ORIGINS']=='http://203.0.113.42:4180'
 assert '--take-install-lock-fd' in sys.argv
 print('PASS signed bootstrap bridge retains lock and publishes configuration')
 ''')
@@ -64,8 +67,8 @@ log() { printf 'Servus: %s\\n' "$*"; }
 cleanup_staging() { rm -rf -- "$servus_staging"; }
 install_dir=/opt/servus config_dir=/etc/servus data_dir="$FIXTURE_ROOT/data"
 config_file=/etc/servus/servus.env
-port=4180 ingress_port=80 socket_gid=999 bind_address=127.0.0.1
-public_url=http://localhost:4180 allowed_origins=http://localhost:4180 secure_cookies=false proxy_secret=
+port=4180 ingress_port=80 socket_gid=999 bind_address=0.0.0.0
+public_url=http://203.0.113.42:4180 allowed_origins=http://203.0.113.42:4180 secure_cookies=false proxy_secret=
 servus_staging="$FIXTURE_ROOT/staging"; mkdir "$servus_staging"
 exec 9>/opt/servus/install.lock; flock -n 9
 bootstrap_signed_install "$FIXTURE_ROOT/source" "$servus_staging"

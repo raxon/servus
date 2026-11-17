@@ -195,16 +195,16 @@ test('reruns preserve a stored host registry, including an explicitly empty one'
 test('dry run validates a supported arm64 checkout without mutating the host', () => {
   const f=fixture();const r=run(f,['main','--dry-run','--source',f.source,'--port','4280','--ingress-port','28080']);succeeds(r);assert.match(r.stdout,/ubuntu 24.04 \(arm64\)/);assert.match(r.stdout,/Panel port: 4280/);assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
 });
-test('management binds to localhost by default and rejects a new public installation', () => {
+test('management binds publicly by default and supports an explicit loopback override', () => {
   const f=fixture(); delete f.env.SERVUS_BIND_ADDRESS;
-  const local=run(f,['main','--dry-run']);succeeds(local);assert.match(local.stdout,/Management bind address: 127\.0\.0\.1/);
-  f.env.SERVUS_BIND_ADDRESS='0.0.0.0';
-  fails(run(f,['main','--dry-run']),/cannot bind publicly/);
-  fails(run(f,['main','--source',f.source]),/cannot bind publicly/);
+  const exposed=run(f,['main','--dry-run']);succeeds(exposed);assert.match(exposed.stdout,/Management bind address: 0\.0\.0\.0/);
   assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
   assert.equal(existsSync(f.env.SERVUS_CONFIG_DIR),false);
   assert.equal(existsSync(f.env.SERVUS_DATA_DIR),false);
-  f.env.SERVUS_BIND_ADDRESS='127.0.0.1';f.env.SERVUS_PUBLIC_URL='https://panel.example.test';
+  fails(run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { :; }; main "$@"'),/intentional build failure/);
+  f.env.SERVUS_BIND_ADDRESS='127.0.0.1';
+  const local=run(f,['main','--dry-run']);succeeds(local);assert.match(local.stdout,/Management bind address: 127\.0\.0\.1/);
+  f.env.SERVUS_PUBLIC_URL='https://panel.example.test';
   succeeds(run(f,['main','--dry-run']));
 });
 test('dry run rejects unsupported operating systems', () => {
@@ -338,7 +338,7 @@ compose) if [[ " $* " == *" up "* ]]; then
   }
 });
 
-test('an existing public installation cannot upgrade without a verifiable admin', () => {
+test('an existing public installation retains its bind and data before administrator setup', () => {
   for (const state of ['missing', 'no-admin', 'admin', 'unreadable', 'symlink']) {
     const f=fixture();for(const path of [f.env.SERVUS_INSTALL_DIR,f.env.SERVUS_CONFIG_DIR,f.env.SERVUS_DATA_DIR])mkdirSync(path);
     writeFileSync(join(f.env.SERVUS_INSTALL_DIR,'.servus-install'),'servus-installer-v1\n');
@@ -354,10 +354,10 @@ c.commit();c.close()`,db,state],{encoding:'utf8'});assert.equal(created.status,0
     const original=existsSync(db)?readFileSync(db):null;
     f.env.SERVUS_TEST_DEPENDENCIES=join(f.root,'dependencies-called');
     const result=run(f,['--source',f.source],'source "$1"; shift; install_dependencies() { touch "$SERVUS_TEST_DEPENDENCIES"; }; main "$@"');
-    fails(result,state==='admin'?/intentional build failure/:/no verifiable administrator/);
+    fails(result,/intentional build failure/);
     assert.equal(readFileSync(config,'utf8'),env);
     assert.equal(existsSync(join(f.env.SERVUS_INSTALL_DIR,'install.lock')),true);
-    assert.equal(existsSync(f.env.SERVUS_TEST_DEPENDENCIES),state==='admin');
+    assert.equal(existsSync(f.env.SERVUS_TEST_DEPENDENCIES),true);
     if(original)assert.deepEqual(readFileSync(db),original);
     else assert.equal(existsSync(db),false);
   }

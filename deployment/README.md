@@ -43,9 +43,10 @@ curl -fsSL https://raw.githubusercontent.com/raxon/servus/main/scripts/install.s
 ```
 
 After a successful installation, both signed bootstrap and source installation
-print the panel origin, the SSH tunnel command, first-administrator instructions,
+print the panel origin, first-administrator instructions,
 service status, recent-log commands and configuration paths. They never print
-passwords, keys or session tokens.
+passwords, keys or session tokens. A localhost installation also prints its SSH
+tunnel command.
 
 ## Install from a local checkout
 
@@ -58,7 +59,13 @@ sudo bash scripts/install.sh --source "$PWD"
 
 Dry run checks the platform, options and source layout. It writes no installation files and does not install packages.
 
-By default, the management panel listens on `127.0.0.1:4180` on the VPS. Application HTTP ingress uses port 80 and is separate from the management panel. To select other ports:
+The management panel listens on `0.0.0.0:4180` by default. Open the printed
+server-IP URL in your browser, including on a fresh installation. The installer
+uses the SSH connection's server IPv4 first, then `--swarm-advertise-addr`, then
+a usable host IPv4. Set `--hostname` or `SERVUS_PUBLIC_URL` to choose the origin
+yourself. Application HTTP ingress uses port 80.
+
+To select other ports:
 
 ```sh
 sudo bash scripts/install.sh --source "$PWD" --port 4280 --ingress-port 28080
@@ -66,19 +73,36 @@ sudo bash scripts/install.sh --source "$PWD" --port 4280 --ingress-port 28080
 
 Both ports must be free for a first install. On rerun, keep the same ports and data directory. The installer accepts ports already held by its own API or ingress and leaves other listeners untouched.
 
-Existing installations retain their configured bind address on rerun. An update does not automatically close a panel that was already exposed on all interfaces.
+Existing installations retain their configured bind address and panel origin on
+rerun, including when the first administrator has not been created yet.
 
 ## First administrator
 
-On your computer, forward the panel port over SSH. Keep this terminal open:
+Open the server-IP URL printed by the installer, such as
+`http://YOUR_SERVER_IPV4:4180`. Create the first administrator with your email
+address and a password of at least 8 characters. On a rerun, sign in with your
+existing account. Allow the selected panel port through your VPS firewall.
+
+Anyone who can reach an unconfigured instance can create its first administrator
+account. Complete setup promptly. Configure HTTPS before entering credentials
+over an untrusted network.
+
+For access through an SSH tunnel or a reverse proxy on the VPS, choose a local
+listener when installing:
+
+```sh
+curl -fsSL https://servus.run/install.sh | \
+  sudo SERVUS_BIND_ADDRESS=127.0.0.1 bash
+```
+
+On your computer, keep this tunnel running:
 
 ```sh
 ssh -N -L 127.0.0.1:4180:127.0.0.1:4180 YOUR_USER@YOUR_SERVER
 ```
 
-Open <http://127.0.0.1:4180> on your computer. On a new installation, create the first local administrator with an email address and a password of at least 8 characters. On a rerun, sign in with your existing account. If you selected another panel port, use that same port on both sides of the SSH tunnel and in the browser address.
-
-Restrict network access to the panel until setup is complete. Anyone who can reach an unconfigured instance can create its first administrator account. Configure HTTPS before entering credentials over an untrusted network.
+Then open <http://127.0.0.1:4180>. If you selected another panel port, use it on
+both sides of the tunnel and in the browser address.
 
 ## Files and service management
 
@@ -113,16 +137,20 @@ Custom installation, configuration and data paths can be set with `SERVUS_INSTAL
 sudo bash scripts/install.sh --hostname panel.example.com
 ```
 
-This sets the allowed HTTP origin. It does not create DNS records or certificates, and the panel still listens on localhost by default. Configure HTTPS before entering credentials over an untrusted network. The Cloudflare website deployment is separate from customer VPS installations.
+This sets the allowed HTTP origin. Create the DNS records and configure HTTPS
+on your reverse proxy separately. The Cloudflare website deployment is separate
+from customer VPS installations.
 
 If an HTTPS reverse proxy is already configured, specify its exact public origin:
 
 ```sh
 curl -fsSL https://servus.run/install.sh | \
-  sudo SERVUS_PUBLIC_URL=https://panel.example.com bash
+  sudo SERVUS_BIND_ADDRESS=127.0.0.1 SERVUS_PUBLIC_URL=https://panel.example.com bash
 ```
 
-An HTTPS origin enables secure session cookies. TLS still terminates at your reverse proxy, which can connect to the panel on `127.0.0.1:4180`. Keep the proxy inaccessible to others until the first administrator account has been created. The installer rejects a public bind on a first installation. On rerun, it keeps the existing bind address.
+An HTTPS origin enables secure session cookies. The command above binds the
+panel to `127.0.0.1:4180`, where your reverse proxy connects to it. TLS terminates
+at the proxy. Rerunning the installer preserves the saved bind address and origin.
 
 ## Updates and failures
 

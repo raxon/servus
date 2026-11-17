@@ -25,7 +25,7 @@ See [AGENTS.md](AGENTS.md) for contribution instructions and [the architecture n
 
 ## VPS installation
 
-The installer supports Ubuntu 22.04, 24.04 and 26.04, plus Debian 12 and 13 on amd64 or arm64. It prepares Docker when needed, builds Servus from source and starts the installation Compose package. You do not need Node.js on the VPS. Installation state lives under `/var/lib/servus`, and host configuration lives under `/etc/servus`.
+The installer supports Ubuntu 22.04, 24.04 and 26.04, plus Debian 12 and 13 on amd64 or arm64. It prepares Docker when needed, verifies a published signed Servus image and starts the installation. Use `--source` with a local checkout to build from source. You do not need Node.js on the VPS. Installation state lives under `/var/lib/servus`, and host configuration lives under `/etc/servus`.
 
 After the website and matching repository revision are published, the public command will be:
 
@@ -46,7 +46,7 @@ On the target Linux host, install from a local checkout with:
 sudo bash scripts/install.sh --source "$(pwd)"
 ```
 
-The installer binds the management panel to `127.0.0.1:4180` by default. Application HTTP ingress uses port 80. To reach a VPS panel from your computer, use the SSH tunnel in the [installation guide](deployment/README.md). Use a tested immutable source revision for a release. Each installed panel needs its own address and management TLS configuration.
+The installer binds the management panel to `0.0.0.0:4180` by default. Open the printed server-IP URL to create your administrator account. Application HTTP ingress uses port 80. For a local listener, set `SERVUS_BIND_ADDRESS=127.0.0.1` and use the SSH tunnel in the [installation guide](deployment/README.md), which also covers custom origins and HTTPS. Reruns retain the saved bind address and origin. Each installed panel needs its own address and management TLS configuration.
 
 ## Website
 

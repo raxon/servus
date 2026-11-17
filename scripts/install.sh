@@ -19,7 +19,7 @@ prepare_docker_client() {
   servus_docker_config=$(mktemp -d "$config_dir/.docker-cli.XXXXXXXX")
 }
 print_success() {
-  local origin=$1 config=$2 install=$3 bind=${4:-127.0.0.1} port=${5:-4180} ssh_host=${6:-YOUR_SERVER_IP}
+  local origin=$1 config=$2 install=$3 bind=${4:-0.0.0.0} port=${5:-4180} ssh_host=${6:-YOUR_SERVER_IP}
   printf '\nServus installation completed.\nConfigured panel origin: %s\nManagement listener: %s:%s\n' "$origin" "$bind" "$port"
   if [[ $bind == 127.0.0.1 && $origin == http://localhost:* || $bind == 127.0.0.1 && $origin == http://127.0.0.1:* ]]; then
     printf '\nOn your computer, open an SSH tunnel and keep it running:\n  ssh -N -L 127.0.0.1:%s:127.0.0.1:%s root@%s\nThen open: http://127.0.0.1:%s\n' "$port" "$port" "$ssh_host" "$port"
@@ -42,7 +42,7 @@ read_installer_answer() {
 }
 installer_wizard() {
   local selection value
-  printf '\nServus installer\n  1) Install with current settings (panel %s, application HTTP %s)\n  2) Choose custom ports\n  3) Show help\n  4) Cancel\n' "$port" "$ingress_port" >&"$servus_tty_fd"
+  printf '\nServus installer\n  1) Install with current settings (panel %s, application HTTP %s, bind %s)\n  2) Choose custom ports\n  3) Show help\n  4) Cancel\n' "$port" "$ingress_port" "${bind_address:-0.0.0.0}" >&"$servus_tty_fd"
   while :; do
     read_installer_answer 'Choose [1-4, default 1]: ' || return 1; selection=${REPLY:-1}
     case "$selection" in
@@ -148,7 +148,7 @@ Without either flag, a terminal session uses the wizard, including curl | sudo b
 --hostname sets the panel HTTP hostname. HTTPS needs a separate reverse proxy.
 --swarm-advertise-addr selects an IPv4 address when initializing a new Docker Swarm.
 Environment: SERVUS_INSTALL_DIR, SERVUS_CONFIG_DIR, SERVUS_DATA_DIR,
-             SERVUS_PUBLIC_URL, SERVUS_BIND_ADDRESS (default 127.0.0.1; 0.0.0.0 is an explicit override).
+             SERVUS_PUBLIC_URL, SERVUS_BIND_ADDRESS (default 0.0.0.0; use 127.0.0.1 for local access).
 The public website and installer URL use servus.run. Customer panels use their
 own VPS hostname or IP address.
 USAGE
@@ -705,7 +705,7 @@ main() {
   local dry_run=0 source_dir= hostname= image_ref= release_tag= swarm_advertise_addr= ref_explicit=0 ref=${SERVUS_REF:-main} port=4180 ingress_port=80
   local interaction=auto wizard_status
   local install_dir=${SERVUS_INSTALL_DIR:-/opt/servus} config_dir=${SERVUS_CONFIG_DIR:-/etc/servus} data_dir=${SERVUS_DATA_DIR:-/var/lib/servus}
-  local public_url=${SERVUS_PUBLIC_URL:-} bind_address=${SERVUS_BIND_ADDRESS:-127.0.0.1}
+  local public_url=${SERVUS_PUBLIC_URL:-} bind_address=${SERVUS_BIND_ADDRESS:-0.0.0.0}
   local host_domain_api=${SERVUS_HOST_DOMAINS_API_URL-https://api.servus.run} host_domain_automatic=${SERVUS_HOST_DOMAINS_AUTOMATIC:-true}
   while (( $# )); do
     case "$1" in
@@ -753,9 +753,6 @@ main() {
     done
   done
   [[ $bind_address == 0.0.0.0 || $bind_address == 127.0.0.1 ]] || fail 'Bind address must be 0.0.0.0 or 127.0.0.1.'
-  if [[ $bind_address == 0.0.0.0 && ! -f $config_dir/servus.env ]]; then
-    fail 'A new installation cannot bind publicly before an administrator exists. Use localhost for setup, then configure public access.'
-  fi
   [[ -z $hostname ]] || validate_host "$hostname"
   if [[ -n $swarm_advertise_addr ]]; then
     usable_swarm_ipv4 "$swarm_advertise_addr" || fail 'Swarm advertise address must be a usable non-loopback IPv4 address.'
@@ -804,17 +801,9 @@ main() {
   trap cleanup_staging EXIT
   [[ ! -e $config_dir/servus-origin-migration.pending && ! -L $config_dir/servus-origin-migration.pending ]] || fail 'An unfinished origin migration requires recovery before installation.'
   [[ ! -L $config_dir/servus.env ]] || fail 'Configuration must not be a symlink.'
-  if [[ $bind_address == 0.0.0.0 && ! -f $config_dir/servus.env ]]; then
-    fail 'A new installation cannot bind publicly before an administrator exists. Use localhost for setup, then configure public access.'
-  fi
   if [[ -f $config_dir/servus.env ]]; then
-    local preflight_bind
     read_proxy_secret "$config_dir/servus.env"
     read_saved_origins "$config_dir/servus.env"
-    preflight_bind=$(awk -F= '$1 == "SERVUS_BIND_ADDRESS" {sub(/^[^=]*=/, ""); print; exit}' "$config_dir/servus.env")
-    if [[ $preflight_bind == 0.0.0.0 ]] && ! has_configured_admin "$data_dir"; then
-      fail 'Existing public installation has no verifiable administrator. Restrict network access and complete setup before updating. Existing data and bind address were not changed.'
-    fi
   fi
   install_dependencies
   local existing_ingress
@@ -833,16 +822,8 @@ main() {
     bind_address=$(read_setting SERVUS_BIND_ADDRESS)
     validate_origin "$public_url"
     [[ $bind_address == 0.0.0.0 || $bind_address == 127.0.0.1 ]] || fail 'Invalid stored bind address.'
-    if [[ $bind_address == 0.0.0.0 ]] && ! has_configured_admin "$data_dir"; then
-      fail 'Existing public installation has no verifiable administrator. Restrict network access and complete setup before updating. Existing data and bind address were not changed.'
-    fi
   fi
   check_port "$port" api; check_port "$ingress_port" ingress
-  if [[ -z $hostname ]]; then
-    if [[ $bind_address == 127.0.0.1 ]]; then hostname=localhost
-    else hostname=$(hostname -I | awk '{for(i=1;i<=NF;i++)if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/){print $i;exit}}'); fi
-  fi
-  hostname=${hostname:-127.0.0.1}; validate_host "$hostname"; hostname=${hostname,,}
   local swarm_state
   swarm_state=$(trusted_docker info --format '{{.Swarm.LocalNodeState}}')
   if [[ $swarm_state == inactive ]]; then
@@ -852,6 +833,14 @@ main() {
     fail 'The Docker daemon is already joined to a Swarm as a worker. Use a manager or a fresh VPS.'
   fi
   ssh_host=$(installation_ssh_host)
+  if [[ -z $hostname && -z $public_url ]]; then
+    if [[ $bind_address == 127.0.0.1 ]]; then hostname=localhost
+    else
+      [[ $ssh_host != YOUR_SERVER_IP ]] || fail 'No usable server IPv4 address was found. Specify --hostname HOST or SERVUS_PUBLIC_URL.'
+      hostname=$ssh_host
+    fi
+  fi
+  if [[ -n $hostname ]]; then validate_host "$hostname"; hostname=${hostname,,}; fi
   close_installer_tty
   public_url=${public_url:-http://$hostname:$port}
   public_url=$(normalize_origin "$public_url")
