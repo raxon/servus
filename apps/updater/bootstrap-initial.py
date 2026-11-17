@@ -12,6 +12,7 @@ import os
 import pathlib
 import re
 import socket
+import sqlite3
 import stat
 import struct
 import subprocess
@@ -25,11 +26,103 @@ class BootstrapError(Exception):
     pass
 
 
+def failure_detail(error, initial=None):
+    initial_error=getattr(initial,'InitialGenerationError',None)
+    known=isinstance(error,BootstrapError) or (isinstance(initial_error,type) and isinstance(error,initial_error))
+    return str(error) if known else type(error).__name__
+
+
 def command(args, *, pass_fds=(), timeout=45):
-    result=subprocess.run(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+    handoff=any(item.endswith('/bootstrap-handoff.py') for item in args)
+    result=subprocess.run(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=None if handoff else subprocess.DEVNULL,
                           cwd='/',env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'},
                           pass_fds=pass_fds,timeout=timeout)
-    if result.returncode:raise BootstrapError('A bootstrap operation failed')
+    if result.returncode:
+        step=next((pathlib.Path(item).name for item in args if item.endswith('.py')),pathlib.Path(args[0]).name)
+        raise BootstrapError('Bootstrap step '+step+' failed (exit '+str(result.returncode)+')')
+
+
+def installation_summary(values, ssh_host='YOUR_SERVER_IP'):
+    """Print only allowlisted connection hints, never accepted secrets or environment."""
+    port=values.get('SERVUS_PORT','4180');bind=values.get('SERVUS_BIND_ADDRESS','127.0.0.1')
+    origin=values.get('SERVUS_PUBLIC_URL','http://127.0.0.1:'+port)
+    if not port.isascii() or not port.isdigit() or not 1<=int(port)<=65535:
+        raise BootstrapError('Invalid summary port')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]{0,252}',ssh_host) and ssh_host!='YOUR_SERVER_IP':
+        raise BootstrapError('Invalid SSH connection hint')
+    print('\nServus installation completed.\nConfigured panel origin: '+origin+'\nManagement listener: '+bind+':'+port)
+    if bind=='127.0.0.1' and origin.startswith(('http://localhost:','http://127.0.0.1:')):
+        print('\nOn your computer, open an SSH tunnel and keep it running:\n  ssh -N -L 127.0.0.1:'+port+':127.0.0.1:'+port+' root@'+ssh_host+'\nThen open: http://127.0.0.1:'+port)
+    else:print('\nOpen the configured panel origin: '+origin)
+    print('\nFirst visit: enter your email and a password of at least 8 characters, then choose Create administrator.\nOn an existing installation, sign in with your account.')
+    manage='sudo docker compose --env-file /etc/servus/servus.env -f /opt/servus/current/deployment/compose.yaml -p servus '
+    print('\nService status:\n  '+manage+'ps\nRecent logs:\n  '+manage+'logs --tail=100')
+    print('\nHost services:\n  sudo systemctl status servus-supervisor.service servus-updater.service\nConfiguration: /etc/servus/servus.env\nData directory: '+values.get('SERVUS_DATA_DIR','/var/lib/servus'))
+
+
+def recover_bootstrap(operation,install_dir,config_dir,state_dir,supervisor,policy,initial,daemon,*,run=command):
+    """Resume an approved pre-launch handoff or finalize its authenticated healthy result."""
+    if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated or not supervisor._uuid4(operation):
+        raise BootstrapError('Invalid initial recovery operation')
+    install=supervisor._trusted_directory(install_dir,0o700);lock=None
+    marker=('servus-bootstrap-verification-v1 '+operation+'\n').encode('ascii')
+    active=config_dir+'/servus.env';journal=pathlib.Path(state_dir)/'journal.sqlite'
+    def acquire():
+        deadline=time.monotonic()+30
+        while True:
+            try:return policy._installation_lock(install,supervisor)
+            except BlockingIOError:
+                if time.monotonic()>=deadline:raise BootstrapError('Installation lock is unavailable')
+                time.sleep(.1)
+    def marker_identity():
+        fd=supervisor._open_root_file(install,MARKER,0o600)
+        try:
+            info=os.fstat(fd);named=os.stat(MARKER,dir_fd=install,follow_symlinks=False)
+            if (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino) or os.read(fd,len(marker)+1)!=marker:
+                raise BootstrapError('Bootstrap recovery marker changed')
+            return info.st_dev,info.st_ino
+        finally:os.close(fd)
+    def status():
+        with sqlite3.connect('file:'+str(journal)+'?mode=ro',uri=True) as db:
+            row=db.execute("SELECT p.status FROM operations o JOIN preparations p ON p.operation_id=o.id JOIN policy_approvals a ON a.operation_id=o.id WHERE o.id=? AND o.status='verified' AND a.state='active' AND a.source_env_path=?",(operation,active)).fetchone()
+            tables={item[0] for item in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            generations=db.execute('SELECT operation_id,phase FROM initial_generations').fetchall() if 'initial_generations' in tables else []
+        if row is None:raise BootstrapError('Initial recovery is not bound to an approved verified operation')
+        return row[0],generations
+    try:
+        lock=acquire()
+        identity=marker_identity();approved=daemon.resolve_active_policy(str(journal),active)
+        phase,generations=status()
+        if phase=='prepared' and not generations:
+            os.close(lock);lock=None
+            run(['/usr/bin/python3','-I','/usr/local/libexec/servus/bootstrap-handoff.py','--recover','--operation',operation],timeout=300)
+            lock=acquire()
+        elif phase!='completed' or generations!=[(operation,'started')]:
+            raise BootstrapError('Initial generation is uncertain and requires operator recovery')
+        if daemon.resolve_active_policy(str(journal),active)!=approved or marker_identity()!=identity:
+            raise BootstrapError('Initial recovery policy or marker changed')
+        if status()!=('completed',[(operation,'started')]):
+            raise BootstrapError('Recovered generation has not completed startup')
+        try:os.stat('.initial-handoff-v1',dir_fd=install,follow_symlinks=False)
+        except FileNotFoundError:pass
+        else:raise BootstrapError('Initial handoff still requires recovery')
+        # Status handlers inspect the runtime under the installation lock too.
+        # Probe without holding it, then revalidate every durable binding before
+        # removing the bootstrap fence.
+        os.close(lock);lock=None
+        initial.check_supervisor(approved[2].control_dir,supervisor,expected='ready')
+        initial.check_updater(approved[2].updater_dir,supervisor)
+        run(['/usr/bin/systemctl','start','servus-host-update.timer'],timeout=45)
+        lock=acquire()
+        if daemon.resolve_active_policy(str(journal),active)!=approved or marker_identity()!=identity or status()!=('completed',[(operation,'started')]):
+            raise BootstrapError('Initial recovery changed during readiness verification')
+        try:os.stat('.initial-handoff-v1',dir_fd=install,follow_symlinks=False)
+        except FileNotFoundError:pass
+        else:raise BootstrapError('Initial handoff still requires recovery')
+        os.unlink(MARKER,dir_fd=install);os.fsync(install)
+    finally:
+        if lock is not None:os.close(lock)
+        os.close(install)
 
 
 def inactive(unit):
@@ -148,11 +241,15 @@ def bootstrap(operation,commit,digest,tag,install_dir,config_dir,state_dir,super
 
 def main():
     parser=argparse.ArgumentParser()
-    for name in ('operation','commit','digest','tag'):parser.add_argument('--'+name,required=True)
+    parser.add_argument('--operation',required=True)
+    for name in ('commit','digest','tag'):parser.add_argument('--'+name)
+    parser.add_argument('--recover',action='store_true',help='Resume a prepared initial handoff or finalize its healthy result')
+    parser.add_argument('--ssh-host',default='YOUR_SERVER_IP',help='Address to display in the SSH setup instructions')
     parser.add_argument('--take-install-lock-fd',type=int,help='Take ownership of the installation lock passed by an exec')
     args=parser.parse_args()
     if sys.platform!='linux' or os.geteuid()!=0 or not sys.flags.isolated:
         print('Initial bootstrap requires isolated Linux root.',file=sys.stderr);return 1
+    initial=None
     try:
         base=pathlib.Path(os.path.realpath(__file__)).parent;current=pathlib.Path('/')
         for part in base.parts[1:]:
@@ -166,11 +263,23 @@ def main():
         spec=importlib.util.spec_from_file_location('servus_initial_generation',path)
         if not spec or not spec.loader:raise BootstrapError('Module unavailable')
         initial=importlib.util.module_from_spec(spec);spec.loader.exec_module(initial)
-        supervisor,_,_,_,policy,_=initial.trusted_modules()
-        bootstrap(args.operation,args.commit,args.digest,args.tag,'/opt/servus','/etc/servus','/var/lib/servus-updater',supervisor,policy,take_lock_fd=args.take_install_lock_fd)
+        supervisor,daemon,_,_,policy,_=initial.trusted_modules()
+        if args.recover:
+            if args.take_install_lock_fd is not None or any((args.commit,args.digest,args.tag)):
+                raise BootstrapError('Recovery accepts an operation ID without a new release or inherited lock')
+            recover_bootstrap(args.operation,'/opt/servus','/etc/servus','/var/lib/servus-updater',supervisor,policy,initial,daemon)
+        else:
+            if any(value is None for value in (args.commit,args.digest,args.tag)):
+                raise BootstrapError('Initial installation requires commit, digest and tag')
+            bootstrap(args.operation,args.commit,args.digest,args.tag,'/opt/servus','/etc/servus','/var/lib/servus-updater',supervisor,policy,take_lock_fd=args.take_install_lock_fd)
+        values=policy._env(policy._read_private_file('/etc/servus/servus.env',65536))
+        installation_summary(values,args.ssh_host)
         return 0
-    except Exception:
-        print('Initial bootstrap failed or requires recovery.',file=sys.stderr);return 1
+    except Exception as error:
+        detail=failure_detail(error,initial)
+        print('Initial bootstrap failed or requires recovery: '+detail+'.',file=sys.stderr)
+        print('Inspect: sudo journalctl -u servus-supervisor.service -u servus-updater.service --since "15 minutes ago"\nOperation: '+args.operation,file=sys.stderr)
+        return 1
 
 
 if __name__=='__main__':raise SystemExit(main())

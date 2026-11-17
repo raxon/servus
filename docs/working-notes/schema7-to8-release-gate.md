@@ -22,6 +22,25 @@ The isolated Linux backup suite currently has 92 tests. No test was skipped in
 the recorded schema 8 run. This is capture/validation evidence, not signed-release
 upgrade acceptance.
 
+The next installer revision adds `--release vMAJOR.MINOR.PATCH` for fresh signed
+installations. Discovery resolves exactly that tag, commit and registry manifest,
+without falling back to a newer tag. The bridge also rejects a candidate whose
+tag differs from the request, before provisioning the host. Signature verification
+still belongs to the unchanged protected bootstrap verifier. The host-safe
+installer suite passed all 53 tests, the discovery suite passed all 18 tests, and
+the isolated Linux bootstrap bridge passed exact-selection and mismatch checks.
+
+The signed-update fixture uses a frozen v0.1.52 host source and filters its normal
+discovery to that tag before updating to v0.1.53. A fixture-only installer branch
+allows signed bootstrap from this frozen source. The production verifier,
+bootstrap and downloaded release artifacts remain unchanged, and original
+discovery is restored before the update. This avoids depending on publication of
+the separate `--release` feature. Both registry digests are resolved before VM
+creation. See `tests/signed-update-e2e/README.md` for the exact scope and cleanup.
+These fixture changes are local follow-up work outside the v0.1.53 release commit.
+A passing result must still be recorded, along with separate evidence for the
+post-migration recovery and interruption scenarios below.
+
 Before a stable release, run the signed installer/updater path from the actual
 published baseline to the final candidate and record its database schema rather
 than assuming schema 7. The published v0.1.52 Store accepts schemas through 5;

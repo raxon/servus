@@ -5,6 +5,7 @@ servus_staging=
 servus_config_temp=
 servus_probe_container=
 servus_docker_config=
+servus_tty_fd=
 
 fail() { printf 'Servus: %s\n' "$*" >&2; return 1; }
 log() { printf 'Servus: %s\n' "$*"; }
@@ -18,7 +19,104 @@ prepare_docker_client() {
   servus_docker_config=$(mktemp -d "$config_dir/.docker-cli.XXXXXXXX")
 }
 print_success() {
-  printf '\nConfigured panel origin: %s\nManagement listener: %s:%s\nOpen the configured origin to sign in, or create the first local administrator if setup is required.\nManage: docker compose --env-file %s -f %s/current/deployment/compose.yaml -p servus ps\n' "$1" "${4:-127.0.0.1}" "${5:-4180}" "$2" "$3"
+  local origin=$1 config=$2 install=$3 bind=${4:-127.0.0.1} port=${5:-4180} ssh_host=${6:-YOUR_SERVER_IP}
+  printf '\nServus installation completed.\nConfigured panel origin: %s\nManagement listener: %s:%s\n' "$origin" "$bind" "$port"
+  if [[ $bind == 127.0.0.1 && $origin == http://localhost:* || $bind == 127.0.0.1 && $origin == http://127.0.0.1:* ]]; then
+    printf '\nOn your computer, open an SSH tunnel and keep it running:\n  ssh -N -L 127.0.0.1:%s:127.0.0.1:%s root@%s\nThen open: http://127.0.0.1:%s\n' "$port" "$port" "$ssh_host" "$port"
+  else printf '\nOpen the configured panel origin: %s\n' "$origin"; fi
+  printf '\nFirst visit: enter your email and a password of at least 8 characters, then choose Create administrator.\nOn an existing installation, sign in with your account.\n'
+  printf '\nService status:\n  sudo docker compose --env-file %s -f %s/current/deployment/compose.yaml -p servus ps\nRecent logs:\n  sudo docker compose --env-file %s -f %s/current/deployment/compose.yaml -p servus logs --tail=100\n' "$config" "$install" "$config" "$install"
+  printf '\nHost services:\n  sudo systemctl status servus-supervisor.service servus-updater.service\nConfiguration: %s\n' "$config"
+}
+
+open_installer_tty() {
+  if { exec {servus_tty_fd}<>/dev/tty; } 2>/dev/null; then return 0; fi
+  servus_tty_fd=; return 1
+}
+close_installer_tty() {
+  if [[ -n $servus_tty_fd ]]; then exec {servus_tty_fd}>&-; servus_tty_fd=; fi
+}
+read_installer_answer() {
+  printf '%s' "$1" >&"$servus_tty_fd"
+  IFS= read -r -u "$servus_tty_fd" REPLY || { fail 'Terminal input closed. Rerun with --non-interactive and explicit options.'; return 1; }
+}
+installer_wizard() {
+  local selection value
+  printf '\nServus installer\n  1) Install with current settings (panel %s, application HTTP %s)\n  2) Choose custom ports\n  3) Show help\n  4) Cancel\n' "$port" "$ingress_port" >&"$servus_tty_fd"
+  while :; do
+    read_installer_answer 'Choose [1-4, default 1]: ' || return 1; selection=${REPLY:-1}
+    case "$selection" in
+      1) return 0;;
+      2)
+        while :; do
+          read_installer_answer "Management panel port [$port]: " || return 1; value=${REPLY:-$port}
+          if validate_port "$value"; then port=$((10#$value)); break; fi
+        done
+        while :; do
+          read_installer_answer "Application HTTP port [$ingress_port]: " || return 1; value=${REPLY:-$ingress_port}
+          if validate_port "$value" && [[ $((10#$value)) != "$port" ]]; then ingress_port=$((10#$value)); return 0; fi
+          printf 'Choose a valid port different from the management port.\n' >&"$servus_tty_fd"
+        done;;
+      3) usage >&"$servus_tty_fd";;
+      4) log 'Installation cancelled before changing the host.'; return 2;;
+      *) printf 'Enter 1, 2, 3 or 4.\n' >&"$servus_tty_fd";;
+    esac
+  done
+}
+host_ipv4_addresses() {
+  local address seen=' ' interface prefix remainder
+  if command -v ip >/dev/null 2>&1; then
+    while read -r _ interface _ prefix remainder; do
+      case "$interface" in lo|docker*|br-*|veth*|virbr*) continue;; esac
+      address=${prefix%/*}
+      if usable_swarm_ipv4 "$address" && [[ $seen != *" $address "* ]]; then printf '%s\n' "$address"; seen+="$address "; fi
+    done < <(ip -o -4 address show scope global)
+  else
+    for address in $(hostname -I); do
+      if usable_swarm_ipv4 "$address" && [[ $seen != *" $address "* ]]; then printf '%s\n' "$address"; seen+="$address "; fi
+    done
+  fi
+}
+usable_swarm_ipv4() {
+  local a b c d octet
+  [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS=. read -r a b c d <<< "$1"
+  for octet in "$a" "$b" "$c" "$d"; do
+    [[ $octet =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    (( 10#$octet <= 255 )) || return 1
+  done
+  [[ $1 != 0.* && $1 != 127.* && $1 != 169.254.* && $a -lt 224 ]]
+}
+select_swarm_address() {
+  [[ -z $swarm_advertise_addr ]] || return 0
+  local addresses=() address choice index
+  while IFS= read -r address; do [[ -z $address ]] || addresses+=("$address"); done < <(host_ipv4_addresses)
+  if [[ ${#addresses[@]} == 1 ]]; then
+    swarm_advertise_addr=${addresses[0]}; log "Using Swarm advertise address $swarm_advertise_addr."; return 0
+  fi
+  [[ ${#addresses[@]} -gt 0 ]] || { fail 'No usable host IPv4 address was found. Specify --swarm-advertise-addr IPV4.'; return 1; }
+  if [[ -z $servus_tty_fd ]]; then
+    fail "Multiple host IPv4 addresses were found: ${addresses[*]}. Rerun with --interactive or --swarm-advertise-addr ${addresses[0]}."; return 1
+  fi
+  printf '\nChoose the IPv4 address Docker Swarm should advertise:\n' >&"$servus_tty_fd"
+  for ((index=0; index<${#addresses[@]}; index++)); do printf '  %s) %s\n' "$((index+1))" "${addresses[index]}" >&"$servus_tty_fd"; done
+  while :; do
+    read_installer_answer 'Address number: ' || return 1; choice=$REPLY
+    if [[ $choice =~ ^[0-9]{1,3}$ ]] && (( 10#$choice > 0 && 10#$choice <= ${#addresses[@]} )); then
+      swarm_advertise_addr=${addresses[$((10#$choice-1))]}; return 0
+    fi
+    printf 'Select one of the listed address numbers.\n' >&"$servus_tty_fd"
+  done
+}
+installation_ssh_host() {
+  local address client client_port server_port
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    read -r client client_port address server_port <<< "$SSH_CONNECTION"
+    if usable_swarm_ipv4 "$address"; then printf '%s' "$address"; return; fi
+  fi
+  if [[ -n ${swarm_advertise_addr:-} ]]; then printf '%s' "$swarm_advertise_addr"; return; fi
+  while IFS= read -r address; do printf '%s' "$address"; return; done < <(host_ipv4_addresses 2>/dev/null)
+  printf 'YOUR_SERVER_IP'
 }
 wait_panel_ready() {
   local port=$1 attempt
@@ -31,12 +129,18 @@ wait_panel_ready() {
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh [--dry-run] [--source DIRECTORY | --image IMAGE] [--ref REF] [--hostname HOST]
-                  [--port PORT] [--ingress-port PORT] [--swarm-advertise-addr IPV4] [--help]
+Usage: install.sh [--dry-run] [--release TAG | --source DIRECTORY | --image IMAGE] [--ref REF] [--hostname HOST]
+                  [--port PORT] [--ingress-port PORT] [--swarm-advertise-addr IPV4]
+                  [--interactive | --non-interactive] [--help]
 
 Installs Servus on Ubuntu 22.04/24.04/26.04 or Debian 12/13 (amd64/arm64).
 Run as root. Existing Servus data and configuration are retained on rerun.
 --dry-run validates input and prints the plan without modifying the host.
+--interactive opens a terminal wizard for installation options and network selection.
+--non-interactive (or --yes) disables prompts; ambiguous network addresses require an explicit flag.
+Without either flag, a terminal session uses the wizard, including curl | sudo bash.
+--release selects an exact signed vMAJOR.MINOR.PATCH release for a fresh installation.
+          Cannot be combined with --source, --image or a source ref override.
 --source builds an existing local monorepo instead of downloading GitHub source.
 --ref selects a GitHub branch, tag or commit (default: main).
 --image pulls ghcr.io/raxon/servus by sha256 digest instead of building.
@@ -597,8 +701,9 @@ PY
 
 main() {
   unset SERVUS_TRUSTED_PROXY_SECRET PANEL_TRUSTED_PROXY_SECRET SERVUS_TRUSTED_PROXY_SECRET_FILE PANEL_TRUSTED_PROXY_SECRET_FILE SERVUS_ALLOWED_ORIGINS SERVUS_LIFECYCLE_DIR SERVUS_SUPERVISOR_CONTROL_DIR SERVUS_SUPERVISOR_SECRET_DIR SERVUS_UPDATER_SOCKET_DIR PANEL_UPDATER_SOCKET PANEL_UPDATER_APPLY_ENABLED PANEL_SUPERVISOR_SOCKET PANEL_SUPERVISOR_SECRET_FILE
-  local proxy_secret= saved_origins=
-  local dry_run=0 source_dir= hostname= image_ref= swarm_advertise_addr= ref_explicit=0 ref=${SERVUS_REF:-main} port=4180 ingress_port=80
+  local proxy_secret= saved_origins= ssh_host=
+  local dry_run=0 source_dir= hostname= image_ref= release_tag= swarm_advertise_addr= ref_explicit=0 ref=${SERVUS_REF:-main} port=4180 ingress_port=80
+  local interaction=auto wizard_status
   local install_dir=${SERVUS_INSTALL_DIR:-/opt/servus} config_dir=${SERVUS_CONFIG_DIR:-/etc/servus} data_dir=${SERVUS_DATA_DIR:-/var/lib/servus}
   local public_url=${SERVUS_PUBLIC_URL:-} bind_address=${SERVUS_BIND_ADDRESS:-127.0.0.1}
   local host_domain_api=${SERVUS_HOST_DOMAINS_API_URL-https://api.servus.run} host_domain_automatic=${SERVUS_HOST_DOMAINS_AUTOMATIC:-true}
@@ -606,6 +711,13 @@ main() {
     case "$1" in
       --help|-h) usage; return 0;;
       --dry-run) dry_run=1; shift;;
+      --interactive|-i) [[ $interaction != never ]] || fail 'Interactive and non-interactive options cannot be combined.'; interaction=always; shift;;
+      --non-interactive|--yes|-y) [[ $interaction != always ]] || fail 'Interactive and non-interactive options cannot be combined.'; interaction=never; shift;;
+      --release)
+        (( $# >= 2 )) || fail 'Missing value for --release'
+        [[ ${#2} -le 64 && $2 =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail 'Invalid signed release tag.'
+        [[ -z $release_tag ]] || fail '--release must be specified once.'
+        release_tag=$2; shift 2;;
       --source|--image|--ref|--hostname|--port|--ingress-port|--swarm-advertise-addr)
         (( $# >= 2 )) || fail "Missing value for $1"
         case "$1" in --source) source_dir=$2;; --image) [[ -n $2 ]] || fail 'Image must not be empty.'; image_ref=$2;; --ref) ref=$2; ref_explicit=1;; --hostname) hostname=$2;; --swarm-advertise-addr) [[ -n $2 ]] || fail 'Swarm advertise address must not be empty.'; swarm_advertise_addr=$2;; --port) port=$2;; --ingress-port) ingress_port=$2;; esac
@@ -613,11 +725,20 @@ main() {
       *) fail "Unknown option: $1";;
     esac
   done
+  if (( ! dry_run )) && [[ $interaction != never ]]; then
+    if open_installer_tty; then
+      wizard_status=0; installer_wizard || wizard_status=$?
+      if (( wizard_status != 0 )); then close_installer_tty; [[ $wizard_status == 2 ]] && return 0; return "$wizard_status"; fi
+    elif [[ $interaction == always ]]; then fail 'Interactive installation requires a terminal. Use --non-interactive and explicit options.'; return 1; fi
+  fi
   validate_port "$port"; validate_port "$ingress_port"
   validate_host_domain_settings "$host_domain_api" "$host_domain_automatic"
   port=$((10#$port)); ingress_port=$((10#$ingress_port))
   [[ $port != "$ingress_port" ]] || fail 'Panel and application ingress need different ports.'
   validate_ref "$ref"
+  if [[ -n $release_tag ]]; then
+    [[ -z $source_dir && -z $image_ref && $ref_explicit == 0 && $ref == main ]] || fail '--release cannot be combined with --source, --image or a source ref override.'
+  fi
   if [[ -n $image_ref ]]; then
     validate_image "$image_ref"
     [[ -z $source_dir ]] || fail '--image cannot be combined with --source.'
@@ -637,9 +758,7 @@ main() {
   fi
   [[ -z $hostname ]] || validate_host "$hostname"
   if [[ -n $swarm_advertise_addr ]]; then
-    [[ $swarm_advertise_addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'Swarm advertise address must be an IPv4 address.'
-    validate_host "$swarm_advertise_addr"
-    [[ $swarm_advertise_addr != 0.* && $swarm_advertise_addr != 127.* && $swarm_advertise_addr != 255.255.255.255 ]] || fail 'Swarm advertise address must be a usable non-loopback IPv4 address.'
+    usable_swarm_ipv4 "$swarm_advertise_addr" || fail 'Swarm advertise address must be a usable non-loopback IPv4 address.'
   fi
   if [[ -n $public_url ]]; then
     validate_origin "$public_url"
@@ -654,6 +773,7 @@ main() {
     printf 'Management bind address: %s\n' "$bind_address"
     printf 'New installation host domain API: %s\nAutomatic host registration: %s\n' "${host_domain_api:-disabled}" "$host_domain_automatic"
     if [[ -n $image_ref ]]; then printf 'Image: %s\n' "$image_ref"; fi
+    if [[ -n $release_tag ]]; then printf 'Signed release: %s\n' "$release_tag"; fi
     if [[ -n $swarm_advertise_addr ]]; then printf 'Swarm advertise address: %s\n' "$swarm_advertise_addr"; fi
     return 0
   fi
@@ -726,14 +846,13 @@ main() {
   local swarm_state
   swarm_state=$(trusted_docker info --format '{{.Swarm.LocalNodeState}}')
   if [[ $swarm_state == inactive ]]; then
-    if [[ -n $swarm_advertise_addr ]]; then
-      trusted_docker swarm init --advertise-addr "$swarm_advertise_addr" >/dev/null
-    else
-      trusted_docker swarm init >/dev/null
-    fi
+    select_swarm_address
+    trusted_docker swarm init --advertise-addr "$swarm_advertise_addr" >/dev/null
   elif [[ $(trusted_docker info --format '{{.Swarm.ControlAvailable}}') != true ]]; then
     fail 'The Docker daemon is already joined to a Swarm as a worker. Use a manager or a fresh VPS.'
   fi
+  ssh_host=$(installation_ssh_host)
+  close_installer_tty
   public_url=${public_url:-http://$hostname:$port}
   public_url=$(normalize_origin "$public_url")
   local secure_cookies=false
@@ -818,7 +937,7 @@ PYCANONICAL
   fi
   ln -s "$source" "$staging/current"
   mv -Tf "$staging/current" "$install_dir/current"
-  print_success "$public_url" "$config_file" "$install_dir" "$bind_address" "$port"
+  print_success "$public_url" "$config_file" "$install_dir" "$bind_address" "$port" "$ssh_host"
   if [[ $bind_address == 127.0.0.1 ]]; then log 'Management is bound to localhost. Use an SSH tunnel or a local HTTPS reverse proxy for remote access.'; fi
   log 'Configure HTTPS before using the panel across an untrusted network.'
   cleanup_staging; trap - EXIT

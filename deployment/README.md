@@ -1,6 +1,7 @@
 # VPS installation
 
-Servus installs from this monorepo and builds its Docker image on the target VPS. A published registry image is not required.
+The default installer verifies and starts a published signed Servus image. An
+explicit `--source` or `--ref` installation builds from source instead.
 
 The intended public command is:
 
@@ -14,7 +15,37 @@ The command becomes usable after the website serves the installer and the select
 
 Use a systemd VPS with Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, on amd64 or arm64. Run the script as root. Docker is installed from its official apt repository when absent. Existing Docker packages are retained, and an existing daemon must have the Compose plugin and the system socket at `/var/run/docker.sock`.
 
-Allow time for the source build. The installer creates a single-node Swarm on an inactive Docker daemon and accepts an existing manager, but it refuses to take over a panel ingress service or Compose project belonging to another installation. Use a fresh VPS for the first install.
+Allow time for verification and image download, or the source build when
+selected. The installer creates a single-node Swarm on an inactive Docker daemon
+and accepts an existing manager, but it refuses to take over a panel ingress
+service or Compose project belonging to another installation. Use a fresh VPS
+for the first install.
+
+## Terminal wizard and network selection
+
+When a terminal is available, the installer offers the current ports, custom
+ports, help and cancellation. It reads `/dev/tty`, so the menu also works when
+the script arrives through `curl | sudo bash`. Use `--interactive` to require
+the wizard or `--non-interactive` (`--yes`) for automation. A dry run never asks
+questions.
+
+Before creating a Swarm, the installer lists the host's IPv4 addresses. It
+selects a single address automatically and asks you to choose when several are
+available. Docker bridges and link-local addresses are excluded. An existing
+Swarm keeps its current configuration.
+
+For a server with both public and private addresses, an automated installation
+must select the address explicitly:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/raxon/servus/main/scripts/install.sh | \
+  sudo bash -s -- --non-interactive --swarm-advertise-addr YOUR_SERVER_IPV4
+```
+
+After a successful installation, both signed bootstrap and source installation
+print the panel origin, the SSH tunnel command, first-administrator instructions,
+service status, recent-log commands and configuration paths. They never print
+passwords, keys or session tokens.
 
 ## Install from a local checkout
 
@@ -94,6 +125,22 @@ curl -fsSL https://servus.run/install.sh | \
 An HTTPS origin enables secure session cookies. TLS still terminates at your reverse proxy, which can connect to the panel on `127.0.0.1:4180`. Keep the proxy inaccessible to others until the first administrator account has been created. The installer rejects a public bind on a first installation. On rerun, it keeps the existing bind address.
 
 ## Updates and failures
+
+If a fresh signed installation stops after verification but before its first
+generation starts, retain the reported operation ID. The updated host helper
+supports an explicit recovery command:
+
+```sh
+sudo python3 -I /usr/local/libexec/servus/bootstrap-initial.py \
+  --recover --operation THE_REPORTED_OPERATION_ID --ssh-host YOUR_SERVER_IPV4
+```
+
+Recovery checks the verified operation, approved policy, protected markers and
+runtime state. It resumes a prepared handoff before any generation started, or
+finalizes an already completed and authenticated healthy generation. Uncertain
+starts remain blocked. Keep the markers and journal intact for investigation.
+This command requires the updated host helper; older installations may need an
+operator to install the reviewed helper changes first.
 
 For a published revision, select a commit or tag with `--ref` or `SERVUS_REF`. The default is `main`.
 

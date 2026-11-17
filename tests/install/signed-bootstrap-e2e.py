@@ -23,7 +23,7 @@ os.chown(data, 1000, 1000)
 lock = Path('/opt/servus/install.lock')
 lock.touch(mode=0o600)
 trace = root / 'trace'
-(source / 'discover-release.py').write_text('import os\nprint(os.environ["FIXTURE_CANDIDATE"])\n')
+(source / 'discover-release.py').write_text('import json, os, pathlib, sys\npathlib.Path(os.environ["FIXTURE_ROOT"], "discovery-args.json").write_text(json.dumps(sys.argv[1:]))\nprint(os.environ["FIXTURE_CANDIDATE"])\n')
 (source / 'install-host.py').write_text('''import os, pathlib, shutil
 root=pathlib.Path(os.environ['FIXTURE_ROOT']); target=pathlib.Path('/usr/local/libexec/servus')
 target.mkdir(parents=True)
@@ -71,8 +71,8 @@ exec 9>/opt/servus/install.lock; flock -n 9
 bootstrap_signed_install "$FIXTURE_ROOT/source" "$servus_staging"
 '''
 
-def run(candidate):
-    env={**os.environ, 'FIXTURE_ROOT':str(root), 'FIXTURE_CANDIDATE':candidate}
+def run(candidate, release=''):
+    env={**os.environ, 'FIXTURE_ROOT':str(root), 'FIXTURE_CANDIDATE':candidate, 'release_tag':release}
     return subprocess.run(['/bin/bash','-c',script], env=env, text=True, capture_output=True, timeout=30)
 
 invalid = [
@@ -101,9 +101,17 @@ for candidate in invalid:
     assert not Path('/usr/local/libexec/servus').exists() and not Path('/etc/servus/servus.env').exists()
     (root / 'staging' / 'release-candidate.json').unlink()
     (root / 'staging').rmdir()
+    assert json.loads((root / 'discovery-args.json').read_text()) == ['--initial']
 valid=json.dumps({'status':'candidate','verified':False,'tag':'v0.1.6','commit':'a'*40,'digest':'sha256:'+'b'*64})
-result=run(valid)
+result=run(valid, 'v0.1.7')
+assert result.returncode != 0 and 'No compatible signed release candidate' in result.stderr
+assert not Path('/usr/local/libexec/servus').exists() and not Path('/etc/servus/servus.env').exists()
+assert json.loads((root / 'discovery-args.json').read_text()) == ['--release', 'v0.1.7']
+(root / 'staging' / 'release-candidate.json').unlink()
+(root / 'staging').rmdir()
+result=run(valid, 'v0.1.6')
 assert result.returncode == 0, (result.stdout,result.stderr)
+assert json.loads((root / 'discovery-args.json').read_text()) == ['--release', 'v0.1.6']
 assert 'SERVUS_HOST_DOMAINS_API_URL=https://api.servus.run\n' in Path('/etc/servus/servus.env').read_text()
 assert 'SERVUS_HOST_DOMAINS_AUTOMATIC=true\n' in Path('/etc/servus/servus.env').read_text()
 assert json.loads(Path('/etc/servus/lifecycle/host-domains.json').read_text()) == {'apiOrigin':'https://api.servus.run','automatic':True}

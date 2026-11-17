@@ -1465,6 +1465,11 @@ def process(journal, request, *, allow_apply=False, discovery=None, recovery=Non
     if action == 'installation_backup_cancel' and set(request) == {'version', 'action', 'approval'}:
         if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
         return installation_backups.cancel(request['approval'])
+    if action == 'apply' and set(request) == {'version', 'action', 'operationId'}:
+        # Reject the readiness probe locally: backup admission can need the
+        # installation lock already held by the initial-generation coordinator.
+        if not allow_apply: raise ProtocolError('unavailable')
+        if not valid_uuid(request['operationId']): raise ProtocolError('invalid_request')
     if installation_backups is not None and action in ('submit', 'retry', 'prepare', 'apply', 'legacy_recovery') and installation_backups.active():
         raise ProtocolError('operation_in_progress')
     if action=='legacy_recovery' and set(request)=={'version','action','operationId','restoreId','serviceId'}:

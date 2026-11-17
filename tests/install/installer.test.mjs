@@ -30,7 +30,7 @@ function fixture() {
 }
 function run(f, args, script = 'source "$1"; shift; "$@"') {
   // Unit fixtures mock Docker and privileged host checks; integration tests run the real checks separately.
-  script = script.replace('source "$1";', 'source "$1"; trusted_docker() { docker "$@"; }; prepare_docker_client() { :; }; prepare_runtime() { :; }; require_supervisor_socket() { :; }; verify_lifecycle_image() { :; }; verify_lifecycle_compose() { printf "{\\\"fixture\\\":true}\\n" > "$9"; };');
+  script = script.replace('source "$1";', 'source "$1"; open_installer_tty() { return 1; }; trusted_docker() { docker "$@"; }; prepare_docker_client() { :; }; prepare_runtime() { :; }; require_supervisor_socket() { :; }; verify_lifecycle_image() { :; }; verify_lifecycle_compose() { printf "{\\\"fixture\\\":true}\\n" > "$9"; };');
   return spawnSync('bash', ['-c', script, 'servus-tests', installer, ...args], { env: f.env, encoding: 'utf8' });
 }
 function succeeds(result) { assert.equal(result.status, 0, result.stderr); }
@@ -47,11 +47,117 @@ test('success instructions cover first setup and reruns without exposing a token
   assert.match(result.stdout,/Configured panel origin: https:\/\/panel\.example\.test/);
   assert.match(result.stdout,/Management listener: 127\.0\.0\.1:4180/);
   assert.doesNotMatch(result.stdout,/is listening at https/);
-  assert.match(result.stdout,/sign in, or create the first local administrator if setup is required/);
+  assert.match(result.stdout,/choose Create administrator/);
+  assert.match(result.stdout,/at least 8 characters/);
+  assert.match(result.stdout,/logs --tail=100/);
+  assert.doesNotMatch(result.stdout,/ssh -N/,'An HTTPS origin uses its configured proxy');
   assert.doesNotMatch(result.stdout,/bootstrap|setup token/i);
+});
+test('loopback setup prints the exact tunnel, browser URL and service commands', () => {
+  const f=fixture();const result=run(f,['print_success','http://localhost:4280','/etc/servus/servus.env','/opt/servus','127.0.0.1','4280','165.227.165.232']);
+  succeeds(result);assert.match(result.stdout,/ssh -N -L 127\.0\.0\.1:4280:127\.0\.0\.1:4280 root@165\.227\.165\.232/);
+  assert.match(result.stdout,/Then open: http:\/\/127\.0\.0\.1:4280/);
+  assert.match(result.stdout,/systemctl status servus-supervisor\.service servus-updater\.service/);
+});
+test('interactive flags remain deterministic in automation and dry runs', () => {
+  const f=fixture();
+  succeeds(run(f,['main','--dry-run','--interactive']));
+  succeeds(run(f,['main','--dry-run','--non-interactive']));
+  succeeds(run(f,['main','--dry-run','--yes']));
+  fails(run(f,['main','--interactive','--non-interactive']),/cannot be combined/);
+  fails(run(f,['main','--interactive']),/requires a terminal/);
+  assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
+});
+test('host IPv4 discovery excludes Docker bridges, loopback, duplicates and link-local addresses', () => {
+  const f=fixture();f.command('ip',`cat <<'IPS'
+1: lo inet 127.0.0.1/8 scope global lo
+2: eth0 inet 165.227.165.232/20 scope global eth0
+2: eth0 inet 10.19.0.5/16 scope global eth0
+2: eth0 inet 10.19.0.5/16 scope global eth0
+3: docker0 inet 172.17.0.1/16 scope global docker0
+4: br-fixture inet 172.18.0.1/16 scope global br-fixture
+5: eth1 inet 169.254.1.1/16 scope global eth1
+IPS`);
+  const result=run(f,['host_ipv4_addresses']);succeeds(result);
+  assert.deepEqual(result.stdout.trim().split('\n'),['165.227.165.232','10.19.0.5']);
+});
+test('ambiguous non-interactive networks fail with the actionable flag before Swarm changes', () => {
+  const f=fixture();f.command('ip',"printf '2: eth0 inet 165.227.165.232/20 scope global eth0\\n2: eth0 inet 10.19.0.5/16 scope global eth0\\n'");
+  const result=run(f,[],'source "$1"; swarm_advertise_addr=; select_swarm_address');
+  fails(result,/Multiple host IPv4 addresses/);assert.match(result.stderr,/--swarm-advertise-addr 165\.227\.165\.232/);
+});
+test('a single host IPv4 is selected automatically', () => {
+  const f=fixture();f.command('ip',"printf '2: eth0 inet 165.227.165.232/20 scope global eth0\\n'");
+  const result=run(f,[],'source "$1"; swarm_advertise_addr=; select_swarm_address; printf "SELECTED=%s" "$swarm_advertise_addr"');
+  succeeds(result);assert.match(result.stdout,/SELECTED=165\.227\.165\.232/);
+});
+
+function terminalFixture(f, mode) {
+  const program=String.raw`import errno,os,pty,select,signal,sys,time
+mode=sys.argv[2]
+if mode in ('wizard','eof'):
+    script='source "$1"; test ! -t 0; port=4180; ingress_port=80; open_installer_tty; installer_wizard; printf "CHOSEN=%s,%s\\n" "$port" "$ingress_port"; close_installer_tty'
+    answers=[(b'Choose [1-4',b'2\n'),(b'Management panel port',b'4280\n'),(b'Application HTTP port',b'28080\n')]
+    if mode=='eof':answers=[(b'Choose [1-4',b'\x04')]
+else:
+    script='source "$1"; test ! -t 0; swarm_advertise_addr=; open_installer_tty; select_swarm_address; printf "CHOSEN_IP=%s\\n" "$swarm_advertise_addr"; close_installer_tty'
+    answers=[(b'Address number:',b'2\n')]
+pid,fd=pty.fork()
+if pid==0:
+    null=os.open('/dev/null',os.O_RDONLY);os.dup2(null,0);os.close(null)
+    os.execvp('bash',['bash','-c',script,'fixture',sys.argv[1]])
+output=b'';deadline=time.monotonic()+10
+while time.monotonic()<deadline:
+    ready,_,_=select.select([fd],[],[],0.1)
+    if ready:
+        try:chunk=os.read(fd,65536)
+        except OSError as error:
+            if error.errno==errno.EIO:break
+            raise
+        if not chunk:break
+        output+=chunk
+        if answers and answers[0][0] in output:
+            os.write(fd,answers.pop(0)[1])
+    done,status=os.waitpid(pid,os.WNOHANG)
+    if done:break
+else:
+    os.kill(pid,signal.SIGKILL);os.waitpid(pid,0);raise RuntimeError('Terminal fixture timed out')
+os.close(fd)
+try:_,status=os.waitpid(pid,0)
+except ChildProcessError:pass
+sys.stdout.buffer.write(output)
+raise SystemExit(os.waitstatus_to_exitcode(status))`;
+  return spawnSync('python3',['-c',program,installer,mode],{env:f.env,encoding:'utf8',timeout:15000});
+}
+test('guided ports read the controlling terminal when stdin belongs to a script pipe', () => {
+  const result=terminalFixture(fixture(),'wizard');succeeds(result);
+  assert.match(result.stdout,/CHOSEN=4280,28080/);
+});
+test('the address picker reads the chosen interface from the controlling terminal', () => {
+  const f=fixture();f.command('ip',"printf '2: eth0 inet 165.227.165.232/20 scope global eth0\\n2: eth0 inet 10.19.0.5/16 scope global eth0\\n'");
+  const result=terminalFixture(f,'address');succeeds(result);assert.match(result.stdout,/CHOSEN_IP=10\.19\.0\.5/);
+});
+test('closing terminal input cancels the wizard instead of accepting defaults', () => {
+  const result=terminalFixture(fixture(),'eof');assert.notEqual(result.status,0);
+  assert.match(result.stdout,/Terminal input closed/);
+  assert.doesNotMatch(result.stdout,/CHOSEN=/);
 });
 test('help works without touching installation directories', () => {
   const f=fixture();const r=run(f,['main','--help']);succeeds(r);assert.match(r.stdout,/--dry-run/);assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
+});
+test('exact signed releases reject ambiguous source selection before host changes', () => {
+  const f=fixture();delete f.env.SERVUS_REF;
+  const planned=run(f,['main','--dry-run','--release','v0.1.52']);succeeds(planned);
+  assert.match(planned.stdout,/Signed release: v0\.1\.52/);
+  for(const tag of ['', '0.1.52','v00.1.52','v0.1.52-beta','v0.1.52;echo','v'+'1'.repeat(64)+'.1.1'])
+    fails(run(f,['main','--dry-run','--release',tag]),/Invalid signed release tag/);
+  fails(run(f,['main','--release']),/Missing value/);
+  fails(run(f,['main','--release','v0.1.52','--release','v0.1.53']),/specified once/);
+  for(const extra of [['--source',f.source],['--image',`ghcr.io/raxon/servus@sha256:${'a'.repeat(64)}`],['--ref','main']])
+    fails(run(f,['main','--dry-run','--release','v0.1.52',...extra]),/cannot be combined/);
+  f.env.SERVUS_REF='v0.1.52';
+  fails(run(f,['main','--dry-run','--release','v0.1.52']),/source ref override/);
+  assert.equal(existsSync(f.env.SERVUS_INSTALL_DIR),false);
 });
 test('host domain settings accept only HTTPS origins and explicit booleans', () => {
   const f=fixture();

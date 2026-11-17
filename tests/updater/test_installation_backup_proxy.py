@@ -116,6 +116,42 @@ class InstallationProxyTest(unittest.TestCase):
             allow_apply=True, installation_backups=proxy))
         journal.assert_not_called()
 
+    def test_invalid_apply_probe_never_queries_host_admission(self):
+        proxy = SimpleNamespace(active=mock.Mock(side_effect=AssertionError('Host admission must not be queried')))
+        recovery = SimpleNamespace(active=mock.Mock(side_effect=AssertionError('Recovery must not be queried')))
+        journal = mock.Mock()
+        for operation in ('invalid', None, True, '../outside'):
+            with self.subTest(operation=operation):
+                self.assert_code('invalid_request', lambda: updater.process(journal,
+                    {'version': 1, 'action': 'apply', 'operationId': operation},
+                    allow_apply=True, installation_backups=proxy, recovery=recovery))
+        proxy.active.assert_not_called();recovery.active.assert_not_called()
+        journal.request_apply.assert_not_called()
+
+    def test_valid_apply_still_requires_idle_backup_admission(self):
+        proxy = SimpleNamespace(active=mock.Mock(return_value=True))
+        journal = mock.Mock()
+        request = {'version': 1, 'action': 'apply', 'operationId': ID}
+        self.assert_code('operation_in_progress', lambda: updater.process(journal, request,
+            allow_apply=True, installation_backups=proxy))
+        proxy.active.assert_called_once_with();journal.request_apply.assert_not_called()
+        proxy.active.side_effect = updater.ProtocolError('unavailable')
+        self.assert_code('unavailable', lambda: updater.process(journal, request,
+            allow_apply=True, installation_backups=proxy))
+        journal.request_apply.assert_not_called()
+        proxy.active.side_effect = None;proxy.active.return_value = False
+        self.assertEqual(updater.process(journal, request, allow_apply=True,
+            installation_backups=proxy), journal.request_apply.return_value)
+        journal.request_apply.assert_called_once_with(ID)
+
+    def test_disabled_apply_probe_remains_unavailable_without_host_queries(self):
+        proxy = SimpleNamespace(active=mock.Mock(side_effect=AssertionError('Host admission must not be queried')))
+        journal = mock.Mock()
+        self.assert_code('unavailable', lambda: updater.process(journal,
+            {'version': 1, 'action': 'apply', 'operationId': 'invalid'},
+            allow_apply=False, installation_backups=proxy))
+        proxy.active.assert_not_called();journal.request_apply.assert_not_called()
+
     def test_legacy_recovery_fences_backup_admission_before_forwarding(self):
         proxy = SimpleNamespace(submit=mock.Mock())
         recovery = SimpleNamespace(active=mock.Mock(return_value=True))

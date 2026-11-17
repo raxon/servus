@@ -6,8 +6,10 @@ bootstrap_signed_install() {
   [[ ! -e $config_file && ! -L $config_file ]] || fail 'An existing installation requires a verified migration.'
   [[ ! -e $data_dir || ( -d $data_dir && ! -L $data_dir && -z $(ls -A "$data_dir") ) ]] || fail 'Existing data requires a verified migration.'
   candidate=$staging/release-candidate.json
-  /usr/bin/python3 -I "$source/apps/updater/discover-release.py" --initial > "$candidate" || fail 'Cannot discover a release candidate.'
-  parsed=$(/usr/bin/python3 -I - "$candidate" <<'PYCANDIDATE'
+  local -a discovery_args=(--initial)
+  if [[ -n ${release_tag:-} ]]; then discovery_args=(--release "$release_tag"); fi
+  /usr/bin/python3 -I "$source/apps/updater/discover-release.py" "${discovery_args[@]}" > "$candidate" || fail 'Cannot discover a release candidate.'
+  parsed=$(/usr/bin/python3 -I - "$candidate" "${release_tag:-}" <<'PYCANDIDATE'
 import json, re, sys, uuid
 def unique(pairs):
     out = {}
@@ -26,6 +28,8 @@ try:
         not isinstance(candidate['commit'], str) or not re.fullmatch(r'[a-f0-9]{40}',candidate['commit']) or
         not isinstance(candidate['digest'], str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',candidate['digest'])):
         raise ValueError('Invalid candidate')
+    if sys.argv[2] and candidate['tag'] != sys.argv[2]:
+        raise ValueError('Candidate does not match the requested release')
     if candidate['digest'] == 'sha256:32f7cccf97841716ffae6bbff4f4234d5c3575e3b3ad9daa61dcf5afba72a13c':
         raise ValueError('The latest release predates supervised installation')
     print(candidate['tag']); print(candidate['commit']); print(candidate['digest']); print(uuid.uuid4())
@@ -93,5 +97,5 @@ finally: os.close(parent)
 PYCONFIG
   log "Verifying the release and starting the panel. Operation: $operation"
   cleanup_staging; trap - EXIT
-  exec /usr/bin/python3 -I /usr/local/libexec/servus/bootstrap-initial.py --operation "$operation" --commit "$commit" --digest "$digest" --tag "$tag" --take-install-lock-fd 9
+  exec /usr/bin/python3 -I /usr/local/libexec/servus/bootstrap-initial.py --operation "$operation" --commit "$commit" --digest "$digest" --tag "$tag" --ssh-host "${ssh_host:-YOUR_SERVER_IP}" --take-install-lock-fd 9
 }

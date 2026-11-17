@@ -1,10 +1,13 @@
 import hashlib
+import io
 import importlib.util
 import json
 import pathlib
+import sys
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -134,6 +137,51 @@ class DiscoveryTest(unittest.TestCase):
         self.server.tags = [{'name': 'v0.0.0', 'commit': {'sha': 'a' * 40}}]
         result = discovery.discover_initial(self.server.transport())
         self.assertEqual(result, {'status': 'candidate', 'verified': False, 'tag': 'v0.0.0', 'commit': 'a' * 40, 'digest': 'sha256:' + hashlib.sha256(self.server.body).hexdigest()})
+
+    def test_explicit_release_fetches_exact_older_tag_and_commit(self):
+        self.server.pages = {
+            1: [{'name': f'build-{i}', 'commit': {'sha': 'c' * 40}} for i in range(100)],
+            2: [{'name': 'v0.1.3', 'commit': {'sha': 'b' * 40}}],
+        }
+        result = discovery.discover_release(self.server.transport(), 'v0.1.3')
+        self.assertEqual(result, {'status': 'candidate', 'verified': False, 'tag': 'v0.1.3', 'commit': 'b' * 40, 'digest': 'sha256:' + hashlib.sha256(self.server.body).hexdigest()})
+        manifests = [path for path, _ in self.server.seen if path.startswith('/v2/')]
+        self.assertEqual(manifests, ['/v2/raxon/servus/manifests/v0.1.3'])
+        self.assertTrue(any(path.endswith('page=2') for path, _ in self.server.seen))
+
+    def test_explicit_release_rejects_invalid_missing_and_duplicate_tags(self):
+        for invalid in ('latest', 'v01.1.0', 'v1.2.3-rc1', 'v1.2.3\n'):
+            with self.subTest(tag=invalid), self.assertRaises(discovery.DiscoveryError):
+                discovery.discover_release(self.server.transport(), invalid)
+        self.assertFalse(self.server.seen)
+
+        with self.assertRaises(discovery.DiscoveryError):
+            discovery.discover_release(self.server.transport(), 'v0.1.2')
+        self.assertFalse(any(path.startswith('/token') or path.startswith('/v2/') for path, _ in self.server.seen))
+
+        self.server.tags.append({'name': 'v0.1.3', 'commit': {'sha': 'b' * 40}})
+        with self.assertRaises(discovery.DiscoveryError):
+            discovery.discover_release(self.server.transport(), 'v0.1.3')
+        self.assertFalse(any(path.startswith('/token') or path.startswith('/v2/') for path, _ in self.server.seen))
+
+    def test_explicit_release_manifest_missing_does_not_fall_back_to_latest(self):
+        self.server.manifest_status = 404
+        result = discovery.discover_release(self.server.transport(), 'v0.1.3')
+        self.assertEqual(result, {'status': 'release_pending', 'verified': False, 'tag': 'v0.1.3', 'commit': 'b' * 40, 'reason': 'manifest_not_available'})
+        manifests = [path for path, _ in self.server.seen if path.startswith('/v2/')]
+        self.assertEqual(manifests, ['/v2/raxon/servus/manifests/v0.1.3'])
+
+    def test_cli_release_option_routes_to_explicit_discovery(self):
+        output = io.StringIO()
+        result = {'status': 'candidate', 'verified': False, 'tag': 'v0.1.3', 'commit': 'b' * 40, 'digest': 'sha256:' + 'c' * 64}
+        with mock.patch.object(sys, 'argv', ['discover-release.py', '--release', 'v0.1.3']), \
+                mock.patch.object(discovery, 'Transport', return_value=object()), \
+                mock.patch.object(discovery, 'discover_release', return_value=result) as discover_release, \
+                mock.patch('sys.stdout', output):
+            self.assertEqual(discovery.main(), 0)
+        discover_release.assert_called_once()
+        self.assertEqual(discover_release.call_args.args[1], 'v0.1.3')
+        self.assertEqual(json.loads(output.getvalue()), result)
 
     def test_initial_discovery_refuses_wrong_owner_and_reports_missing_image(self):
         self.server.invalid_owner = True

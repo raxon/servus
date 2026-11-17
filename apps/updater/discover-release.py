@@ -196,16 +196,44 @@ def _find_latest(transport, channel='beta'):
     return latest
 
 
-def _discover(transport, current, *, initial=False, channel='beta'):
-    if channel not in ('production', 'beta'):
-        raise DiscoveryError('Invalid update channel')
-    current_version = None if initial else parse_tag(current)
-    if not initial and current_version is None:
-        raise DiscoveryError('Current version must be a stable vMAJOR.MINOR.PATCH tag')
-    version, tag, commit = _find_latest(transport, channel)
-    if current_version is not None and version <= current_version:
-        status = 'no_newer_version' if version == current_version else 'ahead'
-        return {'status': status, 'current': current, 'latest': tag}
+def _find_release(transport, tag):
+    version = parse_tag(tag)
+    if version is None:
+        raise DiscoveryError('Release must be a stable vMAJOR.MINOR.PATCH tag')
+    _check_identity(transport)
+    seen, selected = set(), None
+    for page in range(1, MAX_PAGES + 1):
+        data, _ = transport.get(f'{GITHUB}/repos/{REPOSITORY}/tags?per_page=100&page={page}', limit=MAX_JSON, accept='application/vnd.github+json')
+        items = decode_json(data)
+        if not isinstance(items, list) or len(items) > 100:
+            raise DiscoveryError('Invalid tag listing')
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get('name'), str) or len(item['name']) > 255:
+                raise DiscoveryError('Invalid tag listing')
+            name = item['name']
+            if name in seen:
+                raise DiscoveryError('Ambiguous duplicate tag')
+            seen.add(name)
+            tag_version = parse_tag(name)
+            if tag_version is None:
+                continue
+            commit = item.get('commit')
+            sha = commit.get('sha') if isinstance(commit, dict) else None
+            if not isinstance(sha, str) or not COMMIT.fullmatch(sha):
+                raise DiscoveryError('Invalid release commit')
+            if name == tag:
+                selected = tag, sha
+        if len(items) < 100:
+            break
+    else:
+        raise DiscoveryError('Tag listing exceeds page limit')
+    _check_identity(transport)
+    if selected is None:
+        raise DiscoveryError('Requested stable release was not found')
+    return selected
+
+
+def _candidate_for(transport, tag, commit):
     body, _ = transport.get(f'{REGISTRY}/token?service=ghcr.io&scope=repository%3Araxon%2Fservus%3Apull', limit=16384, accept='application/json')
     obj = decode_json(body)
     token = obj.get('token') if isinstance(obj, dict) else None
@@ -227,6 +255,19 @@ def _discover(transport, current, *, initial=False, channel='beta'):
     if supplied is not None and supplied != digest:
         raise DiscoveryError('Registry manifest digest mismatch')
     return {'status': 'candidate', 'verified': False, 'tag': tag, 'commit': commit, 'digest': digest}
+
+
+def _discover(transport, current, *, initial=False, channel='beta'):
+    if channel not in ('production', 'beta'):
+        raise DiscoveryError('Invalid update channel')
+    current_version = None if initial else parse_tag(current)
+    if not initial and current_version is None:
+        raise DiscoveryError('Current version must be a stable vMAJOR.MINOR.PATCH tag')
+    version, tag, commit = _find_latest(transport, channel)
+    if current_version is not None and version <= current_version:
+        status = 'no_newer_version' if version == current_version else 'ahead'
+        return {'status': status, 'current': current, 'latest': tag}
+    return _candidate_for(transport, tag, commit)
 
 
 @contextmanager
@@ -263,16 +304,31 @@ def discover_initial(transport, *, timeout_seconds=TIMEOUT):
         return _discover(transport, None, initial=True)
 
 
+def discover_release(transport, tag, *, timeout_seconds=TIMEOUT):
+    """Find the unverified image candidate for one explicitly selected stable release."""
+    if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or not 0 < timeout_seconds <= TIMEOUT:
+        raise DiscoveryError('Invalid discovery deadline')
+    with total_deadline(timeout_seconds):
+        release_tag, commit = _find_release(transport, tag)
+        return _candidate_for(transport, release_tag, commit)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument('--current', help='Currently installed stable version, such as v0.1.3')
     selection.add_argument('--initial', action='store_true', help='Find the latest candidate for a fresh installation')
+    selection.add_argument('--release', help='Find the candidate for this exact stable release tag')
     parser.add_argument('--channel', choices=['production', 'beta'], default='production')
     args = parser.parse_args()
     try:
         transport = Transport(time.monotonic() + TIMEOUT)
-        result = discover_initial(transport) if args.initial else discover(transport, args.current, channel=args.channel)
+        if args.initial:
+            result = discover_initial(transport)
+        elif args.release:
+            result = discover_release(transport, args.release)
+        else:
+            result = discover(transport, args.current, channel=args.channel)
     except (DiscoveryError, OSError):
         print('Release discovery failed.', file=sys.stderr)
         return 1

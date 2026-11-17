@@ -70,4 +70,5 @@ PY
 printf 'Verified amd64 image startup, frontend, first setup and session.\n'
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+bash "$script_dir/../tests/lifecycle-gate/tools.sh" "$image"
 SERVUS_HOST_IMAGE="$image" python3 "$script_dir/../tests/host-domains/provider-e2e.py"
