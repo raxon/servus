@@ -24,7 +24,7 @@ class LegacyRecoverySocketTest(unittest.TestCase):
         self.control=root/'control';self.control.mkdir(mode=0o750)
         self.sock=self.runtime/'updater.sock';self.supervisor_sock=self.control/'command'
         self.listener=socket.socket(socket.AF_UNIX);self.listener.bind(str(self.supervisor_sock));os.chmod(self.supervisor_sock,0o600);self.listener.listen(16);self.listener.settimeout(.2)
-        self.stop=threading.Event();self.dispatched=threading.Event();self.release=threading.Event();self.received=[];self.handlers=[]
+        self.stop=threading.Event();self.dispatched=threading.Event();self.release=threading.Event();self.backup_busy=threading.Event();self.received=[];self.handlers=[]
         self.server=threading.Thread(target=self.serve,daemon=True);self.server.start();self.process=None;self.start()
     def tearDown(self):
         self.release.set();self.stop.set()
@@ -49,6 +49,8 @@ class LegacyRecoverySocketTest(unittest.TestCase):
                     data+=chunk
                 request=json.loads(data);self.received.append(request)
                 if request['type']=='status':status='ready'
+                elif request['type']=='installation_backup_active':
+                    status=('busy' if self.backup_busy.is_set() else 'idle') if set(request)=={'version','type'} else 'failed'
                 elif request['type']=='recover_legacy_upload':
                     self.dispatched.set();self.release.wait(5);status='starting'
                 elif request['type']=='legacy_recovery_status':status='completed'
@@ -87,6 +89,19 @@ class LegacyRecoverySocketTest(unittest.TestCase):
             time.sleep(.1)
         self.assertEqual(state,'completed')
         self.assertEqual(sum(item['type']=='recover_legacy_upload' for item in self.received),1)
+
+    def test_active_installation_backup_blocks_legacy_admission_until_idle(self):
+        self.backup_busy.set()
+        op=str(uuid.uuid4());restore='a'*32;service=str(uuid.uuid4())
+        request={'version':1,'action':'legacy_recovery','operationId':op,'restoreId':restore,'serviceId':service}
+        self.assertEqual(self.request(request),{'ok':False,'error':'operation_in_progress'})
+        self.assertFalse(self.dispatched.wait(.1))
+        self.assertFalse(any(item['type']=='recover_legacy_upload' for item in self.received))
+        self.assertEqual(self.request({'version':1,'action':'legacy_recovery_status','operationId':op}),{'ok':False,'error':'not_found'})
+        self.backup_busy.clear()
+        accepted=self.request(request)
+        self.assertTrue(accepted['ok']);self.assertEqual(accepted['operation']['status'],'requested')
+        self.assertTrue(self.dispatched.wait(5));self.release.set()
 
 
 if __name__=='__main__':unittest.main()

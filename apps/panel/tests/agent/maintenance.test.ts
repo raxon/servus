@@ -8,6 +8,8 @@ import Database from 'better-sqlite3';
 import WebSocket from 'ws';
 import { createAgent } from '../../src/agent/app.js';
 import { AgentMaintenanceGate, consoleExecStopped } from '../../src/agent/maintenance.js';
+import { HttpsMigrationJournal, HTTPS_MIGRATION_OPERATION_ID } from '../../src/agent/https-migration-journal.js';
+import { SecretVault } from '../../src/shared/secrets.js';
 
 const cleanup: (() => Promise<void> | void)[] = [];
 afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn(); });
@@ -32,6 +34,25 @@ function runtime(apply: (...args:any[])=>Promise<any>) {
 }
 
 describe('agent maintenance barrier', () => {
+  it('fences service changes after restart when ingress recovery is unavailable',async()=>{
+    const config=fixture(),initial=await createAgent(config,runtime(async()=>outcome));
+    await initial.close();
+    const db=new Database(join(config.dataDir,'agent.sqlite')),vault=new SecretVault(config.dataDir);
+    new HttpsMigrationJournal(db,value=>vault.seal(value),value=>vault.open(value)).begin({Name:'old'},{Name:'new'});
+    db.close();
+    const engine=runtime(vi.fn(async()=>outcome)),gate=new AgentMaintenanceGate();
+    const app=await createAgent(config,engine,gate);cleanup.push(()=>app.close());
+    const result=await app.inject({method:'POST',url:'/services/apply',headers,payload:{operationId:randomUUID(),type:'deploy',service:service()}});
+    expect(result.statusCode).toBe(503);
+    expect(result.json().error.code).toBe('INGRESS_RECOVERY_REQUIRED');
+    expect(engine.apply).not.toHaveBeenCalled();
+    expect(await gate.drain(50)).toEqual({status:'uncertain'});
+  });
+  it('reserves the ingress migration operation identity',async()=>{
+    const app=await createAgent(fixture(),runtime(async()=>outcome));cleanup.push(()=>app.close());
+    const result=await app.inject({method:'POST',url:'/services/apply',headers,payload:{operationId:HTTPS_MIGRATION_OPERATION_ID,type:'deploy',service:service()}});
+    expect(result.statusCode).toBe(400);
+  });
   it('permits only the explicitly identified legacy upload during a recovery drain',async()=>{
     const config=fixture(),gate=new AgentMaintenanceGate(),id='a'.repeat(32),serviceId=randomUUID();
     const app=await createAgent(config,runtime(async()=>outcome),gate);cleanup.push(()=>app.close());

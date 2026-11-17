@@ -166,15 +166,15 @@ jobs:
           cp apps/panel/package.json "$scratch/apps/panel/"
           cp apps/website/package.json "$scratch/apps/website/"
           cp -R apps/panel/dist "$scratch/panel-dist"
-          cp apps/updater/adoption-proof.py apps/updater/backup.py apps/updater/legacy-stop.py apps/updater/legacy-recovery.py apps/updater/legacy-transition.py apps/updater/migration-fence.py apps/updater/initial-generation.py apps/updater/supervisor.py apps/updater/supervisor-daemon.py apps/updater/runtime-policy.py apps/updater/update-coordinator.py apps/updater/restore-snapshot.py apps/updater/quiescence.py apps/updater/servus-updater.py "$scratch/apps/updater/"
-          cp tests/updater/test_backup.py tests/updater/test_update_coordinator.py tests/updater/test_updater.py tests/updater/test_runtime_policy.py tests/updater/test_supervisor.py "$scratch/tests/updater/"
+          cp apps/updater/adoption-proof.py apps/updater/backup.py apps/updater/installation-backups.py apps/updater/legacy-stop.py apps/updater/legacy-recovery.py apps/updater/legacy-transition.py apps/updater/migration-fence.py apps/updater/initial-generation.py apps/updater/supervisor.py apps/updater/supervisor-daemon.py apps/updater/runtime-policy.py apps/updater/update-coordinator.py apps/updater/restore-snapshot.py apps/updater/quiescence.py apps/updater/servus-updater.py "$scratch/apps/updater/"
+          cp tests/updater/test_backup.py tests/updater/test_backup_schema_v6.py tests/updater/test_backup_credentials.py tests/updater/test_installation_backups.py tests/updater/test_installation_backup_proxy.py tests/updater/test_update_coordinator.py tests/updater/test_updater.py tests/updater/test_runtime_policy.py tests/updater/test_supervisor.py "$scratch/tests/updater/"
           docker build --file tests/backup-ci/Dockerfile --tag "$image" "$scratch"
-          docker run --rm --user 0:0 --network none --read-only --cgroupns=host --memory 1200m --pids-limit 256 \
+          docker run --rm --user 0:0 --network none --read-only --cgroupns=host --memory 1200m --pids-limit 256 --env NODE_PATH=/app/node_modules \
             --tmpfs /tmp:rw,nosuid,nodev,size=256m \
             --tmpfs /run:rw,nosuid,nodev,size=16m \
             --tmpfs /root:rw,nosuid,nodev,size=16m \
             --entrypoint python3 "$image" -I -B -c \
-            'import sys,unittest; sys.path.insert(0,"tests/updater"); suite=unittest.defaultTestLoader.loadTestsFromNames(["test_backup", "test_update_coordinator", "test_updater.JournalContractTest", "test_runtime_policy.LockedActivationTests"]); result=unittest.TextTestRunner(verbosity=2).run(suite); sys.exit(0 if result.wasSuccessful() and result.testsRun > 1 and not result.skipped else 1)'
+            'import sys,unittest; sys.path.insert(0,"tests/updater"); suite=unittest.defaultTestLoader.loadTestsFromNames(["test_backup", "test_backup_schema_v6", "test_backup_credentials", "test_installation_backups", "test_installation_backup_proxy", "test_update_coordinator", "test_updater.JournalContractTest", "test_runtime_policy.LockedActivationTests"]); result=unittest.TextTestRunner(verbosity=2).run(suite); sys.exit(0 if result.wasSuccessful() and result.testsRun > 1 and not result.skipped else 1)'
           docker run --rm --user 0:0 --network none --read-only --cgroupns=private --memory 1200m --pids-limit 256 \
             --tmpfs /tmp:rw,nosuid,nodev,size=256m --tmpfs /run:rw,nosuid,nodev,size=16m --tmpfs /root:rw,nosuid,nodev,size=16m \
             --env SERVUS_CGROUP_EXPECT=private --entrypoint python3 "$image" -I -B -c \

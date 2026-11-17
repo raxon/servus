@@ -100,9 +100,9 @@ export function agentDatabaseExport(serviceId:string, input:{kind:'postgres'|'ma
 }
 
 export function agentDatabaseUpload(serviceId: string, input: {
-  operationId: string; kind: 'postgres' | 'mariadb'; size: number; stream: Readable; signal?: AbortSignal;
+  operationId: string; kind: 'postgres' | 'mariadb' | 'redis'; size: number; stream: Readable; signal?: AbortSignal;
 }, options: AgentRequestOptions = {}): Promise<{ operationId: string; size: number; sha256: string; phase: 'reserved' }> {
-  if (!z.string().uuid().safeParse(serviceId).success || !/^[a-f0-9]{32}$/.test(input.operationId) || !['postgres','mariadb'].includes(input.kind) || !Number.isSafeInteger(input.size) || input.size < 1 || input.size > 2 * 1024 * 1024 * 1024 || !(input.stream instanceof Readable)) throw new Error('Invalid database restore upload.');
+  if (!z.string().uuid().safeParse(serviceId).success || !/^[a-f0-9]{32}$/.test(input.operationId) || !['postgres','mariadb','redis'].includes(input.kind) || !Number.isSafeInteger(input.size) || input.size < 1 || input.size > 2 * 1024 * 1024 * 1024 || !(input.stream instanceof Readable)) throw new Error('Invalid database restore upload.');
   const config = options.socketPath && options.token ? undefined : agentConfig();
   const schema = z.object({ operationId:z.literal(input.operationId), size:z.literal(input.size), sha256:z.string().regex(/^[a-f0-9]{64}$/), phase:z.literal('reserved') }).strict();
   return new Promise((resolve, reject) => {

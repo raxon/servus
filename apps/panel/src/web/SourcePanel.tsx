@@ -6,6 +6,10 @@ import { api, RequestError } from "./api.js";
 import { FeatureError, FeatureLoading, useServiceSave } from "./feature-ui.js";
 import { useGithubConnection } from "./GithubSettings.js";
 import { SourceChoiceFields, githubRepositoryName, githubRepositoryUrl, initialSourceChoice, type SourceChoice } from "./source-choice.js";
+import { validEnvFilePath } from "../shared/build-options.js";
+import { GithubSourcePicker } from "./GithubSourcePicker.js";
+import {RegistryFields,SshFields} from './SourceCredentialFields.js';
+import {imageRegistry,parseSshRepository} from '../shared/source-credentials.js';
 
 function sourceDraft(service: Service, type = initialSourceChoice(service.source ?? { type: "image" })) {
   const source = service.source;
@@ -20,16 +24,21 @@ function sourceDraft(service: Service, type = initialSourceChoice(service.source
     branch: source?.type === "git" ? source.branch : "main",
     context: source?.type === "git" ? source.context : ".",
     dockerfile: source?.type === "git" ? source.dockerfile : "Dockerfile",
+    generateEnv: source?.type === "git" && source.envFile !== undefined,
+    envFile: source?.type === "git" ? source.envFile ?? ".env" : ".env",
+    knownHosts:source?.type==='git'?source.ssh?.knownHosts??'':'',rotateSsh:false,
+    registryEnabled:Boolean(service.registry),registryServer:service.registry?.server??(()=>{try{return imageRegistry(service.image);}catch{return'docker.io';}})(),registryUsername:service.registry?.username??'',registryPassword:'',
   };
 }
 
 type SourceDraft = ReturnType<typeof sourceDraft>;
 
 function draftKey(draft: SourceDraft) {
-  return JSON.stringify(draft.type === "image" ? [draft.type, draft.image] : [
+  return JSON.stringify(draft.type === "image" ? [draft.type, draft.image,draft.registryEnabled,...(draft.registryEnabled?[draft.registryServer,draft.registryUsername,draft.registryPassword]:[])] : [
     draft.type, draft.type === "github" ? draft.githubRepository : draft.repository,
-    draft.branch, draft.context, draft.dockerfile,
+    draft.branch, draft.context, draft.dockerfile, draft.generateEnv, ...(draft.generateEnv ? [draft.envFile] : []),
     ...(draft.type === "git" ? [draft.privateGit, ...(draft.privateGit ? [draft.gitUsername, draft.gitToken] : [])] : []),
+    draft.knownHosts,draft.rotateSsh,
   ]);
 }
 
@@ -37,10 +46,11 @@ function repositoryError(value: string) {
   if (!value) return "";
   try {
     const url = new URL(value);
+    if(url.protocol==='ssh:'){parseSshRepository(value);return'';}
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
-      return "Enter an HTTP or HTTPS repository URL without credentials.";
+      return "Use HTTPS, or an ssh:// URL with a Git username and no password.";
     }
-  } catch { return "Enter a complete repository URL, including https://."; }
+  } catch { return "Enter a complete HTTPS or ssh:// repository URL."; }
   return "";
 }
 
@@ -68,7 +78,11 @@ function SourceField({ label, help, error, validate, ...props }: Omit<InputHTMLA
         setNativeError("");
         props.onChange?.(event);
       }}
-      onInvalid={event => setNativeError(event.currentTarget.validationMessage)} />
+      onInvalid={event => {
+        const details = event.currentTarget.closest("details");
+        if (details) details.open = true;
+        setNativeError(event.currentTarget.validationMessage);
+      }} />
     {message ? <small className="source-field-error" id={`${id}-error`}><CircleAlert size={14} aria-hidden="true" />{message}</small> : null}
   </div>;
 }
@@ -79,12 +93,14 @@ export function SourcePanel({ service, admin }: { service: Service; admin: boole
   const [savedDraft, setSavedDraft] = useState(() => sourceDraft(service));
   const [draft, setDraft] = useState(savedDraft);
   const [formVersion, setFormVersion] = useState(0);
+  const [buildSettingsOpen, setBuildSettingsOpen] = useState(() => savedDraft.context !== "." || savedDraft.dockerfile !== "Dockerfile" || savedDraft.generateEnv);
   const current = savedService.source ?? { type: "image" };
-  const { type, image, repository, githubRepository, privateGit, gitUsername, gitToken, branch, context, dockerfile } = draft;
+  const { type, image, repository, githubRepository, privateGit, gitUsername, gitToken, branch, context, dockerfile, generateEnv, envFile } = draft;
   const selectedRepository = type === "github" ? githubRepositoryUrl(githubRepository) : repository;
+  const sshSource=type==='git'&&repository.startsWith('ssh:');
   const existingCredential = current.type === "git" ? current.credential : undefined;
   const github = useGithubConnection(admin);
-  const sharedManagedByAdmin = !admin && current.type === "git" && Boolean(current.sharedGithub);
+  const sharedManagedByAdmin = !admin && current.type === "git" && Boolean(current.sharedGithub||current.ssh);
   const isDatabase = Boolean(service.kind && service.kind !== "app");
   const dirty = draftKey(draft) !== draftKey(savedDraft);
   const save = useServiceSave(service);
@@ -94,7 +110,7 @@ export function SourcePanel({ service, admin }: { service: Service; admin: boole
   });
   const busy = save.isPending || checkSource.isPending;
   const sourceFieldError = checkSource.error instanceof RequestError && ["SOURCE_REPOSITORY_OR_BRANCH", "SOURCE_CONTEXT", "SOURCE_DOCKERFILE"].includes(checkSource.error.code) ? checkSource.error : undefined;
-  const checkSupported = current.type === "git" && type !== "image" && !gitToken
+  const checkSupported = current.type === "git" && type !== "image" && !gitToken && (!sshSource||Boolean(current.ssh?.secretRef)&&selectedRepository===current.repository&&draft.knownHosts===current.ssh?.knownHosts&&!draft.rotateSsh)
     && (type === "github" || (privateGit === Boolean(existingCredential) && (!privateGit || gitUsername === existingCredential?.username)))
     && (!existingCredential || current.sharedGithub || selectedRepository === current.repository)
     && (type !== "github" || Boolean(current.sharedGithub) === Boolean(github.data?.connected || current.sharedGithub));
@@ -116,14 +132,15 @@ export function SourcePanel({ service, admin }: { service: Service; admin: boole
   return <form className="surface configuration-card source-panel" aria-labelledby={`${id}-title`} aria-busy={busy}
     onSubmit={event => {
       event.preventDefault();
-      if (!dirty || busy || sharedManagedByAdmin || !githubReady) return;
+      if (!dirty || busy || sharedManagedByAdmin || !githubReady || sshSource&&!admin) return;
       const source: SourceConfig = type === "image" ? { type } : {
-        type: "git", repository: selectedRepository, branch, context, dockerfile,
-        ...(type === "github" && (github.data?.connected || (current.type === "git" && current.sharedGithub)) ? { sharedGithub: true }
+        type: "git", repository: selectedRepository, branch, context, dockerfile, ...(generateEnv ? { envFile } : {}),
+        ...(sshSource?{ssh:{knownHosts:draft.knownHosts,...(current.type==='git'&&current.repository===selectedRepository&&current.ssh?.secretRef&&!draft.rotateSsh?{secretRef:current.ssh.secretRef,publicKey:current.ssh.publicKey}:{})}}:type === "github" && (github.data?.connected || (current.type === "git" && current.sharedGithub)) ? { sharedGithub: true }
           : type === "github" && current.type === "git" && selectedRepository === current.repository && existingCredential ? { credential: existingCredential }
           : type === "git" && privateGit ? { credential: gitToken ? { username: gitUsername, token: gitToken } : { username: gitUsername, secretRef: existingCredential?.secretRef } } : {}),
       };
-      save.mutate({ ...(type === "image" ? { image } : {}), source }, { onSuccess: value => {
+      const registry=type==='image'&&draft.registryEnabled?{server:draft.registryServer,username:draft.registryUsername,...(draft.registryPassword?{password:draft.registryPassword}:{secretRef:savedService.registry?.secretRef})}:null;
+      save.mutate({ ...(type === "image" ? { image } : {}), source,...(!isDatabase?{registry}:{}) }, { onSuccess: value => {
         const next = sourceDraft(value, type);
         setSavedService(value);
         setSavedDraft(next);
@@ -138,7 +155,7 @@ export function SourcePanel({ service, admin }: { service: Service; admin: boole
       <span className={`source-status${dirty ? " source-status-dirty" : ""}`}><span aria-hidden="true" />{dirty ? "Unsaved changes" : "Saved configuration"}</span>
     </header>
 
-    {sharedManagedByAdmin ? <div className="source-access-note"><LockKeyhole size={17} aria-hidden="true" /><p>This source uses the shared GitHub connection. Ask an administrator to make changes.</p></div> : null}
+    {sharedManagedByAdmin ? <div className="source-access-note"><LockKeyhole size={17} aria-hidden="true" /><p>{current.type==='git'&&current.ssh?'This source uses a service SSH deploy key. Ask an administrator to make changes.':'This source uses the shared GitHub connection. Ask an administrator to make changes.'}</p></div> : null}
 
     <fieldset key={formVersion} className="source-fields" disabled={busy || sharedManagedByAdmin}>
       <legend className="sr-only">Source configuration</legend>
@@ -153,20 +170,22 @@ export function SourcePanel({ service, admin }: { service: Service; admin: boole
           pattern={"[a-zA-Z0-9][a-zA-Z0-9._\\/:@\\-]*"} title="Use an image name with an optional registry, version tag or digest."
           placeholder="nginx:alpine" onChange={event => update({ image: event.target.value })}
           help="An image from Docker Hub or another registry, including its tag or digest." />
+        {!isDatabase?<RegistryFields value={draft} needsPassword={!savedService.registry?.secretRef||draft.registryServer!==savedService.registry.server||draft.registryUsername!==savedService.registry.username} onChange={update}/>:null}
         <div className="source-tip"><ShieldCheck size={17} aria-hidden="true" /><p>Use a specific version tag or an immutable digest to keep deployments reproducible.</p></div>
       </section> : <>
         <section className="source-section">
           <div className="source-section-heading"><GitBranch size={17} aria-hidden="true" /><h3>Repository</h3></div>
+          {type === "github" && admin && github.data?.connected ? <GithubSourcePicker repository={githubRepository} branch={branch} disabled={busy} onChange={selection => update({ githubRepository: selection.repository, branch: selection.branch })} /> : null}
           <SourceField key={type} label={type === "github" ? "GitHub repository" : "Repository URL"} name={type === "github" ? "github-repository" : "repository"}
             type={type === "github" ? "text" : "url"} className="mono" value={type === "github" ? githubRepository : repository}
             required maxLength={type === "github" ? 300 : 1000} pattern={type === "github" ? "[A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+" : undefined}
             validate={type === "git" ? repositoryError : undefined} error={fieldError("SOURCE_REPOSITORY_OR_BRANCH")}
             title={type === "github" ? "Enter the owner and repository, for example organization/app." : undefined}
             placeholder={type === "github" ? "organization/repository" : "https://git.example.com/team/application.git"}
-            help={type === "github" ? "Enter the owner and repository name, for example organization/app." : "Use an HTTP or HTTPS URL without credentials."}
+            help={type === "github" ? "Enter the owner and repository name, for example organization/app." : "Use HTTPS with a token, or ssh://git@hostname/owner/repository.git with a deploy key."}
             onChange={event => update(type === "github" ? { githubRepository: event.target.value } : { repository: event.target.value })} />
 
-          {type === "github" ? <div className="source-connection">
+          {sshSource?<><SshFields key={repository} repository={repository} knownHosts={draft.knownHosts} publicKey={!draft.rotateSsh&&current.type==='git'&&current.repository===repository?current.ssh?.publicKey:undefined} rotate={draft.rotateSsh} onKnownHosts={value=>update({knownHosts:value})} onRotate={admin?value=>update({rotateSsh:value}):undefined}/>{!admin?<p>Only an administrator can configure SSH deploy keys and trusted host keys.</p>:null}</>:type === "github" ? <div className="source-connection">
             <LockKeyhole size={17} aria-hidden="true" />
             <div>{admin && github.isPending ? <FeatureLoading label="Loading GitHub connection" /> : <>
               <strong>{github.data?.connected || (current.type === "git" && current.sharedGithub) ? "GitHub connection configured" : existingCredential ? "Saved repository credentials" : "Public repository access"}</strong>
@@ -192,14 +211,25 @@ export function SourcePanel({ service, admin }: { service: Service; admin: boole
 
         <section className="source-section">
           <div className="source-section-heading"><FileCode2 size={17} aria-hidden="true" /><h3>Build settings</h3></div>
-          <div className="source-build-grid">
+          <details className="source-build-advanced" open={buildSettingsOpen || Boolean(fieldError("SOURCE_CONTEXT") || fieldError("SOURCE_DOCKERFILE"))} onToggle={event => setBuildSettingsOpen(event.currentTarget.open)}>
+            <summary>Advanced build settings</summary>
+            <div className="source-build-grid">
             <SourceField label="Build context" name="context" className="mono" value={context} required maxLength={255} placeholder="."
               help="Relative to the repository root. Use . for the root." validate={buildPathError} error={fieldError("SOURCE_CONTEXT")}
               onChange={event => update({ context: event.target.value })} />
             <SourceField label="Dockerfile" name="dockerfile" className="mono" value={dockerfile} required maxLength={255} placeholder="Dockerfile"
               help="Relative to the build context." validate={buildPathError} error={fieldError("SOURCE_DOCKERFILE")}
               onChange={event => update({ dockerfile: event.target.value })} />
-          </div>
+            </div>
+            <label className="checkbox-label"><input type="checkbox" name="generate-env-file" checked={generateEnv}
+              aria-controls={`${id}-env-file`} aria-expanded={generateEnv} onChange={event => update({ generateEnv: event.target.checked })} /> Generate an environment file before building</label>
+            {generateEnv ? <div id={`${id}-env-file`}>
+              <SourceField label="Environment file path" name="env-file" className="mono" value={envFile} required maxLength={255}
+                placeholder=".env" help="Relative to the build context. Includes environment values and secrets; your Dockerfile can include this file in the image."
+                validate={value => validEnvFilePath(value) && value !== dockerfile ? "" : "Use a relative file path outside Git and Docker build configuration files."}
+                onChange={event => update({ envFile: event.target.value })} />
+            </div> : <div id={`${id}-env-file`} hidden />}
+          </details>
           <div className="source-check-row">
             <button type="button" className="button" aria-label={checkSource.isPending ? "Checking source" : undefined} disabled={!checkSupported || busy} onClick={event => {
               if (event.currentTarget.form?.reportValidity()) checkSource.mutate({ repository: selectedRepository, branch, context, dockerfile });
@@ -219,7 +249,7 @@ export function SourcePanel({ service, admin }: { service: Service; admin: boole
       <div className="source-footer-note"><Info size={17} aria-hidden="true" /><div aria-live="polite" aria-atomic="true"><strong>{save.isSuccess ? "Configuration saved" : dirty ? "You have unsaved changes" : "Configuration is up to date"}</strong><p>{save.isSuccess ? "Deploy this service to apply the saved configuration." : "Saving does not change the running deployment."}</p></div></div>
       <div className="source-footer-actions">
         {dirty ? <button type="button" className="button" disabled={busy || sharedManagedByAdmin} onClick={discard}><RotateCcw size={15} aria-hidden="true" />Discard changes</button> : null}
-        <button type="submit" className="button button-primary" aria-label={save.isPending ? "Saving configuration" : undefined} disabled={!dirty || busy || sharedManagedByAdmin || !githubReady}>
+        <button type="submit" className="button button-primary" aria-label={save.isPending ? "Saving configuration" : undefined} disabled={!dirty || busy || sharedManagedByAdmin || !githubReady || sshSource&&!admin}>
           {save.isPending ? <FeatureLoading label="Saving" /> : <><Check size={16} aria-hidden="true" />Save configuration</>}
         </button>
       </div>

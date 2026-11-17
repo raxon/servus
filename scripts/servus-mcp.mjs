@@ -1,0 +1,34 @@
+#!/usr/bin/env node
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import { connection, request } from './servus-client.mjs';
+
+export function createMcpServer(config=connection()) {
+  const server=new McpServer({name:'servus',version:'0.1.53'});
+  const read={readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:true};
+  const mutate={readOnlyHint:false,destructiveHint:true,idempotentHint:true,openWorldHint:true};
+  const run=async(path,options={})=>{
+    try{return {content:[{type:'text',text:JSON.stringify(await request(path,options,config))}]};}
+    catch(error){return {isError:true,content:[{type:'text',text:error instanceof Error?error.message:'Request failed'}]};}
+  };
+  server.registerTool('list_projects',{description:'List the project authorized by this token.',annotations:read},()=>run('/projects'));
+  server.registerTool('list_services',{description:'List services in the authorized project.',inputSchema:{projectId:z.string().uuid()},annotations:read},({projectId})=>run(`/projects/${projectId}/services`));
+  server.registerTool('inspect_service',{description:'Read saved service configuration with secrets masked.',inputSchema:{serviceId:z.string().uuid()},annotations:read},({serviceId})=>run(`/services/${serviceId}`));
+  server.registerTool('inspect_action',{description:'Read an action and its events; poll until succeeded or failed.',inputSchema:{actionId:z.string().uuid()},annotations:read},({actionId})=>run(`/actions/${actionId}`));
+  server.registerTool('read_logs',{description:'Read recent service logs.',inputSchema:{serviceId:z.string().uuid()},annotations:read},({serviceId})=>run(`/services/${serviceId}/logs`));
+  server.registerTool('deploy_service',{description:'Deploy saved configuration. May run application migrations. Returns a durable action, not completion. Reuse idempotencyKey when retrying the same request.',inputSchema:{serviceId:z.string().uuid(),idempotencyKey:z.string().min(1).max(128),forceRebuild:z.boolean().default(false)},annotations:mutate},({serviceId,idempotencyKey,forceRebuild})=>run(`/services/${serviceId}/deploy`,{method:'POST',body:{forceRebuild},key:idempotencyKey}));
+  server.registerTool('control_service',{description:'Start, stop or restart the deployed configuration. May interrupt traffic. Reuse idempotencyKey on retries.',inputSchema:{serviceId:z.string().uuid(),operation:z.enum(['start','stop','restart']),idempotencyKey:z.string().min(1).max(128)},annotations:mutate},({serviceId,operation,idempotencyKey})=>run(`/services/${serviceId}/${operation}`,{method:'POST',body:{},key:idempotencyKey}));
+  server.registerTool('list_compose',{description:'List Compose workloads in the authorized project with source contents omitted.',inputSchema:{projectId:z.string().uuid()},annotations:read},({projectId})=>run(`/projects/${projectId}/compose`));
+  server.registerTool('inspect_compose',{description:'Read Compose workload metadata without revealing source contents.',inputSchema:{workloadId:z.string().uuid()},annotations:read},({workloadId})=>run(`/compose/${workloadId}`));
+  server.registerTool('read_compose_actions',{description:'Read Compose action history; poll until the returned deployment action succeeds or fails.',inputSchema:{workloadId:z.string().uuid()},annotations:read},({workloadId})=>run(`/compose/${workloadId}/actions`));
+  server.registerTool('read_compose_logs',{description:'Read recent Compose service logs.',inputSchema:{workloadId:z.string().uuid()},annotations:read},({workloadId})=>run(`/compose/${workloadId}/logs`));
+  server.registerTool('deploy_compose',{description:'Deploy saved Compose configuration. May interrupt traffic. Returns a durable action; poll read_compose_actions. Reuse idempotencyKey when retrying the same request.',inputSchema:{workloadId:z.string().uuid(),idempotencyKey:z.string().min(1).max(128)},annotations:mutate},({workloadId,idempotencyKey})=>run(`/compose/${workloadId}/deploy`,{method:'POST',body:{},key:idempotencyKey}));
+  server.registerTool('control_compose',{description:'Start, stop or restart the deployed Compose configuration. May interrupt traffic. Reuse idempotencyKey on retries.',inputSchema:{workloadId:z.string().uuid(),operation:z.enum(['start','stop','restart']),idempotencyKey:z.string().min(1).max(128)},annotations:mutate},({workloadId,operation,idempotencyKey})=>run(`/compose/${workloadId}/${operation}`,{method:'POST',body:{},key:idempotencyKey}));
+  return server;
+}
+
+if(process.argv[1]&&import.meta.url===new URL(process.argv[1],'file:').href){
+  try {await createMcpServer().connect(new StdioServerTransport());}
+  catch {process.stderr.write('MCP could not start. Check SERVUS_URL and SERVUS_TOKEN.\n');process.exitCode=1;}
+}

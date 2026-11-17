@@ -55,6 +55,14 @@ function readSecret(path: string): {bytes: Buffer; dev: number; ino: number} {
     return {bytes:Buffer.from(value.slice(0,64),'hex'),dev:stat.dev,ino:stat.ino};
   } finally { closeSync(fd); }
 }
+
+/** Sign a bounded protocol message without exposing the mounted role key. */
+export function signSupervisorRoleMessage(secretPath: string, message: string): string {
+  if (typeof message !== 'string' || Buffer.byteLength(message, 'utf8') > 4096) throw new Error('Invalid supervisor message');
+  const secret = readSecret(secretPath);
+  try { return createHmac('sha256', secret.bytes).update(message, 'utf8').digest('hex'); }
+  finally { secret.bytes.fill(0); }
+}
 function checkSocket(path: string): {dev: number; ino: number} {
   checkAncestors(path);
   const stat = lstatSync(path);

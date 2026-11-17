@@ -13,7 +13,7 @@ export async function rollbackRestoreSwitch(options:{docker:Docker;journal:Resto
   if(!currentStage)throw new Error('Restore switch stage is unavailable.');
   if(currentStage!=='rolling_back'&&currentStage!=='rolled_back')options.journal.advanceSwitchStage(options.operationId,currentStage,'rolling_back');
   const kind=options.journal.get(options.operationId)?.kind;
-  if(kind!=='postgres'&&kind!=='mariadb')throw new Error('Unsupported restore database.');
+  if(kind!=='postgres'&&kind!=='mariadb'&&kind!=='redis')throw new Error('Unsupported restore database.');
   await verifyRestoreSourceVolume({docker:options.docker,journal:options.journal,serviceId:options.serviceId,kind,volumeName:inspection.sourceVolume,spec:plan.previousSpec});
   const node=(await options.docker.info()).Swarm?.NodeID;
   const current=await service.inspect();

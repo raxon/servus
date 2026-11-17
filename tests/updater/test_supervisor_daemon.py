@@ -93,8 +93,9 @@ class DaemonTest(unittest.TestCase):
             def load(_module_name, filename, mode):
                 return modules[filename.removesuffix('.py')]
             operation = str(uuid.uuid4()); hub = SimpleNamespace(policy=SimpleNamespace(data_dir="/root/panel-data")); maintenance = object()
-            with mock.patch.object(runner, '_load', side_effect=load):
+            with mock.patch.object(runner, '_load', side_effect=load), mock.patch.object(runner, 'assert_no_installation_backup') as backup_guard:
                 self.assertEqual(runner(operation, hub, maintenance), {'fixture': True})
+            backup_guard.assert_called_once_with(maintenance)
             self.assertEqual(apply.call_args.args[1:4], (operation, hub, maintenance))
             self.assertEqual(apply.call_args.args[5:10], (str(root / 'journal.sqlite'), '/root/active', str(root / 'backup'), str(root / 'policy'), str(root / 'docker')))
             journal.close.assert_called_once()
@@ -240,13 +241,15 @@ class DaemonTest(unittest.TestCase):
                 ownership.assert_held(str(control))
 
     def test_status_rechecks_approval_with_lock_before_reporting_ready(self):
-        for scenario in ('valid', 'changed_env', 'recovery_required'):
+        for scenario in ('valid', 'changed_env', 'recovery_required', 'changed_pid'):
             with self.subTest(scenario=scenario):
                 command, client = socket.socketpair()
                 pairs = [socket.socketpair() for _ in supervisor.ROLES]
                 marker = object()
                 hub = SimpleNamespace(used=False, policy=marker,
-                                      connections=dict(zip(supervisor.ROLES, [pair[0] for pair in pairs])))
+                                      connections=dict(zip(supervisor.ROLES, [pair[0] for pair in pairs])),
+                                      identities={role: {'id': str(index + 1) * 64, 'pid': 123, 'cgroup': '/docker/' + str(index + 1) * 64}
+                                                  for index, role in enumerate(supervisor.ROLES)})
                 listener = SimpleNamespace(accept=lambda: (command, None))
                 state = {'locked': False}
                 class Operation:
@@ -254,12 +257,16 @@ class DaemonTest(unittest.TestCase):
                     def __exit__(self, *_): state['locked'] = False
                 def recheck(*_, **__):
                     self.assertTrue(state['locked'])
-                    if scenario != 'valid': raise supervisor.SupervisorError('Approval invalid')
+                    if scenario in ('changed_env', 'recovery_required'): raise supervisor.SupervisorError('Approval invalid')
                     return marker
+                def inspect(_policy):
+                    self.assertTrue(state['locked'])
+                    return {**hub.identities, 'worker': {**hub.identities['worker'], 'pid': 456}} if scenario == 'changed_pid' else hub.identities
                 client.sendall(b'{"version":1,"type":"status"}\n')
                 try:
                     with mock.patch.object(supervisor, 'MaintenanceSupervisor', return_value=Operation()), \
-                         mock.patch.object(daemon, 'load_approved_policy', side_effect=recheck):
+                         mock.patch.object(daemon, 'load_approved_policy', side_effect=recheck), \
+                         mock.patch.object(supervisor, 'inspect_servus', side_effect=inspect):
                         daemon.handle_command(listener, hub, '/install', '/gate', '/journal', '/policy', '/approval', '/env')
                     result = json.loads(client.recv(4096))
                     self.assertEqual(result['status'], 'ready' if scenario == 'valid' else 'waiting')

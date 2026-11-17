@@ -7,10 +7,10 @@ export type RestoreSwitchInspection = {serviceId:string;operationId:string;servi
 /** Inspect the exact source and isolated candidate before attempting a switch. */
 export async function inspectRestoreSwitch(options:{docker:Docker;journal:RestoreJournal;serviceId:string;operationId:string}):Promise<RestoreSwitchInspection> {
   const record=options.journal.get(options.operationId);
-  if(!record || record.service_id!==options.serviceId || record.phase!=='prepared' || !['postgres','mariadb'].includes(record.kind))throw new Error('Restore is not ready for switch inspection.');
-  const kind=record.kind as 'postgres'|'mariadb',binding=options.journal.validatedVolumeBinding(record.service_id,kind);
+  if(!record || record.service_id!==options.serviceId || record.phase!=='prepared' || !['postgres','mariadb','redis'].includes(record.kind))throw new Error('Restore is not ready for switch inspection.');
+  const kind=record.kind as 'postgres'|'mariadb'|'redis',binding=options.journal.validatedVolumeBinding(record.service_id,kind);
   const serviceName=`panel-app-${record.service_id}`,sourceVolume=binding?.volume_name??`panel-data-${record.service_id}-database`,candidateVolume=`panel-restore-${record.id}`;
-  const dataPath=record.kind==='postgres'?'/var/lib/postgresql/data':'/var/lib/mysql';
+  const dataPath=record.kind==='postgres'?'/var/lib/postgresql/data':record.kind==='redis'?'/data':'/var/lib/mysql';
   const service=await options.docker.getService(serviceName).inspect(),spec=service.Spec,labels=spec.Labels ?? {},task=spec.TaskTemplate,containerSpec=task?.ContainerSpec;
   const version=service.Version?.Index, info=await options.docker.info(),nodeId=info.Swarm?.NodeID;
   if(!service.ID||!Number.isSafeInteger(version)||!nodeId||labels['panel.owner']!=='self-hosted-panel'||labels['panel.service']!==record.service_id||labels['panel.kind']!==record.kind||spec.Name!==serviceName||spec.Mode?.Replicated?.Replicas!==1||spec.UpdateConfig?.Order!=='stop-first'||task?.Placement?.Constraints?.length!==1||task.Placement.Constraints[0]!==`node.id==${nodeId}`)throw new Error('Database service configuration cannot be safely switched.');

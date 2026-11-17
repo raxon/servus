@@ -1,8 +1,11 @@
 import importlib.util
 import os
 import pathlib
+import sqlite3
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import test_updater
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -47,8 +50,25 @@ class PreparationFenceTest(unittest.TestCase):
         fixture = test_updater.UpdaterTest('test_auth_idempotency_concurrency_and_restart')
         fixture.setUp()
         try:
-            response = fixture.request({'version': 1, 'action': 'prepare', 'operationId': OP}, as_authorized=False)
-            self.assertEqual(response, {'ok': False, 'error': 'unauthorized'})
+            for delay in (0, 0.1):
+                with self.subTest(client_send_delay=delay):
+                    # SO_PEERCRED rejection happens before receive(). A client
+                    # scheduled after rejection can see an early Unix close.
+                    client = test_updater.CLIENT.replace('s.sendall(', f'__import__("time").sleep({delay});s.sendall(')
+                    with mock.patch.object(test_updater, 'CLIENT', client):
+                        try:
+                            response = fixture.request({'version': 1, 'action': 'prepare', 'operationId': OP}, as_authorized=False)
+                        except subprocess.CalledProcessError as error:
+                            self.assertEqual(error.returncode, 1)
+                            self.assertEqual(error.stdout, '')
+                            self.assertRegex(error.stderr, r'(?:BrokenPipeError: \[Errno 32\] Broken pipe|ConnectionResetError: \[Errno 104\] Connection reset by peer)\s*$')
+                        else:
+                            self.assertEqual(response, {'ok': False, 'error': 'unauthorized'})
+                    self.assertIsNone(fixture.server.poll(), 'The helper must survive rejection.')
+                    with sqlite3.connect(fixture.state / 'journal.sqlite') as db:
+                        self.assertEqual(db.execute('SELECT count(*) FROM operations').fetchone(), (0,))
+                        self.assertEqual(db.execute('SELECT count(*) FROM preparations').fetchone(), (0,))
+                    self.assertEqual(fixture.request({'version': 1, 'action': 'status', 'operationId': OP}), {'ok': False, 'error': 'not_found'})
         finally:
             fixture.tearDown()
 

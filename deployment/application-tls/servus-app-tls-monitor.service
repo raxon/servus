@@ -1,0 +1,9 @@
+[Unit]
+Description=Check test.servus.run HTTPS and certificate renewal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/servus-app-tls/check_test_servus.py
+TimeoutStartSec=60

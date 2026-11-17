@@ -15,7 +15,7 @@ export async function finalizeRestoreRollback(options:{docker:Docker;journal:Res
   const name=`panel-app-${options.serviceId}`,service=options.docker.getService(name);
   const verifyService=async()=>{const current=await service.inspect(),node=(await options.docker.info()).Swarm?.NodeID;if(current.ID!==inspection.serviceDockerId||node!==inspection.nodeId||!isDeepStrictEqual(current.Spec,plan.previousSpec))throw new Error('Original database service changed after rollback.');};
   const kind=options.journal.get(options.operationId)?.kind;
-  if(kind!=='postgres'&&kind!=='mariadb')throw new Error('Unsupported restore database.');
+  if(kind!=='postgres'&&kind!=='mariadb'&&kind!=='redis')throw new Error('Unsupported restore database.');
   await verifyRestoreSourceVolume({docker:options.docker,journal:options.journal,serviceId:options.serviceId,kind,volumeName:inspection.sourceVolume,spec:plan.previousSpec});
   const candidateVolume=options.docker.getVolume(inspection.candidateVolume);
   const verifyCandidateVolume=async()=>{const volume=await candidateVolume.inspect();if(volume.Name!==inspection.candidateVolume||volume.Driver!=='local'||volume.Labels?.['panel.restore.operation']!==options.operationId||volume.Labels?.['panel.restore.purpose']!=='candidate'||volume.Labels?.['panel.restore.service']!==options.serviceId)throw new Error('Retained database volume cannot be verified.');};

@@ -1,0 +1,17 @@
+.two-factor-settings .two-factor-setup {
+  max-width: 420px;
+}
+.two-factor-settings label input,
+.two-factor-settings label textarea {
+  font-size: max(1rem, 16px);
+  min-height: 48px;
+}
+.two-factor-settings button.button,
+.two-factor-settings form .heading-actions button.button {
+  min-height: 48px;
+}
+.two-factor-settings .heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

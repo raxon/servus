@@ -15,10 +15,10 @@ export type RestoreCommitResult={operationId:string;phase:'completed'|'cancelled
 /** Resume the durable switch or restore the source when a switch cannot be verified. */
 export async function commitPreparedRestore(options:{docker:Docker;journal:RestoreJournal;vault:SecretVault;dataDir:string;serviceId:string;operationId:string}):Promise<RestoreCommitResult> {
   let record=options.journal.get(options.operationId);
-  if(!record||record.service_id!==options.serviceId||!['postgres','mariadb'].includes(record.kind))throw new Error('Database restore operation not found.');
+  if(!record||record.service_id!==options.serviceId||!['postgres','mariadb','redis'].includes(record.kind))throw new Error('Database restore operation not found.');
   if(record.phase==='completed')return {operationId:record.id,phase:'completed',rolledBack:false};
   if(record.phase==='cancelled')return {operationId:record.id,phase:'cancelled',rolledBack:options.journal.retainedVolume(record.id)?.reason==='rollback_candidate'};
-  const kind=record.kind as 'postgres'|'mariadb';
+  const kind=record.kind as 'postgres'|'mariadb'|'redis';
   if(record.phase==='prepared'){
     loadRestoreSource({dataDir:options.dataDir,serviceId:options.serviceId,kind,vault:options.vault});
     await prepareRestoreSwitchIntent(options);

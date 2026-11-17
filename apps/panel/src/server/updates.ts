@@ -54,7 +54,7 @@ export function registerUpdates(app: FastifyInstance, options: UpdateRoutesOptio
   };
   app.get('/api/v1/updates', { config: { rateLimit } }, async request => {
     options.administrator(request);
-    return { applyAvailable: enabled, verificationStatusConfigured: Boolean(options.socketPath) };
+    return { applyAvailable: enabled, verificationStatusConfigured: Boolean(options.socketPath), ...(enabled ? {currentVersion:`v${options.currentVersion!.replace(/^v/,'')}`} : {}) };
   });
   app.get('/api/v1/updates/preferences', { config: { rateLimit } }, async request => {
     options.administrator(request);

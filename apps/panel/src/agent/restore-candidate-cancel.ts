@@ -9,7 +9,7 @@ export async function cancelPreparedRestore(options:{journal:RestoreJournal;dock
   if(record.phase==='cancelled')return record;
   if(record.phase==='prepared')record=options.journal.advance(record.id,'prepared','discarding_candidate');
   if(record.phase!=='discarding_candidate')throw new Error('Restore candidate cannot be cancelled in this phase.');
-  const name=`panel-restore-${record.id}`,dataPath=record.kind==='postgres'?'/var/lib/postgresql/data':record.kind==='mariadb'?'/var/lib/mysql':'';
+  const name=`panel-restore-${record.id}`,dataPath=record.kind==='postgres'?'/var/lib/postgresql/data':record.kind==='mariadb'?'/var/lib/mysql':record.kind==='redis'?'/data':'';
   if(!dataPath)throw new Error('Unsupported restore candidate.');
   const labels={'panel.restore.operation':record.id,'panel.restore.purpose':'candidate','panel.restore.service':record.service_id};
   const matches=(value:Record<string,string>|undefined)=>Object.entries(labels).every(([key,expected])=>value?.[key]===expected);

@@ -55,7 +55,7 @@ describe('update management API',()=>{
     });});
     await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(socketPath,resolve);});
     cleanups.push(async()=>{await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));});
-    expect((await app.inject({url:'/api/v1/updates',headers})).json().applyAvailable).toBe(true);
+    expect((await app.inject({url:'/api/v1/updates',headers})).json()).toEqual({applyAvailable:true,verificationStatusConfigured:true,currentVersion:'v1.0.0'});
     expect((await app.inject({method:'POST',url:'/api/v1/updates',headers:member,payload:release})).statusCode).toBe(403);
     expect((await app.inject({method:'POST',url:'/api/v1/updates',headers:{cookie:headers.cookie},payload:release})).statusCode).toBe(403);
     expect((await app.inject({method:'POST',url:'/api/v1/updates',headers,payload:{...release,tag:'v1.0.0'}})).statusCode).toBe(400);

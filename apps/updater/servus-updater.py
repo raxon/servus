@@ -31,7 +31,7 @@ EXECUTOR = pathlib.Path('/usr/local/libexec/servus/verification-executor.py')
 PREPARATION_FENCE = pathlib.Path('/usr/local/libexec/servus/preparation-fence.py')
 DISCOVERY_EXECUTOR = pathlib.Path('/usr/local/libexec/servus/discover-release.py')
 DNS_JOURNAL_BACKUP = pathlib.Path('/usr/local/libexec/servus/backup.py')
-DNS_JOURNAL_BACKUP_SHA256 = 'a5f67f984cd5fe2a9f29208858d47beb108697fc9e235f8c9b365e30ee2f3752'
+DNS_JOURNAL_BACKUP_SHA256 = 'c3a687e806a3005f2cbea738f0811435f3d38e24bd2cec344e8555936a39235b'
 FENCE_MODULE = pathlib.Path('/usr/local/libexec/servus/verification-fence.py')
 FENCE_ROOT = pathlib.Path('/run/servus-updater/fences')
 NSS_CONFIG = pathlib.Path('/etc/nsswitch.conf')
@@ -1059,6 +1059,72 @@ def supervisor_request(socket_path,message,timeout):
         return receive(peer, time.monotonic() + timeout)
 
 
+class InstallationBackupProxy:
+    """Forward administrator receipts; the supervisor owns authorization and state.
+
+    This adapter never accepts a source/output path, reads the API role key or
+    creates an update transaction for a standalone backup.
+    """
+    def __init__(self, socket_path):
+        self.socket_path = socket_path
+
+    def _request(self, message):
+        try:
+            return supervisor_request(self.socket_path, message, 2)
+        except (OSError, RuntimeError, ValueError, RecursionError):
+            raise ProtocolError('unavailable') from None
+
+    def active(self):
+        result = self._request({'version': 1, 'type': 'installation_backup_active'})
+        if (not isinstance(result, dict) or set(result) != {'version', 'status'} or
+            type(result['version']) is not int or result['version'] != 1 or result['status'] not in ('idle', 'busy')):
+            raise ProtocolError('unavailable')
+        return result['status'] == 'busy'
+
+    @staticmethod
+    def _name(value):
+        return (isinstance(value, str) and 1 <= len(value) <= 100 and value == value.strip() and
+                not any(ord(char) < 32 or ord(char) == 127 or 0xd800 <= ord(char) <= 0xdfff for char in value))
+
+    def _operation(self, result, operation_id):
+        if result == {'version': 1, 'status': 'not_found'} and type(result.get('version')) is int:
+            raise ProtocolError('not_found')
+        if (not isinstance(result, dict) or set(result) != {'version', 'status', 'backup'} or
+            type(result['version']) is not int or result['version'] != 1):
+            raise ProtocolError('unavailable')
+        item = result['backup']
+        fields = {'operationId', 'actorId', 'name', 'state', 'createdAt', 'updatedAt', 'errorCode'}
+        states = ('requested', 'capturing', 'verified', 'starting', 'recovering', 'completed', 'failed', 'cancelled', 'recovery_required')
+        if (not isinstance(item, dict) or set(item) != fields or item['operationId'] != operation_id or
+            not valid_uuid(item['operationId']) or not valid_uuid(item['actorId']) or not self._name(item['name']) or
+            item['state'] not in states or any(type(item[key]) is not int or item[key] < 0 for key in ('createdAt', 'updatedAt')) or
+            item['errorCode'] not in (None, 'capture_failed', 'resume_required') or
+            result['status'] != item['state'] and not (result['status'] == 'queued' and item['state'] == 'requested')):
+            raise ProtocolError('unavailable')
+        return item
+
+    def submit(self, approval, *, cancel=False):
+        fields = {'version', 'operationId', 'actorId', 'name', 'issuedAt', 'proof'}
+        if (not isinstance(approval, dict) or set(approval) != fields or type(approval['version']) is not int or approval['version'] != 1 or
+            not valid_uuid(approval['operationId']) or not valid_uuid(approval['actorId']) or not self._name(approval['name']) or
+            type(approval['issuedAt']) is not int or approval['issuedAt'] < 0 or not isinstance(approval['proof'], str) or
+            not re.fullmatch(r'[a-f0-9]{64}', approval['proof'])):
+            raise ProtocolError('invalid_request')
+        result = self._request({'version': 1, 'type': 'installation_backup_cancel' if cancel else 'installation_backup_submit', 'receipt': approval})
+        item = self._operation(result, approval['operationId'])
+        if (not cancel and item['actorId'] != approval['actorId']) or item['name'] != approval['name']:
+            raise ProtocolError('unavailable')
+        return item
+
+    def cancel(self, approval):
+        return self.submit(approval, cancel=True)
+
+    def status(self, operation_id):
+        if not valid_uuid(operation_id):
+            raise ProtocolError('invalid_request')
+        return self._operation(self._request({'version': 1, 'type': 'installation_backup_status', 'operationId': operation_id}), operation_id)
+
+
 def wait_supervisor_ready(socket_path):
 
     # Readiness checks are side-effect free; never retry an apply command.
@@ -1385,10 +1451,22 @@ def dns_journal_backup_supported():
         if fd is not None: os.close(fd)
 
 
-def process(journal, request, *, allow_apply=False, discovery=None, recovery=None, preferences=None):
+def process(journal, request, *, allow_apply=False, discovery=None, recovery=None, preferences=None, installation_backups=None):
     if not isinstance(request, dict) or request.get('version') != 1 or type(request.get('version')) is not int:
         raise ProtocolError('invalid_request')
     action = request.get('action')
+    if action == 'installation_backup_submit' and set(request) == {'version', 'action', 'approval'}:
+        if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
+        if recovery is not None and recovery.active(): raise ProtocolError('operation_in_progress')
+        return installation_backups.submit(request['approval'])
+    if action == 'installation_backup_status' and set(request) == {'version', 'action', 'operationId'}:
+        if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
+        return installation_backups.status(request['operationId'])
+    if action == 'installation_backup_cancel' and set(request) == {'version', 'action', 'approval'}:
+        if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
+        return installation_backups.cancel(request['approval'])
+    if installation_backups is not None and action in ('submit', 'retry', 'prepare', 'apply', 'legacy_recovery') and installation_backups.active():
+        raise ProtocolError('operation_in_progress')
     if action=='legacy_recovery' and set(request)=={'version','action','operationId','restoreId','serviceId'}:
         if not allow_apply or recovery is None:raise ProtocolError('unavailable')
         return recovery.submit(request['operationId'],request['restoreId'],request['serviceId'],journal)
@@ -1492,6 +1570,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
         recovery_journal = LegacyRecoveryJournal(state) if supervisor_socket is not None else None
         if recovery_journal is not None:recovery_journal.recover()
         recovery_worker = LegacyRecoveryWorker(recovery_journal,journal,supervisor_socket) if recovery_journal is not None else None
+        installation_backups = InstallationBackupProxy(supervisor_socket) if supervisor_socket is not None else None
         socket_path = directory / 'updater.sock'
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         bound_inode = None
@@ -1529,12 +1608,21 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
             signal.signal(signal.SIGTERM, stop)
             signal.signal(signal.SIGINT, stop)
             while not stopping:
-                worker.tick()
-                preparation_worker.tick()
-                if apply_worker is not None: apply_worker.tick()
-                if discovery_worker is not None: discovery_worker.tick()
-                if recovery_worker is not None: recovery_worker.tick()
-                if automatic_updates is not None and not recovery_journal.active(): automatic_updates.tick()
+                try:
+                    backup_busy = installation_backups is not None and installation_backups.active()
+                except ProtocolError:
+                    backup_busy = True
+                # This singleton loop owns all public/automatic admissions. A
+                # worker reserves durable state before launching its child, and
+                # the supervisor rejects backup submission while that state is
+                # pending. An idle observation alone is never used as a lease.
+                if not backup_busy:
+                    worker.tick()
+                    preparation_worker.tick()
+                    if apply_worker is not None: apply_worker.tick()
+                    if discovery_worker is not None: discovery_worker.tick()
+                    if recovery_worker is not None: recovery_worker.tick()
+                    if automatic_updates is not None and not recovery_journal.active(): automatic_updates.tick()
                 try:
                     client, _ = server.accept()
                 except TimeoutError:
@@ -1545,7 +1633,7 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
                         _pid, uid, _gid = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
                         if uid != allowed_uid:
                             raise ProtocolError('unauthorized')
-                        value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None, discovery=discovery_worker,recovery=recovery_journal,preferences=preferences)
+                        value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None, discovery=discovery_worker,recovery=recovery_journal,preferences=preferences,installation_backups=installation_backups)
                         response = {'ok': True, 'operation': value}
                     except ProtocolError as error:
                         response = {'ok': False, 'error': error.code}

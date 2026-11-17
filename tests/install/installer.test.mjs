@@ -23,12 +23,14 @@ function fixture() {
   writeFileSync(release, 'ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\n');
   const source = join(root, 'checkout');
   mkdirSync(join(source, 'apps/panel'), { recursive: true });mkdirSync(join(source, 'deployment'));
-  writeFileSync(join(source, 'Dockerfile'), 'FROM scratch\n');writeFileSync(join(source, 'apps/panel/package.json'), '{}');writeFileSync(join(source, 'deployment/compose.yaml'), 'services: {}');
+  writeFileSync(join(source, 'Dockerfile'), 'FROM scratch\n');writeFileSync(join(source, 'apps/panel/package.json'), '{}');writeFileSync(join(source, 'deployment/compose.yaml'), '# fixture\nservices: {}');writeFileSync(join(source, 'deployment/compose-supervised.yaml'), '# /run/servus-lifecycle\nservices: {}');writeFileSync(join(source, 'deployment/lifecycle-gate.sh'), '# fixture\n');
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, SERVUS_INSTALLER_LIBRARY: '1', SERVUS_OS_RELEASE: release,
     SERVUS_INSTALL_DIR: join(root, 'install'), SERVUS_CONFIG_DIR: join(root, 'config'), SERVUS_DATA_DIR: join(root, 'data') };
   return { root, bin, command, release, source, env };
 }
 function run(f, args, script = 'source "$1"; shift; "$@"') {
+  // Unit fixtures mock Docker and privileged host checks; integration tests run the real checks separately.
+  script = script.replace('source "$1";', 'source "$1"; trusted_docker() { docker "$@"; }; prepare_docker_client() { :; }; prepare_runtime() { :; }; require_supervisor_socket() { :; }; verify_lifecycle_image() { :; }; verify_lifecycle_compose() { printf "{\\\"fixture\\\":true}\\n" > "$9"; };');
   return spawnSync('bash', ['-c', script, 'servus-tests', installer, ...args], { env: f.env, encoding: 'utf8' });
 }
 function succeeds(result) { assert.equal(result.status, 0, result.stderr); }
@@ -291,7 +293,7 @@ test('pinned image uses matching source and retains the previous configuration o
   const previous=join(f.env.SERVUS_INSTALL_DIR,'releases/previous');mkdirSync(join(previous,'deployment'),{recursive:true});writeFileSync(join(previous,'deployment/compose.yaml'),'services: {}');symlinkSync(previous,join(f.env.SERVUS_INSTALL_DIR,'current'));
   const env=`SERVUS_PORT=4180\nSERVUS_INGRESS_PORT=80\nSERVUS_DATA_DIR=${f.env.SERVUS_DATA_DIR}\nSERVUS_PUBLIC_URL=http://192.0.2.10:4180\nSERVUS_BIND_ADDRESS=127.0.0.1\nSERVUS_IMAGE=previous-image\n`;
   writeFileSync(join(f.env.SERVUS_CONFIG_DIR,'servus.env'),env);const db=join(f.env.SERVUS_DATA_DIR,'panel.sqlite');writeTestDatabase(db);const original=readFileSync(db);
-  const archiveFile=archive(f,[{name:'checkout/Dockerfile',data:'FROM scratch\n'},{name:'checkout/apps/panel/package.json',data:'{}'},{name:'checkout/deployment/compose.yaml',data:'services: {}'}]);
+  const archiveFile=archive(f,[{name:'checkout/Dockerfile',data:'FROM scratch\n'},{name:'checkout/apps/panel/package.json',data:'{}'},{name:'checkout/deployment/compose.yaml',data:'# fixture\nservices: {}'},{name:'checkout/deployment/compose-supervised.yaml',data:'# /run/servus-lifecycle\nservices: {}'},{name:'checkout/deployment/lifecycle-gate.sh',data:'# fixture\n'}]);
   Object.assign(f.env,{SERVUS_TEST_ROOT:f.root,SERVUS_TEST_COMMIT:commit,SERVUS_TEST_ARCHIVE:archiveFile});
   f.command('stat','if [[ $2 == %u ]]; then echo 1000; else echo 0; fi');
   f.command('curl',`if [[ -f "$SERVUS_TEST_ROOT/rollback-started" ]]; then echo '{"status":"ok","version":"0.1.0"}'; exit 0; fi

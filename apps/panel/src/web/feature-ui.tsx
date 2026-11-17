@@ -50,10 +50,10 @@ export function FeatureModal({
       aria-describedby="feature-modal-description"
       onCancel={(event) => {
         if (!dismissible) event.preventDefault();
-        else onClose();
       }}
+      onClose={(event) => { if (!event.currentTarget.open) onClose(); }}
       onClick={(event) => {
-        if (dismissible && event.target === event.currentTarget) onClose();
+        if (dismissible && event.target === event.currentTarget) event.currentTarget.close();
       }}
     >
       <div className="modal-heading">
@@ -64,7 +64,7 @@ export function FeatureModal({
         <button
           className="icon-button"
           type="button"
-          onClick={onClose}
+          onClick={() => ref.current?.close()}
           disabled={!dismissible}
           aria-label="Close dialog"
         >

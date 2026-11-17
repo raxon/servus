@@ -2,7 +2,7 @@ import type Docker from 'dockerode';
 import type { RestoreJournal } from './restore-journal.js';
 
 /** Verify the committed source volume, whether original or from a previous restore. */
-export async function verifyRestoreSourceVolume(options:{docker:Docker;journal:RestoreJournal;serviceId:string;kind:'postgres'|'mariadb';volumeName:string;spec:Docker.ServiceSpec}):Promise<void> {
+export async function verifyRestoreSourceVolume(options:{docker:Docker;journal:RestoreJournal;serviceId:string;kind:'postgres'|'mariadb'|'redis';volumeName:string;spec:Docker.ServiceSpec}):Promise<void> {
   const binding=options.journal.validatedVolumeBinding(options.serviceId,options.kind);
   if(options.volumeName!==(binding?.volume_name??`panel-data-${options.serviceId}-database`))throw new Error('Database source volume binding changed.');
   const volume=await options.docker.getVolume(options.volumeName).inspect();

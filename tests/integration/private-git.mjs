@@ -24,13 +24,12 @@ try {
   await page.getByRole('button',{name:'New service'}).click();const dialog=page.getByRole('dialog');
   await dialog.getByLabel('Service name').fill('private-app');await dialog.getByText('Git',{exact:true}).click();
   await dialog.getByLabel('Repository URL').fill('https://git.example.com/team/app.git');
-  await dialog.getByText('GitHub',{exact:true}).click();
-  await dialog.getByLabel('GitHub repository').fill('example/private.git');await dialog.getByLabel('Private repository').check();
+  await dialog.getByLabel('Private repository').check();
   await dialog.getByLabel('Git username').fill('git-user');await dialog.getByLabel('Access token').fill('test-git-token');
   assert.equal(await dialog.getByLabel('Access token').getAttribute('type'),'password');
   const created=page.waitForResponse(response=>response.url().endsWith('/services')&&response.request().method()==='POST');
   await dialog.getByRole('button',{name:'Create & deploy'}).click();const response=await created;assert.equal(response.status(),202);const value=await response.json();
-  assert.equal(value.service.source.repository,'https://github.com/example/private.git');
+  assert.equal(value.service.source.repository,'https://git.example.com/team/app.git');
   assert.equal(value.service.source.credential.username,'git-user');assert.equal(value.service.source.credential.token,undefined);assert.ok(value.service.source.credential.secretRef);
   await page.getByRole('tab',{name:'Source',exact:true}).click();
   const sourceForm=page.getByRole('form',{name:'Application source'});

@@ -8,7 +8,7 @@ import { inspectRestoreSourceAttachments, verifyRestoreSourceVolume } from './re
 /** Apply a recorded switch. Completion stays fenced until volume binding and recovery are committed. */
 export async function applyRestoreSwitch(options:{docker:Docker;journal:RestoreJournal;vault:SecretVault;serviceId:string;operationId:string;verifyTarget:(plan:RestoreSwitchPlan)=>Promise<void>}):Promise<void> {
   const plan=readRestoreSwitchIntent(options),inspection=plan.inspection,name=`panel-app-${options.serviceId}`;
-  const record=options.journal.get(options.operationId)!,dataPath=record.kind==='postgres'?'/var/lib/postgresql/data':record.kind==='mariadb'?'/var/lib/mysql':'';
+  const record=options.journal.get(options.operationId)!,dataPath=record.kind==='postgres'?'/var/lib/postgresql/data':record.kind==='mariadb'?'/var/lib/mysql':record.kind==='redis'?'/data':'';
   if(!dataPath)throw new Error('Unsupported restore database.');
   const stage=()=>options.journal.switchIntent(options.operationId)?.stage;
   const next=(from:NonNullable<ReturnType<typeof stage>>,to:NonNullable<ReturnType<typeof stage>>)=>options.journal.advanceSwitchStage(options.operationId,from,to);
@@ -22,7 +22,7 @@ export async function applyRestoreSwitch(options:{docker:Docker;journal:RestoreJ
     if(current.ID!==inspection.serviceDockerId||current.Version?.Index!==inspection.serviceVersion||node!==inspection.nodeId||!isDeepStrictEqual(current.Spec,plan.previousSpec))throw new Error('Original database service changed before the switch.');
     const source=await options.docker.getContainer(inspection.sourceContainerId).inspect();
     if(!source.State.Running||source.Id!==inspection.sourceContainerId||source.Image!==inspection.imageId||source.Config.Labels?.['panel.owner']!=='self-hosted-panel'||source.Config.Labels?.['panel.service']!==options.serviceId||source.Config.Labels?.['com.docker.swarm.service.name']!==name||source.Mounts.length!==1||!source.Mounts.some(m=>m.Type==='volume'&&m.Name===inspection.sourceVolume&&m.Destination===dataPath&&m.RW))throw new Error('Original database container changed before the switch.');
-    await verifyRestoreSourceVolume({docker:options.docker,journal:options.journal,serviceId:options.serviceId,kind:record.kind as 'postgres'|'mariadb',volumeName:inspection.sourceVolume,spec:plan.previousSpec});
+    await verifyRestoreSourceVolume({docker:options.docker,journal:options.journal,serviceId:options.serviceId,kind:record.kind as 'postgres'|'mariadb'|'redis',volumeName:inspection.sourceVolume,spec:plan.previousSpec});
     await inspectRestoreSourceAttachments({docker:options.docker,serviceId:options.serviceId,volumeName:inspection.sourceVolume,dataPath,expectedRunningId:inspection.sourceContainerId});
     return current;
   };

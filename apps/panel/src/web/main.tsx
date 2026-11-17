@@ -1,4 +1,7 @@
 import { Skeleton } from "./Skeleton.js";
+import { deploymentProgress } from "./deployment-progress.js";
+import { applicationUrl } from "./application-url.js";
+import { DashboardOverview } from "./DashboardOverview.js";
 import React, {
   createContext,
   useContext,
@@ -33,19 +36,18 @@ import {
   Box,
   Check,
   ChevronRight,
-  ChevronDown,
   Circle,
   CircleAlert,
   Clock3,
   Database,
   ExternalLink,
   Folder,
-  FolderPlus,
   GitBranch,
   Globe2,
   Layers3,
   LayoutGrid,
   LoaderCircle,
+  Menu,
   LogOut,
   Play,
   Plus,
@@ -57,7 +59,6 @@ import {
   Square,
   Terminal,
   X,
-  Zap,
 } from "lucide-react";
 import type {
   Action,
@@ -65,16 +66,24 @@ import type {
   Project,
   RuntimeStatus,
   Service,
+  DomainConfig,
   SessionResponse,
 } from "../shared/types.js";
 import { api, errorMessage, RequestError, setCsrfToken } from "./api.js";
 import { CreateService } from "./ServiceCreate.js";
+import { FeatureModal } from "./feature-ui.js";
 import { AccountLinkSettings, CentralAccessSettings, CentralSignIn } from "./CentralAccess.js";
 import { LocalPasswordSettings } from "./LocalPassword.js";
+import { ApiTokenSettings } from "./ApiTokenSettings.js";
+import { TwoFactorSettings } from "./TwoFactorSettings.js";
+import { ComposeProjects } from "./ComposeProjects.js";
+import { DeployWebhookSettings } from "./DeployWebhookSettings.js";
+import { TemplateProjects } from "./TemplateProjects.js";
 import { GithubSettings } from "./GithubSettings.js";
-import { UpdateSettings, useUpdateDiscovery } from "./UpdateSettings.js";
-import { HostDomainSettings } from "./HostDomainSettings.js";
 import { HttpsSettings } from "./HttpsSettings.js";
+import { HostDomainSettings } from "./HostDomainSettings.js";
+import { UpdateSettings, useUpdateDiscovery } from "./UpdateSettings.js";
+import { InstallationBackupSettings } from "./InstallationBackupSettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
@@ -226,11 +235,12 @@ function AuthForm({ setup }: { setup: boolean }) {
   const client = useQueryClient();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [totpCode, setTotpCode] = useState("");
   const mutation = useMutation({
     mutationFn: () =>
       api<SessionResponse>(setup ? "/setup" : "/auth/login", {
         method: "POST",
-        body: { email, password },
+        body: { email, password, ...(!setup&&totpCode?{totpCode}:{}) },
       }),
     onSuccess: async (data) => {
       await client.cancelQueries({ queryKey: ["session"], exact: true });
@@ -266,6 +276,7 @@ function AuthForm({ setup }: { setup: boolean }) {
               <label htmlFor="setup-password">Password</label>
               <input id="setup-password" name="password" type="password" autoComplete={setup ? "new-password" : "current-password"} placeholder={setup ? "At least 8 characters" : "Enter your password"} minLength={setup ? 8 : undefined} maxLength={128} value={password} onChange={(event) => setPassword(event.target.value)} required aria-describedby={setup ? "setup-password-hint" : undefined} />
               {setup ? <p id="setup-password-hint" className="setup-password-hint">Use at least 8 characters.</p> : null}
+              {!setup&&(totpCode||mutation.error instanceof RequestError&&['TWO_FACTOR_REQUIRED','TWO_FACTOR_CODE_INVALID'].includes(mutation.error.code))?<><label htmlFor="signin-totp">Authenticator or recovery code</label><input id="signin-totp" name="totpCode" type="text" autoComplete="one-time-code" spellCheck={false} autoCapitalize="none" value={totpCode} maxLength={64} onChange={event=>setTotpCode(event.target.value)} required/></>:null}
               <ErrorNotice error={mutation.error} />
               <button className="setup-submit" type="submit" disabled={mutation.isPending}>
                 {mutation.isPending ? <Spinner label={setup ? "Creating administrator" : "Signing in"} /> : <>{setup ? "Create administrator" : "Sign in"} <ArrowRight size={18} aria-hidden="true" /></>}
@@ -314,6 +325,35 @@ function Shell() {
   const path = useRouterState({ select: (state) => state.location.pathname });
   const previousPath = useRef(path);
   const mainRef = useRef<HTMLElement>(null);
+  const navigationRef = useRef<HTMLElement>(null);
+  const navigationTrigger = useRef<HTMLButtonElement>(null);
+  const [mobileNavigation, setMobileNavigation] = useState(() => window.matchMedia("(max-width: 800px)").matches);
+  const [navigationOpen, setNavigationOpen] = useState(false);
+  const nativePopover = "popover" in HTMLElement.prototype;
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 800px)");
+    const update = () => setMobileNavigation(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  useEffect(() => {
+    const navigation = navigationRef.current;
+    if (nativePopover && navigation?.matches(":popover-open")) navigation.hidePopover();
+    setNavigationOpen(false);
+  }, [path, mobileNavigation, nativePopover]);
+  useEffect(() => {
+    if (nativePopover || !navigationOpen) return;
+    navigationRef.current?.querySelector<HTMLAnchorElement>("a")?.focus();
+    const outside = (event: PointerEvent) => {
+      if (!navigationRef.current?.contains(event.target as Node) && !navigationTrigger.current?.contains(event.target as Node)) setNavigationOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setNavigationOpen(false); navigationTrigger.current?.focus(); }
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape);
+    return () => { document.removeEventListener("pointerdown", outside); document.removeEventListener("keydown", escape); };
+  }, [nativePopover, navigationOpen]);
   useEffect(() => {
     if (previousPath.current !== path) {
       previousPath.current = path;
@@ -364,18 +404,23 @@ function Shell() {
       <a className="skip-link" href="#main-content">
         Skip to content
       </a>
-      <aside className="sidebar">
+      <aside id="workspace-navigation" ref={navigationRef} className="sidebar" popover={mobileNavigation && nativePopover ? "auto" : undefined} data-navigation-open={navigationOpen} onToggle={event => setNavigationOpen(event.newState === "open")} onClick={event => {
+        if (!(event.target as Element).closest("a")) return;
+        if (nativePopover && navigationRef.current?.matches(":popover-open")) navigationRef.current.hidePopover();
+        setNavigationOpen(false);
+      }}>
         <Link to="/" className="brand-link" aria-label="Servus overview">
           <Brand />
         </Link>
         <div className="nav-label">WORKSPACE</div>
         <nav aria-label="Main navigation">
-          <Link to="/" className={`nav-item ${path === "/" ? "active" : ""}`}>
+          <Link to="/" aria-current={path === "/" ? "page" : undefined} className={`nav-item ${path === "/" ? "active" : ""}`}>
             <LayoutGrid size={18} />
             Overview
           </Link>
           <Link
             to="/activity"
+            aria-current={path === "/activity" ? "page" : undefined}
             className={`nav-item ${path === "/activity" ? "active" : ""}`}
           >
             <Activity size={18} />
@@ -383,6 +428,7 @@ function Shell() {
           </Link>
           <Link
             to="/settings"
+            aria-current={path === "/settings" ? "page" : undefined}
             className={`nav-item ${path === "/settings" ? "active" : ""}`}
           >
             <Settings2 size={18} />
@@ -440,7 +486,7 @@ function Shell() {
         </div>
       </aside>
       <div className="app-main">
-        <header className="topbar">
+        <header className={`topbar ${path === "/" ? "topbar-dashboard" : ""}`}>
           <nav className="breadcrumbs" aria-label="Breadcrumb">
             <Link to="/">Workspace</Link>
             <ChevronRight size={14} aria-hidden="true" />
@@ -449,14 +495,15 @@ function Shell() {
               <strong aria-current="page">{currentService.data?.name ?? "Service"}</strong>
             </> : <strong aria-current="page">{routeProjectId ? currentProject?.name ?? "Project" : locationName}</strong>}
           </nav>
+          <button ref={navigationTrigger} type="button" className="button mobile-menu-button" aria-controls="workspace-navigation" aria-expanded={navigationOpen} popoverTarget={nativePopover ? "workspace-navigation" : undefined} onClick={nativePopover ? undefined : () => setNavigationOpen(!navigationOpen)}><Menu size={17} aria-hidden="true" />Menu</button>
           <div className="topbar-right">
             {path === "/" ? <div className={`search-field topbar-search ${keyboardNavigation ? "keyboard-navigation" : ""}`}>
               <Search size={16} />
-              <input aria-label="Search projects" placeholder="Search projects..." value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
+              <input aria-label="Search projects and services" placeholder="Search projects and services..." value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
             </div> : null}
           </div>
         </header>
-        <main id="main-content" className="content" ref={mainRef} tabIndex={-1}>
+        <main id="main-content" className={`content ${path === "/" ? "content-dashboard" : ""}`} ref={mainRef} tabIndex={-1}>
           <ProjectSearchContext.Provider value={projectSearch}><Outlet /></ProjectSearchContext.Provider>
         </main>
       </div>
@@ -596,130 +643,13 @@ function CreateProject({ onClose }: { onClose: () => void }) {
 function Dashboard() {
   const { user } = useAuth();
   const projects = useProjects();
-  const [showCreate, setShowCreate] = useState(false);
   const search = useContext(ProjectSearchContext);
-  const [sort, setSort] = useState<"name" | "time">("name");
-  const visible = (projects.data ?? [])
-    .filter((project) =>
-      `${project.name} ${project.description}`
-        .toLowerCase()
-        .includes(search.toLowerCase()),
-    )
-    .sort((a, b) => sort === "name"
-      ? a.name.localeCompare(b.name)
-      : b.createdAt.localeCompare(a.createdAt));
-  return (
-    <>
-      <div className="dashboard-project-region">
-          <div className="section-heading">
-            <div>
-              <h2>
-                Projects{" "}
-                <span className="count-pill">{projects.isPending ? "..." : projects.error ? "--" : projects.data?.length ?? 0}</span>
-              </h2>
-              <p>Manage related services within a project.</p>
-            </div>
-            <div className="dashboard-project-controls">
-              <details className="dashboard-sort" onBlur={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
-              }} onKeyDown={(event) => {
-                if (event.key === "Escape") {
-                  event.currentTarget.open = false;
-                  event.currentTarget.querySelector("summary")?.focus();
-                }
-              }}>
-                <summary aria-label={`Sort projects: ${sort === "name" ? "Name" : "Newest"}`}>
-                  <span>{sort === "name" ? "Name" : "Newest"}</span><ChevronDown size={16} aria-hidden="true" />
-                </summary>
-                <div className="dashboard-sort-menu" role="group" aria-label="Sort projects">
-                  {([ ["name", "Name"], ["time", "Newest"] ] as const).map(([value, label]) =>
-                    <button key={value} type="button" aria-pressed={sort === value} onClick={(event) => {
-                      setSort(value);
-                      const details = event.currentTarget.closest("details");
-                      if (details) { details.open = false; details.querySelector("summary")?.focus(); }
-                    }}>{label}{sort === value ? <Check size={15} aria-hidden="true" /> : null}</button>
-                  )}
-                </div>
-              </details>
-              {user.role === "admin" ? <button className="button button-primary" onClick={() => setShowCreate(true)}>
-                <Plus size={17} /> New project
-              </button> : null}
-            </div>
-          </div>
-          <ErrorNotice error={projects.error} />
-          {projects.isPending ? (
-            <Skeleton kind="projects" label="Loading projects" />
-          ) : projects.error ? null : projects.data?.length ? (
-            <div className="dashboard-project-list">
-              {visible.map((project) => (
-                <DashboardProject key={project.id} project={project} />
-              ))}
-              {!visible.length ? (
-                <div className="surface no-results">
-                  No projects match "{search}".
-                </div>
-              ) : null}
-            </div>
-          ) : (
-            <div className="empty-projects surface">
-              <div className="empty-illustration">
-                <span className="empty-tile tile-back">
-                  <Box size={24} />
-                </span>
-                <span className="empty-tile tile-front">
-                  <FolderPlus size={31} strokeWidth={1.5} />
-                </span>
-                <span className="illustration-cross">+</span>
-              </div>
-              <span className="eyebrow">PROJECTS</span>
-              <h2>No projects yet</h2>
-              <p>{user.role === "admin" ? "Create a project to group your applications, then add a service to deploy." : "Ask an administrator to give you access to a project."}</p>
-              {user.role === "admin" ? <button
-                className="button button-primary"
-                onClick={() => setShowCreate(true)}
-              >
-                <Plus size={16} />
-                Create your first project
-              </button> : null}
-            </div>
-          )}
-      </div>
-      {showCreate ? <CreateProject onClose={() => setShowCreate(false)} /> : null}
-    </>
-  );
-}
-
-function DashboardProject({ project }: { project: Project }) {
-  const services = useQuery({
-    queryKey: ["services", project.id],
-    queryFn: () => api<Service[]>(`/projects/${project.id}/services`),
-    refetchInterval: 5_000,
-  });
-  return (
-    <section className="dashboard-project-group">
-      <div className="dashboard-project-heading">
-        <Link to="/projects/$projectId" params={{ projectId: project.id }}>
-          <Folder size={18} />
-          <h3>{project.name}</h3>
-          <ChevronRight size={16} />
-        </Link>
-        <span>{project.serviceCount} {project.serviceCount === 1 ? "service" : "services"}</span>
-      </div>
-      {services.isPending ? <Skeleton kind="services" label="Loading services" />
-        : services.error ? <div className="dashboard-services-message"><ErrorNotice error={services.error} /><button className="text-link" onClick={() => void services.refetch()}>Try again</button></div>
-        : services.data?.length ? <div className="dashboard-services-grid">
-          {services.data.map((service) => <Link key={service.id} to="/services/$serviceId" params={{ serviceId: service.id }} className="dashboard-service-card">
-            <span className="dashboard-service-identity">
-              <span className={`dashboard-service-icon dashboard-service-icon-${service.kind ?? "app"}`} aria-hidden="true">
-                {service.kind === "redis" ? <Zap size={19} /> : service.kind === "postgres" || service.kind === "mariadb" ? <Database size={19} /> : <Box size={19} />}
-              </span>
-              <span className="dashboard-service-name"><strong>{service.name}</strong><small>{service.kind ?? "app"}</small></span>
-            </span>
-            <Badge status={service.state} />
-          </Link>)}
-        </div> : <p className="dashboard-services-message">No services yet. Open the project to add one.</p>}
-    </section>
-  );
+  const [showCreate, setShowCreate] = useState(false);
+  return <>
+    <DashboardOverview projects={projects.data} loading={projects.isPending} error={projects.error}
+      userId={user.id} canCreate={user.role === "admin"} search={search} onCreate={() => setShowCreate(true)} />
+    {showCreate ? <CreateProject onClose={() => setShowCreate(false)} /> : null}
+  </>;
 }
 
 function ProjectPage() {
@@ -755,19 +685,19 @@ function ProjectPage() {
           </p>
         </div>
         <div className="heading-actions">
-          {project ? (
+          {project?.canWrite ? (
             <ProjectSettings
               project={project}
               onDeleted={() => void navigate({ to: "/" })}
             />
           ) : null}
-          <button
+          {project?.canWrite ? <button
             className="button button-primary"
             onClick={() => setCreate(true)}
           >
             <Plus size={17} />
             New service
-          </button>
+          </button> : null}
         </div>
       </div>
       <div className="project-meta">
@@ -872,6 +802,8 @@ function ProjectPage() {
           </button>
         </div>
       )}
+      {projectId?<TemplateProjects projectId={projectId} canWrite={project?.canWrite===true}/>:null}
+      {projectId?<ComposeProjects projectId={projectId} canWrite={project?.canWrite===true}/>:null}
       <div className="section-heading activity-heading">
         <div>
           <h2>Project activity</h2>
@@ -930,6 +862,7 @@ function ActionsTable({
               : void router.navigate({
                   to: "/services/$serviceId",
                   params: { serviceId: action.serviceId },
+                  search: { tab: "deployments", action: action.id },
                 })
           }
         >
@@ -975,14 +908,23 @@ function ServicePage() {
   const navigate = useNavigate();
   const { user } = useAuth();
   const runtime = useRuntime();
-  const [tab, setTab] = useState<ServiceTab>("overview");
-  const [selectedAction, setSelectedAction] = useState<string | null>(null);
+  const projects = useProjects();
+  const { tab = "overview", action: selectedAction } = serviceRoute.useSearch();
+  const selectAction = (action: string) => void navigate({
+    to: "/services/$serviceId", params: { serviceId: serviceId! },
+    search: { tab: "deployments", action },
+  });
   const [destroying, setDestroying] = useState(false);
   const serviceQuery = useQuery({
     queryKey: ["service", serviceId],
     queryFn: () => api<Service>(`/services/${serviceId}`),
     enabled: !!serviceId,
     refetchInterval: destroying ? false : 2_000,
+  });
+  const changesQuery = useQuery({
+    queryKey: ["configuration-changes", serviceId, serviceQuery.data?.revision, serviceQuery.data?.deployedRevision],
+    queryFn: () => api<{status:"not_deployed"|"unavailable"|"available"; sections:string[];deployedPrimaryDomain?:DomainConfig|null}>(`/services/${serviceId}/configuration-changes`),
+    enabled: !!serviceId && !!serviceQuery.data && serviceQuery.data.deployedRevision !== null && serviceQuery.data.revision !== serviceQuery.data.deployedRevision,
   });
   const actionsQuery = useQuery({
     queryKey: ["service-actions", serviceId],
@@ -991,15 +933,14 @@ function ServicePage() {
     refetchInterval: 1_500,
   });
   const execute = useMutation({
-    mutationFn: (operation: "deploy" | "start" | "stop" | "restart") =>
-      api<Action>(`/services/${serviceId}/${operation}`, {
+    mutationFn: (operation: "deploy" | "force-rebuild" | "start" | "stop" | "restart") =>
+      api<Action>(`/services/${serviceId}/${operation === "force-rebuild" ? "deploy" : operation}`, {
         method: "POST",
-        body: {},
+        body: operation === "force-rebuild" ? {forceRebuild:true} : {},
         idempotent: true,
       }),
     onSuccess: (action) => {
-      setSelectedAction(action.id);
-      setTab("deployments");
+      selectAction(action.id);
       void client.invalidateQueries({
         queryKey: ["service-actions", serviceId],
       });
@@ -1030,10 +971,11 @@ function ServicePage() {
   const domains = service.domains ?? [
     { hostname: service.hostname, port: service.port, primary: true },
   ];
-  const primaryDomain = domains.find((domain) => domain.primary) ?? domains[0];
-  const appUrl = primaryDomain
-    ? `http://${primaryDomain.hostname}:${runtime.data?.ingressPort ?? 18080}`
-    : null;
+  const savedPrimaryDomain = domains.find((domain) => domain.primary) ?? domains[0];
+  const primaryDomain = service.deployedRevision === null ? null : changed
+    ? changesQuery.data?.status === "available" ? changesQuery.data.deployedPrimaryDomain : null
+    : savedPrimaryDomain;
+  const appUrl = applicationUrl(primaryDomain, runtime.data?.ingressPort ?? 18080);
   const sourceLabel =
     service.source?.type === "git"
       ? `${service.source.repository} · ${service.source.branch}`
@@ -1084,6 +1026,7 @@ function ServicePage() {
               });
             }}
           />
+          {service.source?.type === "git" ? <button className="button" type="button" disabled={busy} onClick={()=>execute.mutate("force-rebuild")}>Force rebuild</button> : null}
           <button
             className="button button-primary"
             onClick={() => execute.mutate("deploy")}
@@ -1100,26 +1043,26 @@ function ServicePage() {
           </button>
         </div>
       </div>
-      <div
+      <nav
         className="service-tabs feature-tabs"
-        role="tablist"
         aria-label="Service sections"
       >
         {serviceTabs.map((item) => (
-          <button
+          <Link
             key={item.id}
-            role="tab"
-            aria-selected={tab === item.id}
+            to="/services/$serviceId"
+            params={{ serviceId: service.id }}
+            search={{ tab: item.id, action: item.id === "deployments" ? selectedAction : undefined }}
+            aria-current={tab === item.id ? "page" : undefined}
             className={tab === item.id ? "selected" : ""}
-            onClick={() => setTab(item.id)}
           >
             <span>{item.label}</span>
             {item.id === "deployments" && actionsQuery.data?.length ? (
               <span className="tab-count">{actionsQuery.data.length}</span>
             ) : null}
-          </button>
+          </Link>
         ))}
-      </div>
+      </nav>
       <ErrorNotice error={execute.error} />
       {service.lastError ? (
         <div className="error-notice">
@@ -1143,6 +1086,7 @@ function ServicePage() {
                 : ""}
               . Deploy to apply the saved settings.
             </span>
+            {changesQuery.data?.status === "available" ? <span>{changesQuery.data.sections.length ? `Changed: ${changesQuery.data.sections.join(", ")}.` : "No configuration differences found."}</span> : changesQuery.data?.status === "unavailable" ? <span>Details for the running revision are unavailable.</span> : null}
           </div>
         </div>
       ) : null}
@@ -1155,10 +1099,11 @@ function ServicePage() {
             <ActionsTable
               actions={actionsQuery.data ?? []}
               loading={actionsQuery.isPending}
-              onSelect={(action) => setSelectedAction(action.id)}
+              onSelect={(action) => selectAction(action.id)}
             />
           </div>
-          <ActionLog actionId={actionId} />
+          <DeployWebhookSettings service={service} canWrite={projects.data?.find(project=>project.id===service.projectId)?.canWrite===true}/>
+          <ActionLog actionId={actionId} busy={busy} onRedeployed={action => {selectAction(action.id);void client.invalidateQueries({queryKey:["service-actions",serviceId]});void client.invalidateQueries({queryKey:["service",serviceId]});}} />
         </div>
       ) : tab !== "overview" ? (
         <ServiceConfigurationPanel
@@ -1166,13 +1111,14 @@ function ServicePage() {
           service={service}
           tab={tab}
           admin={user.role === "admin"}
+          canWrite={projects.data?.find(project=>project.id===service.projectId)?.canWrite === true}
         />
       ) : (
         <>
           <ServiceMetricsPanel service={service} />
           <div className="service-overview-grid">
             {database ? (
-              <DatabaseConnection service={service} admin={user.role === "admin"} />
+              <DatabaseConnection service={service} admin={user.role === "admin"} canWrite={projects.data?.find(project=>project.id===service.projectId)?.canWrite===true} />
             ) : (
               <section className="surface details-card">
                 <div className="card-heading">
@@ -1295,7 +1241,13 @@ function ServicePage() {
   );
 }
 
-function ActionLog({ actionId }: { actionId?: string }) {
+function ActionLog({ actionId, busy = false, onRedeployed }: { actionId?: string; busy?: boolean; onRedeployed?: (action:Action)=>void }) {
+  const [confirmRedeploy, setConfirmRedeploy] = useState(false);
+  const [logSearch, setLogSearch] = useState("");
+  const [copyState, setCopyState] = useState("");
+  const [followOutput, setFollowOutput] = useState(true);
+  const operationOutputRef = useRef<HTMLDivElement>(null);
+  const buildOutputRef = useRef<HTMLPreElement>(null);
   const detail = useQuery({
     queryKey: ["action", actionId],
     queryFn: () => api<ActionDetail>(`/actions/${actionId}`),
@@ -1305,6 +1257,32 @@ function ActionLog({ actionId }: { actionId?: string }) {
         ? false
         : 1_000,
   });
+  const buildLog = useQuery({
+    queryKey:["build-log",actionId],
+    queryFn:()=>api<{available:boolean;text:string;truncated:boolean}>(`/actions/${actionId}/build-log`),
+    enabled:!!actionId && detail.data?.action.type === "deploy",
+    refetchInterval: detail.data && pendingAction(detail.data.action) ? 2_000 : false,
+    retry:false,
+  });
+  const project = useQuery({queryKey:["project-access",detail.data?.action.projectId],queryFn:()=>api<Project>(`/projects/${detail.data!.action.projectId}`),enabled:!!onRedeployed && !!detail.data?.action.projectId});
+  const redeploy = useMutation({
+    mutationFn:()=>api<Action>(`/services/${detail.data!.action.serviceId}/deployments/${detail.data!.action.id}/redeploy`,{method:"POST",body:{confirm:true},idempotent:true}),
+    onSuccess:action=>{setConfirmRedeploy(false);onRedeployed?.(action);},
+  });
+  const sourceCommit = detail.data?.events.find(event => /^Source commit: [a-f0-9]{40,64}$/.test(event.message))?.message.slice('Source commit: '.length);
+  const deployedImage = detail.data?.events.find(event => event.message.startsWith('Deployed image: '))?.message.slice('Deployed image: '.length);
+  const started = detail.data?.events.find(event => event.message === 'Worker claimed the durable deployment job.')?.createdAt;
+  const startTime = started ? Date.parse(started) : NaN;
+  const endTime = detail.data?.action.finishedAt ? Date.parse(detail.data.action.finishedAt) : Date.now();
+  const duration = Number.isFinite(startTime) && Number.isFinite(endTime) && endTime >= startTime ? Math.floor((endTime-startTime)/1000) : undefined;
+  const buildLines = buildLog.data?.text.split('\n').filter(line => line.toLowerCase().includes(logSearch.toLowerCase())).join('\n') ?? '';
+  useEffect(()=>{setFollowOutput(true);setLogSearch('');setCopyState('');},[actionId]);
+  useEffect(()=>{
+    if(!followOutput)return;
+    for(const node of [operationOutputRef.current,buildOutputRef.current])if(node)node.scrollTop=node.scrollHeight;
+  },[followOutput,detail.data?.events,buildLog.data?.text,logSearch]);
+  const pauseIfScrolledUp = (node:HTMLElement) => {if(node.scrollHeight-node.scrollTop-node.clientHeight>32)setFollowOutput(false);};
+  const canRedeploy = !!onRedeployed && !!project.data?.canWrite && detail.data?.action.type === "deploy" && detail.data.action.status === "succeeded" && !!deployedImage && /^(?:sha256:[a-f0-9]{64}|[a-zA-Z0-9][a-zA-Z0-9._/:@-]*@sha256:[a-f0-9]{64})$/.test(deployedImage);
   return (
     <section className="log-card">
       <div className="log-heading">
@@ -1322,8 +1300,21 @@ function ActionLog({ actionId }: { actionId?: string }) {
           )}
         </span>
       </div>
+      {detail.data ? <div className="operation-tools">
+        <div className="operation-meta"><span>Progress: {deploymentProgress(detail.data.action,buildLog.data)}</span><span>Queued: {new Date(detail.data.action.createdAt).toLocaleString()}</span>{started ? <span>Started: {new Date(started).toLocaleString()}</span> : null}{duration!==undefined ? <span>Duration: {Math.floor(duration/60)}m {duration%60}s</span> : null}{detail.data.action.finishedAt ? <span>Finished: {new Date(detail.data.action.finishedAt).toLocaleString()}</span> : null}{sourceCommit ? <span>Commit: <code>{sourceCommit}</code></span> : null}{deployedImage ? <span>Image: <code>{deployedImage}</code></span> : null}</div>
+        <label>Search output <input type="search" value={logSearch} onChange={event => setLogSearch(event.target.value)} /></label>
+        <button type="button" className="button button-small" aria-pressed={followOutput} onClick={()=>setFollowOutput(value=>!value)}>{followOutput ? 'Pause auto-scroll' : 'Resume auto-scroll'}</button>
+        <button type="button" className="button button-small" onClick={() => {
+          const events = detail.data!.events.map(event => `${event.createdAt} ${event.level.toUpperCase()} ${event.message}`).join("\n");
+          const text = buildLog.data?.available && buildLog.data.text ? `${events}\n\nBuild output${buildLog.data.truncated?' (recent output)':''}:\n${buildLog.data.text}` : events;
+          if(!navigator.clipboard){setCopyState("Unable to copy output");return;}
+          void navigator.clipboard.writeText(text).then(() => setCopyState("Copied"), () => setCopyState("Unable to copy output"));
+        }}>Copy all output</button><span role="status">{copyState}</span>
+      </div> : null}
       <div
         className="log-body"
+        ref={operationOutputRef}
+        onScroll={event=>pauseIfScrolledUp(event.currentTarget)}
         role="log"
         aria-label="Operation output"
         aria-live="polite"
@@ -1336,7 +1327,7 @@ function ActionLog({ actionId }: { actionId?: string }) {
           <ErrorNotice error={detail.error} />
         ) : (
           <>
-            {detail.data?.events.map((event) => (
+            {detail.data?.events.filter(event => event.message.toLowerCase().includes(logSearch.toLowerCase())).map((event) => (
               <div key={event.id} className={`log-line log-${event.level}`}>
                 <time>
                   {new Date(event.createdAt).toLocaleTimeString("en", {
@@ -1346,6 +1337,7 @@ function ActionLog({ actionId }: { actionId?: string }) {
                 <span>{event.message}</span>
               </div>
             ))}
+            {detail.data && detail.data.events.length > 0 && logSearch && !detail.data.events.some(event => event.message.toLowerCase().includes(logSearch.toLowerCase())) ? <p className="log-placeholder">No output matches your search.</p> : null}
             {detail.data && !detail.data.events.length ? (
               <p className="log-placeholder">
                 Waiting for the worker to pick up this operation...
@@ -1362,6 +1354,16 @@ function ActionLog({ actionId }: { actionId?: string }) {
           </>
         )}
       </div>
+      {detail.data?.action.type === "deploy" ? <details className="build-log-details" onToggle={()=>{if(followOutput && buildOutputRef.current)buildOutputRef.current.scrollTop=buildOutputRef.current.scrollHeight;}}>
+        <summary>Build output {buildLog.data?.truncated ? "(recent output)" : ""}</summary>
+        {buildLog.isPending ? <Spinner label="Loading build output" /> : buildLog.error ? <ErrorNotice error={buildLog.error} /> : buildLog.data?.available ? <pre ref={buildOutputRef} onScroll={event=>pauseIfScrolledUp(event.currentTarget)}>{buildLog.data.text ? buildLines || "No build output matches your search." : "Waiting for build output..."}</pre> : <p>Build output is not available for this operation.</p>}
+      </details> : null}
+      {canRedeploy ? <div className="historical-deploy-action"><button type="button" className="button button-small" disabled={busy || redeploy.isPending} onClick={()=>{redeploy.reset();setConfirmRedeploy(true);}}>Redeploy this version</button></div> : null}
+      {confirmRedeploy ? <FeatureModal title="Redeploy this version?" description="The selected image and its saved application configuration will be deployed." onClose={()=>setConfirmRedeploy(false)} dismissible={!redeploy.isPending}>
+        <p>This does not restore database contents, reverse migrations, or undo external changes. The image must still be available.</p>
+        <ErrorNotice error={redeploy.error} />
+        <div className="historical-deploy-actions"><button type="button" className="button" disabled={redeploy.isPending} onClick={()=>setConfirmRedeploy(false)}>Cancel</button><button type="button" className="button button-primary" disabled={redeploy.isPending} onClick={()=>redeploy.mutate()}>{redeploy.isPending ? "Queuing..." : "Redeploy version"}</button></div>
+      </FeatureModal> : null}
       <div className="log-footer">
         <span>Persisted operation history</span>
         {actionId ? <span className="mono">{shortId(actionId)}</span> : null}
@@ -1372,7 +1374,8 @@ function ActionLog({ actionId }: { actionId?: string }) {
 
 function ActivityPage() {
   const actions = useActions();
-  const [selected, setSelected] = useState<string | undefined>();
+  const { action: selected } = activityRoute.useSearch();
+  const navigate = useNavigate();
   return (
     <>
       <div className="page-heading">
@@ -1391,7 +1394,7 @@ function ActivityPage() {
       <ActionsTable
         actions={actions.data ?? []}
         loading={actions.isPending}
-        onSelect={(action) => setSelected(action.id)}
+        onSelect={(action) => void navigate({ to: "/activity", search: { action: action.id } })}
       />
       {selected ? (
         <div className="activity-log">
@@ -1491,10 +1494,13 @@ function SettingsPage() {
         </section>
       </div>
       {user.role === "admin" ? <UpdateSettings /> : null}
+      {user.role === "admin" ? <InstallationBackupSettings userId={user.id} /> : null}
+      {user.role === "admin" ? <GithubSettings /> : null}
       {user.role === "admin" ? <HostDomainSettings /> : null}
       {user.role === "admin" ? <HttpsSettings configured={runtime.data?.httpsConfigured === true} access={runtime.data?.httpsAccess} recoveryRequired={runtime.data?.ingressRecoveryRequired === true} busy={runtime.data?.ingressBusy === true} /> : null}
-      {user.role === "admin" ? <GithubSettings /> : null}
       <LocalPasswordSettings />
+      <TwoFactorSettings />
+      <ApiTokenSettings />
       {user.role === "admin" ? <CentralAccessSettings /> : null}
       <AccountLinkSettings />
       {user.role === "admin" ? <ProjectAccess /> : null}
@@ -1527,11 +1533,18 @@ const projectRoute = createRoute({
 const serviceRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/services/$serviceId",
+  validateSearch: (search: Record<string, unknown>): { tab?: ServiceTab; action?: string } => ({
+    tab: serviceTabs.find((item) => item.id === search.tab)?.id,
+    action: typeof search.action === "string" ? search.action : undefined,
+  }),
   component: ServicePage,
 });
 const activityRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/activity",
+  validateSearch: (search: Record<string, unknown>): { action?: string } => ({
+    action: typeof search.action === "string" ? search.action : undefined,
+  }),
   component: ActivityPage,
 });
 const settingsRoute = createRoute({

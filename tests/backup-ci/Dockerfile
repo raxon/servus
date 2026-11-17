@@ -13,8 +13,4 @@ COPY --from=dependencies /build/node_modules /app/node_modules
 COPY package.json /app/package.json
 COPY panel-dist /app/dist
 COPY apps/updater /work/apps/updater
-COPY tests/updater/test_backup.py /work/tests/updater/test_backup.py
-COPY tests/updater/test_update_coordinator.py /work/tests/updater/test_update_coordinator.py
-COPY tests/updater/test_updater.py /work/tests/updater/test_updater.py
-COPY tests/updater/test_runtime_policy.py /work/tests/updater/test_runtime_policy.py
-COPY tests/updater/test_supervisor.py /work/tests/updater/test_supervisor.py
+COPY tests/updater /work/tests/updater

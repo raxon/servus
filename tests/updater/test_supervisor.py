@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socket
 import stat
+import struct
 import shutil
 import subprocess
 import sys
@@ -236,6 +237,35 @@ class SupervisorTest(unittest.TestCase):
             with self.assertRaises(supervisor.SupervisorError): hub.drain(5000, ids)
         self.assertEqual(diagnostics.getvalue(), 'servus drain failure role=api outcome=invalid_response\n')
 
+    def test_registration_rejects_restarted_pid_even_when_container_and_cgroup_match(self):
+        changed = {**IDENTITIES, 'worker': {**IDENTITIES['worker'], 'pid': IDENTITIES['worker']['pid'] + 1}}
+        listener = mock.Mock(); channel, peer = socket.socketpair()
+        self.addCleanup(channel.close); self.addCleanup(peer.close)
+        listener.accept.return_value = (channel, None)
+        hub = supervisor.DrainHub(listener, TOKENS, 1000, POLICY, IDENTITIES)
+        with mock.patch.object(supervisor, 'inspect_servus', return_value=changed), \
+             mock.patch.object(supervisor, '_send_message') as send:
+            with self.assertRaisesRegex(supervisor.SupervisorError, 'Container identity changed'): hub.accept()
+        listener.accept.assert_not_called(); send.assert_not_called(); self.assertEqual(hub.connections, {})
+
+    def test_registration_rechecks_identity_after_authenticated_confirm_before_ready(self):
+        changed = {**IDENTITIES, 'worker': {**IDENTITIES['worker'], 'pid': IDENTITIES['worker']['pid'] + 1}}
+        connection = mock.Mock()
+        connection.getsockopt.return_value = struct.pack('3i', 456, 1000, 1000)
+        listener = mock.Mock(); listener.accept.return_value = (connection, None)
+        hub = supervisor.DrainHub(listener, TOKENS, 1000, POLICY, IDENTITIES)
+        challenge, fresh = '4' * 64, '5' * 64
+        confirm = supervisor._proof(TOKENS['worker'], 'client', 'worker', challenge, fresh)
+        messages = [{'version': 1, 'type': 'hello', 'role': 'worker', 'challenge': challenge},
+                    {'version': 1, 'type': 'hello_confirm', 'proof': confirm}]
+        with mock.patch.object(supervisor, 'inspect_servus', side_effect=[IDENTITIES, changed]), \
+             mock.patch.object(supervisor, '_cgroup', return_value=IDENTITIES['worker']['cgroup']), \
+             mock.patch.object(supervisor.secrets, 'token_hex', return_value=fresh), \
+             mock.patch.object(supervisor, '_read_message', side_effect=messages), mock.patch.object(supervisor, '_send_message') as send:
+            with self.assertRaisesRegex(supervisor.SupervisorError, 'Container identity changed'): hub.accept()
+        self.assertEqual([call.args[1]['type'] for call in send.call_args_list], ['hello_ack'])
+        connection.close.assert_called_once(); self.assertEqual(hub.connections, {})
+
     def test_legacy_recovery_scope_is_sent_only_to_authenticated_agent(self):
         hub=supervisor.DrainHub(mock.Mock(),TOKENS,1000,POLICY,IDENTITIES)
         hub.connections={role:mock.Mock() for role in supervisor.ROLES}
@@ -356,6 +386,23 @@ class SupervisorTest(unittest.TestCase):
                 os.close(fd)
             with self.assertRaises(supervisor.SupervisorError): lease.release_for_start()
 
+    def test_recovery_start_permits_boot_without_enabling_application_work(self):
+        operation = str(uuid.uuid4())
+        requests = {role: str(uuid.uuid4()) for role in supervisor.ROLES}
+        (self.gate / 'state').write_bytes(b'servus-lifecycle-v1 maintenance\n')
+        with supervisor.MaintenanceSupervisor(self.install, self.gate, self.journal) as owner:
+            fcntl.flock(owner.gate_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lease = supervisor.DrainLease(owner, operation, requests, 5000)
+            with self.assertRaises(supervisor.SupervisorError): lease.release_for_start(recovering=True)
+            for state in ('snapshotting', 'snapshot_verified', 'switching', 'starting'):
+                lease.record(state)
+            with self.assertRaises(supervisor.SupervisorError): lease.release_for_start(recovering=1)
+            self.assertEqual((self.gate / 'state').read_bytes(), b'servus-lifecycle-v1 maintenance\n')
+            lease.release_for_start(recovering=True)
+            self.assertEqual((self.gate / 'state').read_bytes(), b'servus-lifecycle-v1 recovering\n')
+            self.assertEqual(json.loads((self.journal / 'maintenance.json').read_bytes())['state'], 'starting')
+            with self.assertRaises(supervisor.SupervisorError): lease.release_for_start(recovering=True)
+
     def test_host_socket_and_credentials_are_root_owned_and_never_adopt_existing_socket(self):
         directory = self.root / 'control'
         directory.mkdir(mode=0o750); os.chown(directory, 0, 1000)
@@ -398,10 +445,10 @@ class SupervisorTest(unittest.TestCase):
                 'Mounts': [{'Type': kind, 'Source': source, 'Destination': dest, 'RW': rw}
                            for kind, source, dest, rw in POLICY.mounts_for(role)],
             })
-        def inspect(items, *, created=False, stopped=False):
+        def inspect(items, *, created=False, stopped=False, recovering=False):
             ids = ('\n'.join(item['Id'] for item in items) + '\n').encode()
             with mock.patch.object(supervisor, '_docker', side_effect=[ids, json.dumps(items).encode()]), mock.patch.object(supervisor, '_verify_data_directory'), mock.patch.object(supervisor, '_cgroup', side_effect=['/docker/' + item['Id'] for item in items]):
-                return supervisor.inspect_servus(POLICY, created=created, stopped=stopped)
+                return supervisor.inspect_servus(POLICY, created=created, stopped=stopped, recovering=recovering)
         self.assertEqual(set(inspect(records)), set(supervisor.ROLES))
         for mutation in (
             lambda x: x[0]['Config'].__setitem__('Entrypoint', ['node']),
@@ -438,6 +485,19 @@ class SupervisorTest(unittest.TestCase):
         stopped = copy.deepcopy(candidates)
         for item in stopped: item['State'].update({'Status':'exited','StartedAt':'2026-01-01T00:00:00Z'})
         self.assertEqual(set(inspect(stopped, stopped=True)), set(supervisor.ROLES))
+        mixed = copy.deepcopy(stopped)
+        mixed[0]['State'].update({'Status': 'running', 'Running': True, 'Pid': 123})
+        self.assertEqual(inspect(mixed, recovering=True), {role: {'id': item['Id']} for role, item in zip(supervisor.ROLES, mixed)})
+        with self.assertRaises(supervisor.SupervisorError): inspect(mixed, stopped=True)
+        with self.assertRaises(supervisor.SupervisorError): inspect(mixed, recovering=True, stopped=True)
+        for field, value in (('Status', 'restarting'), ('Paused', True), ('Restarting', True), ('Dead', True), ('Pid', 0), ('Running', 'true')):
+            changed = copy.deepcopy(mixed); changed[0]['State'][field] = value
+            with self.subTest(recovering_field=field), self.assertRaises(supervisor.SupervisorError): inspect(changed, recovering=True)
+        for mutate in (lambda item: item['HostConfig'].__setitem__('Privileged', True),
+                       lambda item: item['Config']['Env'].append('EXTRA=unapproved'),
+                       lambda item: item['Mounts'][0].__setitem__('RW', not item['Mounts'][0]['RW'])):
+            changed = copy.deepcopy(mixed); mutate(changed[0])
+            with self.assertRaises(supervisor.SupervisorError): inspect(changed, recovering=True)
         for field, value in (('Status','created'),('Pid',123),('Running',True),('Paused',True),('Restarting',True),('Dead',True)):
             changed = copy.deepcopy(stopped); changed[0]['State'][field] = value
             with self.subTest(stopped_field=field), self.assertRaises(supervisor.SupervisorError): inspect(changed, stopped=True)
@@ -498,7 +558,8 @@ r=json.loads(f.readline());send({'version':1,'type':'drain_result','requestId':r
                     os.setgroups([]); os.setgid(1000); os.setuid(1000)
                 child = subprocess.Popen([sys.executable, '-c', script, role, TOKENS[role], str(path)], preexec_fn=demote, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 children.append(child)
-                with mock.patch.object(supervisor, '_cgroup', return_value='/docker/' + CID):
+                with mock.patch.object(supervisor, '_cgroup', return_value='/docker/' + CID), \
+                     mock.patch.object(supervisor, 'inspect_servus', return_value=IDENTITIES):
                     self.assertEqual(hub.accept(), role)
             with mock.patch.object(supervisor, 'inspect_servus', return_value=IDENTITIES):
                 ids={role:str(uuid.uuid4()) for role in supervisor.ROLES}
@@ -540,7 +601,8 @@ await runSupervisorControl({role:%s,socketPath:%s,secretPath:%s,signal:controlle
                     os.setgroups([]); os.setgid(1000); os.setuid(1000)
                 child = subprocess.Popen(['/usr/local/bin/node', '--input-type=module', '-e', source], preexec_fn=demote, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 children.append(child)
-                with mock.patch.object(supervisor, '_cgroup', return_value='/docker/' + CID):
+                with mock.patch.object(supervisor, '_cgroup', return_value='/docker/' + CID), \
+                     mock.patch.object(supervisor, 'inspect_servus', return_value=IDENTITIES):
                     self.assertEqual(hub.accept(), role)
             with mock.patch.object(supervisor, 'inspect_servus', return_value=IDENTITIES):
                 hub.drain(5000, {role:str(uuid.uuid4()) for role in supervisor.ROLES})

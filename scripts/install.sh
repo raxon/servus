@@ -3,9 +3,20 @@ set -Eeuo pipefail
 umask 077
 servus_staging=
 servus_config_temp=
+servus_probe_container=
+servus_docker_config=
 
 fail() { printf 'Servus: %s\n' "$*" >&2; return 1; }
 log() { printf 'Servus: %s\n' "$*"; }
+trusted_docker() {
+  # Docker and Compose must not inherit host interpolation, context or plugin settings.
+  [[ -n $servus_docker_config ]] || fail 'Isolated Docker client configuration is unavailable.'
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DOCKER_CONFIG="$servus_docker_config" DOCKER_CONTEXT=default DOCKER_HOST=unix:///var/run/docker.sock /usr/bin/docker "$@"
+}
+prepare_docker_client() {
+  [[ ! -L $config_dir && $(stat -c '%u:%g:%a' "$config_dir") == 0:0:700 ]] || fail 'Configuration directory must be root-owned and mode 0700.'
+  servus_docker_config=$(mktemp -d "$config_dir/.docker-cli.XXXXXXXX")
+}
 print_success() {
   printf '\nConfigured panel origin: %s\nManagement listener: %s:%s\nOpen the configured origin to sign in, or create the first local administrator if setup is required.\nManage: docker compose --env-file %s -f %s/current/deployment/compose.yaml -p servus ps\n' "$1" "${4:-127.0.0.1}" "${5:-4180}" "$2" "$3"
 }
@@ -59,8 +70,10 @@ check_path_ancestors() {
   done
 }
 cleanup_staging() {
+  if [[ $servus_probe_container =~ ^[0-9a-f]{64}$ ]]; then trusted_docker rm "$servus_probe_container" >/dev/null 2>&1 || :; servus_probe_container=; fi
   if [[ -n $servus_staging ]]; then rm -rf -- "$servus_staging"; servus_staging=; fi
   if [[ -n $servus_config_temp ]]; then rm -f -- "$servus_config_temp"; servus_config_temp=; fi
+  if [[ -n $servus_docker_config ]]; then rm -rf -- "$servus_docker_config"; servus_docker_config=; fi
 }
 validate_image() { [[ $1 =~ ^ghcr\.io/raxon/servus@sha256:[0-9a-f]{64}$ ]] || fail 'Image must be ghcr.io/raxon/servus with a lowercase sha256 digest.'; }
 validate_ref() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$ && $1 != *..* && $1 != */ && $1 != *//* ]] || fail 'Invalid source ref.'; }
@@ -104,8 +117,8 @@ detect_platform() {
   [[ $os_codename =~ ^[a-z]+$ ]] || fail 'Missing or invalid distribution codename.'
   case "$(uname -m)" in x86_64|amd64) architecture=amd64;; aarch64|arm64) architecture=arm64;; *) fail 'Use an amd64 or arm64 VPS.';; esac
 }
-has_setting() { awk -F= -v key="$1" '$1 == key {found=1; exit} END {exit !found}' "$config_file"; }
 read_setting() { awk -F= -v key="$1" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$config_file"; }
+has_setting() { awk -F= -v key="$1" '$1 == key {found=1; exit} END {exit !found}' "$config_file"; }
 canonical_saved_origin() {
   local value=${1,,} scheme host port octet a b c d
   [[ $value =~ ^(https?)://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*)(:([0-9]{1,5}))?$ ]] || return 1
@@ -204,11 +217,324 @@ except (OSError, sqlite3.Error, ValueError):
     sys.exit(1)
 PYADMIN
 }
+prepare_lifecycle_gate() {
+  # This operates under install.lock. Lifecycle lock inodes must never be replaced.
+  python3 -I - "$config_dir" "$install_dir" <<'PYGATE'
+import fcntl, os, pathlib, stat, sys
+
+class Unsafe(Exception): pass
+
+def directory(path):
+    path = pathlib.PurePosixPath(path)
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            new = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd); fd = new
+            info = os.fstat(fd)
+            if info.st_uid != 0 or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+                raise Unsafe('Untrusted lifecycle ancestor')
+        return fd
+    except BaseException:
+        os.close(fd); raise
+
+def open_file(parent, name, mode):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != mode:
+        os.close(fd); raise Unsafe('Untrusted lifecycle file')
+    return fd
+
+def create_file(parent, name, value, mode):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+    try:
+        os.fchmod(fd, mode)
+        os.write(fd, value)
+        os.fsync(fd)
+    finally: os.close(fd)
+
+def exists(parent, name):
+    try: os.stat(name, dir_fd=parent, follow_symlinks=False); return True
+    except FileNotFoundError: return False
+
+try:
+    if os.geteuid() != 0: raise Unsafe('Lifecycle preparation requires root')
+    config = directory(sys.argv[1]); install = directory(sys.argv[2])
+    marker, gate = '.lifecycle-enabled-v1', 'lifecycle'
+    marked, present = exists(install, marker), exists(config, gate)
+    if marked != present: raise Unsafe('Incomplete lifecycle gate requires manual recovery')
+    content = b''
+    if exists(config, 'servus.env'):
+        env = open_file(config, 'servus.env', 0o600)
+        try: content = os.read(env, 65537)
+        finally: os.close(env)
+        if len(content) > 65536: raise Unsafe('Existing configuration is too large')
+        lifecycle = [line for line in content.splitlines() if line == b'SERVUS_LIFECYCLE_DIR' or line.startswith(b'SERVUS_LIFECYCLE_DIR=')]
+        expected = ('SERVUS_LIFECYCLE_DIR=' + sys.argv[1] + '/lifecycle').encode('ascii')
+        if len(lifecycle) > 1 or (lifecycle and lifecycle[0] != expected): raise Unsafe('Invalid existing lifecycle configuration')
+    if not marked:
+        # An existing lifecycle configuration must never be recreated as normal.
+        if exists(config, 'servus.env'):
+            if any(line == b'SERVUS_LIFECYCLE_DIR' or line.startswith(b'SERVUS_LIFECYCLE_DIR=') for line in content.splitlines()):
+                raise Unsafe('Existing lifecycle configuration requires manual recovery')
+            current = pathlib.Path(sys.argv[2]) / 'current' / 'deployment' / 'compose.yaml'
+            if not current.is_file() or '/run/servus-lifecycle' in current.read_text():
+                raise Unsafe('Existing lifecycle installation requires manual recovery')
+        os.mkdir(gate, 0o755, dir_fd=config)
+        gate_fd = os.open(gate, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=config)
+        try:
+            os.fchmod(gate_fd, 0o755)
+            create_file(gate_fd, 'lock', b'', 0o644)
+            create_file(gate_fd, 'state', b'servus-lifecycle-v1 normal\n', 0o644)
+            os.fsync(gate_fd); os.fsync(config)
+        finally: os.close(gate_fd)
+        create_file(install, marker, b'servus-lifecycle-v1\n', 0o600)
+        os.fsync(install)
+    marker_fd = open_file(install, marker, 0o600)
+    try:
+        if os.read(marker_fd, 64) != b'servus-lifecycle-v1\n': raise Unsafe('Unrecognized lifecycle marker')
+    finally: os.close(marker_fd)
+    gate_fd = os.open(gate, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=config)
+    try:
+        info = os.fstat(gate_fd)
+        if info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o755: raise Unsafe('Untrusted lifecycle directory')
+        lock = open_file(gate_fd, 'lock', 0o644)
+        try:
+            try: fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError: raise Unsafe('Lifecycle gate is locked for maintenance')
+            by_name = os.stat('lock', dir_fd=gate_fd, follow_symlinks=False)
+            by_fd = os.fstat(lock)
+            if (by_name.st_dev, by_name.st_ino) != (by_fd.st_dev, by_fd.st_ino): raise Unsafe('Lifecycle lock changed')
+            state = open_file(gate_fd, 'state', 0o644)
+            try:
+                if os.read(state, 128) != b'servus-lifecycle-v1 normal\n': raise Unsafe('Lifecycle gate is not in normal state')
+            finally: os.close(state)
+        finally: os.close(lock)
+    finally: os.close(gate_fd)
+    os.close(config); os.close(install)
+except (Unsafe, OSError, UnicodeError) as error:
+    print('Servus: Lifecycle gate rejected installation: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PYGATE
+}
+prepare_supervisor_credentials() {
+  # Install lock must cover provisioning; existing credentials are never rotated here.
+  python3 -I - "$config_dir" "$install_dir" <<'PYSUPERVISOR'
+import os, pathlib, re, secrets, stat, sys
+
+class Unsafe(Exception): pass
+
+def trusted_directory(path):
+    value = pathlib.PurePosixPath(path)
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in value.parts[1:]:
+            new = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd); fd = new
+            info = os.fstat(fd)
+            if info.st_uid != 0 or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX): raise Unsafe('Untrusted supervisor ancestor')
+        return fd
+    except BaseException:
+        os.close(fd); raise
+
+def exists(directory, name):
+    try: os.stat(name, dir_fd=directory, follow_symlinks=False); return True
+    except FileNotFoundError: return False
+
+def create_file(directory, name, data, mode, gid):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=directory)
+    try:
+        os.fchown(fd, 0, gid); os.fchmod(fd, mode)
+        written = 0
+        while written < len(data):
+            count = os.write(fd, data[written:])
+            if count <= 0: raise Unsafe('A supervisor file could not be written')
+            written += count
+        os.fsync(fd)
+    finally: os.close(fd)
+
+def open_file(directory, name, mode, gid):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != gid or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != mode:
+        os.close(fd); raise Unsafe('A supervisor file is unsafe')
+    return fd
+
+def child(directory, name, mode, gid):
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+    info = os.fstat(fd)
+    if info.st_uid != 0 or info.st_gid != gid or stat.S_IMODE(info.st_mode) != mode:
+        os.close(fd); raise Unsafe('A supervisor directory is unsafe')
+    return fd
+
+try:
+    if os.geteuid() != 0: raise Unsafe('Supervisor provisioning requires root')
+    config, install = trusted_directory(sys.argv[1]), trusted_directory(sys.argv[2])
+    secret_name, control_name, marker = 'supervisor-secrets', 'supervisor-control', '.supervisor-enabled-v1'
+    presence = [exists(config, name) for name in (secret_name, control_name, marker)]
+    if any(presence) and not all(presence): raise Unsafe('Incomplete supervisor provisioning requires recovery')
+    settings = []
+    if exists(config, 'servus.env'):
+        fd = open_file(config, 'servus.env', 0o600, 0)
+        try: content = os.read(fd, 65537)
+        finally: os.close(fd)
+        if len(content) > 65536: raise Unsafe('Existing configuration is too large')
+        settings = [line for line in content.splitlines() if line.split(b'=',1)[0] in (b'SERVUS_SUPERVISOR_CONTROL_DIR', b'SERVUS_SUPERVISOR_SECRET_DIR')]
+        expected = {('SERVUS_SUPERVISOR_CONTROL_DIR=' + sys.argv[1] + '/supervisor-control').encode('ascii'), ('SERVUS_SUPERVISOR_SECRET_DIR=' + sys.argv[1] + '/supervisor-secrets').encode('ascii')}
+        if settings and (len(settings) != 2 or set(settings) != expected): raise Unsafe('Existing supervisor configuration is invalid')
+    if not any(presence):
+        if settings: raise Unsafe('Existing supervisor provisioning requires recovery')
+        if exists(config, 'servus.env'):
+            compose = pathlib.Path(sys.argv[2]) / 'current' / 'deployment' / 'compose.yaml'
+            if not compose.is_file() or '/run/servus-supervisor' in compose.read_text(): raise Unsafe('Existing supervisor installation requires recovery')
+        os.mkdir(secret_name, 0o700, dir_fd=config)
+        secret_dir = child(config, secret_name, 0o700, 0)
+        try:
+            tokens = set()
+            for role in ('api', 'worker', 'agent'):
+                token = secrets.token_hex(32)
+                if token in tokens: raise Unsafe('Unable to provision distinct supervisor credentials')
+                tokens.add(token)
+                create_file(secret_dir, role, (token + '\n').encode('ascii'), 0o640, 1000)
+            os.fsync(secret_dir)
+        finally: os.close(secret_dir)
+        os.mkdir(control_name, 0o750, dir_fd=config)
+        control_dir = os.open(control_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=config)
+        try:
+            os.fchown(control_dir, 0, 1000); os.fchmod(control_dir, 0o750); os.fsync(control_dir)
+        finally: os.close(control_dir)
+        os.fsync(config)
+        create_file(config, marker, b'servus-supervisor-v1\n', 0o600, 0)
+        os.fsync(config)
+    marker_fd = open_file(config, marker, 0o600, 0)
+    try:
+        if os.read(marker_fd, 64) != b'servus-supervisor-v1\n': raise Unsafe('Invalid supervisor marker')
+    finally: os.close(marker_fd)
+    secret_dir = child(config, secret_name, 0o700, 0)
+    control_dir = child(config, control_name, 0o750, 1000)
+    try:
+        tokens = set()
+        for role in ('api', 'worker', 'agent'):
+            fd = open_file(secret_dir, role, 0o640, 1000)
+            try: raw = os.read(fd, 66)
+            finally: os.close(fd)
+            if not re.fullmatch(b'[a-f0-9]{64}\n', raw) or raw in tokens: raise Unsafe('A supervisor credential is unsafe')
+            tokens.add(raw)
+    finally:
+        os.close(secret_dir); os.close(control_dir)
+    os.close(config); os.close(install)
+except (Unsafe, OSError, UnicodeError) as error:
+    print('Servus: Supervisor provisioning was rejected: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PYSUPERVISOR
+}
+prepare_runtime() {
+  python3 -I "$1/apps/updater/provision-host.py" --runtime --config-dir "$config_dir" --install-dir "$install_dir" --install-lock-fd 9
+}
+require_supervisor_socket() {
+  python3 -I - "$config_dir/supervisor-control" <<'PYSOCKET'
+import os, socket, stat, sys
+try:
+    directory = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory)
+        if info.st_uid != 0 or info.st_gid != 1000 or stat.S_IMODE(info.st_mode) != 0o750: raise ValueError()
+        entry = os.stat('socket', dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISSOCK(entry.st_mode) or entry.st_uid != 0 or entry.st_gid != 1000 or stat.S_IMODE(entry.st_mode) != 0o660: raise ValueError()
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(2)
+            probe.connect('/proc/self/fd/' + str(directory) + '/socket')
+            current = os.stat('socket', dir_fd=directory, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (entry.st_dev, entry.st_ino): raise ValueError()
+        finally: probe.close()
+    finally: os.close(directory)
+except (OSError, ValueError):
+    print('Servus: A root-owned supervisor socket is required before starting the panel.', file=sys.stderr)
+    sys.exit(1)
+PYSOCKET
+}
+inspect_lifecycle_file() {
+  local container_id=$1 path=$2 mode=$3 expected=${4:-}
+  trusted_docker cp "$container_id:$path" - 2>/dev/null | python3 -I -c '
+import sys, tarfile
+try:
+    limit = 1048576 if sys.argv[1] == "script" else 16777216
+    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as archive:
+        member = archive.next()
+        if not member or not member.isfile() or member.size <= 0 or member.size > limit or (sys.argv[1] == "tool" and not member.mode & 0o111): raise ValueError()
+        source = archive.extractfile(member)
+        if source is None: raise ValueError()
+        data = source.read(limit + 1)
+        if len(data) != member.size or len(data) > limit or archive.next() is not None: raise ValueError()
+        if sys.argv[1] == "script":
+            with open(sys.argv[2], "rb") as expected: reference = expected.read(limit + 1)
+            if len(reference) > limit or data != reference: raise ValueError()
+except (OSError, ValueError, tarfile.TarError):
+    print("Servus: The image lifecycle component is invalid.", file=sys.stderr)
+    sys.exit(1)
+' "$mode" "$expected"
+}
+verify_lifecycle_image() {
+  local image=$1 expected=$2 staging=$3 container_id result=1 tool
+  [[ -f $expected && ! -L $expected ]] || fail 'The release does not include a regular lifecycle gate.'
+  trusted_docker image inspect --format '{{json .Config.Env}}' "$image" | head -c 65537 > "$staging/lifecycle-image-env.json" || fail 'Cannot inspect the lifecycle image environment.'
+  trusted_docker image inspect --format '{{json .Config.User}}' "$image" | head -c 1025 > "$staging/lifecycle-image-user.json" || fail 'Cannot inspect the lifecycle image user.'
+  python3 -I -c '
+import json, sys
+try:
+    with open(sys.argv[1], "rb") as stream: data = stream.read(1025)
+    if len(data) > 1024 or json.loads(data) != "node": raise ValueError()
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    print("Servus: The image user is invalid.", file=sys.stderr)
+    sys.exit(1)
+' "$staging/lifecycle-image-user.json" || return 1
+  python3 -I -c '
+import json, re, sys
+try:
+    with open(sys.argv[1], "rb") as stream: data = stream.read(65537)
+    if len(data) > 65536: raise ValueError()
+    values = json.loads(data)
+    if not isinstance(values, list): raise ValueError()
+    environment = {}
+    for item in values:
+        if not isinstance(item, str) or "=" not in item: raise ValueError()
+        key, value = item.split("=", 1)
+        if not key or key in environment: raise ValueError()
+        environment[key] = value
+    expected = {"PATH", "NODE_VERSION", "YARN_VERSION", "NODE_ENV", "PANEL_DATA_DIR", "PANEL_HOST", "PANEL_PORT"}
+    if set(environment) != expected: raise ValueError()
+    if environment["PATH"] != "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin": raise ValueError()
+    if not re.fullmatch(r"24\.[0-9]+\.[0-9]+", environment["NODE_VERSION"]) or not re.fullmatch(r"1\.[0-9]+\.[0-9]+", environment["YARN_VERSION"]): raise ValueError()
+    if environment["NODE_ENV"] != "production" or environment["PANEL_DATA_DIR"] != "/var/lib/panel" or environment["PANEL_HOST"] != "0.0.0.0" or environment["PANEL_PORT"] != "4180": raise ValueError()
+except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+    print("Servus: The image environment is invalid.", file=sys.stderr)
+    sys.exit(1)
+' "$staging/lifecycle-image-env.json" || return 1
+  container_id=$(trusted_docker create --network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 64 --entrypoint /bin/sh "$image" -c true) || fail 'Cannot inspect the lifecycle image.'
+  [[ $container_id =~ ^[0-9a-f]{64}$ ]] || fail 'Docker returned an invalid inspection container.'
+  servus_probe_container=$container_id
+  if inspect_lifecycle_file "$container_id" '/app/lifecycle-gate.sh' script "$expected"; then
+    result=0
+    if ! inspect_lifecycle_file "$container_id" '/app/dist/shared/supervisor-entrypoint.js' data; then result=1; fi
+    for tool in flock findmnt cmp stat; do
+      if ! inspect_lifecycle_file "$container_id" "/usr/bin/$tool" tool; then result=1; fi
+    done
+  fi
+  trusted_docker rm "$container_id" >/dev/null || fail 'Cannot remove the lifecycle inspection container.'
+  servus_probe_container=
+  (( result == 0 )) || fail 'The image lifecycle gate does not match the release.'
+}
+verify_lifecycle_compose() {
+  local env_file=$1 compose_file=$2 lifecycle_dir=$3 expected_image=$4 data_dir=$5 image_env_file=$6 control_dir=$7 secret_dir=$8 canonical_out=$9
+  trusted_docker compose --env-file "$env_file" -f "$compose_file" -p servus config --format json |
+    python3 -I "$source/apps/updater/validate-compose.py" "$lifecycle_dir" "$expected_image" "$data_dir" "$env_file" "$image_env_file" "$control_dir" "$secret_dir" "$canonical_out"
+}
 install_dependencies() {
   command -v apt-get >/dev/null || fail 'apt-get is required.'
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl python3 nodejs iproute2 util-linux
-  if ! command -v docker >/dev/null; then
+  if [[ ! -x /usr/bin/docker ]]; then
     install -d -m 0755 /etc/apt/keyrings
     curl --proto '=https' --tlsv1.2 -fsSL "https://download.docker.com/linux/$os_id/gpg" -o /etc/apt/keyrings/docker.asc
     chmod 0644 /etc/apt/keyrings/docker.asc
@@ -218,8 +544,8 @@ install_dependencies() {
   fi
   command -v systemctl >/dev/null || fail 'A systemd VPS is required.'
   systemctl enable --now docker
-  docker info >/dev/null
-  docker compose version >/dev/null || fail 'Docker Compose plugin is missing. Install docker-compose-plugin, then retry.'
+  trusted_docker info >/dev/null
+  trusted_docker compose version >/dev/null || fail 'Docker Compose plugin is missing. Install docker-compose-plugin, then retry.'
   [[ -S /var/run/docker.sock ]] || fail 'The system Docker socket /var/run/docker.sock is required.'
 }
 check_port() {
@@ -228,9 +554,9 @@ check_port() {
   [[ -n $listener ]] || return 0
   if [[ -f $install_dir/.servus-install ]]; then
     if [[ $role == api ]]; then
-      owned=$(docker ps --filter label=com.docker.compose.project=servus --filter label=com.docker.compose.service=api --filter "publish=$port" --format '{{.ID}}')
+      owned=$(trusted_docker ps --filter label=com.docker.compose.project=servus --filter label=com.docker.compose.service=api --filter "publish=$port" --format '{{.ID}}')
     else
-      owned=$(docker service inspect panel-ingress --format '{{index .Spec.Labels "panel.owner"}}' 2>/dev/null || true)
+      owned=$(trusted_docker service inspect panel-ingress --format '{{index .Spec.Labels "panel.owner"}}' 2>/dev/null || true)
       [[ $owned == self-hosted-panel ]] || owned=
     fi
   fi
@@ -267,8 +593,10 @@ with tarfile.open(archive, 'r:*') as source:
             target.chmod(0o755 if item.mode & 0o111 else 0o644)
 PY
 }
+
+
 main() {
-  unset SERVUS_TRUSTED_PROXY_SECRET PANEL_TRUSTED_PROXY_SECRET SERVUS_TRUSTED_PROXY_SECRET_FILE PANEL_TRUSTED_PROXY_SECRET_FILE SERVUS_ALLOWED_ORIGINS
+  unset SERVUS_TRUSTED_PROXY_SECRET PANEL_TRUSTED_PROXY_SECRET SERVUS_TRUSTED_PROXY_SECRET_FILE PANEL_TRUSTED_PROXY_SECRET_FILE SERVUS_ALLOWED_ORIGINS SERVUS_LIFECYCLE_DIR SERVUS_SUPERVISOR_CONTROL_DIR SERVUS_SUPERVISOR_SECRET_DIR SERVUS_UPDATER_SOCKET_DIR PANEL_UPDATER_SOCKET PANEL_UPDATER_APPLY_ENABLED PANEL_SUPERVISOR_SOCKET PANEL_SUPERVISOR_SECRET_FILE
   local proxy_secret= saved_origins=
   local dry_run=0 source_dir= hostname= image_ref= swarm_advertise_addr= ref_explicit=0 ref=${SERVUS_REF:-main} port=4180 ingress_port=80
   local install_dir=${SERVUS_INSTALL_DIR:-/opt/servus} config_dir=${SERVUS_CONFIG_DIR:-/etc/servus} data_dir=${SERVUS_DATA_DIR:-/var/lib/servus}
@@ -285,8 +613,8 @@ main() {
       *) fail "Unknown option: $1";;
     esac
   done
-  validate_host_domain_settings "$host_domain_api" "$host_domain_automatic"
   validate_port "$port"; validate_port "$ingress_port"
+  validate_host_domain_settings "$host_domain_api" "$host_domain_automatic"
   port=$((10#$port)); ingress_port=$((10#$ingress_port))
   [[ $port != "$ingress_port" ]] || fail 'Panel and application ingress need different ports.'
   validate_ref "$ref"
@@ -352,6 +680,8 @@ main() {
   [[ ! -e $install_dir/.bootstrap-verification-v1 && ! -L $install_dir/.bootstrap-verification-v1 ]] || fail 'An interrupted bootstrap verification requires recovery before installation.'
   [[ ! -e $install_dir/.legacy-migration-v1 && ! -L $install_dir/.legacy-migration-v1 ]] || fail 'An interrupted legacy migration requires recovery before installation.'
   [[ ! -e $install_dir/.lifecycle-enabled-v1 && ! -L $install_dir/.lifecycle-enabled-v1 ]] || fail 'A supervised installation must be managed through the panel updater.'
+  prepare_docker_client
+  trap cleanup_staging EXIT
   [[ ! -e $config_dir/servus-origin-migration.pending && ! -L $config_dir/servus-origin-migration.pending ]] || fail 'An unfinished origin migration requires recovery before installation.'
   [[ ! -L $config_dir/servus.env ]] || fail 'Configuration must not be a symlink.'
   if [[ $bind_address == 0.0.0.0 && ! -f $config_dir/servus.env ]]; then
@@ -368,17 +698,17 @@ main() {
   fi
   install_dependencies
   local existing_ingress
-  existing_ingress=$(docker service inspect panel-ingress --format '{{index .Spec.Labels "panel.owner"}}' 2>/dev/null || true)
+  existing_ingress=$(trusted_docker service inspect panel-ingress --format '{{index .Spec.Labels "panel.owner"}}' 2>/dev/null || true)
   if [[ -n $existing_ingress && ! -f $install_dir/.servus-install ]]; then fail 'A panel ingress service already exists. Use a fresh Docker host for this installation.'; fi
   [[ -z $existing_ingress || $existing_ingress == self-hosted-panel ]] || fail 'The existing panel-ingress service has a different owner.'
-  if [[ ! -f $install_dir/.servus-install && -n $(docker ps -a --filter label=com.docker.compose.project=servus --format '{{.ID}}') ]]; then fail 'A Compose project named servus already exists. Use a fresh Docker host.'; fi
+  if [[ ! -f $install_dir/.servus-install && -n $(trusted_docker ps -a --filter label=com.docker.compose.project=servus --format '{{.ID}}') ]]; then fail 'A Compose project named servus already exists. Use a fresh Docker host.'; fi
   printf 'servus-installer-v1\n' > "$install_dir/.servus-install"
   local config_file=$config_dir/servus.env
   if [[ -f $config_file ]]; then
     [[ $(read_setting SERVUS_PORT) == "$port" && $(read_setting SERVUS_INGRESS_PORT) == "$ingress_port" && $(read_setting SERVUS_DATA_DIR) == "$data_dir" ]] || fail 'Existing install uses different ports or data directory. Keep the original arguments when rerunning.'
     public_url=$(read_setting SERVUS_PUBLIC_URL)
     if has_setting SERVUS_HOST_DOMAINS_API_URL; then host_domain_api=$(read_setting SERVUS_HOST_DOMAINS_API_URL); fi
-    if has_setting SERVUS_HOST_DOMAINS_AUTOMATIC; then host_domain_automatic=$(read_setting SERVUS_HOST_DOMAINS_AUTOMATIC); fi
+    if [[ -n $(read_setting SERVUS_HOST_DOMAINS_AUTOMATIC) ]]; then host_domain_automatic=$(read_setting SERVUS_HOST_DOMAINS_AUTOMATIC); fi
     validate_host_domain_settings "$host_domain_api" "$host_domain_automatic"
     bind_address=$(read_setting SERVUS_BIND_ADDRESS)
     validate_origin "$public_url"
@@ -394,14 +724,14 @@ main() {
   fi
   hostname=${hostname:-127.0.0.1}; validate_host "$hostname"; hostname=${hostname,,}
   local swarm_state
-  swarm_state=$(docker info --format '{{.Swarm.LocalNodeState}}')
+  swarm_state=$(trusted_docker info --format '{{.Swarm.LocalNodeState}}')
   if [[ $swarm_state == inactive ]]; then
     if [[ -n $swarm_advertise_addr ]]; then
-      docker swarm init --advertise-addr "$swarm_advertise_addr" >/dev/null
+      trusted_docker swarm init --advertise-addr "$swarm_advertise_addr" >/dev/null
     else
-      docker swarm init >/dev/null
+      trusted_docker swarm init >/dev/null
     fi
-  elif [[ $(docker info --format '{{.Swarm.ControlAvailable}}') != true ]]; then
+  elif [[ $(trusted_docker info --format '{{.Swarm.ControlAvailable}}') != true ]]; then
     fail 'The Docker daemon is already joined to a Swarm as a worker. Use a manager or a fresh VPS.'
   fi
   public_url=${public_url:-http://$hostname:$port}
@@ -417,12 +747,11 @@ main() {
   release=$(date -u +%Y%m%d%H%M%S)-$$
   staging=$(mktemp -d "$install_dir/.staging.XXXXXXXX")
   servus_staging=$staging
-  trap cleanup_staging EXIT
   if [[ -n $image_ref ]]; then
     log "Pulling the pinned image $image_ref."
-    docker pull "$image_ref"
+    trusted_docker pull "$image_ref"
     local image_revision
-    image_revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_ref")
+    image_revision=$(trusted_docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_ref")
     [[ $image_revision == "$ref" ]] || fail 'Image revision label does not match the requested source commit.'
   fi
   install -d -m 0755 "$staging/source"
@@ -432,7 +761,7 @@ main() {
     curl --proto '=https' --tlsv1.2 -fSL "https://github.com/raxon/servus/archive/$ref.tar.gz" -o "$staging/source.tar.gz"
   fi
   extract_source "$staging/source.tar.gz" "$staging/source"
-  [[ -f $staging/source/apps/panel/package.json && -f $staging/source/deployment/compose.yaml && -f $staging/source/Dockerfile ]] || fail 'Downloaded revision has no Servus monorepo installer. Publish a compatible revision, then retry.'
+  [[ -f $staging/source/apps/panel/package.json && -f $staging/source/deployment/compose.yaml && -f $staging/source/deployment/compose-supervised.yaml && -f $staging/source/Dockerfile ]] || fail 'Downloaded revision has no Servus monorepo installer. Publish a compatible revision, then retry.'
   mv "$staging/source" "$install_dir/releases/$release"
   local source=$install_dir/releases/$release
   if [[ -z $source_dir && -z $image_ref && $ref_explicit == 0 && $ref == main ]]; then
@@ -446,24 +775,41 @@ main() {
   else
     image="servus:install-$release"
     log "Building $image from $ref. This can take several minutes."
-    docker build --label io.servus.installer=true -t "$image" "$source"
+    trusted_docker build --label io.servus.installer=true -t "$image" "$source"
   fi
-  if [[ ! -d $data_dir ]]; then install -d -m 0700 -o 1000 -g 1000 "$data_dir"; fi
-  [[ $(stat -c '%u' "$data_dir") == 1000 ]] || fail 'The data directory must belong to container UID 1000. Existing ownership was left unchanged.'
   local next_env=$staging/servus.env
-  printf 'SERVUS_IMAGE=%s\nSERVUS_DATA_DIR=%s\nSERVUS_PORT=%s\nSERVUS_INGRESS_PORT=%s\nSERVUS_DOCKER_GID=%s\nSERVUS_BIND_ADDRESS=%s\nSERVUS_PUBLIC_URL=%s\nSERVUS_ALLOWED_ORIGINS=%s\nSERVUS_SECURE_COOKIES=%s\nSERVUS_SOURCE_REF=%s\n' "$image" "$data_dir" "$port" "$ingress_port" "$socket_gid" "$bind_address" "$public_url" "$allowed_origins" "$secure_cookies" "$ref" > "$next_env"
+  printf 'SERVUS_IMAGE=%s\nSERVUS_DATA_DIR=%s\nSERVUS_PORT=%s\nSERVUS_INGRESS_PORT=%s\nSERVUS_DOCKER_GID=%s\nSERVUS_BIND_ADDRESS=%s\nSERVUS_PUBLIC_URL=%s\nSERVUS_ALLOWED_ORIGINS=%s\nSERVUS_SECURE_COOKIES=%s\nSERVUS_SOURCE_REF=%s\nSERVUS_LIFECYCLE_DIR=%s\nSERVUS_SUPERVISOR_CONTROL_DIR=%s\nSERVUS_SUPERVISOR_SECRET_DIR=%s\n' "$image" "$data_dir" "$port" "$ingress_port" "$socket_gid" "$bind_address" "$public_url" "$allowed_origins" "$secure_cookies" "$ref" "$config_dir/lifecycle" "$config_dir/supervisor-control" "$config_dir/supervisor-secrets" > "$next_env"
+  printf 'SERVUS_UPDATER_SOCKET_DIR=/run/servus-updater/control\n' >> "$next_env"
   printf 'SERVUS_HOST_DOMAINS_API_URL=%s\nSERVUS_HOST_DOMAINS_AUTOMATIC=%s\n' "$host_domain_api" "$host_domain_automatic" >> "$next_env"
   if [[ -n $proxy_secret ]]; then printf 'SERVUS_TRUSTED_PROXY_SECRET=%s\n' "$proxy_secret" >> "$next_env"; fi
-  docker compose --env-file "$next_env" -f "$source/deployment/compose.yaml" -p servus config --quiet
+  verify_lifecycle_image "$image" "$source/deployment/lifecycle-gate.sh" "$staging"
+  local canonical=$staging/compose-canonical.json canonical_check=$staging/compose-canonical-check.json
+  verify_lifecycle_compose "$next_env" "$source/deployment/compose-supervised.yaml" "$config_dir/lifecycle" "$image" "$data_dir" "$staging/lifecycle-image-env.json" "$config_dir/supervisor-control" "$config_dir/supervisor-secrets" "$canonical"
+  verify_lifecycle_compose "$next_env" "$canonical" "$config_dir/lifecycle" "$image" "$data_dir" "$staging/lifecycle-image-env.json" "$config_dir/supervisor-control" "$config_dir/supervisor-secrets" "$canonical_check"
+  cmp -s "$canonical" "$canonical_check" || fail 'The canonical Compose configuration is not stable.'
+  prepare_runtime "$source"
+  require_supervisor_socket
+  if [[ ! -d $data_dir ]]; then install -d -m 0700 -o 1000 -g 1000 "$data_dir"; fi
+  [[ $(stat -c '%u' "$data_dir") == 1000 ]] || fail 'The data directory must belong to container UID 1000. Existing ownership was left unchanged.'
   if [[ -f $config_file ]]; then
     old_env=$install_dir/releases/$release-previous.env
     (umask 077; cp "$config_file" "$old_env")
   fi
   local healthy=0
+  [[ ! -e $source/deployment/compose.template.yaml && ! -L $source/deployment/compose.template.yaml ]] || fail 'The release contains an unexpected Compose template.'
+  python3 -I - "$source/deployment" "$canonical" <<'PYCANONICAL'
+import os, sys
+directory = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    os.rename('compose-supervised.yaml', 'compose.template.yaml', src_dir_fd=directory, dst_dir_fd=directory)
+    os.replace(sys.argv[2], 'compose.yaml', dst_dir_fd=directory)
+    os.fsync(directory)
+finally: os.close(directory)
+PYCANONICAL
   servus_config_temp=$(mktemp "$config_dir/.servus.env.XXXXXXXX")
   cp "$next_env" "$servus_config_temp"; chmod 0600 "$servus_config_temp"
   mv -f "$servus_config_temp" "$config_file"; servus_config_temp=
-  if docker compose --env-file "$config_file" -f "$source/deployment/compose.yaml" -p servus up -d --remove-orphans && wait_panel_ready "$port"; then healthy=1; fi
+  if trusted_docker compose --env-file "$config_file" -f "$source/deployment/compose.yaml" -p servus up -d --remove-orphans && wait_panel_ready "$port"; then healthy=1; fi
   if (( ! healthy )); then
     if [[ -n $old_env ]]; then
       fail "Manual recovery required: the new panel did not become healthy. The previous image was not started because database compatibility is not verified. Database migrations are not rolled back. Previous configuration: $old_env. Inspect: docker compose --env-file $config_file -f $source/deployment/compose.yaml -p servus logs"

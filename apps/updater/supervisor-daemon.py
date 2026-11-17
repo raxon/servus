@@ -236,6 +236,7 @@ class HostApply:
 
     def recover_legacy_upload(self, operation_id, restore_id, service_id, hub, maintenance):
         """Run one scoped recovery; the daemon finalizer confirms fresh roles."""
+        self.assert_no_installation_backup(maintenance)
         if (not supervisor._uuid4(operation_id) or not isinstance(restore_id,str) or not re.fullmatch(r'[a-f0-9]{32}',restore_id) or
             not isinstance(service_id,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service_id) or
             not isinstance(hub,supervisor.DrainHub) or not isinstance(maintenance,supervisor.MaintenanceSupervisor)):
@@ -268,7 +269,236 @@ class HostApply:
             raise supervisor.SupervisorError('Ingress image differs from the approved installation')
         return tuple(current)
 
+    def _backup_module(self):
+        return self._load('servus_installation_backups', 'installation-backups.py', 0o644)
+
+    @staticmethod
+    def _backup_errors(*modules):
+        """Translate only declared operational errors from protected modules."""
+        errors = []
+        for module in modules:
+            for name in ('BackupError', 'CaptureError', 'QuiescenceError', 'UpdateError', 'ProvisionError', 'PolicyError'):
+                value = getattr(module, name, None)
+                if isinstance(value, type) and issubclass(value, Exception):
+                    errors.append(value)
+        return tuple(errors)
+
+    def installation_backup_active(self, maintenance):
+        """Read the protected scheduling fence while install.lock is held."""
+        module = self._backup_module()
+        try:
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                return journal.active()
+        except module.BackupError as error:
+            raise supervisor.SupervisorError('Installation backup requires local reconciliation') from error
+
+    def assert_no_installation_backup(self, maintenance):
+        if self.installation_backup_active(maintenance) is not None:
+            raise supervisor.SupervisorError('An installation backup must finish or be reconciled first')
+
+    def _backup_ready(self, maintenance):
+        """Exclude pending host writers as well as incomplete runtime updates."""
+        maintenance._verify_no_previous_operation()
+        fd = supervisor._open_root_file(maintenance.gate, 'state', 0o644)
+        try:
+            if os.read(fd, 64) != b'servus-lifecycle-v1 normal\n':
+                raise supervisor.SupervisorError('Installation startup gate is not normal')
+        finally:
+            os.close(fd)
+        _private_journal(self.approval_journal, 64 * 1024 * 1024)
+        uri = 'file:' + urllib.parse.quote(self.approval_journal, safe='/') + '?mode=ro'
+        try:
+            with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
+                queries = (
+                    "SELECT 1 FROM update_transactions WHERE phase!='completed' OR phase IS NULL LIMIT 1",
+                    "SELECT 1 FROM preparations WHERE status IN ('preparing','recovery_required') OR status IS NULL LIMIT 1",
+                    "SELECT 1 FROM extraction_probes WHERE status='intent' OR status IS NULL LIMIT 1",
+                    "SELECT 1 FROM policy_approvals WHERE state IN ('activating','recovery_required') OR state IS NULL LIMIT 1",
+                    "SELECT 1 FROM operations WHERE status IN ('accepted','verifying','recovery_required') OR status IS NULL LIMIT 1",
+                )
+                if any(db.execute(query).fetchone() for query in queries):
+                    raise supervisor.SupervisorError('Another host operation must finish before an installation backup')
+                if db.execute("SELECT 1 FROM apply_requests WHERE state!='completed' OR state IS NULL LIMIT 1").fetchone():
+                    raise supervisor.SupervisorError('An update request is still pending')
+                active = db.execute("SELECT p.status FROM policy_approvals a JOIN preparations p ON p.operation_id=a.operation_id WHERE a.state='active' AND a.source_env_path=?", (self.active_env,)).fetchall()
+                if active != [('completed',)]:
+                    raise supervisor.SupervisorError('The active installation has not completed health verification')
+            recovery_path = str(pathlib.Path(self.approval_journal).parent / 'legacy-recovery-requests.sqlite')
+            try:
+                _private_journal(recovery_path, 64 * 1024 * 1024)
+            except FileNotFoundError:
+                pass
+            else:
+                recovery_uri = 'file:' + urllib.parse.quote(recovery_path, safe='/') + '?mode=ro'
+                with closing(sqlite3.connect(recovery_uri, uri=True, timeout=2)) as recovery:
+                    if recovery.execute('PRAGMA user_version').fetchone() != (1,) or recovery.execute("SELECT 1 FROM requests WHERE state!='completed' OR state IS NULL LIMIT 1").fetchone():
+                        raise supervisor.SupervisorError('Legacy recovery must finish before an installation backup')
+        except sqlite3.Error as error:
+            raise supervisor.SupervisorError('The protected host operation journal is unavailable') from error
+
+    @staticmethod
+    def _backup_summary(record):
+        return {key: record[key] for key in ('operationId', 'actorId', 'name', 'state', 'createdAt', 'updatedAt', 'errorCode')}
+
+    def submit_installation_backup(self, receipt, api_token, maintenance):
+        module = self._backup_module()
+        try:
+            # Verify the exact receipt even when replaying an existing identity.
+            module.verify_approval(receipt, api_token)
+            self.ownership.assert_held(os.readlink('/proc/self/fd/' + str(self.ownership.directory)))
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                active = journal.active()
+                if active is None:
+                    self._backup_ready(maintenance)
+                    resolve_active_policy(self.approval_journal, self.active_env)
+                record = journal.request(receipt, api_token)
+                return self._backup_summary(record)
+        except module.BackupError as error:
+            raise supervisor.SupervisorError('Installation backup approval or scheduling was rejected') from error
+
+    def installation_backup_status(self, operation_id, maintenance):
+        module = self._backup_module()
+        try:
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                return self._backup_summary(journal.get(operation_id))
+        except module.BackupError as error:
+            raise supervisor.SupervisorError('Installation backup status is unavailable') from error
+
+    def cancel_installation_backup(self, receipt, api_token, maintenance):
+        module = self._backup_module()
+        try:
+            self.ownership.assert_held(os.readlink('/proc/self/fd/' + str(self.ownership.directory)))
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                return self._backup_summary(journal.cancel(receipt, api_token))
+        except module.BackupError as error:
+            raise supervisor.SupervisorError('Installation backup cancellation was rejected') from error
+
+    def recover_installation_backup(self, operation_id, maintenance):
+        """Explicit root CLI only; the public socket never dispatches recovery."""
+        module = self._backup_module()
+        node_fd = None
+        modules = {}
+        try:
+            modules = {name: self._load('servus_recover_backup_' + name.replace('-', '_'), name + '.py', 0o644)
+                       for name in ('backup', 'quiescence', 'update-coordinator', 'provision-host', 'runtime-policy')}
+            _, _, policy = resolve_active_policy(self.approval_journal, self.active_env)
+            ingress = self._current_ingress(modules['provision-host'], modules['runtime-policy'], policy.data_dir)
+            node_fd = self._node()
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                daemon = SimpleNamespace(resolve_active_policy=resolve_active_policy, approved_policy_binding=approved_policy_binding)
+                return module.recover_original_generation(journal, operation_id, self.ownership, self.approval_journal,
+                    self.active_env, supervisor, daemon, modules['quiescence'], modules['backup'],
+                    modules['update-coordinator'], node_fd, trusted_ingress=ingress)
+        except Exception as error:
+            if isinstance(error, self._backup_errors(module, *modules.values())):
+                raise supervisor.SupervisorError('Installation backup recovery requires local reconciliation') from error
+            raise
+        finally:
+            if node_fd is not None:
+                os.close(node_fd)
+
+    def capture_installation_backup(self, hub, maintenance):
+        """Capture only the requested operation after three fresh role channels."""
+        module = self._backup_module()
+        if (hub is None or hub.used or set(hub.connections) != set(supervisor.ROLES) or
+                select.select(list(hub.connections.values()), [], [], 0)[0]):
+            return False
+        node_fd = None
+        operation_id = None
+        drain_entered = False
+        modules = {}
+        try:
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                pending = journal.active()
+                if pending is None or pending['state'] != 'requested':
+                    return False
+                operation_id = pending['operationId']
+                self._backup_ready(maintenance)
+                control_dir = os.readlink('/proc/self/fd/' + str(self.ownership.directory))
+                self.ownership.assert_held(control_dir)
+                policy_path, accepted_env, policy = resolve_active_policy(self.approval_journal, self.active_env)
+                if policy != hub.policy:
+                    raise supervisor.SupervisorError('The approved installation generation changed')
+                binding = approved_policy_binding(hub, policy_path, self.approval_journal, accepted_env)
+                modules = {name: self._load('servus_snapshot_' + name.replace('-', '_'), name + '.py', 0o644)
+                           for name in ('backup', 'quiescence', 'update-coordinator', 'provision-host', 'runtime-policy')}
+                ingress = self._current_ingress(modules['provision-host'], modules['runtime-policy'], hub.policy.data_dir)
+                node_fd = self._node()
+                modules['update-coordinator'].preflight_external_containers(hub, supervisor, modules['quiescence'], trusted_ingress=ingress)
+                self._backup_ready(maintenance)
+                self.ownership.assert_held(control_dir)
+                daemon = SimpleNamespace(resolve_active_policy=resolve_active_policy, approved_policy_binding=approved_policy_binding)
+                journal.bind_generation(pending['operationId'], binding[:3],
+                                        {role: hub.identities[role]['id'] for role in supervisor.ROLES})
+                # __enter__ may persist maintenance intent before it yields.
+                drain_entered = True
+                with maintenance.drained_window(hub, pending['operationId'], policy_binding=binding) as lease:
+                    module.capture_stopped_snapshot(journal, pending['operationId'], lease, self.config['backupRoot'], node_fd,
+                                                   supervisor, modules['quiescence'], modules['backup'], modules['update-coordinator'], trusted_ingress=ingress)
+                    module.start_captured_snapshot(journal, pending['operationId'], lease, self.ownership, self.approval_journal,
+                                                  self.active_env, supervisor, daemon, modules['backup'], modules['update-coordinator'], node_fd)
+                return True
+        except BaseException as error:
+            if operation_id is not None:
+                try:
+                    with module.BackupJournal(maintenance, supervisor) as failed:
+                        current = failed.get(operation_id)
+                        if current['state'] == 'requested':
+                            if drain_entered:
+                                failed.transition(operation_id, 'requested', 'recovery_required', errorCode='resume_required')
+                            else:
+                                failed._locked()
+                                maintenance._verify_no_previous_operation()
+                                fd = supervisor._open_root_file(maintenance.gate, 'state', 0o644)
+                                try:
+                                    if os.read(fd, 64) != b'servus-lifecycle-v1 normal\n':
+                                        raise supervisor.SupervisorError('The startup gate requires reconciliation')
+                                finally:
+                                    os.close(fd)
+                                failed.transition(operation_id, 'requested', 'failed', errorCode='capture_failed')
+                                failed.clear_terminal(operation_id)
+                except Exception:
+                    # A different marker, changed journal or uncertain cleanup
+                    # retains its existing fence and never resets the gate.
+                    pass
+            if isinstance(error, self._backup_errors(module, *modules.values())):
+                raise supervisor.SupervisorError('Installation backup requires local reconciliation') from error
+            raise
+        finally:
+            if node_fd is not None:
+                os.close(node_fd)
+
+    def finalize_installation_backup(self, hub, maintenance, policy_path, accepted_env):
+        module = self._backup_module()
+        node_fd = None
+        modules = {}
+        try:
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                pending = journal.active()
+                if pending is None or pending['state'] not in ('starting', 'recovering', 'completed', 'failed'):
+                    return False
+                if (hub is None or hub.used or set(hub.connections) != set(supervisor.ROLES) or
+                        select.select(list(hub.connections.values()), [], [], 0)[0]):
+                    return False
+                control_dir = os.readlink('/proc/self/fd/' + str(self.ownership.directory))
+                self.ownership.assert_held(control_dir)
+                node_fd = self._node()
+                backup = self._load('servus_snapshot_final_backup', 'backup.py', 0o644)
+                coordinator = self._load('servus_snapshot_final_update', 'update-coordinator.py', 0o644)
+                modules = {'backup': backup, 'coordinator': coordinator}
+                daemon = SimpleNamespace(approved_policy_binding=approved_policy_binding)
+                return module.finalize_captured_snapshot(journal, hub, policy_path, self.approval_journal, accepted_env,
+                                                         supervisor, daemon, backup, coordinator, node_fd)
+        except Exception as error:
+            if isinstance(error, self._backup_errors(module, *modules.values())):
+                raise supervisor.SupervisorError('Installation backup finalization requires local reconciliation') from error
+            raise
+        finally:
+            if node_fd is not None:
+                os.close(node_fd)
+
     def __call__(self, operation_id, hub, maintenance):
+        self.assert_no_installation_backup(maintenance)
         modules = {name: self._load('servus_host_' + name.replace('-', '_'), name + '.py', 0o755 if name == 'servus-updater' else 0o644)
                    for name in ('servus-updater', 'update-coordinator', 'runtime-policy', 'extract-install', 'quiescence', 'backup', 'verify-release', 'provision-host')}
         node_fd = self._node()
@@ -483,12 +713,14 @@ def finalize_legacy_recovery(hub, operation, policy_path, approval_journal, acce
     return True
 
 
-def finalize_started_update(hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env):
+def finalize_started_update(hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env, *, backup_guard=None):
     """Finalize only a matching durable start after every new role reconnects."""
     if (hub is None or hub.used or set(hub.connections) != set(supervisor.ROLES) or
         select.select(list(hub.connections.values()), [], [], 0)[0]):
         return False
     with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
+        if backup_guard is not None:
+            backup_guard(operation)
         try:os.stat('legacy-upload-recovery.json',dir_fd=operation.journal,follow_symlinks=False)
         except FileNotFoundError:pass
         else:return finalize_legacy_recovery(hub,operation,policy_path,approval_journal,accepted_env)
@@ -513,9 +745,11 @@ def finalize_started_update(hub, install_dir, gate_dir, journal_dir, policy_path
 class DaemonOwnership:
     """Serialize daemon lifetimes and remove only proven abandoned sockets."""
 
-    def __init__(self, socket_dir, journal_dir, gid):
+    def __init__(self, socket_dir, journal_dir, gid, *, recovery_operation_id=None):
         self.directory = self.lock = None
         try:
+            if recovery_operation_id is not None and not supervisor._uuid4(recovery_operation_id):
+                raise supervisor.SupervisorError('Invalid installation backup recovery identity')
             self.directory = supervisor._trusted_directory(socket_dir, 0o750)
             if os.fstat(self.directory).st_gid != gid:
                 raise supervisor.SupervisorError('Invalid control directory group')
@@ -539,7 +773,18 @@ class DaemonOwnership:
                 except FileNotFoundError:
                     pass
                 else:
-                    raise supervisor.SupervisorError('Previous maintenance requires local reconciliation')
+                    if recovery_operation_id is None:
+                        raise supervisor.SupervisorError('Previous maintenance requires local reconciliation')
+                    fd = supervisor._open_root_file(journal, 'maintenance.json', 0o600)
+                    try:
+                        raw = os.read(fd, 16385)
+                        marker = json.loads(raw, object_pairs_hook=supervisor._pairs)
+                    finally:
+                        os.close(fd)
+                    if (len(raw) > 16384 or not isinstance(marker, dict) or
+                        set(marker) != {'version', 'operationId', 'state', 'requestIds', 'timeoutMs'} or
+                        type(marker['version']) is not int or marker['version'] != 1 or marker['operationId'] != recovery_operation_id):
+                        raise supervisor.SupervisorError('Maintenance belongs to another recovery')
             finally:
                 os.close(journal)
             self._remove_abandoned('socket', {(gid, 0o660), (0, 0o700), (gid, 0o700)})
@@ -694,7 +939,7 @@ def legacy_recovery_status(journal_dir,operation_id,restore_id,service_id):
     finally:os.close(directory)
 
 
-def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env, *, apply=None):
+def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env, *, apply=None, api_token=None):
     connection, _ = listener.accept()
     try:
         _, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
@@ -703,6 +948,32 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
         deadline = time.monotonic() + 5
         request = supervisor._read_message(connection, deadline)
         kind = request.get('type')
+        if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_status', 'installation_backup_active'):
+            fields = {'version', 'type', 'receipt'} if kind in ('installation_backup_submit', 'installation_backup_cancel') else {'version', 'type', 'operationId'} if kind == 'installation_backup_status' else {'version', 'type'}
+            if (set(request) != fields or type(request.get('version')) is not int or request['version'] != 1 or
+                    not isinstance(apply, HostApply) or
+                    (kind == 'installation_backup_status' and not supervisor._uuid4(request.get('operationId')))):
+                raise supervisor.SupervisorError('Invalid or unavailable installation backup command')
+            with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
+                if kind == 'installation_backup_active':
+                    response = {'version': 1, 'status': 'busy' if apply.installation_backup_active(operation) is not None else 'idle'}
+                elif kind == 'installation_backup_submit':
+                    record = apply.submit_installation_backup(request['receipt'], api_token, operation)
+                    response = {'version': 1, 'status': 'queued' if record['state'] == 'requested' else record['state'], 'backup': record}
+                elif kind == 'installation_backup_cancel':
+                    record = apply.cancel_installation_backup(request['receipt'], api_token, operation)
+                    response = {'version': 1, 'status': record['state'], 'backup': record}
+                else:
+                    try:
+                        record = apply.installation_backup_status(request['operationId'], operation)
+                    except FileNotFoundError:
+                        response = {'version': 1, 'status': 'not_found'}
+                    else:
+                        response = {'version': 1, 'status': record['state'], 'backup': record}
+            # Queue acknowledgement is sent before any drain. The daemon loop
+            # executes the approved operation only after this handler returns.
+            supervisor._send_message(connection, response, time.monotonic() + 1)
+            return
         if kind=='legacy_recovery_status' and set(request)=={'version','type','operationId','restoreId','serviceId'} and type(request.get('version')) is int and request['version']==1:
             status=legacy_recovery_status(journal_dir,request['operationId'],request['restoreId'],request['serviceId'])
             supervisor._send_message(connection,{'version':1,'status':status},time.monotonic()+1)
@@ -728,8 +999,11 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
                      and not select.select(list(hub.connections.values()), [], [], 0)[0])
             if ready:
                 try:
-                    with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir):
-                        ready = load_approved_policy(policy_path, approval_journal, accepted_env) == hub.policy
+                    with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
+                        ready = (load_approved_policy(policy_path, approval_journal, accepted_env) == hub.policy and
+                                 supervisor.inspect_servus(hub.policy) == hub.identities)
+                        if isinstance(apply, HostApply):
+                            apply.assert_no_installation_backup(operation)
                 except (supervisor.SupervisorError, OSError, ValueError):
                     ready = False
             supervisor._send_message(connection, {'version': 1, 'status': 'ready' if ready else 'waiting'}, time.monotonic() + 1)
@@ -754,6 +1028,8 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
                                             expected_operation_id=request['operationId'] if kind == 'complete' else None)
             if approved != hub.policy:
                 raise supervisor.SupervisorError('Active policy changed')
+            if isinstance(apply, HostApply):
+                apply.assert_no_installation_backup(operation)
             if kind == 'complete':
                 complete_healthy_preparation(hub, approval_journal, request['operationId'], policy_path, accepted_env, maintenance=operation)
                 result = 'completed'
@@ -775,6 +1051,31 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
         connection.close()
 
 
+def advance_installation_backup(host_apply, hub, install_dir, gate_dir, journal_dir, policy_path, accepted_env):
+    """An active backup owns finalization, including uncertain states."""
+    with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
+        pending = host_apply.installation_backup_active(operation)
+        if pending is None:
+            return False
+        if pending['state'] == 'requested':
+            host_apply.capture_installation_backup(hub, operation)
+        elif pending['state'] in ('starting', 'recovering', 'completed', 'failed'):
+            host_apply.finalize_installation_backup(hub, operation, policy_path, accepted_env)
+        return True
+
+
+def _backup_history_exists(journal_dir):
+    directory = supervisor._trusted_directory(journal_dir, 0o700)
+    try:
+        try:
+            os.stat('installation-backups', dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        os.close(directory)
+
+
 def run(args):
     if type(args.uid) is not int or args.uid <= 0 or type(args.gid) is not int or args.gid <= 0:
         raise supervisor.SupervisorError('Invalid component identity')
@@ -787,16 +1088,30 @@ def run(args):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        ownership = DaemonOwnership(args.socket_dir, args.journal_dir, args.gid)
+        recovery_id = getattr(args, 'recover_installation_backup', None)
+        ownership = (DaemonOwnership(args.socket_dir, args.journal_dir, args.gid, recovery_operation_id=recovery_id)
+                     if recovery_id is not None else DaemonOwnership(args.socket_dir, args.journal_dir, args.gid))
         active_env = getattr(args, 'active_env', None)
         apply_config = getattr(args, 'apply_config', None)
         host_apply = HostApply(apply_config, args.approval_journal, active_env, ownership) if apply_config else None
-        with supervisor.MaintenanceSupervisor(args.install_dir, args.gate_dir, args.journal_dir):
+        with supervisor.MaintenanceSupervisor(args.install_dir, args.gate_dir, args.journal_dir) as operation:
             if active_env:
                 policy_path, accepted_env, policy = resolve_active_policy(args.approval_journal, active_env)
             else:
                 policy_path, accepted_env = args.policy, args.accepted_env
                 policy = load_approved_policy(policy_path, args.approval_journal, accepted_env)
+            if policy.install_dir != args.install_dir or policy.gate_dir != args.gate_dir or policy.control_dir != args.socket_dir:
+                raise supervisor.SupervisorError('Policy paths do not match daemon configuration')
+            if host_apply is not None:
+                if recovery_id is not None:
+                    host_apply.recover_installation_backup(recovery_id, operation)
+                pending_backup = host_apply.installation_backup_active(operation)
+                permitted = ('requested', 'completed') if recovery_id is None else ('requested', 'starting', 'recovering', 'completed', 'failed')
+                if pending_backup is not None and (pending_backup['state'] not in permitted or
+                    recovery_id is not None and pending_backup['operationId'] != recovery_id):
+                    raise supervisor.SupervisorError('Previous installation backup requires local reconciliation')
+            elif recovery_id is not None or _backup_history_exists(args.journal_dir):
+                raise supervisor.SupervisorError('Installation backup history requires protected host configuration')
         if policy.install_dir != args.install_dir or policy.gate_dir != args.gate_dir or policy.control_dir != args.socket_dir:
             raise supervisor.SupervisorError('Policy paths do not match daemon configuration')
         tokens = endpoint.read_component_tokens(args.secret_dir, args.gid)
@@ -824,7 +1139,7 @@ def run(args):
                 continue
             if control in ready:
                 handle_command(control, hub, args.install_dir, args.gate_dir, args.journal_dir,
-                               policy_path, args.approval_journal, accepted_env, apply=host_apply)
+                               policy_path, args.approval_journal, accepted_env, apply=host_apply, api_token=tokens.get('api'))
                 if hub and hub.used:
                     hub.close()
                     hub = None
@@ -840,12 +1155,25 @@ def run(args):
                         hub.close()
                         hub = None
             if host_apply and hub and not hub.used and set(hub.connections) == set(supervisor.ROLES):
+                backup_handled = True
                 try:
-                    finalize_started_update(hub, args.install_dir, args.gate_dir, args.journal_dir,
-                                            policy_path, args.approval_journal, accepted_env)
+                    backup_handled = advance_installation_backup(host_apply, hub, args.install_dir, args.gate_dir,
+                                                                  args.journal_dir, policy_path, accepted_env)
                 except (supervisor.SupervisorError, OSError, ValueError, sqlite3.Error):
-                    # Health and channels may still settle; uncertain state never completes.
+                    # No update finalizer may consume a backup's receipt after
+                    # an uncertain read, capture or finalization outcome.
                     pass
+                if hub.used:
+                    hub.close()
+                    hub = None
+                elif not backup_handled:
+                    try:
+                        finalize_started_update(hub, args.install_dir, args.gate_dir, args.journal_dir,
+                                                policy_path, args.approval_journal, accepted_env,
+                                                backup_guard=host_apply.assert_no_installation_backup)
+                    except (supervisor.SupervisorError, OSError, ValueError, sqlite3.Error):
+                        # Health and channels may still settle; uncertain state never completes.
+                        pass
     finally:
         if hub:
             hub.close()
@@ -870,6 +1198,7 @@ def main():
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--active-env')
     parser.add_argument('--apply-config')
+    parser.add_argument('--recover-installation-backup', metavar='UUID')
     parser.add_argument('--uid', type=int, required=True)
     parser.add_argument('--gid', type=int, required=True)
     try:

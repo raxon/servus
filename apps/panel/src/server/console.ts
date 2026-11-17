@@ -63,6 +63,11 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
       if(socket.readyState===WebSocket.OPEN)socket.close(1000,'Console ended');
       if(upstream?.readyState===WebSocket.OPEN)upstream.close();else if(upstream?.readyState===WebSocket.CONNECTING)upstream.terminate();
     };
+    const hasAccess=()=>{
+      if(!ticket)return false;
+      const current=store.getSession(ticket.sessionToken),service=store.getService(ticket.serviceId);
+      return !!current && !!service && store.canAccess(current.user,service.projectId,true);
+    };
     cleanup.add(close);
     socket.on('error',close);socket.on('close',close);
     socket.on('message',(data,isBinary)=>{
@@ -96,8 +101,7 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
         checkSession=setInterval(()=>{
           try {
             if(closed)return;
-            const current=store.getSession(activeTicket.sessionToken);
-            if(!current||!store.canAccess(current.user,store.getService(activeTicket.serviceId)?.projectId??'',true))close();
+            if(!hasAccess())close();
           } catch {if(socket.readyState===WebSocket.OPEN)socket.close(1011,'Console is unavailable');close();}
         },1000);
         const upstreamFailed=()=>{if(socket.readyState===WebSocket.OPEN)socket.close(1011,'Console is unavailable');close();};
@@ -111,10 +115,17 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
             phase='ready';clearTimeout(timeout);releasePending();socket.send(JSON.stringify({type:'ready'}),error=>{if(error)close();});
           } catch {upstreamFailed();}
         });
-        upstream.on('message',(chunk,binary)=>{if(socket.readyState===WebSocket.OPEN)socket.send(chunk,{binary});});
+        upstream.on('message',(chunk,binary)=>{
+          try {
+            if(closed)return;
+            if(!hasAccess()){close();return;}
+            if(socket.readyState===WebSocket.OPEN)socket.send(chunk,{binary});
+          } catch {upstreamFailed();}
+        });
         return;
       }
       const valid=terminalInput.safeParse(parsed);if(!valid.success){socket.close(1008,'Invalid terminal command');return;}
+      if(!hasAccess()){close();return;}
       const encoded=JSON.stringify(valid.data);
       if(upstream?.readyState===WebSocket.OPEN)upstream.send(encoded);
       else socket.close(1008,'Console is not ready');
@@ -143,6 +154,8 @@ export function registerConsole(app:FastifyInstance,options:ConsoleOptions) {
       try{
         const result=await options.runtimeRequest<import('../shared/types.js').ServiceLogs>(`/services/${req.params.id}/logs?tail=200${cursor?`&since=${encodeURIComponent(cursor)}`:''}`);
         if(ended)return;
+        const current=store.getSession(req.cookies.panel_session!),currentService=store.getService(req.params.id);
+        if(!current||!currentService||!store.canAccess(current.user,currentService.projectId)){close();return;}
         const lines=result.lines.filter(line=>!seen.has(line));
         for(const line of lines){seen.add(line);if(seen.size>1000)seen.delete(seen.values().next().value!);}
         const last=result.lines.at(-1)?.match(/^(\d{4}-\d\d-\d\dT[^ ]+Z)/)?.[1];cursor=last??before;

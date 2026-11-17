@@ -8,6 +8,9 @@ import type Docker from 'dockerode';
 import { DockerRuntime, OWNER, type RecoveryContext } from '../../src/agent/runtime.js';
 import { createAgent } from '../../src/agent/app.js';
 import { SecretVault } from '../../src/shared/secrets.js';
+import { HttpsMigrationJournal } from '../../src/agent/https-migration-journal.js';
+import { migrateManagedHttps } from '../../src/agent/https-migration-run.js';
+import * as builds from '../../src/agent/build.js';
 import type { Service } from '../../src/shared/types.js';
 
 const cleanup: (() => Promise<void> | void)[] = [];
@@ -53,6 +56,93 @@ function harness(initial: Docker.ServiceSpec | null) {
   return { runtime, client, updates, probe, current: () => current, setCurrent: (value: Docker.ServiceSpec | null) => { current = value; }, setUpdate: (value: string) => { updateState = value; } };
 }
 
+it('does not replace an existing route when HTTPS redirect has no deployed HTTPS route',async()=>{
+  const h=harness(spec());
+  h.client.info=vi.fn(async()=>({Swarm:{NodeID:'a'.repeat(25)}}));
+  vi.spyOn(h.runtime as any,'managedHttpsConfigured').mockResolvedValue('direct');
+  const value=service();value.domains=[{hostname:'app.example.com',port:80,https:true,redirectHttps:true}];
+  await expect(h.runtime.apply(value,'deploy',randomUUID())).rejects.toThrow('Deploy HTTPS for app.example.com');
+  expect(h.updates).toHaveLength(0);
+});
+
+it('rechecks HTTPS redirect safety when a recorded target was not applied before restart',async()=>{
+  const old=spec(),h=harness(old),value=service();
+  value.domains=[{hostname:'app.example.com',port:80,https:true,redirectHttps:true}];
+  h.client.info=vi.fn(async()=>({Swarm:{NodeID:'a'.repeat(25)}}));
+  vi.spyOn(h.runtime as any,'managedHttpsConfigured').mockResolvedValue('direct');
+  const recovery:RecoveryContext={previousRecorded:true,previousSpec:old,targetSpec:spec(2,'new'),stage:'applying',previousError:null,recordPrevious:vi.fn(),recordTarget:vi.fn(),beginRollback:vi.fn()};
+  await expect(h.runtime.apply(value,'deploy','new',recovery)).rejects.toThrow('Deploy HTTPS for app.example.com');
+  expect(h.updates).toHaveLength(0);
+});
+
+it('preserves the running application when building a new Git revision fails',async()=>{
+  const old=spec(),h=harness(old),value=service();
+  value.source={type:'git',repository:'https://github.com/example/app',branch:'main',context:'.',dockerfile:'Dockerfile'};
+  const build=vi.spyOn(builds,'buildSource').mockRejectedValue(new Error('Dockerfile build failed'));
+  try {
+    await expect(h.runtime.apply(value,'deploy',randomUUID())).rejects.toThrow('Dockerfile build failed');
+    expect(h.updates).toHaveLength(0);
+    expect(h.current()).toEqual(old);
+  } finally {build.mockRestore();}
+});
+
+it('checks the HTTPS application route instead of its HTTP redirect',async()=>{
+  const h=harness(spec()),target=spec();
+  target.Labels={...target.Labels,
+    'traefik.http.routers.route.rule':'Host(`app.example.com`)',
+    'traefik.http.routers.route.middlewares':'route-redirect',
+    'traefik.http.middlewares.route-redirect.redirectscheme.scheme':'https',
+    'traefik.http.routers.route-https.rule':'Host(`app.example.com`)',
+  };
+  delete target.Labels['traefik.http.routers.test.rule'];
+  await (h.runtime as any).verifyService(target,'service');
+  expect(h.probe).toHaveBeenCalledTimes(1);
+  expect(h.probe).toHaveBeenCalledWith('app.example.com',true);
+});
+
+it('recovers an interrupted ingress migration before accepting requests',async()=>{
+  const old: Docker.ServiceSpec={Name:'panel-ingress',TaskTemplate:{ContainerSpec:{Image:'traefik',Args:['--old']}},Mode:{Replicated:{Replicas:1}}};
+  const target=structuredClone(old);target.TaskTemplate!.ContainerSpec!.Args=['--new'];
+  const h=harness(target),config={dataDir:h.runtime.dataDir,token:'token',socketPath:join(h.runtime.dataDir,'agent.sock'),dockerSocket:'/never-connect',ingressPort:18080,ingressImage:'unused'};
+  const initial=await createAgent(config,h.runtime);await initial.close();
+  const db=new Database(join(config.dataDir,'agent.sqlite')),vault=new SecretVault(config.dataDir);
+  new HttpsMigrationJournal(db,value=>vault.seal(value),value=>vault.open(value)).begin(old,target);db.close();
+  let current=target,version=1;
+  h.client.getService=()=>({inspect:async()=>({Spec:structuredClone(current),Version:{Index:version},UpdateStatus:{State:'completed'}}),update:async(value:Docker.ServiceSpec & {version:number})=>{const {version:expected,...saved}=value;expect(expected).toBe(version);current=saved;version++;}});
+  h.client.listTasks=async()=>[{Spec:current.TaskTemplate,Status:{State:'running',ContainerStatus:{ContainerID:'id'}}}];
+  h.client.getContainer=()=>({inspect:async()=>({State:{Running:true}})});
+  const app=await createAgent(config,h.runtime);cleanup.push(()=>app.close());
+  expect(current).toEqual(old);
+  const check=new Database(join(config.dataDir,'agent.sqlite'));
+  expect(check.prepare("SELECT COUNT(*) AS count FROM operations WHERE state='running'").get()).toEqual({count:0});check.close();
+});
+
+it('checks host port 443 before touching an existing ingress',async()=>{
+  const old:Docker.ServiceSpec={Name:'panel-ingress',Labels:{'panel.owner':OWNER},Mode:{Replicated:{Replicas:1}},TaskTemplate:{Placement:{Constraints:['node.role==manager']},ContainerSpec:{Image:'traefik',Args:['--providers.swarm.endpoint=unix:///var/run/docker.sock','--providers.swarm.exposedbydefault=false','--providers.swarm.network=panel-ingress','--entrypoints.web.address=:8080','--api.dashboard=false','--log.level=WARN'],Mounts:[{Type:'bind',Source:'/var/run/docker.sock',Target:'/var/run/docker.sock',ReadOnly:true}]}},EndpointSpec:{Ports:[{Protocol:'tcp',PublishedPort:80,TargetPort:8080,PublishMode:'host'}]}};
+  old.TaskTemplate!.Networks=[{Target:'n'.repeat(25)}];
+  const h=harness(old);(h.runtime as {ingressPort:number}).ingressPort=80;
+  h.client.getNetwork=vi.fn(()=>({inspect:async()=>({Id:'n'.repeat(25),Driver:'overlay',Attachable:true,Labels:{'panel.owner':OWNER}})}));
+  const config={dataDir:h.runtime.dataDir,token:'token',socketPath:join(h.runtime.dataDir,'agent.sock'),dockerSocket:'/never-connect',ingressPort:80,ingressImage:'unused'};
+  const app=await createAgent(config,h.runtime);await app.close();
+  h.runtime.vault.setHttpsIngress('ops@example.com',false);
+  h.client.info=vi.fn(async()=>({Swarm:{ControlAvailable:true,NodeID:'a'.repeat(25)}}));
+  h.client.getContainer=()=>({inspect:async()=>({State:{Running:true}})});
+  const db=new Database(join(config.dataDir,'agent.sqlite')),vault=h.runtime.vault;
+  const journal=new HttpsMigrationJournal(db,value=>vault.seal(value),value=>vault.open(value));
+  const probe={localAgentImage:async()=>`sha256:${'a'.repeat(64)}`,hostTcpPortAvailable:async()=>false};
+  await expect(migrateManagedHttps(h.runtime,journal,()=>{},probe)).rejects.toThrow('Port 443 is already in use');
+  expect(h.updates).toHaveLength(0);expect(journal.load()).toBeUndefined();db.close();
+});
+
+it('refuses HTTPS deployment when the ingress is not configured, before touching the service',async()=>{
+  const h=harness(spec());
+  h.client.info=vi.fn().mockResolvedValue({Swarm:{NodeID:'a'.repeat(25)}});
+  const saved={...service(),domains:[{hostname:'app.example.com',port:80,https:true}]};
+  await expect(h.runtime.apply(saved,'deploy',randomUUID())).rejects.toThrow('Automatic HTTPS ingress is not configured');
+  expect(h.updates).toHaveLength(0);
+  expect(h.client.createService).not.toHaveBeenCalled();
+});
+
 describe('target revision readiness', () => {
   it('does not accept the old running task during an unsettled update', async () => {
     const target = spec(2, 'new'), h = harness(target);
@@ -89,6 +179,41 @@ describe('target revision readiness', () => {
   });
 });
 
+it('adds HTTPS only for requested domains while preserving application HTTP routes',async()=>{
+  const h=harness(null),saved=service(),node='a'.repeat(25);
+  saved.domains=[{hostname:'app.example.com',port:3000,https:true},{hostname:'other.example.com',port:8080}];
+  h.client.info=vi.fn().mockResolvedValue({Swarm:{NodeID:node}});
+  h.client.getVolume=vi.fn().mockReturnValue({inspect:async()=>({Driver:'local',Labels:{'panel.owner':'self-hosted-panel','panel.purpose':'acme'}})});
+  const ingress={Labels:{'panel.owner':'self-hosted-panel','panel.https':'servus-acme-v1'},Mode:{Replicated:{Replicas:1}},TaskTemplate:{Placement:{Constraints:[`node.id==${node}`]},ContainerSpec:{Args:['--entrypoints.web.address=:8080','--entrypoints.websecure.address=:8443','--certificatesresolvers.servus.acme.storage=/letsencrypt/acme.json','--certificatesresolvers.servus.acme.httpchallenge.entrypoint=web'],Mounts:[{Type:'volume',Source:'servus-acme',Target:'/letsencrypt',ReadOnly:false}]}},EndpointSpec:{Ports:[{Protocol:'tcp',PublishedPort:443,TargetPort:8443,PublishMode:'host'}]}};
+  const original=h.client.getService;
+  h.client.getService=(name:string)=>name==='panel-ingress'?{inspect:async()=>({Spec:ingress})}:original(name);
+  await h.runtime.apply(saved,'deploy',randomUUID());
+  const key=saved.id.replaceAll('-','');const labels=h.current()!.Labels!;
+  expect(labels[`traefik.http.routers.${key}-0.rule`]).toBe('Host(`app.example.com`)');
+  expect(labels[`traefik.http.routers.${key}-0-https.rule`]).toBe('Host(`app.example.com`)');
+  expect(labels[`traefik.http.routers.${key}-0-https.tls.certresolver`]).toBe('servus');
+  expect(labels[`traefik.http.routers.${key}-1.rule`]).toBe('Host(`other.example.com`)');
+  expect(labels[`traefik.http.routers.${key}-1-https.rule`]).toBeUndefined();
+});
+
+it('redeploys a verified immutable local image without rebuilding a moving Git branch',async()=>{
+  const h=harness(null),saved=service(),digest='sha256:'+'1'.repeat(64),commit='a'.repeat(40);
+  saved.source={type:'git',repository:'https://github.com/example/app.git',branch:'main',context:'.',dockerfile:'Dockerfile'};
+  saved.rollbackImage=digest;saved.rollbackCommit=commit;
+  h.client.getImage=vi.fn().mockReturnValue({inspect:async()=>({Id:digest})});
+  const result=await h.runtime.apply(saved,'deploy',randomUUID());
+  expect(result.imageDigest).toBe(digest);expect(result.sourceCommit).toBe(commit);
+  expect(h.runtime.pull).not.toHaveBeenCalled();
+  expect((h.current()?.TaskTemplate as Docker.ContainerTaskSpec).ContainerSpec?.Image).toBe(digest);
+  expect(h.current()?.Labels?.['panel.sourceCommit']).toBe(commit);
+});
+it('rejects a historical image when its identity does not match',async()=>{
+  const h=harness(null),saved=service();saved.rollbackImage='sha256:'+'1'.repeat(64);
+  h.client.getImage=vi.fn().mockReturnValue({inspect:async()=>({Id:'sha256:'+'2'.repeat(64)})});
+  await expect(h.runtime.apply(saved,'deploy',randomUUID())).rejects.toThrow('historical image cannot be verified');
+  expect(h.client.createService).not.toHaveBeenCalled();
+});
+
 describe('deployment and lifecycle recovery', () => {
   it.each(['start', 'restart'])('rejects %s when the runtime is absent without deploying unpublished settings', async type => {
     const h = harness(null);
@@ -105,7 +230,7 @@ describe('deployment and lifecycle recovery', () => {
     const target = h.updates[0]!;
     expect(target.Mode?.Replicated?.Replicas).toBe(2);
     expect((target.TaskTemplate as Docker.ContainerTaskSpec).ContainerSpec?.Image).toBe('image-1@sha256:digest');
-    expect(h.probe).toHaveBeenCalledWith('old.localhost');
+    expect(h.probe).toHaveBeenCalledWith('old.localhost',false);
   });
   it('sets task revision identity and requires the requested initial replicas', async () => {
     const h = harness(null), saved = service(); saved.replicas = 2;

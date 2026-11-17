@@ -383,7 +383,7 @@ describe('v1 to v2 migration',()=>{
     db.prepare('INSERT INTO actions VALUES (?,?,?,?,?,?,?,?,?,?,?)').run('legacy-action','legacy','service','admin','deploy','queued','queued',null,'2026-01-01','2026-01-01',null);
     db.prepare('INSERT INTO jobs(id,action_id,service_id,snapshot,status,created_at) VALUES (?,?,?,?,?,?)').run('legacy-job','legacy-action','service',JSON.stringify(legacySnapshot),'queued','2026-01-01');
     db.close();const store=new Store(dir);cleanup.push(async()=>store.close());
-    expect(store.db.pragma('user_version',{simple:true})).toBe(5);expect(store.getProject('legacy')!.description).toBe('existing data');expect(store.getService('service')!.kind).toBe('app');
+    expect(store.db.pragma('user_version',{simple:true})).toBe(8);expect(store.getProject('legacy')!.description).toBe('existing data');expect(store.getService('service')!.kind).toBe('app');
     const recovered=store.claimNextJob('migration-worker',60000)!;expect(recovered.actionId).toBe('legacy-action');expect(recovered.snapshot).toEqual(legacySnapshot);
     expect(store.updateService('service',{expectedRevision:1,environment:[{name:'TOKEN',secret:true,value:'migration-secret-123'}]}).environment![0]!.secretRef).toBeTruthy();
   });
@@ -410,4 +410,149 @@ it('checks a saved Git source only for authorized editors and never returns cred
   expect(store.getService(service.id)?.source).toMatchObject({branch:'main',context:'.'});
   expect((await app.inject({method:'POST',url,headers,payload:{...candidate,context:'../escape'}})).statusCode).toBe(400);
   expect((await app.inject({method:'POST',url,headers,payload:{...candidate,repository:'https://github.com/other/repo.git'}})).statusCode).toBe(403);
+});
+
+it('requires edit access and validates domains before any DNS query',async()=>{
+  const {app,headers,create,store}=await fixture();
+  const {service}=(await create(appInput)).json();
+  const url=`/api/v1/services/${service.id}/check-domain-dns`;
+  expect((await app.inject({method:'POST',url,headers:{cookie:headers.cookie},payload:{hostname:'example.com'}})).statusCode).toBe(403);
+  const viewer=store.createUser('dns-viewer@example.test',await hashPassword('viewer-testing-password'));store.addMember(service.projectId,viewer.id,'viewer');const session=store.createSession(viewer.id);
+  expect((await app.inject({method:'POST',url,headers:{cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken},payload:{hostname:'example.com'}})).statusCode).toBe(404);
+  for(const hostname of ['127.0.0.1','localhost','https://example.com']) expect((await app.inject({method:'POST',url,headers,payload:{hostname}})).statusCode).toBe(400);
+});
+
+it('compares saved configuration to the actual deployed snapshot without exposing values',async()=>{
+  const {app,headers,create,store}=await fixture();
+  const secret='never-display-this-secret';
+  const {service}=(await create({...appInput,environment:[{name:'TOKEN',secret:true,value:secret}]})).json();
+  const url=`/api/v1/services/${service.id}/configuration-changes`;
+  expect((await app.inject({method:'GET',url,headers})).json()).toEqual({status:'not_deployed',sections:[]});
+  finishFirst(store);
+  const patched=await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:1,image:'nginx:stable',domains:[{hostname:'new.example.com',port:80,https:true,primary:true}],environment:[{name:'TOKEN',secret:true,value:'another-secret'}]}});
+  expect(patched.statusCode).toBe(200);
+  const result=await app.inject({method:'GET',url,headers});expect(result.statusCode).toBe(200);
+  expect(result.json()).toEqual({status:'available',sections:['Source','Domains','Environment'],deployedPrimaryDomain:{hostname:'advanced.localhost',port:80,primary:true}});
+  expect(result.body).not.toContain(secret);expect(result.body).not.toContain('another-secret');expect(result.body).not.toContain('nginx:stable');
+  store.db.prepare("UPDATE services SET deployed_revision=999 WHERE id=?").run(service.id);
+  expect((await app.inject({method:'GET',url,headers})).json()).toEqual({status:'unavailable',sections:[]});
+});
+
+it('validates HTTPS domains without affecting existing HTTP-only sources',async()=>{
+  const {create}=await fixture();
+  for(const hostname of ['localhost','bad.localhost','127.0.0.1']) {
+    const result=await create({...appInput,domains:[{hostname,port:80,https:true}]},`https-${hostname}`);
+    expect(result.statusCode).toBe(400);
+  }
+  const result=await create({...appInput,domains:[{hostname:'app.example.com',port:80,https:true}]},'https-valid');
+  expect(result.statusCode).toBe(202);expect(result.json().service.domains[0].https).toBe(true);
+});
+
+it('restricts managed certificate inspection to saved HTTPS domains and never forwards private data',async()=>{
+  let result:unknown={status:'active',notBefore:'2026-01-01T00:00:00.000Z',expiresAt:'2027-01-01T00:00:00.000Z',fingerprint:Array(32).fill('AA').join(':'),eventsAvailable:true};
+  const calls:string[]=[];
+  const runtime:typeof agentRequest=async<T>(path:string)=>{calls.push(path);return result as T;};
+  const {app,headers,create,store}=await fixture({agentRequest:runtime});
+  const {service}=(await create({...appInput,domains:[{hostname:'app.example.com',port:80,https:true}]})).json();
+  const url=`/api/v1/services/${service.id}/check-managed-certificate`;
+  expect((await app.inject({method:'POST',url,headers:{cookie:headers.cookie},payload:{hostname:'app.example.com'}})).statusCode).toBe(403);
+  expect((await app.inject({method:'POST',url,headers,payload:{hostname:'other.example.com'}})).statusCode).toBe(400);
+  const viewer=store.createUser('certificate-viewer@example.test',await hashPassword('viewer-testing-password'));store.addMember(service.projectId,viewer.id,'viewer');const session=store.createSession(viewer.id);
+  expect((await app.inject({method:'POST',url,headers:{cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken},payload:{hostname:'app.example.com'}})).statusCode).toBe(404);
+  expect(calls).toEqual([]);
+  const response=await app.inject({method:'POST',url,headers,payload:{hostname:'app.example.com'}});
+  expect(response.statusCode).toBe(200);expect(response.json()).toMatchObject({hostname:'app.example.com',status:'active'});
+  result={...(result as object),privateKey:'must-never-be-returned'};
+  const invalid=await app.inject({method:'POST',url,headers,payload:{hostname:'app.example.com'}});
+  expect(invalid.statusCode).toBe(503);expect(invalid.body).not.toContain('must-never-be-returned');
+});
+
+it('allows certificate retry only for an editable saved HTTPS domain',async()=>{
+  const calls:{path:string;body:unknown}[]=[];
+  const runtime:typeof agentRequest=async<T>(path:string,body?:unknown)=>{calls.push({path,body});return {accepted:true,requestedAt:'2026-01-01T00:00:00.000Z'} as T;};
+  const {app,headers,create,store}=await fixture({agentRequest:runtime});
+  const {service}=(await create({...appInput,domains:[{hostname:'app.example.com',port:80,https:true}]})).json();
+  const url=`/api/v1/services/${service.id}/retry-certificate`;
+  expect((await app.inject({method:'POST',url,headers:{cookie:headers.cookie},payload:{hostname:'app.example.com'}})).statusCode).toBe(403);
+  expect((await app.inject({method:'POST',url,headers,payload:{hostname:'other.example.com'}})).statusCode).toBe(400);
+  const viewer=store.createUser('retry-viewer@example.test',await hashPassword('viewer-testing-password'));store.addMember(service.projectId,viewer.id,'viewer');const session=store.createSession(viewer.id);
+  expect((await app.inject({method:'POST',url,headers:{cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken},payload:{hostname:'app.example.com'}})).statusCode).toBe(404);
+  expect(calls).toEqual([]);
+  expect((await app.inject({method:'POST',url,headers,payload:{hostname:'app.example.com'}})).json()).toEqual({accepted:true,requestedAt:'2026-01-01T00:00:00.000Z'});
+  expect(calls).toEqual([{path:'/certificates/retry',body:{serviceId:service.id,hostname:'app.example.com'}}]);
+});
+
+it('only returns an operation-specific build log to project members',async()=>{
+  const secret='redact-build-secret';
+  const runtime:typeof agentRequest=async<T>(path:string)=>({available:true,text:`output ${secret}`,truncated:false}) as T;
+  const {app,headers,create,store}=await fixture({agentRequest:runtime});
+  const {action,service}=(await create({...appInput,environment:[{name:'SECRET',secret:true,value:secret}]})).json();
+  const url=`/api/v1/actions/${action.id}/build-log`;
+  const result=await app.inject({method:'GET',url,headers});expect(result.statusCode).toBe(200);expect(result.body).not.toContain(secret);expect(result.body).toContain('[REDACTED]');
+  const outsider=store.createUser('outside@example.test',await hashPassword('viewer-testing-password'));const session=store.createSession(outsider.id);
+  expect((await app.inject({method:'GET',url,headers:{cookie:`panel_session=${session.token}`}})).statusCode).toBe(404);
+  expect((await app.inject({method:'GET',url:`/api/v1/actions/${service.id}/build-log`,headers})).statusCode).toBe(404);
+});
+
+it('reports per-project write permission without granting viewers mutation access',async()=>{
+  const {app,headers,project,store,create}=await fixture();
+  const {service}=(await create(appInput)).json();
+  const viewer=store.createUser('readonly-actions@example.test',await hashPassword('viewer-testing-password'));store.addMember(project.id,viewer.id,'viewer');
+  const editor=store.createUser('editor-actions@example.test',await hashPassword('editor-testing-password'));store.addMember(project.id,editor.id,'editor');
+  const viewerSession=store.createSession(viewer.id),editorSession=store.createSession(editor.id);
+  const getHeaders=(s:typeof viewerSession)=>({cookie:`panel_session=${s.token}`,'x-csrf-token':s.csrfToken});
+  for(const [who,expected] of [[headers,true],[getHeaders(editorSession),true],[getHeaders(viewerSession),false]] as const){
+    const list=await app.inject({url:'/api/v1/projects',headers:who});expect(list.json().find((item:{id:string})=>item.id===project.id).canWrite).toBe(expected);
+    const detail=await app.inject({url:`/api/v1/projects/${project.id}`,headers:who});expect(detail.json().canWrite).toBe(expected);
+  }
+  const attempt=await app.inject({method:'POST',url:`/api/v1/services/${service.id}/restart`,headers:{...getHeaders(viewerSession),'idempotency-key':'denied-viewer'},payload:{}});
+  expect(attempt.statusCode).toBe(404);
+});
+
+it('queues a historical deployment with the exact verified image and immutable old configuration',async()=>{
+  const {app,headers,create,store}=await fixture();
+  const source={type:'git',repository:'https://github.com/example/app.git',branch:'main',context:'.',dockerfile:'Dockerfile'};
+  const {service,action}= (await create({...appInput,source})).json();
+  const worker=store.claimNextJob('deploy-worker',60000)!;
+  const image='sha256:'+'1'.repeat(64),commit='a'.repeat(40);
+  expect(store.completeAction(action.id,'deploy-worker',{state:'running',deployedRevision:1,imageDigest:image,sourceCommit:commit})).toBe(true);
+  expect(worker.snapshot.source).toMatchObject({branch:'main'});
+  expect((await app.inject({method:'PATCH',url:`/api/v1/services/${service.id}`,headers,payload:{expectedRevision:1,source:{...source,branch:'next'}}})).statusCode).toBe(200);
+  const url=`/api/v1/services/${service.id}/deployments/${action.id}/redeploy`,key='historical-test';
+  expect((await app.inject({method:'POST',url,headers:{...headers,'idempotency-key':key},payload:{}})).statusCode).toBe(400);
+  const request={method:'POST' as const,url,headers:{...headers,'idempotency-key':key},payload:{confirm:true}};
+  const response=await app.inject(request);expect(response.statusCode).toBe(202);
+  expect((await app.inject(request)).json().id).toBe(response.json().id);
+  const queued=store.claimNextJob('historical-worker',60000)!;
+  expect(queued.snapshot).toMatchObject({revision:1,rollbackImage:image,rollbackCommit:commit,source:{branch:'main'}});
+  expect(store.getService(service.id)?.source).toMatchObject({branch:'next'});
+  expect((await app.inject({method:'POST',url,headers:{...headers,'idempotency-key':'busy'},payload:{confirm:true}})).statusCode).toBe(409);
+});
+
+it('saves encrypted ACME settings only for administrators with CSRF protection',async()=>{
+  const {app,headers,store}=await fixture();
+  const url='/api/v1/settings/https';
+  expect((await app.inject({url,headers})).json()).toEqual({settings:null});
+  expect((await app.inject({method:'PUT',url,headers:{cookie:headers.cookie},payload:{email:'ops@example.com',staging:true}})).statusCode).toBe(403);
+  const member=store.createUser('https-member@example.test',await hashPassword('member-testing-password'));const session=store.createSession(member.id);
+  expect((await app.inject({method:'PUT',url,headers:{cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken},payload:{email:'ops@example.com',staging:true}})).statusCode).toBe(403);
+  expect((await app.inject({method:'PUT',url,headers,payload:{email:'invalid',staging:true}})).statusCode).toBe(400);
+  expect((await app.inject({method:'PUT',url,headers,payload:{email:'ops@example.com',staging:true}})).json()).toEqual({settings:{email:'ops@example.com',staging:true}});
+  expect(store.vault.httpsIngress()).toEqual({email:'ops@example.com',staging:true});
+});
+
+it('requires administrator confirmation before invoking an ingress migration or recovery',async()=>{
+  const calls:string[]=[];
+  const runtime:typeof agentRequest=async<T>(path:string)=>{calls.push(path);return {ok:true} as T;};
+  const {app,headers,store}=await fixture({agentRequest:runtime});
+  const url='/api/v1/settings/https/migrate';
+  expect((await app.inject({method:'POST',url,headers:{cookie:headers.cookie},payload:{confirm:true}})).statusCode).toBe(403);
+  expect((await app.inject({method:'POST',url,headers,payload:{confirm:false}})).statusCode).toBe(400);
+  const member=store.createUser('ingress-member@example.test',await hashPassword('member-testing-password')),session=store.createSession(member.id);
+  expect((await app.inject({method:'POST',url,headers:{cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken},payload:{confirm:true}})).statusCode).toBe(403);
+  expect(calls).toEqual([]);
+  expect((await app.inject({method:'POST',url,headers,payload:{confirm:true}})).json()).toEqual({ok:true});
+  expect((await app.inject({method:'POST',url:'/api/v1/settings/https/migrate-external',headers,payload:{confirm:true}})).json()).toEqual({ok:true});
+  expect((await app.inject({method:'POST',url:'/api/v1/settings/https/recover',headers,payload:{confirm:true}})).json()).toEqual({ok:true});
+  expect(calls).toEqual(['/https/ingress/migrate','/https/ingress/migrate-external','/https/ingress/recover']);
 });

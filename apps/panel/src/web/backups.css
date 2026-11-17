@@ -1,0 +1,26 @@
+.database-backups { display:grid; gap:20px; max-width:960px; }
+.backup-section { display:grid; gap:16px; min-width:0; padding:24px; border:1px solid var(--line, #dce1dc); border-radius:14px; background:var(--surface, #fff); }
+.backup-heading { display:flex; align-items:center; gap:10px; }
+.database-backups h2, .database-backups h3 { margin:0; font-size:16px; line-height:1.4; }
+.database-backups p { margin:0; line-height:1.65; }
+.database-backups .feature-helper { font-size:13px; color:var(--muted, #626b65); }
+.database-backups form { display:grid; gap:10px; max-width:650px; min-width:0; }
+.database-backups form h3 { margin-top:8px; }
+.database-backups form > label { font-size:13px; font-weight:600; margin-top:8px; }
+.database-backups input:not([type="checkbox"]):not([type="radio"]), .database-backups select { display:block; box-sizing:border-box; width:100%; min-width:0; min-height:44px; padding:10px 12px; border:1px solid #8c968e; border-radius:8px; background:var(--surface, #fff); color:var(--ink, #202922); font:inherit; }
+.database-backups input:focus-visible { outline:2px solid #227a49; outline-offset:3px; }
+.database-backups input:user-invalid { border-color:#b42318; }
+.database-backups input:disabled { opacity:.7; cursor:not-allowed; }
+.database-backups form > .button { justify-self:start; margin-top:6px; }
+.backup-toggle { display:flex; align-items:center; gap:10px; padding:8px 0; }
+.backup-toggle input { width:18px; height:18px; margin:0; accent-color:#227a49; }
+.backup-toggle label { font-size:14px; line-height:1.5; }
+.backup-destination-choice { margin:0; padding:12px; border:1px solid var(--line, #dce1dc); border-radius:8px; }
+.backup-destination-choice legend { padding:0 6px; font-size:13px; font-weight:600; }
+.backup-history { display:grid; gap:16px; margin:0; padding:0; list-style:none; }
+.backup-history li { display:flex; align-items:center; flex-wrap:wrap; gap:10px; padding-top:16px; border-top:1px solid var(--line, #dce1dc); min-width:0; }
+.backup-history li > .detail-row, .backup-history li > p, .backup-history li > div { width:100%; min-width:0; overflow-wrap:anywhere; }
+.backup-history .detail-row { border:0; padding:0; margin:0; }
+.backup-history .detail-row strong { font-size:14px; }
+.backup-history li > div > .button { margin:10px 6px 0 0; }
+@media (max-width:600px) { .backup-section { padding:18px; } .database-backups input:not([type="checkbox"]):not([type="radio"]), .database-backups select { font-size:16px; min-height:48px; } .database-backups .button { min-height:44px; } }

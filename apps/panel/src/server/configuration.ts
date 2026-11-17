@@ -4,6 +4,8 @@ import { z } from 'zod';
 import type { ServiceConfiguration, ServiceInput, ServicePatch } from '../shared/types.js';
 import { AppError } from './errors.js';
 import { canonicalDnsName } from '../agent/acme/dns01.js';
+import { validEnvFilePath } from '../shared/build-options.js';
+import {registryCredentialSchema,gitSshCredentialSchema,canonicalRegistry,imageRegistry,normalizeKnownHosts,parseSshRepository} from '../shared/source-credentials.js';
 
 export const nameSchema = z.string().min(1).max(63).regex(/^[a-z0-9][a-z0-9-]*$/, 'Use lowercase letters, numbers and hyphens');
 const imageSchema = z.string().min(1).max(300).regex(/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$/,'Enter a valid image reference');
@@ -12,14 +14,14 @@ const targetSchema = z.string().min(2).max(255).refine(value=>value.startsWith('
 const kindSchema = z.enum(['app','postgres','redis','mariadb']);
 const sourceSchema = z.discriminatedUnion('type',[
   z.object({type:z.literal('image')}).strict(),
-  z.object({type:z.literal('git'),repository:z.string().url().max(1000),branch:z.string().min(1).max(200).regex(/^[^\s\x00-\x1f~^:?*\[\\]+$/),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),sharedGithub:z.boolean().optional(),credential:z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),secretRef:z.string().uuid().optional()}).strict().refine(v=>Boolean(v.token)!==Boolean(v.secretRef)).optional()}).strict(),
+  z.object({type:z.literal('git'),repository:z.string().url().max(1000),branch:z.string().min(1).max(200).regex(/^[^\s\x00-\x1f~^:?*\[\\]+$/),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),envFile:z.string().refine(validEnvFilePath,'Use a relative file path outside Git and build configuration files').optional(),sharedGithub:z.boolean().optional(),ssh:gitSshCredentialSchema.optional(),credential:z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),secretRef:z.string().uuid().optional()}).strict().refine(v=>Boolean(v.token)!==Boolean(v.secretRef)).optional()}).strict(),
 ]);
 const envSchema = z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32000).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).strict();
 const domainSchema = z.object({hostname:hostnameSchema,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional()}).strict();
 const mountSchema = z.object({type:z.enum(['volume','file','bind']),name:nameSchema,target:targetSchema,readOnly:z.boolean().optional(),content:z.string().max(32000).optional(),source:z.string().max(1000).optional()}).strict();
 const resourcesSchema = z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).strict();
 const databaseSchema = z.object({database:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),user:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),password:z.string().min(12).max(128).optional(),passwordSecretRef:z.string().uuid().optional()}).strict();
-const fields={kind:kindSchema.optional(),source:sourceSchema.optional(),environment:z.array(envSchema).max(100).optional(),domains:z.array(domainSchema).max(20).optional(),mounts:z.array(mountSchema).max(20).optional(),resources:resourcesSchema.optional(),database:databaseSchema.optional()};
+const fields={kind:kindSchema.optional(),source:sourceSchema.optional(),environment:z.array(envSchema).max(100).optional(),domains:z.array(domainSchema).max(20).optional(),mounts:z.array(mountSchema).max(20).optional(),resources:resourcesSchema.optional(),database:databaseSchema.optional(),registry:registryCredentialSchema.nullable().optional()};
 export const newServiceSchema=z.object({name:nameSchema,image:imageSchema.optional(),port:z.number().int().min(1).max(65535).optional(),hostname:hostnameSchema.optional(),replicas:z.number().int().min(1).max(5).default(1),...fields}).strict();
 export const servicePatchSchema=z.object({expectedRevision:z.number().int().positive(),image:imageSchema.optional(),port:z.number().int().min(1).max(65535).optional(),hostname:hostnameSchema.optional(),replicas:z.number().int().min(1).max(5).optional(),...fields}).strict();
 
@@ -39,6 +41,7 @@ export function normalizeServiceInput(value: unknown): ServiceInput {
 
 export function validateConfiguration(config: ServiceConfiguration & {replicas?:number}) {
   const kind=config.kind??'app';
+  if(config.registry){if(kind!=='app'||config.source?.type==='git')throw new AppError('REGISTRY_SOURCE','Private registry credentials are available for application image sources');if('image'in config&&canonicalRegistry(config.registry.server)!==imageRegistry(String(config.image)))throw new AppError('REGISTRY_MISMATCH','Registry credentials must match the image registry');}
   const unique=(values:string[],name:string)=>{if(new Set(values).size!==values.length)throw new AppError('DUPLICATE_CONFIG',`${name} must be unique`);};
   unique((config.environment??[]).map(item=>item.name),'Environment names');
   unique((config.domains??[]).map(item=>item.hostname),'Domain hostnames');
@@ -66,6 +69,14 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
   }
   if(config.source?.type==='git') {
     const source=config.source,url=new URL(source.repository);
+    if(source.envFile!==undefined && !validEnvFilePath(source.envFile))throw new AppError('ENV_FILE_PATH','Use a relative environment file path outside Git and build configuration files');
+    if(source.envFile!==undefined && source.envFile===source.dockerfile)throw new AppError('ENV_FILE_PATH','The environment file cannot replace the Dockerfile');
+    if(url.protocol==='ssh:'){
+      try{const target=parseSshRepository(source.repository);if(!source.ssh||source.credential||source.sharedGithub)throw new Error('SSH Git requires a service deploy key and a verified host key.');normalizeKnownHosts(source.ssh.knownHosts,source.repository);const allowed=(process.env.PANEL_GIT_SSH_HOSTS??'').split(',').map(item=>item.trim());if(!allowed.includes(target.hostname)&&(target.hostname==='localhost'||target.hostname.endsWith('.localhost')||target.hostname==='metadata.google.internal'||isIP(target.hostname)!==0))throw new Error('Private SSH Git hosts require an explicit allowlist.');}catch(error){throw new AppError('GIT_SSH',error instanceof Error?error.message:'Invalid SSH Git source');}
+      for(const path of[source.context,source.dockerfile])if(path.startsWith('/')||path.split(/[\\/]/).includes('..')||path.includes('\0'))throw new AppError('GIT_PATH','Build paths must stay within the repository');
+      return;
+    }
+    if(source.ssh)throw new AppError('GIT_SSH','Deploy keys require an ssh:// repository URL');
     if(!['https:','http:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw new AppError('GIT_SOURCE','Git URLs must not contain credentials, query strings or fragments');
     const allowed=(process.env.PANEL_GIT_HTTP_HOSTS??'').split(',').map(item=>item.trim()).filter(Boolean);
     if(url.protocol==='http:'&&!allowed.includes(url.hostname))throw new AppError('GIT_SOURCE','HTTP Git sources require an explicit local-test allowlist');
@@ -78,7 +89,7 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
 }
 
 export function configurationOf(input: ServiceConfiguration): ServiceConfiguration {
-  return {kind:input.kind??'app',source:input.source??{type:'image'},environment:input.environment??[],domains:input.domains,mounts:(input.mounts??[]).map(mount=>({...mount,readOnly:mount.readOnly??mount.type==='file'})),resources:input.resources,database:input.database};
+  return {kind:input.kind??'app',source:input.source??{type:'image'},environment:input.environment??[],domains:input.domains,mounts:(input.mounts??[]).map(mount=>({...mount,readOnly:mount.readOnly??mount.type==='file'})),resources:input.resources,database:input.database,registry:input.registry};
 }
 
 export function parseServicePatch(value:unknown): ServicePatch { return servicePatchSchema.parse(value); }

@@ -37,6 +37,35 @@ TRUSTED_INGRESS_ARGS = [
     '--api.dashboard=false',
     '--log.level=WARN',
 ]
+COMPOSE_INGRESS_ARGS = [
+    '--providers.docker.endpoint=unix:///var/run/docker.sock',
+    '--providers.docker.exposedbydefault=false',
+    '--providers.docker.network=panel-ingress',
+    '--providers.docker.constraints=Label(`panel.compose`,`true`)',
+]
+
+
+def ingress_without_compose_provider(arguments):
+    """Remove one exact constrained provider block before checking stock/TLS args.
+
+    Runtime upgrades append the block to existing arguments; fresh ingress may
+    put it before TLS arguments. Every remaining argument still has to match a
+    known configuration. Partial, duplicate and conflicting blocks are refused.
+    """
+    if (not isinstance(arguments, list) or not all(isinstance(item, str) for item in arguments) or
+        arguments[:len(TRUSTED_INGRESS_ARGS)] != TRUSTED_INGRESS_ARGS):
+        raise ProvisionError('Untrusted ingress arguments')
+    indexes = [index for index in range(len(TRUSTED_INGRESS_ARGS), len(arguments))
+               if arguments[index:index + len(COMPOSE_INGRESS_ARGS)] == COMPOSE_INGRESS_ARGS]
+    if len(indexes) > 1:
+        raise ProvisionError('Duplicate Compose ingress provider')
+    remaining = list(arguments)
+    if indexes:
+        index = indexes[0]
+        del remaining[index:index + len(COMPOSE_INGRESS_ARGS)]
+    if any(item.startswith('--providers.docker') for item in remaining):
+        raise ProvisionError('Untrusted Compose ingress provider')
+    return remaining
 
 
 def directory(path, mode=None):
@@ -345,8 +374,9 @@ def trusted_ingress(docker_config, runtime, *, data_dir=None):
         raise ProvisionError('Untrusted ingress identity')
     socket_path = os.path.realpath('/var/run/docker.sock')
     matching = [mount for mount in mounts if isinstance(mount, dict) and isinstance(mount.get('Source'), str) and os.path.realpath(mount['Source']) == socket_path]
-    managed = config.get('Cmd') != TRUSTED_INGRESS_ARGS
-    if managed and not managed_ingress_mounts(config, mounts, docker_config, runtime, data_dir):
+    arguments = ingress_without_compose_provider(config.get('Cmd'))
+    managed = arguments != TRUSTED_INGRESS_ARGS
+    if managed and not managed_ingress_mounts({**config, 'Cmd': arguments}, mounts, docker_config, runtime, data_dir):
         raise ProvisionError('Untrusted managed ingress configuration')
     if ((not managed and len(mounts) != 1) or len(matching) != 1 or matching[0].get('RW') is not False or
         matching[0].get('Destination') != '/var/run/docker.sock'):

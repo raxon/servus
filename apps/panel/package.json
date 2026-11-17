@@ -1,6 +1,6 @@
 {
   "name": "@servus/panel",
-  "version": "0.1.52",
+  "version": "0.1.53",
   "private": true,
   "type": "module",
   "license": "PolyForm-Noncommercial-1.0.0",
@@ -20,11 +20,13 @@
     "start:worker": "cd ../.. && node apps/panel/dist/worker/index.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1170.0",
     "@fastify/cookie": "11.1.5",
     "@fastify/rate-limit": "11.2.2",
     "@fastify/static": "10.1.11",
     "@fastify/websocket": "11.3.7",
     "@fontsource-variable/inter": "5.3.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@tanstack/react-query": "5.107.1",
     "@tanstack/react-router": "1.170.46",
     "@xterm/addon-fit": "0.11.0",
@@ -39,7 +41,10 @@
     "openid-client": "6.8.3",
     "react": "19.3.1",
     "react-dom": "19.3.1",
+    "ssh2": "1.17.0",
+    "tar": "7.5.23",
     "ws": "8.23.0",
+    "yaml": "2.9.1",
     "zod": "4.6.7"
   },
   "devDependencies": {
@@ -49,6 +54,7 @@
     "@types/node": "26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
+    "@types/ssh2": "1.15.6",
     "@types/ws": "8.18.2",
     "@vitejs/plugin-react": "6.3.0",
     "tsx": "4.23.15",

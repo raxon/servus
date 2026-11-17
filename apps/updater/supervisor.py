@@ -347,9 +347,10 @@ class RuntimePolicy:
         return set(entries)
 
 
-def inspect_servus(policy, *, created=False, stopped=False):
+def inspect_servus(policy, *, created=False, stopped=False, recovering=False):
     """Inspect exactly one approved running or never-started container per role."""
-    if not isinstance(policy, RuntimePolicy) or type(created) is not bool or type(stopped) is not bool or (created and stopped):
+    if (not isinstance(policy, RuntimePolicy) or any(type(value) is not bool for value in (created, stopped, recovering)) or
+        sum((created, stopped, recovering)) > 1):
         raise SupervisorError('Verified runtime policy is required')
     _verify_data_directory(policy.data_dir)
     try:
@@ -380,12 +381,14 @@ def inspect_servus(policy, *, created=False, stopped=False):
                 state.get('Dead') is not False or type(pid) is not int or pid != 0 or
                 state.get('StartedAt') != '0001-01-01T00:00:00Z'):
                 raise SupervisorError('A candidate container has already started')
-        elif stopped:
+        elif stopped or recovering and state.get('Running') is False:
             if (state.get('Status') != 'exited' or state.get('Running') is not False or
                 state.get('Paused') is not False or state.get('Restarting') is not False or
                 state.get('Dead') is not False or type(pid) is not int or pid != 0):
                 raise SupervisorError('A previous container is not safely stopped')
-        elif state.get('Running') is not True or type(pid) is not int or pid <= 1:
+        elif (state.get('Running') is not True or type(pid) is not int or pid <= 1 or
+              recovering and (state.get('Status') != 'running' or state.get('Paused') is not False or
+                              state.get('Restarting') is not False or state.get('Dead') is not False)):
             raise SupervisorError('Unexpected Servus container set')
         expected_command = ['dist/' + ('server' if role == 'api' else role) + '/index.js']
         if (item.get('Image') != policy.image_id or config.get('Image') != policy.image_reference or
@@ -416,7 +419,9 @@ def inspect_servus(policy, *, created=False, stopped=False):
             actual.append((mount.get('Type'), mount.get('Source'), mount.get('Destination'), mount['RW']))
         if len(actual) != len(policy.mounts_for(role)) or set(actual) != policy.mounts_for(role):
             raise SupervisorError('Servus runtime mounts are not trusted')
-        if created or stopped:
+        if recovering and state.get('Running') is True and cid not in _cgroup(pid):
+            raise SupervisorError('Container cgroup cannot be identified')
+        if created or stopped or recovering:
             output[role] = {'id': cid}
         else:
             cgroup = _cgroup(pid)
@@ -450,6 +455,10 @@ class DrainHub:
         """Accept one component connection; caller controls listener lifetime."""
         if timeout <= 0 or timeout > 60 or self.used:
             raise SupervisorError('Control registration is closed')
+        # A Docker restart can retain both the container ID and its cgroup but
+        # replace the host PID. Never authenticate into that stale generation.
+        if inspect_servus(self.policy) != self.identities:
+            raise SupervisorError('Container identity changed')
         try:
             self.listener.settimeout(timeout)
             connection, _ = self.listener.accept()
@@ -479,6 +488,8 @@ class DrainHub:
                 confirm.get('type') != 'hello_confirm' or not isinstance(given, str) or not HEX64.fullmatch(given) or
                 not hmac.compare_digest(given, _proof(self.tokens[role], 'client', role, challenge, fresh))):
                 raise SupervisorError('Control peer was rejected')
+            if inspect_servus(self.policy) != self.identities:
+                raise SupervisorError('Container identity changed')
             _send_message(connection, {'version': 1, 'type': 'ready', 'role': role}, deadline)
             self.connections[role] = connection
             return role
@@ -951,10 +962,12 @@ class DrainLease:
         _atomic_file(self._owner.journal,'legacy-upload-recovery.json',json.dumps(marker,separators=(',',':')).encode('ascii')+b'\n',0o600)
         self._state='starting'
 
-    def release_for_start(self):
-        """Open the gate only after a durable starting marker has been recorded."""
+    def release_for_start(self, *, recovering=False):
+        """Permit startup after durable intent; recovery still fences application work."""
+        if type(recovering) is not bool:
+            raise SupervisorError('Invalid startup gate state')
         self.assert_locked(self._operation_id, 'starting')
-        state=b'servus-lifecycle-v1 recovering\n' if self._legacy_upload_id is not None else b'servus-lifecycle-v1 normal\n'
+        state=b'servus-lifecycle-v1 recovering\n' if recovering or self._legacy_upload_id is not None else b'servus-lifecycle-v1 normal\n'
         _atomic_file(self._owner.gate, 'state', state, 0o644)
         fcntl.flock(self._owner.gate_lock, fcntl.LOCK_UN)
         self._settled = True

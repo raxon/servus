@@ -67,3 +67,11 @@ check=$(openssl x509 -in "$root/config/live/fixture/fullchain.pem" -noout -check
 openssl x509 -in "$root/config/live/fixture/fullchain.pem" -noout -issuer -dates
 openssl x509 -in "$root/config/live/fixture/fullchain.pem" -noout -issuer | grep -F '(STAGING)' >/dev/null
 echo "PASS staging certificate issued for $SERVUS_ACME_DOMAIN"
+docker run --rm --network bridge \
+  --mount "type=bind,src=$root/web,dst=/challenge" \
+  --mount "type=bind,src=$root/config,dst=/etc/letsencrypt" \
+  --mount "type=bind,src=$root/work,dst=/var/lib/letsencrypt" \
+  --mount "type=bind,src=$root/logs,dst=/var/log/letsencrypt" \
+  certbot/certbot@sha256:c23159d30afdd9c97960578aa4654f5901de6cae394958f894074dedd55e599d \
+  renew --dry-run --non-interactive --no-random-sleep-on-renew
+echo "PASS staging certificate renewal dry run for $SERVUS_ACME_DOMAIN"

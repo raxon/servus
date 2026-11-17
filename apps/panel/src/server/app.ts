@@ -26,6 +26,16 @@ import { BUILD_INFO } from './generated-build-info.js';
 import { clientAddress, normalizeClientAddress, trustedProxyRequest } from './proxy-address.js';
 import { MaintenanceGate } from './maintenance.js';
 import { registerUpdates } from './updates.js';
+import { registerInstallationBackups } from './installation-backups.js';
+import { ApiTokens } from './api-tokens.js';
+import { registerBackups } from './backups.js';
+import { registerVolumeBackups } from './volume-backups.js';
+import { registerGithubRepositories } from './github-repositories.js';
+import { registerReleaseNotes } from './release-notes.js';
+import { registerTwoFactor } from './two-factor.js';
+import { registerCompose } from './compose.js';
+import { registerDeployWebhooks } from './deploy-webhooks.js';
+import { registerTemplates } from './templates.js';
 import { startLegacyRecovery, legacyRecoveryStatus, UpdaterClientError } from './updater-client.js';
 
 const prefix = '/api/v1';
@@ -40,6 +50,7 @@ const restoreStatusSchema = z.object({
   reviewPhase:z.enum(['uploading','reserved','discarding','importing','prepared','switching']).optional(),
   recoveryReason:z.enum(['legacy_upload_unverified','preparation_unverified']).optional(),
   rolledBack:z.literal(true).optional(),
+  canRollback:z.literal(true).optional(),restoreDirection:z.literal('rollback').optional(),redisRecoveryRequired:z.literal(true).optional(),
 }).strict().refine(value=>!value.recoveryReason||(value.recoveryReason==='legacy_upload_unverified'?value.phase==='uploading':value.phase==='importing'));
 
 export interface AppOptions {
@@ -52,11 +63,13 @@ export interface AppOptions {
   updaterSocketPath?: string;
   updaterApplyEnabled?: boolean;
   updaterCurrentVersion?: string;
+  installationBackupApprovalSecretPath?: string;
   hostDomains?:HostDomainOptions;
 }
 export async function createApp(options: AppOptions) {
   if(options.trustedProxySecret!==undefined && !/^[a-f0-9]{64}$/.test(options.trustedProxySecret))throw new Error('Invalid trusted proxy secret configuration');
   const store = options.store ?? new Store(options.dataDir);
+  const apiTokens = new ApiTokens(store);
   const app = Fastify({ logger: options.logger ?? false, logController: new LogController({ disableRequestLogging: true }), bodyLimit: 256 * 1024, trustProxy: false });
   const exportTickets=new Map<string,{serviceId:string;sessionHash:string;stream:IncomingMessage;length:string;extension:string;timer:ReturnType<typeof setTimeout>}>();
   let exportsPreparing=0;
@@ -128,6 +141,7 @@ export async function createApp(options: AppOptions) {
   app.addHook('onClose',async()=>{if(hostDomainTimer)clearInterval(hostDomainTimer);await hostDomains.drain();});
 
   function session(req: FastifyRequest, mutation = false) {
+    if(req.headers.authorization!==undefined)return apiTokens.authenticate(req);
     const result = req.cookies[cookieName] ? store.getSession(req.cookies[cookieName]!) : null;
     if (!result) throw new AppError('UNAUTHORIZED','Sign in to continue',401);
     if (mutation && req.headers['x-csrf-token'] !== result.csrfToken) throw new AppError('CSRF_DENIED','Refresh the page and try again',403);
@@ -155,6 +169,8 @@ export async function createApp(options: AppOptions) {
     return {user,csrfToken:created.csrfToken};
   }
 
+  const twoFactor=registerTwoFactor(app,{store,session});
+
   app.get(`${prefix}/health`, async () => ({status:'ok',...BUILD_INFO}));
   app.get('/health', async () => ({status:'ok',...BUILD_INFO}));
   app.get(`${prefix}/setup`, async () => ({required:!store.isSetup()}));
@@ -166,8 +182,10 @@ export async function createApp(options: AppOptions) {
     return setSession(reply,user,false,undefined,req);
   });
   app.post(`${prefix}/auth/login`, {config:{rateLimit:{max:10,timeWindow:'1 minute'}}}, async (req,reply) => {
-    const input = credentials.parse(req.body), user = store.findUser(input.email);
+    const input = credentials.extend({totpCode:z.string().max(64).optional()}).strict().parse(req.body), user = store.findUser(input.email);
     if (!user || !await verifyPassword(input.password,user.passwordHash)) throw new AppError('INVALID_CREDENTIALS','Email or password is incorrect',401);
+    if(twoFactor.status(user.id).enabled&&!input.totpCode)throw new AppError('TWO_FACTOR_REQUIRED','Enter your authenticator or recovery code',401);
+    if(!twoFactor.verifyLogin(user.id,input.totpCode))throw new AppError('TWO_FACTOR_CODE_INVALID','Enter an unused authenticator or recovery code',401);
     return setSession(reply,{id:user.id,email:user.email,role:user.role,createdAt:user.createdAt},false,user.passwordHash,req);
   });
   app.get(`${prefix}/auth/session`, async req => session(req));
@@ -185,8 +203,15 @@ export async function createApp(options: AppOptions) {
     if(!await verifyPassword(input.currentPassword,credential.passwordHash))throw new AppError('INVALID_PASSWORD','Current password is incorrect',401);
     const replacement=await hashPassword(input.newPassword);
     if(!store.changeLocalPassword(user.id,token,credential.passwordHash,replacement))throw new AppError('PASSWORD_CHANGE_CONFLICT','Your session or password changed. Sign in and try again',409);
+    apiTokens.revokeUser(user.id);
     return {success:true};
   });
+  apiTokens.register(app,session);
+  registerBackups(app,{store,serviceAccess,agentConnection:options.agentConnection,databaseExport:options.databaseExport,maintenance});
+  registerVolumeBackups(app,{store,serviceAccess,agentConnection:options.agentConnection,agentRequest:runtimeRequest,maintenance});
+  const compose=registerCompose(app,{store,session:req=>session(req,!['GET','HEAD','OPTIONS'].includes(req.method)),projectAccess,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance});
+  registerTemplates(app,{session,projectAccess,createWorkload:compose.createWorkload});
+  await registerDeployWebhooks(app,{store,serviceAccess});
   registerCentralAuth(app,{store,allowedOrigins,secureCookies:options.secureCookies??false,session,setSession});
   registerHostDomainRoutes(app,hostDomains,session);
 
@@ -196,6 +221,9 @@ export async function createApp(options: AppOptions) {
     return auth.user;
   }
   registerUpdates(app,{administrator,socketPath:options.updaterSocketPath,applyEnabled:options.updaterApplyEnabled,currentVersion:options.updaterCurrentVersion ?? BUILD_INFO.version});
+  registerInstallationBackups(app,{administrator,socketPath:options.updaterSocketPath,applyEnabled:options.updaterApplyEnabled,approvalSecretPath:options.installationBackupApprovalSecretPath});
+  registerReleaseNotes(app,{administrator});
+  registerGithubRepositories(app,{store,administrator});
   app.get(`${prefix}/integrations/github`,async req=>{
     administrator(req);
     const connection=store.vault.githubConnection();
@@ -216,6 +244,7 @@ export async function createApp(options: AppOptions) {
   });
   function approveSharedGithub(user:User, configuration:{source?: import('../shared/types.js').SourceConfig}) {
     if (configuration.source?.type === 'git' && configuration.source.sharedGithub && user.role !== 'admin') throw new AppError('FORBIDDEN','Only administrators can configure the shared GitHub connection',403);
+    if(configuration.source?.type==='git'&&configuration.source.ssh&&user.role!=='admin')throw new AppError('FORBIDDEN','Only administrators can configure SSH deploy keys and trusted host keys',403);
   }
   app.get(`${prefix}/settings/https`,async req=>{
     administrator(req);return {settings:store.vault.httpsIngress()};
@@ -264,14 +293,14 @@ export async function createApp(options: AppOptions) {
     return {success:true};
   });
 
-  app.get(`${prefix}/projects`, async req => store.listProjects(session(req).user));
+  app.get(`${prefix}/projects`, async req => {const {user}=session(req),token=apiTokens.current(req);return store.listProjects(user).filter(project=>!token||project.id===token.projectId).map(project=>({...project,canWrite:store.canAccess(user,project.id,true)&&(!token||token.scope==='deploy')}));});
   app.post(`${prefix}/projects`, async (req,reply) => {
     const {user} = session(req,true);
     if (user.role !== 'admin') throw new AppError('FORBIDDEN','Only administrators can create projects',403);
     const input = z.object({name:slug,description:z.string().max(500).default('')}).parse(req.body);
     return reply.code(201).send(store.createProject(input.name,input.description,user.id));
   });
-  app.get<{Params:{id:string}}>(`${prefix}/projects/:id`, async req => { const {user}=session(req);projectAccess(user,req.params.id);return store.getProject(req.params.id); });
+  app.get<{Params:{id:string}}>(`${prefix}/projects/:id`, async req => { const {user}=session(req);projectAccess(user,req.params.id);return {...store.getProject(req.params.id)!,canWrite:store.canAccess(user,req.params.id,true)}; });
   app.patch<{Params:{id:string}}>(`${prefix}/projects/:id`,async req=>{
     const {user}=session(req,true);projectAccess(user,req.params.id,true);
     return store.updateProject(req.params.id,z.object({name:slug.optional(),description:z.string().max(500).optional()}).strict().parse(req.body),user.id);
@@ -354,7 +383,7 @@ export async function createApp(options: AppOptions) {
     const raw=req.body && typeof req.body==='object' && Object.keys(req.body).length===0 ? undefined : req.body;
     const changes=z.object({repository:z.string().url().max(1000),branch:z.string().min(1).max(128),context:z.string().max(255),dockerfile:z.string().max(255)}).strict().optional().parse(raw);
     const candidate=changes ? {...service.source,...changes} : service.source;
-    if (service.source.credential && !service.source.sharedGithub && candidate.repository!==service.source.repository) throw new AppError('SECRET_REFERENCE','Save a separate credential for this repository before checking it',403);
+    if ((service.source.credential && !service.source.sharedGithub || service.source.ssh) && candidate.repository!==service.source.repository) throw new AppError('SECRET_REFERENCE','Save a separate credential for this repository before checking it',403);
     const parsed=parseServicePatch({expectedRevision:service.revision,source:candidate});
     validateConfiguration({kind:service.kind,source:parsed.source});
     let result:unknown;
@@ -371,6 +400,7 @@ export async function createApp(options: AppOptions) {
     approveBindMounts(auth.user,input);
     approveSharedGithub(auth.user,input);
     if (input.source && auth.user.role !== 'admin' && service.source?.type === 'git' && service.source.sharedGithub) throw new AppError('FORBIDDEN','Only administrators can change a source using the shared GitHub connection',403);
+    if(input.source&&auth.user.role!=='admin'&&service.source?.type==='git'&&service.source.ssh)throw new AppError('FORBIDDEN','Only administrators can change a source using an SSH deploy key',403);
     if (input.source?.type === 'git' && input.source.credential?.secretRef) {
       const previous = service.source?.type === 'git' ? service.source : undefined;
       if (previous?.sharedGithub && !input.source.sharedGithub && input.source.credential.secretRef === previous.credential?.secretRef) throw new AppError('SECRET_REFERENCE','Enter a separate token when disconnecting the shared GitHub connection',403);
@@ -385,12 +415,31 @@ export async function createApp(options: AppOptions) {
   for (const type of ['deploy','start','stop','restart'] as ActionType[]) app.post<{Params:{id:string}}>(`${prefix}/services/:id/${type}`, async (req,reply) => {
     const {auth}=serviceAccess(req,req.params.id,true);
     const key=z.string().min(1).max(128).parse(req.headers['idempotency-key']);
-    return reply.code(202).send(store.createAction(req.params.id,type,auth.user.id,key));
+    const deploymentOptions=type==='deploy'?z.object({forceRebuild:z.boolean().optional()}).strict().parse(req.body??{}):undefined;
+    return reply.code(202).send(store.createAction(req.params.id,type,auth.user.id,key,deploymentOptions));
   });
+  app.post<{Params:{id:string;actionId:string}}>(`${prefix}/services/:id/deployments/:actionId/redeploy`,async(req,reply)=>{
+    const {auth}=serviceAccess(req,req.params.id,true);
+    z.object({confirm:z.literal(true)}).strict().parse(req.body);
+    const key=z.string().min(1).max(128).parse(req.headers['idempotency-key']);
+    return reply.code(202).send(store.createHistoricalDeploy(req.params.id,req.params.actionId,auth.user.id,key));
+  });
+  app.get<{Params:{id:string}}>(`${prefix}/services/:id/configuration-changes`, async req => {const {service}=serviceAccess(req,req.params.id);return store.configurationChanges(service.id);});
   app.get<{Params:{id:string}}>(`${prefix}/services/:id/actions`, async req => {const {service}=serviceAccess(req,req.params.id,false,true);return store.listActions(undefined,service.id);});
   app.get<{Querystring:{projectId?:string}}>(`${prefix}/actions`, async req => {
     const {user}=session(req);if(req.query.projectId&&!store.canReadAudit(user,req.query.projectId))throw new AppError('NOT_FOUND','Project not found',404);
     return store.listActions(req.query.projectId).filter(action=>store.canReadAudit(user,action.projectId));
+  });
+  app.get<{Params:{id:string}}>(`${prefix}/actions/:id/build-log`,async req=>{
+    const {user}=session(req),action=store.getAction(req.params.id);
+    if(!action || !store.canReadAudit(user,action.projectId))throw new AppError('NOT_FOUND','Action not found',404);
+    if(action.type!=='deploy')return {available:false,text:'',truncated:false};
+    let result:unknown;
+    try {result=await runtimeRequest(`/services/${action.serviceId}/build-log/${action.id}`,undefined,options.agentConnection);}
+    catch(error){if(error instanceof AgentRequestError && error.statusCode===404)return {available:false,text:'',truncated:false};throw error;}
+    const checked=z.object({available:z.boolean(),text:z.string().max(512*1024),truncated:z.boolean()}).strict().safeParse(result);
+    if(!checked.success)throw new AppError('RUNTIME_UNAVAILABLE','The build log response was invalid',503);
+    return {...checked.data,text:store.vault.redact(checked.data.text)};
   });
   app.get<{Params:{id:string}}>(`${prefix}/actions/:id`, async req => {
     const {user}=session(req),action=store.getAction(req.params.id);
@@ -446,7 +495,7 @@ export async function createApp(options: AppOptions) {
       onRequest: async req => {
         const {service} = serviceAccess(req,req.params.id,true);
         if (!/^[a-f0-9]{32}$/.test(req.params.operationId)) throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
-        if (!['postgres','mariadb'].includes(service.kind || '')) throw new AppError('NOT_FOUND','Managed database not found',404);
+        if (!['postgres','mariadb','redis'].includes(service.kind || '')) throw new AppError('NOT_FOUND','Managed database not found',404);
         store.connectionInfo(service.id);
         const size = req.headers['content-length'];
         if (typeof size !== 'string' || !/^[1-9][0-9]*$/.test(size) || Number(size) > 2*1024*1024*1024 || req.headers['content-type']?.split(';',1)[0]?.trim().toLowerCase() !== 'application/octet-stream') throw new AppError('INVALID_UPLOAD','Invalid database restore upload',400);
@@ -459,7 +508,7 @@ export async function createApp(options: AppOptions) {
       req.raw.once('aborted',abort); reply.raw.once('close',abort);
       store.recordAudit(auth.user.id,'database.restore.upload.started',service.id);
       try {
-        const result = await agentDatabaseUpload(service.id,{operationId:req.params.operationId,kind:service.kind as 'postgres'|'mariadb',size:Number(req.headers['content-length']),stream:req.body,signal:controller.signal},options.agentConnection);
+        const result = await agentDatabaseUpload(service.id,{operationId:req.params.operationId,kind:service.kind as 'postgres'|'mariadb'|'redis',size:Number(req.headers['content-length']),stream:req.body,signal:controller.signal},options.agentConnection);
         store.recordAudit(auth.user.id,'database.restore.upload.staged',service.id);
         return result;
       } finally { req.raw.off('aborted',abort); reply.raw.off('close',abort); }
@@ -527,12 +576,12 @@ export async function createApp(options: AppOptions) {
     store.recordAudit(auth.user.id,'database.restore.cancelled',service.id);
     return result;
   });
-  for (const action of ['prepare','commit'] as const) {
+  for (const action of ['prepare','commit','rollback','recover'] as const) {
     app.post<{Params:{id:string;operationId:string}}>(`${prefix}/services/:id/database-restore/:operationId/${action}`,async req => {
       const {auth,service}=serviceAccess(req,req.params.id,true);
       if(!/^[a-f0-9]{32}$/.test(req.params.operationId))throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
-      if(!['postgres','mariadb'].includes(service.kind || ''))throw new AppError('NOT_FOUND','Managed database not found',404);
-      if(action==='commit')z.object({confirm:z.literal(true)}).strict().parse(req.body);
+      if(!['postgres','mariadb','redis'].includes(service.kind || '')||(['rollback','recover'].includes(action)&&service.kind!=='redis'))throw new AppError('NOT_FOUND','Managed database not found',404);
+      if(action==='commit'||action==='rollback')z.object({confirm:z.literal(true)}).strict().parse(req.body);
       else z.object({}).strict().parse(req.body ?? {});
       store.connectionInfo(service.id);
       store.recordAudit(auth.user.id,`database.restore.${action}.started`,service.id);
@@ -540,6 +589,7 @@ export async function createApp(options: AppOptions) {
         const result=await runtimeRequest(`/services/${service.id}/database-restore/${req.params.operationId}/${action}`,{}, {...options.agentConnection,timeoutMs:900_000});
         const schema=action==='prepare'
           ? z.object({operationId:z.literal(req.params.operationId),phase:z.literal('prepared')}).strict()
+          : action==='recover'?z.object({operationId:z.literal(req.params.operationId),phase:z.enum(['uploading','reserved','discarding','discarding_candidate','importing','prepared','switching','needs_review','completed','cancelled']),rolledBack:z.boolean()}).strict().refine(value=>value.phase!=='completed'||!value.rolledBack)
           : z.object({operationId:z.literal(req.params.operationId),phase:z.enum(['completed','cancelled']),rolledBack:z.boolean()}).strict().refine(value=>value.phase!=='completed'||!value.rolledBack);
         const parsed=schema.safeParse(result);
         if(!parsed.success)throw new AppError('RESTORE_UNCERTAIN','The restore outcome is unknown. Check the operation status.',503);

@@ -1,7 +1,9 @@
 import { createConnection } from 'node:net';
+import {randomUUID} from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { z } from 'zod';
+import { installationBackupApprovalSchema, installationBackupId, installationBackupName, type InstallationBackupApproval } from './installation-backup-approval.js';
 
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const commit = z.string().regex(/^[0-9a-f]{40}$/);
@@ -29,6 +31,16 @@ const preferencesSchema = z.strictObject({
 const preferencesInput = preferencesSchema.pick({automatic: true, channel: true, installTime: true, timeZone: true});
 export type UpdatePreferences = z.infer<typeof preferencesSchema>;
 const maxResponseBytes = 4096;
+
+const installationBackupOperationSchema = z.strictObject({
+  operationId: installationBackupId, actorId: installationBackupId, name: installationBackupName,
+  state: z.enum(['requested', 'capturing', 'verified', 'starting', 'recovering', 'completed', 'failed', 'cancelled', 'recovery_required']),
+  createdAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  updatedAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  errorCode: z.enum(['capture_failed', 'resume_required']).nullable(),
+}).refine(value => value.updatedAt >= value.createdAt);
+export type InstallationBackupOperation = z.infer<typeof installationBackupOperationSchema>;
+export type InstallationBackupCapability={available:true}|{available:false;reason:'not_configured'|'host_unavailable'|'host_unsupported'};
 
 export type UpdateOperation = z.infer<typeof operationSchema>;
 export type UpdateSubmission = z.infer<typeof submitSchema>;
@@ -87,8 +99,8 @@ function parseUniqueJson(text: string): unknown {
   const parsed = value(0); whitespace(); if (position !== text.length) throw new Error('invalid JSON'); return parsed;
 }
 
-async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'apply' | 'apply_status' | 'discover' | 'backup_schema' | 'legacy_recovery' | 'legacy_recovery_status' | 'preferences' | 'set_preferences', input: UpdateSubmission | LegacyRecoveryIdentity | { operationId: string } | {current: string} | Record<string,never> | Pick<UpdatePreferences, 'automatic' | 'channel' | 'installTime' | 'timeZone'>, options: UpdaterClientOptions): Promise<UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery | UpdatePreferences> {
-  const validInput = action === 'set_preferences' ? preferencesInput.safeParse(input) : action === 'preferences' ? z.strictObject({}).safeParse(input) : action === 'submit' ? submitSchema.safeParse(input) : action === 'legacy_recovery' ? legacyIdentitySchema.safeParse(input) : action === 'discover' ? z.strictObject({current: tag}).safeParse(input) : action === 'backup_schema' ? z.strictObject({}).safeParse(input) : z.strictObject({ operationId: uuid }).safeParse(input);
+async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'apply' | 'apply_status' | 'discover' | 'backup_schema' | 'legacy_recovery' | 'legacy_recovery_status' | 'preferences' | 'set_preferences' | 'installation_backup_submit' | 'installation_backup_cancel' | 'installation_backup_status', input: {approval: InstallationBackupApproval} | UpdateSubmission | LegacyRecoveryIdentity | { operationId: string } | {current: string} | Record<string,never> | Pick<UpdatePreferences, 'automatic' | 'channel' | 'installTime' | 'timeZone'>, options: UpdaterClientOptions): Promise<UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery | UpdatePreferences | InstallationBackupOperation> {
+  const validInput = (action === 'installation_backup_submit' || action === 'installation_backup_cancel') ? z.strictObject({approval: installationBackupApprovalSchema}).safeParse(input) : action === 'set_preferences' ? preferencesInput.safeParse(input) : action === 'preferences' ? z.strictObject({}).safeParse(input) : action === 'submit' ? submitSchema.safeParse(input) : action === 'legacy_recovery' ? legacyIdentitySchema.safeParse(input) : action === 'discover' ? z.strictObject({current: tag}).safeParse(input) : action === 'backup_schema' ? z.strictObject({}).safeParse(input) : z.strictObject({ operationId: uuid }).safeParse(input);
   const timeout = options.timeoutMs ?? 5000;
   if (!validInput.success || typeof options.socketPath !== 'string' || !isAbsolute(options.socketPath) || options.socketPath.includes('\0') || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120000) throw new UpdaterClientError('invalid_input', 'definitive');
   const payload = Buffer.from(JSON.stringify({ version: 1, action, ...validInput.data }) + '\n');
@@ -96,7 +108,7 @@ async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'appl
     let dispatched = false, settled = false, length = 0;
     const chunks: Buffer[] = [];
     const socket = createConnection({ path: options.socketPath });
-    const finish = (error?: UpdaterClientError, operation?: UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery | UpdatePreferences) => {
+    const finish = (error?: UpdaterClientError, operation?: UpdateOperation | UpdatePreparation | UpdateApplication | UpdateDiscovery | BackupFileSchemaObservation | LegacyRecovery | UpdatePreferences | InstallationBackupOperation) => {
       if (settled) return;
       settled = true; clearTimeout(timer); socket.destroy();
       if (error) reject(error); else resolve(operation!);
@@ -115,7 +127,7 @@ async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'appl
       let data: unknown;
       try { data = parseUniqueJson(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, -1))); }
       catch { fail('invalid_response'); return; }
-      const resultSchema = action === 'preferences' || action === 'set_preferences' ? preferencesSchema : action === 'discover' ? discoverySchema : action === 'backup_schema' ? backupSchemaObservation : action === 'prepare' ? preparationSchema : action === 'legacy_recovery' || action === 'legacy_recovery_status' ? legacyRecoverySchema : action === 'apply' || action === 'apply_status' ? applySchema : operationSchema;
+      const resultSchema = action === 'installation_backup_submit' || action === 'installation_backup_cancel' || action === 'installation_backup_status' ? installationBackupOperationSchema : action === 'preferences' || action === 'set_preferences' ? preferencesSchema : action === 'discover' ? discoverySchema : action === 'backup_schema' ? backupSchemaObservation : action === 'prepare' ? preparationSchema : action === 'legacy_recovery' || action === 'legacy_recovery_status' ? legacyRecoverySchema : action === 'apply' || action === 'apply_status' ? applySchema : operationSchema;
       const responseSchema = z.union([z.strictObject({ ok: z.literal(true), operation: resultSchema }), z.strictObject({ ok: z.literal(false), error: errorCode })]);
       const parsed = responseSchema.safeParse(data);
       if (!parsed.success) { fail('invalid_response'); return; }
@@ -124,7 +136,10 @@ async function request(action: 'submit' | 'status' | 'retry' | 'prepare' | 'appl
         finish(new UpdaterClientError(parsed.data.error, certainty)); return;
       }
       const operation = parsed.data.operation;
-      if (action === 'backup_schema' || action === 'preferences' || action === 'set_preferences') {
+      if (action === 'installation_backup_submit' || action === 'installation_backup_cancel') {
+        const approval = (validInput.data as {approval: InstallationBackupApproval}).approval;
+        if (!('actorId' in operation) || operation.operationId !== approval.operationId || (action === 'installation_backup_submit' && operation.actorId !== approval.actorId) || operation.name !== approval.name) { fail('invalid_response'); return; }
+      } else if (action === 'backup_schema' || action === 'preferences' || action === 'set_preferences') {
         // These responses have no operation identity to correlate.
       } else if (action === 'discover') {
         if ('current' in operation && operation.current !== (validInput.data as {current: string}).current) { fail('invalid_response'); return; }
@@ -156,3 +171,20 @@ export function legacyRecoveryStatus(identity: LegacyRecoveryIdentity, options: 
 
 export function getUpdatePreferences(options: UpdaterClientOptions): Promise<UpdatePreferences> { return request('preferences', {}, options) as Promise<UpdatePreferences>; }
 export function setUpdatePreferences(input: Pick<UpdatePreferences, 'automatic' | 'channel' | 'installTime' | 'timeZone'>, options: UpdaterClientOptions): Promise<UpdatePreferences> { return request('set_preferences', input, options) as Promise<UpdatePreferences>; }
+
+export function submitInstallationBackup(approval: InstallationBackupApproval, options: UpdaterClientOptions): Promise<InstallationBackupOperation> { return request('installation_backup_submit', {approval}, options) as Promise<InstallationBackupOperation>; }
+export function installationBackupStatus(operationId: string, options: UpdaterClientOptions): Promise<InstallationBackupOperation> { return request('installation_backup_status', {operationId}, options) as Promise<InstallationBackupOperation>; }
+
+/** Probe the existing read-only operation endpoint; never create an approval or a backup. */
+export async function installationBackupCapability(options:UpdaterClientOptions):Promise<InstallationBackupCapability>{
+  try{await installationBackupStatus(randomUUID(),options);return{available:true};}
+  catch(error){
+    if(error instanceof UpdaterClientError&&error.certainty==='definitive'){
+      if(error.code==='not_found')return{available:true};
+      if(error.code==='invalid_request'||error.code==='invalid_input')return{available:false,reason:'host_unsupported'};
+    }
+    return{available:false,reason:'host_unavailable'};
+  }
+}
+
+export function cancelInstallationBackup(approval:InstallationBackupApproval,options:UpdaterClientOptions):Promise<InstallationBackupOperation>{return request('installation_backup_cancel',{approval},options) as Promise<InstallationBackupOperation>;}

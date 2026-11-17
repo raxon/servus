@@ -31,7 +31,7 @@ it('requires agent authentication and validates headers before reserving a resto
   const { app, dataDir, url } = await fixture();
   const payload = Buffer.from('archive');
   expect((await app.inject({ method: 'POST', url, headers: { 'content-type':'application/octet-stream' }, payload })).statusCode).toBe(401);
-  expect((await app.inject({ method: 'POST', url: url.replace('kind=postgres','kind=redis'), headers: { authorization:'Bearer fixture-token', 'content-type':'application/octet-stream' }, payload })).statusCode).toBe(400);
+  expect((await app.inject({ method: 'POST', url: url.replace('kind=postgres','kind=app'), headers: { authorization:'Bearer fixture-token', 'content-type':'application/octet-stream' }, payload })).statusCode).toBe(400);
   const db = new Database(join(dataDir,'agent.sqlite'), { readonly:true });
   try { expect(db.prepare('SELECT count(*) AS count FROM restore_operations').get()).toEqual({ count:0 }); } finally { db.close(); }
 });

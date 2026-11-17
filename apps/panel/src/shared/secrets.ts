@@ -125,13 +125,13 @@ export class SecretVault {
   }
 
   /** Read only references authorized for this service and use. */
-  getServiceSecret(reference: string, serviceId: string, purpose: 'environment' | 'database' | 'git'): string {
+  getServiceSecret(reference: string, serviceId: string, purpose: 'environment' | 'database' | 'git' | 'backup-storage' | 'registry' | 'git-ssh'): string {
     if (!referencePattern.test(reference) || !referencePattern.test(serviceId)) throw new Error('Invalid secret identity.');
     const db = new Database(this.database, { readonly: true, fileMustExist: true });
     try {
-      if (db.pragma('user_version', { simple: true }) !== 5) throw new Error('Secret purpose metadata is unavailable.');
+      if (![5,6,7,8].includes(Number(db.pragma('user_version', { simple: true })))) throw new Error('Secret purpose metadata is unavailable.');
       const row = db.prepare('SELECT purpose FROM service_secret_refs WHERE reference=? AND service_id=?').get(reference, serviceId) as { purpose: string } | undefined;
-      if (!row || !(row.purpose === purpose || (row.purpose === 'legacy_shared' && purpose !== 'git'))) throw new Error('Secret reference is not valid for this purpose.');
+      if (!row || !(row.purpose === purpose || (row.purpose === 'legacy_shared' && (purpose === 'environment' || purpose === 'database')))) throw new Error('Secret reference is not valid for this purpose.');
       return this.get(reference);
     } finally { db.close(); }
   }
@@ -141,7 +141,7 @@ export class SecretVault {
     if (!referencePattern.test(reference)) throw new Error('Invalid secret identity.');
     const db = new Database(this.database, { readonly: true, fileMustExist: true });
     try {
-      if (db.pragma('user_version', { simple: true }) !== 5 || db.prepare('SELECT 1 FROM service_secret_refs WHERE reference=?').get(reference)) throw new Error('Database root secret is invalid.');
+      if (![5,6,7,8].includes(Number(db.pragma('user_version', { simple: true }))) || db.prepare('SELECT 1 FROM service_secret_refs WHERE reference=?').get(reference)) throw new Error('Database root secret is invalid.');
       return this.get(reference);
     } finally { db.close(); }
   }
@@ -154,6 +154,15 @@ export class SecretVault {
         try {
           const record: unknown = JSON.parse(value);
           if(record && typeof record==='object' && 'kind' in record && record.kind==='servus-host-v1' && 'token' in record && typeof record.token==='string')return [value,record.token,Buffer.from(record.token).toString('base64')];
+          if(record && typeof record==='object' && 'kind' in record && record.kind==='backup-storage-v1' && 'destination' in record && record.destination && typeof record.destination==='object') {
+            const destination=record.destination as {accessKeyId?:unknown;secretAccessKey?:unknown};
+            return [value,...[destination.accessKeyId,destination.secretAccessKey].filter((item):item is string=>typeof item==='string'&&item.length>0)];
+          }
+          if(record&&typeof record==='object'&&'kind' in record&&record.kind==='registry-credential-v1'&&'password' in record&&typeof record.password==='string'&&'username' in record&&typeof record.username==='string') {
+            const auth='server' in record&&typeof record.server==='string'?{username:record.username,password:record.password,serveraddress:record.server==='docker.io'?'https://index.docker.io/v1/':record.server}:undefined;
+            return [value,record.password,JSON.stringify(record.password).slice(1,-1),Buffer.from(record.password).toString('base64'),Buffer.from(`${record.username}:${record.password}`).toString('base64'),...(auth?[Buffer.from(JSON.stringify(auth)).toString('base64'),Buffer.from(JSON.stringify(auth)).toString('base64url')]:[])];
+          }
+          if(record&&typeof record==='object'&&'kind' in record&&record.kind==='git-ssh-v1'&&'privateKey' in record&&typeof record.privateKey==='string')return [value,record.privateKey,JSON.stringify(record.privateKey).slice(1,-1),Buffer.from(record.privateKey).toString('base64'),...record.privateKey.split(/\r?\n/).filter(line=>line.length>=32&&!line.startsWith('-----'))];
           if (record && typeof record === 'object' && 'kind' in record && (record.kind === 'git-credential-v1' || record.kind === 'github-connection-v1') && 'token' in record && typeof record.token === 'string' && 'username' in record && typeof record.username === 'string') return [value, record.token, Buffer.from(record.token).toString('base64'), Buffer.from(`${record.username}:${record.token}`).toString('base64')];
         } catch { /* Ordinary secrets need not contain JSON. */ }
         return [value];

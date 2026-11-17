@@ -1,0 +1,27 @@
+services:
+  challenge:
+    image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    volumes:
+      - type: bind
+        source: /var/lib/servus-ip-tls/webroot
+        target: /usr/share/nginx/html
+        read_only: true
+    networks:
+      - ingress
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.id == ${CHALLENGE_NODE_ID:?Set CHALLENGE_NODE_ID}
+      labels:
+        traefik.enable: 'true'
+        traefik.swarm.network: panel-ingress
+        traefik.http.routers.servus-ip-acme.rule: 'Host(`159.65.115.230`) && PathPrefix(`/.well-known/acme-challenge/`)'
+        traefik.http.routers.servus-ip-acme.entrypoints: web
+        traefik.http.routers.servus-ip-acme.priority: '1100'
+        traefik.http.routers.servus-ip-acme.service: servus-ip-acme
+        traefik.http.services.servus-ip-acme.loadbalancer.server.port: '80'
+networks:
+  ingress:
+    external: true
+    name: panel-ingress

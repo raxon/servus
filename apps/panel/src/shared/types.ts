@@ -7,7 +7,9 @@ export interface SessionResponse { user: User; csrfToken: string }
 export interface Project { id: string; name: string; description: string; createdAt: string; serviceCount: number; canWrite?: boolean }
 export type ServiceKind = 'app' | 'postgres' | 'redis' | 'mariadb';
 export interface GitCredential { username: string; token?: string; secretRef?: string }
-export type SourceConfig = { type: 'image' } | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string; credential?: GitCredential; sharedGithub?: boolean };
+export type {RegistryCredential,GitSshCredential} from './source-credentials.js';
+export interface DeploymentOptions { forceRebuild?: boolean }
+export type SourceConfig = { type: 'image' } | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string; envFile?: string; credential?: GitCredential; sharedGithub?: boolean;ssh?:import('./source-credentials.js').GitSshCredential };
 export interface EnvironmentVariable { name: string; value?: string; secret?: boolean; secretRef?: string }
 export interface DomainConfig { hostname: string; port: number; primary?: boolean; https?: boolean; redirectHttps?: boolean }
 export interface MountConfig { type: 'volume' | 'file' | 'bind'; name: string; target: string; readOnly?: boolean; content?: string; source?: string }
@@ -16,6 +18,7 @@ export interface DatabaseConfig { database: string; user: string; password?: str
 export interface ServiceConfiguration {
   kind?: ServiceKind; source?: SourceConfig; environment?: EnvironmentVariable[];
   domains?: DomainConfig[]; mounts?: MountConfig[]; resources?: ResourceConfig; database?: DatabaseConfig;
+  registry?:import('./source-credentials.js').RegistryCredential|null;
 }
 export interface Service extends ServiceConfiguration {
   id: string; projectId: string; name: string; image: string; port: number; hostname: string;
@@ -24,6 +27,7 @@ export interface Service extends ServiceConfiguration {
   deletedAt?: string | null;
   sourceCommit?: string | null; imageDigest?: string | null;
   rollbackImage?: string; rollbackCommit?: string;
+  deploymentOptions?: DeploymentOptions;
 }
 export interface Action {
   id: string; projectId: string; serviceId: string; type: ActionType; status: ActionStatus;

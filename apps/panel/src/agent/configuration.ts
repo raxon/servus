@@ -5,6 +5,8 @@ import { isAbsolute, relative, resolve, sep, join } from 'node:path';
 import { SecretVault } from '../shared/secrets.js';
 import type { Service } from '../shared/types.js';
 import type { RestoreVolumeBinding } from './restore-journal.js';
+import type { VolumeRestoreBinding } from '../shared/volume-backups.js';
+import { validateBoundMounts, verifyApplicationVolume } from './volume-binding.js';
 
 const helperImage = 'alpine:3.21';
 export const databaseKinds = new Set(['postgres', 'redis', 'mariadb']);
@@ -14,7 +16,7 @@ export const databasePaths = { postgres: '/var/lib/postgresql/data', mariadb: '/
 export const postgresScramVersion = 'scram-v1';
 const postgresHba = 'local all all scram-sha-256\nhost all all 0.0.0.0/0 scram-sha-256\nhost all all ::/0 scram-sha-256\n';
 
-export async function compileConfiguration(docker: Docker, service: Service, vault: SecretVault, dataDir: string, options: { postgresScram?: boolean; freshPostgres?: boolean; restoreBinding?:RestoreVolumeBinding } = {}): Promise<{
+export async function compileConfiguration(docker: Docker, service: Service, vault: SecretVault, dataDir: string, options: { postgresScram?: boolean; freshPostgres?: boolean; restoreBinding?:RestoreVolumeBinding; volumeBindings?:VolumeRestoreBinding[] } = {}): Promise<{
   mounts: Docker.MountSettings[]; environment: string[]; secrets: NonNullable<Docker.ContainerSpec['Secrets']>; command?: string[]; args?: string[]; postgresReservation?: string;
 }> {
   if (stateful(service) && service.replicas !== 1) throw new Error('Writable storage and databases require a single replica.');
@@ -22,12 +24,14 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
   const environment = (service.environment || []).map(item => `${item.name}=${item.secretRef ? vault.getServiceSecret(item.secretRef,service.id,'environment') : item.value || ''}`);
   const secrets: NonNullable<Docker.ContainerSpec['Secrets']> = [];
   const configured = service.mounts || [];
+  validateBoundMounts(service,options.volumeBindings??[]);
   if(options.restoreBinding&&(options.freshPostgres||options.restoreBinding.service_id!==service.id||options.restoreBinding.kind!==service.kind||configured.some(mount=>mount.target===databasePaths[options.restoreBinding!.kind])))throw new Error('Restored database volume configuration cannot be changed.');
   if(options.freshPostgres && (!options.postgresScram || service.kind!=='postgres' || configured.length || service.environment?.some(item=>item.name==='PGDATA')))throw new Error('A new protected PostgreSQL service requires its default data volume and data path.');
   for (const mount of configured) {
     if (mount.type === 'volume') {
-      const name = `panel-data-${service.id}-${mount.name}`;
-      await volume(docker, name, service.id);
+      const binding=options.volumeBindings?.find(item=>item.mount_target===mount.target);
+      const name = binding?.volume_name??`panel-data-${service.id}-${mount.name}`;
+      if(binding)await verifyApplicationVolume(docker,binding);else await volume(docker, name, service.id);
       mounts.push({ Type: 'volume', Source: name, Target: mount.target, ReadOnly: mount.readOnly || false });
     } else if (mount.type === 'file') {
       const content = mount.content || '', digest = createHash('sha256').update(content).digest('hex').slice(0, 16);

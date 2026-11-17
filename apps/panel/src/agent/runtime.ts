@@ -4,6 +4,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { SecretVault } from '../shared/secrets.js';
 import { buildSource } from './build.js';
+import { withComposeProvider } from './compose-ingress.js';
 import { httpsRouteLabels, httpsRedirectLabels, supportsManagedHttps, httpsIngressOptions } from './https-routing.js';
 import { LOCAL_TLS_FORWARDER, verifyLocalTlsForwarder } from './https-local-forwarder.js';
 import { inspectManagedCertificate } from './managed-certificate.js';
@@ -12,6 +13,8 @@ import { isHostApplication } from '../shared/host-domain.js';
 import { verifyRedirectEndpoints, verifyPublicHttpsRoute } from '../server/domain-tls.js';
 import { compileConfiguration, databaseKind, stateful, decodeDockerLogs, postgresScramVersion, verifyRestoredVolume } from './configuration.js';
 import { readRestoreBinding } from './restore-binding.js';
+import { applyRegistryService, imageDigestForReference, registryAuth, registryAuthFromSpec, registryLabels } from './registry-credentials.js';
+import { readVolumeBindings, verifyBoundRuntime } from './volume-binding.js';
 import type { RestoreVolumeBinding } from './restore-journal.js';
 import { serviceContainers, serviceMetrics, ownedContainer, outputBuffer, execOutput, ingressStatus } from './observability.js';
 import type { Service, RuntimeStatus, ServiceLogs, ContainerInfo, ServiceMetrics } from '../shared/types.js';
@@ -105,9 +108,11 @@ export class DockerRuntime {
     catch (error) { if (!isNotFound(error)) throw error; }
     if (existing) {
       if (existing.Spec.Labels?.['panel.owner'] !== OWNER) throw new Error('Ingress name belongs to another service.');
-      if (existing.Spec.TaskTemplate?.RestartPolicy?.Condition !== 'any') {
+      const currentArgs=existing.Spec.TaskTemplate?.ContainerSpec?.Args??[];
+      const nextArgs=withComposeProvider(currentArgs);
+      if (existing.Spec.TaskTemplate?.RestartPolicy?.Condition !== 'any'||nextArgs.length!==currentArgs.length) {
         await this.docker.getService(INGRESS_SERVICE).update({ ...existing.Spec, version: existing.Version.Index,
-          TaskTemplate: { ...existing.Spec.TaskTemplate, RestartPolicy: { ...existing.Spec.TaskTemplate?.RestartPolicy, Condition: 'any' } } });
+          TaskTemplate: { ...existing.Spec.TaskTemplate, ContainerSpec:{...existing.Spec.TaskTemplate?.ContainerSpec,Args:nextArgs}, RestartPolicy: { ...existing.Spec.TaskTemplate?.RestartPolicy, Condition: 'any' } } });
       }
       return;
     }
@@ -127,8 +132,8 @@ export class DockerRuntime {
       if(volume.Labels?.['panel.owner']!==OWNER || volume.Labels?.['panel.purpose']!=='acme' || volume.Driver!=='local')throw new Error('HTTPS certificate storage belongs to another installation or uses an unsupported driver.');
     }
     await this.pull(this.ingressImage);
-    const args=['--providers.swarm.endpoint=unix:///var/run/docker.sock', '--providers.swarm.exposedbydefault=false',
-      `--providers.swarm.network=${INGRESS_NETWORK}`, '--entrypoints.web.address=:8080', '--api.dashboard=false', '--log.level=WARN'];
+    const args=withComposeProvider(['--providers.swarm.endpoint=unix:///var/run/docker.sock', '--providers.swarm.exposedbydefault=false',
+      `--providers.swarm.network=${INGRESS_NETWORK}`, '--entrypoints.web.address=:8080', '--api.dashboard=false', '--log.level=WARN']);
     if(https)args.push('--entrypoints.websecure.address=:8443',`--certificatesresolvers.servus.acme.email=${https.email}`,
       '--certificatesresolvers.servus.acme.storage=/letsencrypt/acme.json','--certificatesresolvers.servus.acme.httpchallenge.entrypoint=web',
       ...(https.staging ? ['--certificatesresolvers.servus.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory'] : []));
@@ -143,15 +148,15 @@ export class DockerRuntime {
         ...(https ? [{Protocol:'tcp' as const,PublishedPort:443,TargetPort:8443,PublishMode:'host' as const}] : [])] } });
   }
 
-  async pull(image: string): Promise<string> {
+  async pull(image: string, auth?:Docker.AuthConfigObject): Promise<string> {
     if (process.env.PANEL_ALLOW_LOCAL_IMAGES === '1') {
-      try { const existing = await this.docker.getImage(image).inspect(); return existing.RepoDigests?.[0] || existing.Id; }
+      try { const existing = await this.docker.getImage(image).inspect(); return imageDigestForReference(image,existing); }
       catch (error) { if (!isNotFound(error)) throw error; }
     }
-    const stream = await this.docker.pull(image);
+    const stream = auth ? await this.docker.pull(image,{authconfig:auth}) : await this.docker.pull(image);
     await new Promise<void>((resolve, reject) => this.docker.modem.followProgress(stream, error => error ? reject(error) : resolve()));
     const details = await this.docker.getImage(image).inspect();
-    return details.RepoDigests?.[0] || image;
+    return imageDigestForReference(image,details);
   }
 
   private async verifyProtectedPostgresVolume(serviceId: string, spec: Docker.ServiceSpec | null | undefined, binding?:RestoreVolumeBinding): Promise<void> {
@@ -169,13 +174,15 @@ export class DockerRuntime {
 
   async apply(service: Service, type: string, operationId: string, recovery?: RecoveryContext): Promise<ApplyResult> {
     const name = `panel-app-${service.id}`;
-    const binding=service.kind==='postgres'||service.kind==='mariadb'?readRestoreBinding(this.dataDir,service.id,service.kind):undefined;
+    const binding=service.kind==='postgres'||service.kind==='mariadb'||service.kind==='redis'?readRestoreBinding(this.dataDir,service.id,service.kind):undefined;
+    const volumeBindings=readVolumeBindings(this.dataDir,service.id);
     const verifyBinding=async (...specs:(Docker.ServiceSpec|null|undefined)[])=>{
-      if(service.kind!=='postgres'&&service.kind!=='mariadb')return;
+      for(const spec of specs)await verifyBoundRuntime(this.docker,spec,volumeBindings);
+      if(service.kind!=='postgres'&&service.kind!=='mariadb'&&service.kind!=='redis')return;
       for(const spec of specs){
         if(!spec)continue;
         if(!binding){if(spec.Labels?.['panel.restore.operation'])throw new Error('Restored database volume binding is unavailable.');continue;}
-        const mounts=containerSpec(spec)?.Mounts??[],target=binding.kind==='postgres'?'/var/lib/postgresql/data':'/var/lib/mysql';
+        const mounts=containerSpec(spec)?.Mounts??[],target=binding.kind==='postgres'?'/var/lib/postgresql/data':binding.kind==='redis'?'/data':'/var/lib/mysql';
         if(spec.Labels?.['panel.restore.operation']!==binding.operation_id||mounts.length!==1||mounts[0]?.Type!=='volume'||mounts[0].Source!==binding.volume_name||mounts[0].Target!==target||mounts[0].ReadOnly)throw new Error('Restored database service does not match its committed volume.');
       }
       if(binding)await verifyRestoredVolume(this.docker,binding);
@@ -203,7 +210,7 @@ export class DockerRuntime {
     }
     const messages: string[] = [];
     const existing = await this.inspect(name);
-    if(binding&&!existing)throw new Error('The restored database service is missing; recover its saved configuration before continuing.');
+    if((binding||volumeBindings.length)&&!existing)throw new Error('The restored service is missing; recover its saved configuration before continuing.');
     if (existing && existing.Spec.Labels?.['panel.owner'] !== OWNER) throw new Error('Service ownership check failed.');
     // A journaled target may have been recorded before Docker received it. Recheck
     // the live certificate before applying such a target after a restart, but do
@@ -236,16 +243,23 @@ export class DockerRuntime {
     let sourceCommit = spec?.Labels?.['panel.sourceCommit'];
     if (!spec) {
       if (type === 'deploy') {
+        if(service.rollbackImage && service.kind && service.kind!=='app')throw new Error('Historical deployment is only available for applications.');
         if(service.kind==='postgres'&&!previousSpec&&service.deployedRevision===null&&(service.image!=='postgres:17-alpine'||service.source?.type==='git'))throw new Error('New PostgreSQL services require the managed postgres:17-alpine image.');
         if (service.kind==='postgres'&&previousSpec?.Labels?.['panel.postgres-auth']===postgresScramVersion) {
           imageDigest=containerSpec(previousSpec)?.Image;
           if(!imageDigest||!/(?:^|@)sha256:[a-f0-9]{64}$/.test(imageDigest))throw new Error('The previous PostgreSQL image is not pinned. Back up the database and use an explicit upgrade procedure.');
           assertPostgresImageReference(service,previousSpec);
+        } else if (service.rollbackImage) {
+          if(!/^(?:sha256:[a-f0-9]{64}|[a-zA-Z0-9][a-zA-Z0-9._/:@-]*@sha256:[a-f0-9]{64})$/.test(service.rollbackImage))throw new Error('The historical image is not pinned.');
+          if(!service.rollbackImage.startsWith('sha256:'))await this.pull(service.rollbackImage,registryAuth(service,service.rollbackImage,this.vault));
+          const image=await this.docker.getImage(service.rollbackImage).inspect();
+          if(service.rollbackImage.startsWith('sha256:') ? image.Id!==service.rollbackImage : !image.RepoDigests?.includes(service.rollbackImage))throw new Error('The historical image cannot be verified.');
+          imageDigest=service.rollbackImage;sourceCommit=service.rollbackCommit;
         } else if (service.source?.type === 'git') {
-          const built = await buildSource(service, operationId, this.dataDir, this.socketPath, this.vault);
+          const built = await buildSource(service, operationId, this.dataDir, this.socketPath, this.vault,{forceRebuild:service.deploymentOptions?.forceRebuild});
           const image = await this.docker.getImage(built.image).inspect();
           imageDigest = image.RepoDigests?.[0] || image.Id; sourceCommit = built.sourceCommit;
-        } else imageDigest = await this.pull(service.image);
+        } else imageDigest = await this.pull(service.image,registryAuth(service,service.image,this.vault));
         messages.push(`Resolved image: ${imageDigest}`);
         const projectNetwork = `panel-project-${service.projectId}`;
         try {
@@ -260,10 +274,10 @@ export class DockerRuntime {
         if(service.kind==='postgres' && previousPostgresAuth!==undefined && previousPostgresAuth!==postgresScramVersion)throw new Error('Unsupported PostgreSQL authentication policy. Update the agent before redeploying.');
         const freshPostgres=service.kind==='postgres' && !previousSpec && service.deployedRevision===null;
         const postgresScram=service.kind==='postgres' && (previousPostgresAuth===postgresScramVersion || freshPostgres);
-        const configuration = await compileConfiguration(this.docker, service, this.vault, this.dataDir, {postgresScram,freshPostgres,restoreBinding:binding});
+        const configuration = await compileConfiguration(this.docker, service, this.vault, this.dataDir, {postgresScram,freshPostgres,restoreBinding:binding,volumeBindings});
         const key = service.id.replaceAll('-', '');
         const labels: Record<string, string> = { 'panel.owner': OWNER, 'panel.project': service.projectId, 'panel.service': service.id,
-          'panel.revision': String(service.revision), 'panel.operation': operationId, 'panel.replicas': String(service.replicas), 'panel.kind': service.kind || 'app' };
+          'panel.revision': String(service.revision), 'panel.operation': operationId, 'panel.replicas': String(service.replicas), 'panel.kind': service.kind || 'app',...registryLabels(service) };
         if(binding)labels['panel.restore.operation']=binding.operation_id;
         if(postgresScram)labels['panel.image-reference']=service.image;
         if (sourceCommit) labels['panel.sourceCommit'] = sourceCommit;
@@ -332,8 +346,7 @@ export class DockerRuntime {
     }
     try {
       if (existing?.Spec.Labels?.['panel.operation'] === operationId) messages.push('Recovered a previously applied operation; inspecting its target tasks.');
-      else if (existing) await this.docker.getService(name).update({ ...spec, version: existing.Version.Index });
-      else await this.docker.createService(spec);
+      else await applyRegistryService(this.docker,spec,existing?.Version.Index,registryAuthFromSpec(service.id,spec,this.vault),name);
       messages.push(`Applied ${type}; waiting for the target runtime state.`);
       if (type === 'stop') await this.waitStopped(name);
       else {
@@ -403,7 +416,7 @@ export class DockerRuntime {
       }
       throw new Error('Database authentication/readiness could not be verified.');
     }
-    for (const hostname of routeHostnames(spec)) await this.probeRoute(hostname);
+    for (const hostname of routeHostnames(spec)) await this.probeRoute(hostname,redirectedRouteHostnames(spec).has(hostname));
   }
 
   private async inspect(name: string): Promise<ServiceInspection | undefined> {
@@ -418,8 +431,7 @@ export class DockerRuntime {
       if (current && current.Spec.Labels?.['panel.operation'] === operationId) await this.docker.getService(name).remove();
       return;
     }
-    if (current) await this.docker.getService(name).update({ ...previous, version: current.Version.Index });
-    else await this.docker.createService(previous);
+    await applyRegistryService(this.docker,previous,current?.Version.Index,registryAuthFromSpec(name.replace('panel-app-',''),previous,this.vault),name);
     if ((previous.Mode?.Replicated?.Replicas || 0) === 0) await this.waitStopped(name);
     else {
       await this.waitReady(name, previous, true);

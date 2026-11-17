@@ -22,8 +22,17 @@ class LegacyHostApplyTest(unittest.TestCase):
         self.runner.approval_journal='/root/journal';self.runner.active_env='/root/active'
         self.runner._current_ingress=mock.Mock(return_value=None)
         self.coordinator=mock.Mock();self.quiescence=mock.Mock()
-        modules={'update-coordinator':self.coordinator,'quiescence':self.quiescence,'provision-host':mock.Mock(),'runtime-policy':mock.Mock()}
-        self.runner._load=mock.Mock(side_effect=lambda _name,filename:modules[filename[:-3]])
+        self.backup_journal=mock.MagicMock()
+        self.backup_journal.__enter__.return_value=self.backup_journal
+        self.backup_journal.active.return_value=None
+        self.backups=SimpleNamespace(BackupJournal=mock.Mock(return_value=self.backup_journal),
+                                     BackupError=type('FixtureBackupError',(Exception,),{}))
+        modules={'update-coordinator':self.coordinator,'quiescence':self.quiescence,'provision-host':mock.Mock(),'runtime-policy':mock.Mock(),
+                 'installation-backups':self.backups}
+        def load(_name,filename,mode=0o644):
+            self.assertEqual(mode,0o644)
+            return modules[filename[:-3]]
+        self.runner._load=mock.Mock(side_effect=load)
         self.hub=mock.create_autospec(supervisor.DrainHub,instance=True);self.hub.policy=SimpleNamespace(data_dir="/root/panel-data")
         self.maintenance=mock.create_autospec(supervisor.MaintenanceSupervisor,instance=True)
         self.lease=object();self.maintenance.drained_window.return_value=nullcontext(self.lease)
@@ -43,6 +52,8 @@ class LegacyHostApplyTest(unittest.TestCase):
         self.maintenance.drained_window.assert_called_once_with(self.hub,self.op,policy_binding=self.binding,legacy_upload_id=self.restore,legacy_service_id=self.service)
         self.assertEqual([call[0] for call in self.coordinator.method_calls],['preflight_external_containers','cleanup_stopped_legacy_upload','start_cleaned_legacy_upload'])
         self.assertEqual(self.coordinator.cleanup_stopped_legacy_upload.call_args.args[:4],(self.op,self.restore,self.service,self.lease))
+        self.backups.BackupJournal.assert_called_once_with(self.maintenance,supervisor)
+        self.backup_journal.active.assert_called_once_with()
 
     def test_invalid_identity_or_failed_preflight_never_stops_services(self):
         with self.assertRaises(supervisor.SupervisorError):self.invoke('../bad')
@@ -50,6 +61,17 @@ class LegacyHostApplyTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):self.invoke()
         self.maintenance.drained_window.assert_not_called()
         self.coordinator.cleanup_stopped_legacy_upload.assert_not_called()
+
+    def test_active_installation_backup_refuses_legacy_recovery_before_preflight_or_drain(self):
+        for state in ('requested','capturing','verified','starting','completed','failed','recovery_required'):
+            with self.subTest(state=state):
+                self.backup_journal.active.return_value={'operationId':str(uuid.uuid4()),'state':state}
+                with self.assertRaisesRegex(supervisor.SupervisorError,'installation backup'):
+                    self.invoke()
+        self.coordinator.preflight_external_containers.assert_not_called()
+        self.maintenance.drained_window.assert_not_called()
+        self.coordinator.cleanup_stopped_legacy_upload.assert_not_called()
+        self.coordinator.start_cleaned_legacy_upload.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()

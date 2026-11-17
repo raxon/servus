@@ -255,9 +255,12 @@ class HostProvisioningTest(unittest.TestCase):
                          'Env':['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'],'User':''},
                'HostConfig':{'Privileged':False,'PidMode':'','CapAdd':None,'Devices':None,'DeviceRequests':None},
                'Mounts':[{'Source':'/var/run/docker.sock','Destination':'/var/run/docker.sock','RW':False}]}
-        runtime=SimpleNamespace(_docker=mock.Mock(side_effect=[(identifier+'\n').encode(),json.dumps([entry]).encode()]),_json=json.loads)
-        self.assertEqual(module.trusted_ingress('/root/docker',runtime),[identifier,'panel-ingress','traefik:3.7.13',image])
-        for change in ('writable','wrong_image','wrong_digest','privileged','command','environment','entrypoint','extra_mount'):
+        for arguments in (list(module.TRUSTED_INGRESS_ARGS), list(module.TRUSTED_INGRESS_ARGS) + module.COMPOSE_INGRESS_ARGS):
+            entry['Config']['Cmd'] = arguments
+            runtime=SimpleNamespace(_docker=mock.Mock(side_effect=[(identifier+'\n').encode(),json.dumps([entry]).encode()]),_json=json.loads)
+            self.assertEqual(module.trusted_ingress('/root/docker',runtime),[identifier,'panel-ingress','traefik:3.7.13',image])
+        for change in ('writable','wrong_image','wrong_digest','privileged','command','environment','entrypoint','extra_mount',
+                       'partial_provider','duplicate_provider','unconstrained_provider','remote_provider','foreign_network'):
             bad=json.loads(json.dumps(entry))
             if change=='writable': bad['Mounts'][0]['RW']=True
             if change=='wrong_image': bad['Config']['Image']='other:latest'
@@ -267,6 +270,11 @@ class HostProvisioningTest(unittest.TestCase):
             if change=='environment': bad['Config']['Env'].append('TRAEFIK_API_INSECURE=true')
             if change=='entrypoint': bad['Config']['Entrypoint']=['/bin/sh']
             if change=='extra_mount': bad['Mounts'].append({'Source':'/tmp','Destination':'/etc/traefik','RW':False})
+            if change=='partial_provider': bad['Config']['Cmd'].pop()
+            if change=='duplicate_provider': bad['Config']['Cmd'].extend(module.COMPOSE_INGRESS_ARGS)
+            if change=='unconstrained_provider': bad['Config']['Cmd'][-1]='--providers.docker.constraints='
+            if change=='remote_provider': bad['Config']['Cmd'][-4]='--providers.docker.endpoint=tcp://docker.example.test:2375'
+            if change=='foreign_network': bad['Config']['Cmd'][-2]='--providers.docker.network=foreign'
             runtime=SimpleNamespace(_docker=mock.Mock(side_effect=[(identifier+'\n').encode(),json.dumps([bad]).encode()]),_json=json.loads)
             with self.subTest(change=change), self.assertRaises(module.ProvisionError): module.trusted_ingress('/root/docker',runtime)
 
@@ -290,6 +298,11 @@ class HostProvisioningTest(unittest.TestCase):
             runtime=SimpleNamespace(_docker=mock.Mock(side_effect=[(identifier+'\n').encode(),json.dumps([item]).encode(),json.dumps([storage]).encode()]),_json=json.loads)
             return module.trusted_ingress('/root/docker',runtime,data_dir=data)
         self.assertEqual(check(),[identifier,'panel-ingress','traefik:3.7.13',image])
+        for index in (len(module.TRUSTED_INGRESS_ARGS), len(args)-2, len(args)):
+            with self.subTest(compose_provider_offset=index):
+                composed=json.loads(json.dumps(entry))
+                composed['Config']['Cmd'][index:index]=module.COMPOSE_INGRESS_ARGS
+                self.assertEqual(check(composed),[identifier,'panel-ingress','traefik:3.7.13',image])
         staging=json.loads(json.dumps(entry));staging['Config']['Cmd'].insert(-2,'--certificatesresolvers.servus.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory')
         self.assertEqual(check(staging),[identifier,'panel-ingress','traefik:3.7.13',image])
         for change in ('writable_projection','wrong_projection','missing_approval','custom_provider','extra_argument','foreign_volume','remote_volume','volume_alias'):

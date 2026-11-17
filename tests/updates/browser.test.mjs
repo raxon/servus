@@ -20,7 +20,8 @@ try{
   if(path==='/api/v1/updates/preferences'){
    if(req.method()==='PUT')preferences={...preferences,...req.postDataJSON()};
    body={preferences};
-  }else if(path==='/api/v1/updates/discovery')body={discovery:{status:'candidate',tag:'v1.0.1',commit:'a'.repeat(40),digest:'sha256:'+'b'.repeat(64)}};
+  }else if(path==='/api/v1/updates/release-notes/v1.0.1')body={tag:'v1.0.1',notes:'<img src=x onerror=window.releaseNotesInjected=true>\nChanges: certificate renewal and backup fixes.'};
+  else if(path==='/api/v1/updates/discovery')body={discovery:{status:'candidate',tag:'v1.0.1',commit:'a'.repeat(40),digest:'sha256:'+'b'.repeat(64)}};
   else if(path==='/api/v1/updates'&&req.method()==='POST'){submitted++;body={operation:{status:'accepted'}};}
   else if(path==='/api/v1/updates')body={applyAvailable:true};
   else body={operation:{status:'accepted'}};
@@ -44,6 +45,9 @@ try{
  assert.equal(preferences.automatic,true);assert.equal(preferences.channel,'beta');assert.equal(preferences.installTime,'03:30');
  await page.getByRole('button',{name:'Install update',exact:true}).click();
  await page.getByRole('dialog').waitFor();
+ await page.getByText('Changes: certificate renewal and backup fixes.',{exact:false}).waitFor();
+ assert.equal(await page.evaluate(()=>window.releaseNotesInjected),undefined);
+ assert.equal(await page.getByRole('dialog').locator('img').count(),0);
  for(const width of [375,768,1440]){await page.setViewportSize({width,height:960});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.screenshot({path:`/tmp/servus-update-confirm-${width}.png`});}
  assert.equal(submitted,0);
  await page.keyboard.press('Escape');
@@ -70,5 +74,46 @@ try{
  await stale.getByRole('button',{name:'Install update',exact:true}).waitFor();
  assert.equal(await stale.evaluate(()=>localStorage.getItem('servus.update.operation.v1')),null);
  await stale.close();
+ const saved={operationId:'12345678-1234-4123-8123-123456789abc',tag:'v1.0.1',commit:'a'.repeat(40),digest:'sha256:'+'b'.repeat(64),stage:'applying'};
+ for(const source of ['capability','health','discovery']){
+  const recovered=await browser.newPage();
+  await recovered.addInitScript(value=>localStorage.setItem('servus.update.operation.v1',JSON.stringify(value)),saved);
+  let posts=0;
+  await recovered.route('**/api/v1/**',async route=>{
+   const req=route.request(),path=new URL(req.url()).pathname;
+   if(path.endsWith('/apply')){if(req.method()==='POST')posts++;return route.fulfill({status:404,json:{error:{code:'NOT_FOUND',message:'Not found'}}});}
+   const body=path.endsWith('/preferences')?{preferences}:path.endsWith('/health')&&source==='health'?{status:'ok',version:'1.0.2'}:path.endsWith('/discovery')?{discovery:source==='discovery'?{status:'no_newer_version',current:'v1.0.2',latest:'v1.0.2'}:{status:'candidate',tag:'v1.0.3',commit:'a'.repeat(40),digest:'sha256:'+'b'.repeat(64)}}:{applyAvailable:true,...(source==='capability'?{currentVersion:'v1.0.2'}:{})};
+   return route.fulfill({status:200,json:body});
+  });
+  await recovered.goto(`http://127.0.0.1:${server.httpServer.address().port}/__updates`);
+  await recovered.getByText('Version v1.0.2 is already installed.',{exact:false}).waitFor();
+  assert.equal(posts,0);assert.equal(await recovered.evaluate(()=>localStorage.getItem('servus.update.operation.v1')),null);
+  await recovered.close();
+ }
+ const active=await browser.newPage();
+ await active.addInitScript(value=>localStorage.setItem('servus.update.operation.v1',JSON.stringify(value)),saved);
+ await active.route('**/api/v1/**',async route=>{
+  const path=new URL(route.request().url()).pathname;
+  const body=path.endsWith('/apply')?{operation:{status:'awaiting_completion'}}:path.endsWith('/preferences')?{preferences}:path.endsWith('/discovery')?{discovery:{status:'no_newer_version',current:'v1.0.2',latest:'v1.0.2'}}:{applyAvailable:true,currentVersion:'v1.0.2'};
+  return route.fulfill({status:200,json:body});
+ });
+ await active.goto(`http://127.0.0.1:${server.httpServer.address().port}/__updates`);
+ await active.getByText('Installing the update.',{exact:false}).waitFor();
+ assert.notEqual(await active.evaluate(()=>localStorage.getItem('servus.update.operation.v1')),null);
+ await active.close();
+ const legacy=await browser.newPage();
+ await legacy.addInitScript(value=>localStorage.setItem('servus.update.operation.v1',JSON.stringify(value)),saved);
+ await legacy.route('**/api/v1/**',async route=>{
+  const req=route.request(),path=new URL(req.url()).pathname;
+  if(path.endsWith('/apply'))return req.method()==='GET'?route.fulfill({status:404,json:{error:{code:'NOT_FOUND',message:'Not found'}}}):route.fulfill({status:400,json:{error:{code:'INVALID_UPDATE',message:'The release must be newer than this installation'}}});
+  const body=path.endsWith('/preferences')?{preferences}:path.endsWith('/discovery')?{discovery:{status:'candidate',tag:'v1.0.3',commit:'a'.repeat(40),digest:'sha256:'+'b'.repeat(64)}}:{applyAvailable:true};
+  return route.fulfill({status:200,json:body});
+ });
+ await legacy.goto(`http://127.0.0.1:${server.httpServer.address().port}/__updates`);
+ await legacy.getByText('The saved update cannot be resumed.',{exact:false}).waitFor();
+ await legacy.getByRole('button',{name:'Clear saved progress'}).click();
+ await legacy.getByRole('button',{name:'Install update',exact:true}).waitFor();
+ assert.equal(await legacy.evaluate(()=>localStorage.getItem('servus.update.operation.v1')),null);
+ await legacy.close();
  console.log('PASS: defaults, save automatic/channel/time, responsive layouts, working switch polyfill, modal cancellation and explicit confirmation, no JS errors');
 }finally{await browser.close();await server.close();}

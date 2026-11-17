@@ -16,13 +16,15 @@ RUN npm run build --workspace=@servus/panel && npm prune --omit=dev --workspace=
 FROM node:24-bookworm-slim
 WORKDIR /app
 ENV NODE_ENV=production PANEL_DATA_DIR=/var/lib/panel PANEL_HOST=0.0.0.0 PANEL_PORT=4180
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates util-linux diffutils && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client ca-certificates util-linux diffutils && rm -rf /var/lib/apt/lists/*
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
+COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/apps/panel/dist ./dist
 COPY deployment/lifecycle-gate.sh /app/lifecycle-gate.sh
 COPY package.json ./
+COPY scripts/servus-client.mjs scripts/servus.mjs scripts/servus-mcp.mjs ./scripts/
 COPY LICENSE ./
 RUN mkdir -p /var/lib/panel && chown -R node:node /var/lib/panel
 USER node

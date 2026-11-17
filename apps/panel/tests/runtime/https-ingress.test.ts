@@ -30,11 +30,14 @@ it('provisions a single node-pinned HTTPS ingress with persistent managed ACME v
   docker.getVolume.mockReturnValue({inspect:async()=>({Driver:'local',Labels:{'panel.owner':'other','panel.purpose':'acme'}})});
   expect((await runtime.status()).httpsConfigured).toBe(false);
 });
-it('will not adopt an unrelated volume or modify an existing HTTP ingress',async()=>{
+it('will not adopt an unrelated volume or enable HTTPS on an existing HTTP ingress',async()=>{
   vi.stubEnv('PANEL_HTTPS_ENABLED','true');vi.stubEnv('PANEL_HTTPS_EMAIL','admin@example.com');
   const foreign=harness(false);await expect(foreign.runtime.ensureInfrastructure()).rejects.toThrow('certificate storage belongs');expect(foreign.docker.createService).not.toHaveBeenCalled();
   const existing=harness();const update=vi.fn();existing.docker.getService.mockReturnValue({inspect:async()=>({Spec:{Labels:{'panel.owner':'self-hosted-panel'},TaskTemplate:{RestartPolicy:{Condition:'any'}}},Version:{Index:1}}),update});
-  await existing.runtime.ensureInfrastructure();expect(update).not.toHaveBeenCalled();expect(existing.docker.createService).not.toHaveBeenCalled();
+  await existing.runtime.ensureInfrastructure();expect(existing.docker.createService).not.toHaveBeenCalled();
+  const args=update.mock.calls[0]![0].TaskTemplate.ContainerSpec.Args as string[];
+  expect(args.some(argument=>argument.includes('certificatesresolvers')||argument.includes('websecure'))).toBe(false);
+  expect(args).toContain('--providers.docker.constraints=Label(`panel.compose`,`true`)');
 });
 it('refuses invalid ACME configuration before creating the ingress',async()=>{
   vi.stubEnv('PANEL_HTTPS_ENABLED','true');vi.stubEnv('PANEL_HTTPS_EMAIL','bad-value');const {runtime,docker}=harness();

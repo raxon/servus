@@ -22,6 +22,7 @@
 100644 apps/updater/initial-generation.py
 100644 apps/updater/install-gh.py
 100644 apps/updater/install-host.py
+100644 apps/updater/installation-backups.py
 100644 apps/updater/legacy-bootstrap.py
 100644 apps/updater/legacy-early-recovery.py
 100644 apps/updater/legacy-host-bootstrap.py

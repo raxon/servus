@@ -8,6 +8,24 @@ import Database from 'better-sqlite3';
 
 const roots:string[]=[];
 afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
+it('upgrades a v6 copy without changing sessions, existing secret ownership or queued snapshots',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'purpose-v6-'));roots.push(root);
+  const original=join(root,'original'),copy=join(root,'copy');
+  const source=new Store(original),user=source.createUser('six@example.test',await hashPassword('migration-password'),'admin'),session=source.createSession(user.id),project=source.createProject('before-six');
+  const created=source.createService(project.id,{name:'web',image:'nginx:alpine',hostname:'six.localhost',port:80,environment:[{name:'TOKEN',secret:true,value:'v6-fixture-secret'}]},user.id);
+  const reference=created.service.environment![0]!.secretRef!;
+  const prior=(source.db.prepare('SELECT snapshot FROM jobs WHERE action_id=?').get(created.action.id) as {snapshot:string}).snapshot;
+  source.db.exec(`DROP TABLE volume_restores; DROP TABLE volume_backups; DROP TABLE volume_backup_settings;
+    CREATE TABLE service_secret_refs_v6(reference TEXT PRIMARY KEY,service_id TEXT NOT NULL REFERENCES services(id),purpose TEXT NOT NULL CHECK(purpose IN ('unclassified','environment','database','git','legacy_shared','backup-storage')));
+    INSERT INTO service_secret_refs_v6 SELECT * FROM service_secret_refs; DROP TABLE service_secret_refs; ALTER TABLE service_secret_refs_v6 RENAME TO service_secret_refs; PRAGMA user_version=6;`);source.close();
+  cpSync(original,copy,{recursive:true});const migrated=new Store(copy);
+  expect(migrated.db.pragma('user_version',{simple:true})).toBe(8);
+  expect(migrated.getSession(session.token)?.user.id).toBe(user.id);
+  expect(migrated.vault.getServiceSecret(reference,created.service.id,'environment')).toBe('v6-fixture-secret');
+  expect((migrated.db.prepare('SELECT snapshot FROM jobs WHERE action_id=?').get(created.action.id) as {snapshot:string}).snapshot).toBe(prior);
+  for(const purpose of ['registry','git-ssh'] as const)expect(()=>migrated.vault.getServiceSecret(reference,created.service.id,purpose)).toThrow();
+  migrated.close();const unchanged=new Database(join(original,'panel.sqlite'),{readonly:true});expect(unchanged.pragma('user_version',{simple:true})).toBe(6);unchanged.close();
+});
 it('migrates a copy of v4 with users, sessions, queued snapshots and legacy purpose references',async()=>{
   const root=mkdtempSync(join(tmpdir(),'purpose-v4-'));roots.push(root);
   const original=join(root,'original'),copy=join(root,'copy');
@@ -19,7 +37,7 @@ it('migrates a copy of v4 with users, sessions, queued snapshots and legacy purp
   source.db.exec('ALTER TABLE service_secret_refs DROP COLUMN purpose; PRAGMA user_version=4');source.close();
   cpSync(original,copy,{recursive:true});
   const migrated=new Store(copy);
-  expect(migrated.db.pragma('user_version',{simple:true})).toBe(5);
+  expect(migrated.db.pragma('user_version',{simple:true})).toBe(8);
   expect(migrated.getSession(session.token)?.user.id).toBe(user.id);
   expect(migrated.getProject(project.id)?.name).toBe('before');
   expect(migrated.vault.getServiceSecret(envRef,env.service.id,'environment')).toBe('legacy-env-secret');

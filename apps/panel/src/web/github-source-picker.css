@@ -1,0 +1,6 @@
+.github-source-picker .form-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.github-source-picker select { min-width: 0; max-width: 100%; }
+.github-source-picker .heading-actions { flex-wrap: wrap; margin-top: 10px; }
+@media (max-width: 600px) {
+  .github-source-picker .form-grid { grid-template-columns: minmax(0, 1fr); }
+}

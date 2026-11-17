@@ -39,8 +39,46 @@ MAX_DATABASE = 64 * 1024 ** 2
 MEMORY_RESERVE = 512 * 1024 ** 2
 MAX_SECRETS = 4096
 MAX_TOTAL = 32 * 1024 * 1024
-NODE_VERIFY = r'''const {createDecipheriv}=require('node:crypto');
-let text='';process.stdin.setEncoding('utf8');process.stdin.on('data',v=>text+=v);process.stdin.on('end',()=>{try{const x=JSON.parse(text);const k=Buffer.from(x.key,'hex');for(const s of x.sealed){const b=Buffer.from(s.value,'base64');const d=createDecipheriv('aes-256-gcm',k,b.subarray(0,12));d.setAAD(Buffer.from('panel-secret-v1'));d.setAuthTag(b.subarray(12,28));const p=Buffer.concat([d.update(b.subarray(28)),d.final()]);if(s.json||s.git){const j=JSON.parse(p.toString('utf8'));if(!j||typeof j!=='object'||Array.isArray(j))throw Error();if(s.git){if(Object.keys(j).sort().join(',')!=='kind,repository,serviceId,token,username'||j.kind!=='git-credential-v1'||typeof j.token!=='string'||!j.token||j.token.length>4096||/[\x00-\x20\x7f]/.test(j.token)||!Array.isArray(s.git)||!s.git.length)throw Error();for(const e of s.git){const u=new URL(e.repository);if(u.protocol!=='https:'||u.username||u.password||u.search||u.hash||u.href!==e.repository||j.serviceId!==e.serviceId||j.repository!==e.repository||j.username!==e.username)throw Error();}}}}process.stdout.write('ok');}catch{process.exitCode=1;}});'''
+NODE_VERIFY = r'''const {createDecipheriv,createPrivateKey,createPublicKey}=require('node:crypto');
+function object(value,keys){if(!value||typeof value!=='object'||Array.isArray(value)||keys&&Object.keys(value).sort().join(',')!==keys)throw Error();return value;}
+function string(value,max=4096){if(typeof value!=='string'||!value||value.length>max||value.includes('\0'))throw Error();return value;}
+function registry(value){string(value,253);if(/[\s/@?#\\]/.test(value))throw Error();const u=new URL('https://'+value);if(u.pathname!=='/'||!u.hostname.split('.').every(p=>/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(p)))throw Error();const host=['index.docker.io','registry-1.docker.io'].includes(u.hostname)?'docker.io':u.hostname;return host+(u.port?':'+u.port:'');}
+function imageRegistry(image){string(image,512);const first=image.split('/')[0];return image.includes('/')&&(first.includes('.')||first.includes(':')||first==='localhost')?registry(first):'docker.io';}
+function sshTarget(value){const u=new URL(string(value,1000)),host=u.hostname.replace(/^\[|\]$/g,'').toLowerCase(),port=u.port?Number(u.port):22,validHost=host.includes(':')?/^[0-9a-f:]+$/i.test(host):host.split('.').every(part=>/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(part));if(u.protocol!=='ssh:'||u.password||u.search||u.hash||u.href!==value||!host||!validHost||!/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(u.username)||!/^\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(u.pathname)||u.pathname.split('/').includes('..')||port<1||port>65535)throw Error();return port===22?host:'['+host+']:'+port;}
+function ed25519(value){const b=Buffer.from(value,'base64');if(b.length!==51||b.readUInt32BE(0)!==11||b.subarray(4,15).toString()!=='ssh-ed25519'||b.readUInt32BE(15)!==32||b.toString('base64')!==value)throw Error();return b.subarray(19);}
+function keyPair(record){
+ const lines=string(record.privateKey,16384).trim().split(/\r?\n/);if(lines.shift()!=='-----BEGIN OPENSSH PRIVATE KEY-----'||lines.pop()!=='-----END OPENSSH PRIVATE KEY-----')throw Error();
+ const encoded=lines.join(''),b=Buffer.from(encoded,'base64');let offset=15;if(b.toString('base64')!==encoded||b.subarray(0,15).toString()!=='openssh-key-v1\0')throw Error();
+ const number=()=>{if(offset+4>b.length)throw Error();const n=b.readUInt32BE(offset);offset+=4;return n;};
+ const field=()=>{const n=number();if(n>b.length-offset)throw Error();const v=b.subarray(offset,offset+n);offset+=n;return v;};
+ if(field().toString()!=='none'||field().toString()!=='none'||field().length||number()!==1)throw Error();const publicBlob=field(),privateBlob=field();if(offset!==b.length)throw Error();
+ const publicPart=string(record.publicKey,1024).split(' ');if(!/^ssh-ed25519 [A-Za-z0-9+/]+={0,2}(?: [^\r\n\0]*)?$/.test(record.publicKey)||!publicBlob.equals(Buffer.from(publicPart[1],'base64')))throw Error();const expected=ed25519(publicPart[1]);
+ let i=0;const integer=()=>{if(i+4>privateBlob.length)throw Error();const n=privateBlob.readUInt32BE(i);i+=4;return n;};const part=()=>{const n=integer();if(n>privateBlob.length-i)throw Error();const p=privateBlob.subarray(i,i+n);i+=n;return p;};
+ if(integer()!==integer()||part().toString()!=='ssh-ed25519'||!part().equals(expected))throw Error();const privatePart=part();part();if(privatePart.length!==64||!privatePart.subarray(32).equals(expected)||privateBlob.length%8!==0||privateBlob.length-i<1||privateBlob.length-i>8)throw Error();let pad=1;while(i<privateBlob.length)if(privateBlob[i++]!==pad++)throw Error();
+ const key=createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),privatePart.subarray(0,32)]),format:'der',type:'pkcs8'});if(!createPublicKey(key).export({format:'der',type:'spki'}).subarray(-32).equals(expected))throw Error();
+}
+function redisPlan(j,expected){
+ object(j,'previousBinding,switchPlan,version');if(j.version!==1)throw Error();const plan=object(j.switchPlan,'inspection,previousSpec,targetSpec,version'),inspection=object(plan.inspection,'candidateContainerId,candidateVolume,imageId,nodeId,operationId,serviceDockerId,serviceId,serviceVersion,sourceContainerId,sourceVolume');
+ if(plan.version!==1||inspection.serviceId!==expected.serviceId||inspection.operationId!==expected.operationId||inspection.candidateVolume!=='panel-restore-'+expected.operationId||!/^sha256:[a-f0-9]{64}$/.test(inspection.imageId)||!Number.isSafeInteger(inspection.serviceVersion)||inspection.serviceVersion<1||!/^[a-f0-9]{64}$/.test(inspection.sourceContainerId)||!/^[a-f0-9]{64}$/.test(inspection.candidateContainerId))throw Error();string(inspection.serviceDockerId);string(inspection.nodeId);
+ const binding=j.previousBinding;if(binding!==null){object(binding,'created_at,kind,operation_id,service_id,volume_name');if(binding.kind!=='redis'||binding.service_id!==expected.serviceId||!/^[a-f0-9]{32}$/.test(binding.operation_id)||binding.operation_id===expected.operationId||binding.volume_name!=='panel-restore-'+binding.operation_id||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(binding.created_at))throw Error();}
+ if(inspection.sourceVolume!==(binding?binding.volume_name:'panel-data-'+expected.serviceId+'-database'))throw Error();
+ for(const [spec,volume,operation] of [[plan.previousSpec,inspection.sourceVolume,binding?.operation_id],[plan.targetSpec,inspection.candidateVolume,expected.operationId]]){
+  object(spec);const labels=object(spec.Labels),task=object(spec.TaskTemplate),container=object(task.ContainerSpec),mounts=container.Mounts;
+  if(spec.Name!=='panel-app-'+expected.serviceId||labels['panel.owner']!=='self-hosted-panel'||labels['panel.service']!==expected.serviceId||labels['panel.kind']!=='redis'||labels['panel.restore.operation']!==operation||spec.Mode?.Replicated?.Replicas!==1||spec.UpdateConfig?.Order!=='stop-first'||!Array.isArray(mounts)||mounts.length!==1||mounts[0].Type!=='volume'||mounts[0].Source!==volume||mounts[0].Target!=='/data'||mounts[0].ReadOnly)throw Error();
+ }
+}
+let text='';process.stdin.setEncoding('utf8');process.stdin.on('data',v=>text+=v);process.stdin.on('end',()=>{try{
+ const x=JSON.parse(text),k=Buffer.from(x.key,'hex');
+ for(const s of x.sealed){
+  const b=Buffer.from(s.value,'base64'),d=createDecipheriv('aes-256-gcm',k,b.subarray(0,12));d.setAAD(Buffer.from('panel-secret-v1'));d.setAuthTag(b.subarray(12,28));const p=Buffer.concat([d.update(b.subarray(28)),d.final()]);
+  if(!s.json&&!s.git&&!s.registry&&!s.ssh&&!s.redis)continue;const j=object(JSON.parse(p.toString('utf8')));
+  if(s.git){object(j,'kind,repository,serviceId,token,username');if(j.kind!=='git-credential-v1'||/[\x00-\x20\x7f]/.test(string(j.token))||!Array.isArray(s.git)||!s.git.length)throw Error();for(const e of s.git){const u=new URL(e.repository);if(u.protocol!=='https:'||u.username||u.password||u.search||u.hash||u.href!==e.repository||j.serviceId!==e.serviceId||j.repository!==e.repository||j.username!==e.username)throw Error();}}
+  if(s.registry){object(j,'kind,password,server,serviceId,username');if(j.kind!=='registry-credential-v1'||j.serviceId!==s.registry.serviceId||registry(j.server)!==j.server||/[\x00-\x1f\x7f]/.test(string(j.username,256)))throw Error();string(j.password);for(const e of s.registry.requirements)if(e.server!==j.server||e.username!==j.username||imageRegistry(e.image)!==j.server)throw Error();}
+  if(s.ssh){object(j,'kind,knownHosts,privateKey,publicKey,repository,serviceId');if(j.kind!=='git-ssh-v1'||j.serviceId!==s.ssh.serviceId)throw Error();const host=sshTarget(j.repository),lines=string(j.knownHosts).trim().split('\n');if(lines.length<1||lines.length>4||[...new Set(lines)].sort().join('\n')+'\n'!==j.knownHosts)throw Error();for(const line of lines){const parts=line.split(' ');if(parts.length!==3||parts[0]!==host||parts[1]!=='ssh-ed25519')throw Error();ed25519(parts[2]);}keyPair(j);for(const e of s.ssh.requirements)if(e.repository!==j.repository||e.knownHosts!==j.knownHosts||e.publicKey!==j.publicKey)throw Error();}
+  if(s.redis)redisPlan(j,s.redis);
+ }
+ process.stdout.write('ok');
+}catch{process.exitCode=1;}});'''
 
 PANEL_SCHEMA = {
  'users': {'id','email','password_hash','role','created_at'},
@@ -66,12 +104,34 @@ PANEL_SCHEMA = {
  'central_link_proofs': {'token_hash','user_id','session_hash','issuer','subject','expires_at'},
 }
 AGENT_SCHEMA = {'operations': {'id','request_hash','state','response','updated_at','previous_spec','previous_recorded','target_spec','operation_stage','previous_error','service_id'}}
+PANEL_V6_ADDITIONS = {
+ 'api_tokens': {'id','user_id','project_id','name','token_hash','scope','created_at','expires_at','last_used_at','revoked_at'},
+ 'database_backup_settings': {'service_id','actor_id','enabled','cron','retention','last_tick','updated_at','destination_ref'},
+ 'database_backups': {'id','service_id','actor_id','name','status','trigger','idempotency_key','request_hash','created_at','finished_at','size','sha256','extension','error','owner_id','lease_until','destination_ref','object_key'},
+ 'two_factor_auth': {'user_id','pending_secret','pending_created_at','secret','recovery_hashes','last_counter','enabled_at','updated_at'},
+ 'compose_workloads': {'id','project_id','name','revision','deployed_revision','state','configuration','created_at','updated_at','last_error','deleted_at'},
+ 'compose_actions': {'id','workload_id','project_id','actor_id','type','status','revision','snapshot','request_hash','idempotency_key','created_at','updated_at','lease_until','worker_id','error','logs'},
+ 'compose_domains': {'hostname','workload_id'},
+ 'deployment_webhooks': {'service_id','actor_id','token_hash','secret','enabled','created_at'},
+}
+PANEL_V7_ADDITIONS = {
+ 'volume_backup_settings': {'service_id','mount_target','actor_id','enabled','cron','retention','last_tick','updated_at','destination_ref'},
+ 'volume_backups': {'id','service_id','mount_target','actor_id','name','status','trigger','idempotency_key','request_hash','created_at','finished_at','size','sha256','error','owner_id','lease_until','destination_ref','object_key'},
+ 'volume_restores': {'id','backup_id','service_id','mount_target','actor_id','phase','candidate_volume','previous_volume','error','created_at','updated_at','idempotency_key','owner_id','lease_until'},
+}
+AGENT_VOLUME_SCHEMA = {
+ 'volume_backup_operations': {'id','service_id','mount_target','mount_name','source_volume','phase','sealed_plan','sealed_manifest','size','sha256','error','created_at','updated_at'},
+ 'volume_restore_operations': {'id','service_id','backup_id','mount_target','mount_name','phase','sealed_plan','candidate_volume','previous_volume','error','created_at','updated_at'},
+ 'volume_restore_bindings': {'service_id','mount_target','mount_name','volume_name','operation_id','created_at'},
+}
+AGENT_COMPOSE_COLUMNS = {'id','workload_id','project_id','type','request_hash','state','process_group','snapshot','response','error','updated_at'}
 AGENT_RESTORE_SCHEMA = {**AGENT_SCHEMA, 'restore_operations': {'id','service_id','kind','archive_sha256','phase','updated_at'}}
 AGENT_DNS_COLUMNS = {'operation_id','identifier','record_name','value','provider','state','record_id','outcome','review_from','updated_at'}
 AGENT_SWITCH_OLD_SCHEMA = {**AGENT_RESTORE_SCHEMA, 'restore_switch_intents': {'id','service_id','service_version','sealed_plan','created_at'}}
 AGENT_SWITCH_SCHEMA = {**AGENT_RESTORE_SCHEMA, 'restore_switch_intents': {'id','service_id','service_version','sealed_plan','created_at','stage'}}
 AGENT_RETAINED_COLUMNS = {'operation_id','service_id','volume_name','reason','created_at'}
 AGENT_BINDING_COLUMNS = {'service_id','operation_id','volume_name','kind','created_at'}
+AGENT_REDIS_PLAN_COLUMNS = {'operation_id','service_id','sealed_plan','phase','updated_at'}
 
 class CaptureError(Exception): pass
 
@@ -395,22 +455,50 @@ def _dns_journal_schema(db):
         seen.add(ident)
 
 def _agent_schema(db):
+    volume_tables={name for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'volume_%'")}
+    if volume_tables and volume_tables!=set(AGENT_VOLUME_SCHEMA): raise CaptureError('Unsupported database schema')
+    has_compose = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='compose_operations'").fetchone())
     has_restore = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_operations'").fetchone())
     has_switch = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_switch_intents'").fetchone())
     has_retained = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_retained_volumes'").fetchone())
     has_bindings = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_volume_bindings'").fetchone())
+    has_redis = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='redis_restore_plans'").fetchone())
     has_upload_locks = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_upload_locks'").fetchone())
     has_review_phases = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_review_phases'").fetchone())
     has_dns = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='acme_dns_challenges'").fetchone())
     if (has_switch or has_retained or has_bindings or has_upload_locks or has_review_phases) and not has_restore: raise CaptureError('Unsupported database schema')
+    if has_redis and not (has_restore and has_retained and has_bindings): raise CaptureError('Unsupported database schema')
     switch_columns={r[1] for r in db.execute('PRAGMA table_info(restore_switch_intents)')} if has_switch else set()
     schema=(AGENT_SWITCH_SCHEMA if 'stage' in switch_columns else AGENT_SWITCH_OLD_SCHEMA) if has_switch else AGENT_RESTORE_SCHEMA if has_restore else AGENT_SCHEMA
     if has_retained: schema={**schema,'restore_retained_volumes':AGENT_RETAINED_COLUMNS}
     if has_bindings: schema={**schema,'restore_volume_bindings':AGENT_BINDING_COLUMNS}
+    if has_redis: schema={**schema,'redis_restore_plans':AGENT_REDIS_PLAN_COLUMNS}
     if has_upload_locks: schema={**schema,'restore_upload_locks':{'operation_id','lock_id'}}
     if has_review_phases: schema={**schema,'restore_review_phases':{'operation_id','phase'}}
     if has_dns: schema={**schema,'acme_dns_challenges':AGENT_DNS_COLUMNS}
+    if has_compose: schema={**schema,'compose_operations':AGENT_COMPOSE_COLUMNS}
+    if volume_tables: schema={**schema,**AGENT_VOLUME_SCHEMA}
     _schema(db, schema, 0)
+    if volume_tables:
+        for table,terminal in (('volume_backup_operations',('completed','failed')),('volume_restore_operations',('completed','cancelled','failed','rolled_back'))):
+            for ident,service,phase,sealed in db.execute(f'SELECT id,service_id,phase,sealed_plan FROM {table}'):
+                if phase not in terminal: raise CaptureError('Unresolved application volume operation requires recovery')
+                if not all(isinstance(value,str) and UUID.fullmatch(value) for value in (ident,service)) or not isinstance(sealed,str) or not sealed.startswith('enc:v1:'):
+                    raise CaptureError('Application volume operation metadata is invalid')
+        for service,target,name,volume,ident,created in db.execute('SELECT service_id,mount_target,mount_name,volume_name,operation_id,created_at FROM volume_restore_bindings'):
+            if (not all(isinstance(value,str) and UUID.fullmatch(value) for value in (service,ident)) or
+                volume!='panel-volume-restore-'+ident or not isinstance(target,str) or not target.startswith('/') or
+                not isinstance(name,str) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}',name) or
+                not isinstance(created,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',created) or
+                not db.execute("SELECT 1 FROM volume_restore_operations WHERE id=? AND service_id=? AND mount_target=? AND mount_name=? AND candidate_volume=? AND phase='completed'",(ident,service,target,name,volume)).fetchone()):
+                raise CaptureError('Application volume binding is invalid')
+    if has_compose:
+        for ident,workload,project,operation,state,group,snapshot in db.execute('SELECT id,workload_id,project_id,type,state,process_group,snapshot FROM compose_operations'):
+            if state=='running': raise CaptureError('A Compose operation is still running')
+            if (not all(isinstance(value,str) and UUID.fullmatch(value) for value in (ident,workload,project)) or
+                operation not in ('deploy','start','stop','restart','destroy') or state not in ('succeeded','failed') or
+                group is not None or not isinstance(snapshot,str) or not snapshot.startswith('enc:v1:')):
+                raise CaptureError('Compose operation metadata is invalid')
     if has_dns: _dns_journal_schema(db)
     if not has_restore: return
     for ident, service, kind, digest, phase, updated in db.execute('SELECT id,service_id,kind,archive_sha256,phase,updated_at FROM restore_operations'):
@@ -426,7 +514,7 @@ def _agent_schema(db):
         for ident,lock_id in db.execute('SELECT operation_id,lock_id FROM restore_upload_locks'):
             if (not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or ident in seen_operations or
                 not isinstance(lock_id,str) or not re.fullmatch(r'[a-f0-9]{32}',lock_id) or lock_id in seen_locks or
-                not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND kind IN ('postgres','mariadb') AND phase IN ('completed','cancelled')",(ident,)).fetchone()):
+                not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND kind IN ('postgres','mariadb','redis') AND phase IN ('completed','cancelled')",(ident,)).fetchone()):
                 raise CaptureError('Upload lock journal is invalid')
             seen_operations.add(ident);seen_locks.add(lock_id)
     if has_review_phases and db.execute('SELECT 1 FROM restore_review_phases LIMIT 1').fetchone():
@@ -452,14 +540,26 @@ def _agent_schema(db):
         for service,ident,volume,kind,created in db.execute('SELECT service_id,operation_id,volume_name,kind,created_at FROM restore_volume_bindings'):
             if (not isinstance(service,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service) or service in seen_services or
                 not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or ident in seen_operations or
-                volume!='panel-restore-'+ident or volume in seen_volumes or kind not in ('postgres','mariadb') or
+                volume!='panel-restore-'+ident or volume in seen_volumes or kind not in ('postgres','mariadb','redis') or
                 not isinstance(created,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',created) or
                 not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND service_id=? AND kind=? AND phase='completed'",(ident,service,kind)).fetchone() or
                 not has_retained or volume in retained_volumes or not db.execute("SELECT 1 FROM restore_retained_volumes WHERE operation_id=? AND service_id=? AND reason='pre_restore_source'",(ident,service)).fetchone()):
                 raise CaptureError('Database restore volume binding is invalid')
             seen_services.add(service);seen_operations.add(ident);seen_volumes.add(volume)
+    if has_redis:
+        for ident,service,sealed,phase,updated in db.execute('SELECT operation_id,service_id,sealed_plan,phase,updated_at FROM redis_restore_plans'):
+            if phase not in ('completed','rolled_back'): raise CaptureError('Unresolved Redis restore plan requires recovery')
+            if (not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or
+                not isinstance(service,str) or not UUID.fullmatch(service) or not isinstance(sealed,str) or not sealed.startswith('enc:v1:') or
+                not isinstance(updated,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',updated) or
+                not db.execute('SELECT 1 FROM restore_operations WHERE id=? AND service_id=? AND kind=? AND phase=?',(ident,service,'redis','completed' if phase=='completed' else 'cancelled')).fetchone()):
+                raise CaptureError('Redis restore plan metadata is invalid')
+    if has_restore:
+        for ident,service in db.execute("SELECT id,service_id FROM restore_operations WHERE kind='redis' AND phase='completed'"):
+            if not has_redis or not db.execute("SELECT 1 FROM redis_restore_plans WHERE operation_id=? AND service_id=? AND phase='completed'",(ident,service)).fetchone():
+                raise CaptureError('Completed Redis restore lacks a recovery plan')
 
-def _config_references(config, refs, service_id, owners, purposes=None, git_requirements=None):
+def _config_references(config, refs, service_id, owners, purposes=None, git_requirements=None, registry_requirements=None, ssh_requirements=None, image=None):
     if not isinstance(config,dict): raise CaptureError('Service configuration is invalid')
     environment=config.get('environment',[])
     if not isinstance(environment,list): raise CaptureError('Service configuration is invalid')
@@ -471,6 +571,16 @@ def _config_references(config, refs, service_id, owners, purposes=None, git_requ
             if owners.get(reference)!=service_id: raise CaptureError('Secret reference belongs to another service')
             if purposes is not None and purposes.get(reference) not in ('environment','legacy_shared'): raise CaptureError('Secret reference has an invalid purpose')
             refs.add(reference)
+    registry=config.get('registry')
+    if registry is not None:
+        if not isinstance(registry,dict) or set(registry)!={'server','username','secretRef'}: raise CaptureError('Registry credential reference is invalid')
+        reference=registry['secretRef']
+        if not isinstance(reference,str) or owners.get(reference)!=service_id or purposes is None or purposes.get(reference)!='registry': raise CaptureError('Registry credential reference has an invalid owner or purpose')
+        if registry_requirements is None: raise CaptureError('Registry credential validation is unavailable')
+        server,username=registry['server'],registry['username']
+        if not all(isinstance(value,str) and value for value in (server,username,image)): raise CaptureError('Registry credential reference is invalid')
+        registry_requirements.setdefault(reference,set()).add((server,username,image))
+        refs.add(reference)
     database=config.get('database')
     if database is not None:
         if not isinstance(database,dict): raise CaptureError('Service configuration is invalid')
@@ -492,6 +602,16 @@ def _config_references(config, refs, service_id, owners, purposes=None, git_requ
             if not isinstance(repository,str) or not repository or len(repository)>1000 or not credential['username'] or len(credential['username'])>256 or re.search(r'[\x00-\x20\x7f:=]',credential['username']): raise CaptureError('Git credential reference is invalid')
             if git_requirements is None: raise CaptureError('Git credential validation is unavailable')
             git_requirements.setdefault(reference,set()).add((service_id,repository,credential['username']))
+            refs.add(reference)
+        ssh=source.get('ssh')
+        if ssh is not None:
+            if source.get('type')!='git' or credential is not None or source.get('sharedGithub') or not isinstance(ssh,dict) or set(ssh)!={'knownHosts','publicKey','secretRef'}: raise CaptureError('SSH credential reference is invalid')
+            reference=ssh['secretRef']
+            if not isinstance(reference,str) or owners.get(reference)!=service_id or purposes is None or purposes.get(reference)!='git-ssh': raise CaptureError('SSH credential reference has an invalid owner or purpose')
+            repository,known_hosts,public_key=source.get('repository'),ssh['knownHosts'],ssh['publicKey']
+            if not all(isinstance(value,str) and value for value in (repository,known_hosts,public_key)): raise CaptureError('SSH credential reference is invalid')
+            if ssh_requirements is None: raise CaptureError('SSH credential validation is unavailable')
+            ssh_requirements.setdefault(reference,set()).add((repository,known_hosts,public_key))
             refs.add(reference)
 
 def _validate_operation_history(panel, agent):
@@ -556,32 +676,73 @@ def _validate_staging(dest_fd,node_fd):
         try: data[name]=_read(fd).decode('ascii')
         finally: os.close(fd)
         if not re.fullmatch(r'[a-f0-9]{64}',data[name]): raise CaptureError('Installation key or token is invalid')
-    encrypted=[]; refs=set(); mariadb=set(); git_requirements={}; dev=os.fstat(dest_fd).st_dev
+    encrypted=[]; refs=set(); mariadb=set(); git_requirements={}; registry_requirements={}; ssh_requirements={}; dev=os.fstat(dest_fd).st_dev
     with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/panel.sqlite?mode=ro&immutable=1',uri=True)) as db:
         version=db.execute('PRAGMA user_version').fetchone()[0]
         if version==4: _schema(db,PANEL_SCHEMA,4)
-        elif version==5: _schema(db,{**PANEL_SCHEMA,'service_secret_refs':PANEL_SCHEMA['service_secret_refs']|{'purpose'}},5)
+        elif version in (5,6,7,8):
+            expected={**PANEL_SCHEMA,'service_secret_refs':PANEL_SCHEMA['service_secret_refs']|{'purpose'}}
+            if version>=6: expected.update(PANEL_V6_ADDITIONS)
+            if version>=7: expected.update(PANEL_V7_ADDITIONS)
+            _schema(db,expected,version)
         else: raise CaptureError('Unsupported database schema')
         owners=dict(db.execute('SELECT reference,service_id FROM service_secret_refs'))
-        purposes=dict(db.execute('SELECT reference,purpose FROM service_secret_refs')) if version==5 else None
-        if purposes is not None and any(value not in ('unclassified','environment','database','git','legacy_shared') for value in purposes.values()): raise CaptureError('Secret purpose metadata is invalid')
+        purposes=dict(db.execute('SELECT reference,purpose FROM service_secret_refs')) if version>=5 else None
+        if version>=7:
+            if db.execute("SELECT 1 FROM volume_backups WHERE status='running' LIMIT 1").fetchone(): raise CaptureError('An application volume backup is still running')
+            if db.execute("SELECT 1 FROM volume_restores WHERE phase NOT IN ('completed','cancelled','failed','rolled_back') OR phase IS NULL LIMIT 1").fetchone(): raise CaptureError('Unresolved application volume restore requires recovery')
+            for table in ('volume_backup_settings','volume_backups'):
+                for service,reference in db.execute(f'SELECT service_id,destination_ref FROM {table} WHERE destination_ref IS NOT NULL'):
+                    if owners.get(reference)!=service or purposes.get(reference)!='backup-storage': raise CaptureError('Backup destination reference has an invalid owner or purpose')
+        if version>=6:
+            if db.execute("SELECT 1 FROM database_backups WHERE status='running' LIMIT 1").fetchone():
+                raise CaptureError('A database backup is still running')
+            for token_hash,scope in db.execute('SELECT token_hash,scope FROM api_tokens'):
+                if not isinstance(token_hash,str) or not re.fullmatch(r'[a-f0-9]{64}',token_hash) or scope not in ('read','deploy'):
+                    raise CaptureError('API token metadata is invalid')
+            if db.execute("SELECT 1 FROM compose_actions WHERE status='running' LIMIT 1").fetchone():
+                raise CaptureError('A Compose action is still running')
+            for table in ('database_backup_settings','database_backups'):
+                for service,reference in db.execute(f'SELECT service_id,destination_ref FROM {table} WHERE destination_ref IS NOT NULL'):
+                    if owners.get(reference)!=service or purposes.get(reference)!='backup-storage':
+                        raise CaptureError('Backup destination reference has an invalid owner or purpose')
+            for table,column in (('compose_workloads','configuration'),('compose_actions','snapshot')):
+                for (value,) in db.execute(f'SELECT {column} FROM {table}'):
+                    encrypted.append(_sealed(value,True))
+        allowed_purposes=('unclassified','environment','database','git','legacy_shared')+(('backup-storage',) if version>=6 else ())+(('registry','git-ssh') if version>=7 else ())
+        if purposes is not None and any(value not in allowed_purposes for value in purposes.values()): raise CaptureError('Secret purpose metadata is invalid')
         refs.update(owners)
-        for ident,raw,deployed in db.execute('SELECT id,config,deployed_revision FROM services'):
+        for ident,raw,deployed,image in db.execute('SELECT id,config,deployed_revision,image FROM services'):
             try: config=json.loads(raw)
             except (TypeError,ValueError): raise CaptureError('Service configuration is invalid') from None
-            _config_references(config,refs,ident,owners,purposes,git_requirements)
+            _config_references(config,refs,ident,owners,purposes,git_requirements,registry_requirements,ssh_requirements,image)
             if config.get('kind')=='mariadb' and deployed is not None: mariadb.add(ident)
         for ident,raw in db.execute('SELECT service_id,snapshot FROM jobs'):
             try: snapshot=json.loads(raw)
             except (TypeError,ValueError): raise CaptureError('Job snapshot is invalid') from None
-            _config_references(snapshot,refs,ident,owners,purposes,git_requirements)
+            _config_references(snapshot,refs,ident,owners,purposes,git_requirements,registry_requirements,ssh_requirements,snapshot.get('image') if isinstance(snapshot,dict) else None)
         checks={'central_config':['client_secret','revoke_token'],'central_pending_revocations':['revoke_token'],'central_pairings':['secret','redeemed_credentials'],'central_transactions':['verifier']}
+        if version>=6:
+            checks['two_factor_auth']=['pending_secret','secret']
+            checks['deployment_webhooks']=['secret']
         for table,cols in checks.items():
             for col in cols:
                 for (value,) in db.execute(f'SELECT {col} FROM {table} WHERE {col} IS NOT NULL'):
                     encrypted.append(_sealed(value,table=='central_pairings' and col=='redeemed_credentials'))
     with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/agent.sqlite?mode=ro&immutable=1',uri=True)) as db:
         _agent_schema(db)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='compose_operations'").fetchone():
+            for (value,) in db.execute('SELECT snapshot FROM compose_operations'):
+                encrypted.append(_sealed(value,True))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='redis_restore_plans'").fetchone():
+            for ident,service,value in db.execute('SELECT operation_id,service_id,sealed_plan FROM redis_restore_plans'):
+                entry=_sealed(value,True)
+                entry['redis']={'operationId':ident,'serviceId':service}
+                encrypted.append(entry)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='volume_backup_operations'").fetchone():
+            for table,column in (('volume_backup_operations','sealed_plan'),('volume_backup_operations','sealed_manifest'),('volume_restore_operations','sealed_plan')):
+                for (value,) in db.execute(f'SELECT {column} FROM {table} WHERE {column} IS NOT NULL'):
+                    encrypted.append(_sealed(value,True))
         with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/panel.sqlite?mode=ro&immutable=1',uri=True)) as panel:
             _validate_operation_history(panel, db)
         for (response,) in db.execute('SELECT response FROM operations'):
@@ -607,8 +768,10 @@ def _validate_staging(dest_fd,node_fd):
                 try: text=_read(fd).decode('ascii')
                 finally: os.close(fd)
                 if directory==secret_dir:
-                    entry=_sealed(text)
+                    entry=_sealed(text,purposes is not None and purposes.get(name)=='backup-storage')
                     if name in git_requirements: entry['git']=[{'serviceId':service_id,'repository':repository,'username':username} for service_id,repository,username in sorted(git_requirements[name])]
+                    if purposes is not None and purposes.get(name)=='registry': entry['registry']={'serviceId':owners[name],'requirements':[{'server':server,'username':username,'image':image} for server,username,image in sorted(registry_requirements.get(name,()))]}
+                    if purposes is not None and purposes.get(name)=='git-ssh': entry['ssh']={'serviceId':owners[name],'requirements':[{'repository':repository,'knownHosts':known_hosts,'publicKey':public_key} for repository,known_hosts,public_key in sorted(ssh_requirements.get(name,()))]}
                     encrypted.append(entry)
                 else:
                     if not UUID.fullmatch(text): raise CaptureError('Secret reference is invalid')

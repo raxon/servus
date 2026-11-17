@@ -3,12 +3,12 @@ import { join } from 'node:path';
 import type { RestoreVolumeBinding } from './restore-journal.js';
 
 /** Read the committed volume binding; missing or inconsistent metadata must not select an older volume. */
-export function readRestoreBinding(dataDir:string,serviceId:string,kind:'postgres'|'mariadb'):RestoreVolumeBinding|undefined {
+export function readRestoreBinding(dataDir:string,serviceId:string,kind:'postgres'|'mariadb'|'redis'):RestoreVolumeBinding|undefined {
   const db=new Database(join(dataDir,'agent.sqlite'),{readonly:true,fileMustExist:true});
   try {return validateRestoreBinding(db,serviceId,kind);} finally {db.close();}
 }
 
-export function validateRestoreBinding(db:Database.Database,serviceId:string,kind:'postgres'|'mariadb'):RestoreVolumeBinding|undefined {
+export function validateRestoreBinding(db:Database.Database,serviceId:string,kind:'postgres'|'mariadb'|'redis'):RestoreVolumeBinding|undefined {
     const table=db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_volume_bindings'").get();
     if(!table)return undefined;
     const binding=db.prepare('SELECT * FROM restore_volume_bindings WHERE service_id=?').get(serviceId) as RestoreVolumeBinding|undefined;

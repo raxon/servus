@@ -105,6 +105,22 @@ describe('worker uncertain operation reconciliation',()=>{
   });
 });
 
+it('retains the commit and image for each successful deployment',async()=>{
+  const {store,actor,service,action}=fixture();
+  const firstCommit='a'.repeat(40),secondCommit='b'.repeat(40);
+  const first=new Worker(store,60000,{apply:async()=>({...success,sourceCommit:firstCommit,imageDigest:'registry.example/app@sha256:'+'1'.repeat(64)})});
+  await first.once();
+  const secondAction=store.createAction(service.id,'deploy',actor.id,'next-deploy');
+  const second=new Worker(store,60000,{apply:async()=>({...success,sourceCommit:secondCommit,imageDigest:'registry.example/app@sha256:'+'2'.repeat(64)})});
+  await second.once();
+  const firstEvents=store.getEvents(action.id).map(item=>item.message);
+  const secondEvents=store.getEvents(secondAction.id).map(item=>item.message);
+  expect(firstEvents).toContain(`Source commit: ${firstCommit}`);
+  expect(firstEvents).toContain(`Deployed image: registry.example/app@sha256:${'1'.repeat(64)}`);
+  expect(firstEvents).not.toContain(`Source commit: ${secondCommit}`);
+  expect(secondEvents).toContain(`Source commit: ${secondCommit}`);
+});
+
 describe('worker drain',()=>{
   function deferred<T>() {
     let resolve!: (value:T)=>void;

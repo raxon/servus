@@ -288,13 +288,13 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
 
     def capture(self,reader_gid=65534): return backup._capture_quiescent(self.source_fd,self.destination_fd,self.node_fd,source_uid=1000,reader_gid=reader_gid)
 
-    def test_standalone_v5_capture_has_no_sidecars_and_restores(self):
+    def test_standalone_v8_capture_has_no_sidecars_and_restores(self):
         self.panel.close(); self.agent.close()
         self.capture()
         self.assertFalse(any(p.name.endswith(('-wal', '-shm', '-journal')) for p in self.dst.iterdir()))
         backup._validate_staging(self.destination_fd, self.node_fd)
         with closing(sqlite3.connect(f'file:{self.dst}/panel.sqlite?mode=ro&immutable=1',uri=True)) as db:
-            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],5)
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],8)
             self.assertEqual(db.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
             self.assertEqual(db.execute('SELECT description FROM projects WHERE id=?',(UUID,)).fetchone(),('committed-wal',))
         restored=self.root/'restored-v5'; shutil.copytree(self.dst,restored)
@@ -305,6 +305,8 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
             backup._validate_staging(self.destination_fd,self.node_fd)
 
     def test_standalone_v4_capture_has_no_sidecars_and_restores(self):
+        for table in ('volume_restores','volume_backups','volume_backup_settings','api_tokens','database_backups','database_backup_settings','compose_domains','compose_actions','compose_workloads','two_factor_auth','deployment_webhooks'):
+            self.panel.execute('DROP TABLE '+table)
         self.panel.execute('ALTER TABLE service_secret_refs DROP COLUMN purpose')
         self.panel.execute('PRAGMA user_version=4'); self.panel.commit()
         self.panel.close(); self.agent.close()
@@ -317,8 +319,112 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
             self.assertEqual(db.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
             self.assertEqual(db.execute('SELECT description FROM projects WHERE id=?',(UUID,)).fetchone(),('committed-wal',))
         restored=self.root/'restored-v4-standalone'; shutil.copytree(self.dst,restored)
-        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==5||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
         subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
+
+    def test_standalone_v6_snapshot_remains_readable_and_migrates_only_its_copy(self):
+        for table in ('volume_restores','volume_backups','volume_backup_settings'):
+            self.panel.execute('DROP TABLE '+table)
+        self.panel.execute('PRAGMA user_version=6');self.panel.commit();self.panel.close();self.agent.close();self.fix_permissions()
+        self.capture();backup._validate_staging(self.destination_fd,self.node_fd)
+        restored=self.root/'restored-v6';shutil.copytree(self.dst,restored)
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+        subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
+        with closing(sqlite3.connect(self.dst/'panel.sqlite')) as snapshot:
+            self.assertEqual(snapshot.execute('PRAGMA user_version').fetchone()[0],6)
+
+    def test_standalone_v7_snapshot_remains_readable_and_migrates_only_its_copy(self):
+        self.panel.execute('PRAGMA user_version=7');self.panel.commit();self.panel.close()
+        self.agent.execute('DROP TABLE redis_restore_plans');self.agent.commit();self.agent.close();self.fix_permissions()
+        self.capture();backup._validate_staging(self.destination_fd,self.node_fd)
+        restored=self.root/'restored-v7';shutil.copytree(self.dst,restored)
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+        subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
+        for path in (self.src,self.dst):
+            with closing(sqlite3.connect(path/'panel.sqlite')) as original:
+                self.assertEqual(original.execute('PRAGMA user_version').fetchone()[0],7)
+
+    def redis_plan(self):
+        ident='a'*32
+        source='panel-data-'+UUID+'-database'
+        candidate='panel-restore-'+ident
+        def specification(volume,operation=None):
+            labels={'panel.owner':'self-hosted-panel','panel.service':UUID,'panel.kind':'redis'}
+            if operation:labels['panel.restore.operation']=operation
+            return {'Name':'panel-app-'+UUID,'Labels':labels,'Mode':{'Replicated':{'Replicas':1}},
+                    'UpdateConfig':{'Order':'stop-first'},'TaskTemplate':{'ContainerSpec':{'Image':'redis:7',
+                    'Mounts':[{'Type':'volume','Source':volume,'Target':'/data','ReadOnly':False}]}}}
+        return {'version':1,'previousBinding':None,'switchPlan':{'version':1,
+                'inspection':{'serviceId':UUID,'operationId':ident,'serviceDockerId':'owned-service',
+                    'serviceVersion':1,'sourceContainerId':'b'*64,'sourceVolume':source,'candidateContainerId':'c'*64,
+                    'candidateVolume':candidate,'imageId':'sha256:'+'d'*64,'nodeId':'owned-node'},
+                'previousSpec':specification(source),'targetSpec':specification(candidate,ident)}}
+
+    def add_redis_plan(self,plan=None,phase='completed',sealed=None):
+        ident='a'*32;now='2026-11-17T00:00:00.000Z'
+        self.panel.execute('UPDATE services SET image=?,port=?,config=? WHERE id=?',('redis:7',6379,json.dumps({'kind':'redis'}),UUID));self.panel.commit()
+        if sealed is None:
+            script="import {SecretVault} from '/app/dist/shared/secrets.js';const v=new SecretVault(process.argv[1]);process.stdout.write(v.seal(process.argv[2]));"
+            sealed=subprocess.check_output([NODE,'--input-type=module','-e',script,str(self.src),json.dumps(plan or self.redis_plan())],text=True,timeout=20)
+        self.agent.execute('INSERT INTO restore_operations(id,service_id,kind,archive_sha256,phase,updated_at) VALUES(?,?,?,?,?,?)',
+                           (ident,UUID,'redis','b'*64,'completed' if phase=='completed' else 'cancelled',now))
+        self.agent.execute('INSERT INTO redis_restore_plans(operation_id,service_id,sealed_plan,phase,updated_at) VALUES(?,?,?,?,?)',
+                           (ident,UUID,sealed,phase,now))
+        retained='panel-data-'+UUID+'-database' if phase=='completed' else 'panel-restore-'+ident
+        self.agent.execute('INSERT INTO restore_retained_volumes(operation_id,service_id,volume_name,reason,created_at) VALUES(?,?,?,?,?)',
+                           (ident,UUID,retained,'pre_restore_source' if phase=='completed' else 'rollback_candidate',now))
+        if phase=='completed':
+            self.agent.execute('INSERT INTO restore_volume_bindings(service_id,operation_id,volume_name,kind,created_at) VALUES(?,?,?,?,?)',
+                               (UUID,ident,'panel-restore-'+ident,'redis',now))
+        self.agent.commit();self.fix_permissions()
+
+    def test_v8_capture_preserves_completed_redis_plan_and_binding(self):
+        self.add_redis_plan();self.capture();backup._validate_staging(self.destination_fd,self.node_fd)
+        with closing(sqlite3.connect(self.dst/'agent.sqlite')) as captured:
+            self.assertEqual(captured.execute('SELECT phase FROM redis_restore_plans').fetchone(),('completed',))
+            self.assertEqual(captured.execute('SELECT kind,volume_name FROM restore_volume_bindings').fetchone(),('redis','panel-restore-'+'a'*32))
+        self.assertNotIn('previousSpec',(self.dst/'manifest.json').read_text())
+
+    def test_v8_capture_preserves_rolled_back_redis_plan_and_cancelled_restore(self):
+        self.add_redis_plan(phase='rolled_back');self.capture()
+        with closing(sqlite3.connect(self.dst/'agent.sqlite')) as captured:
+            self.assertEqual(captured.execute('SELECT phase FROM redis_restore_plans').fetchone(),('rolled_back',))
+            self.assertEqual(captured.execute('SELECT phase FROM restore_operations').fetchone(),('cancelled',))
+
+    def test_redis_plan_ciphertext_must_authenticate_with_the_installation_key(self):
+        import base64
+        self.add_redis_plan(sealed='enc:v1:'+base64.b64encode(bytes(28)).decode('ascii'))
+        with self.assertRaisesRegex(backup.CaptureError,'Encryption verification failed'):self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
+
+    def test_sealed_redis_plan_cannot_retarget_another_service(self):
+        plan=self.redis_plan();plan['switchPlan']['inspection']['serviceId']='22345678-1234-4123-8123-123456789abc'
+        self.add_redis_plan(plan)
+        with self.assertRaisesRegex(backup.CaptureError,'Encryption verification failed'):self.capture()
+        self.assertFalse((self.dst/'manifest.json').exists())
+
+    def test_sealed_redis_plan_must_preserve_owned_runtime_and_volume_identity(self):
+        for mutate in ('owner','volume','replicas','operation','version','container','unknown-field','node'):
+            with self.subTest(mutate=mutate):
+                plan=self.redis_plan();target=plan['switchPlan']['targetSpec']
+                if mutate=='owner':target['Labels']['panel.owner']='foreign'
+                elif mutate=='volume':target['TaskTemplate']['ContainerSpec']['Mounts'][0]['Source']='foreign-volume'
+                elif mutate=='replicas':target['Mode']['Replicated']['Replicas']=2
+                elif mutate=='operation':target['Labels']['panel.restore.operation']='b'*32
+                elif mutate=='version':plan['switchPlan']['inspection']['serviceVersion']=0
+                elif mutate=='container':plan['switchPlan']['inspection']['candidateContainerId']='untrusted'
+                elif mutate=='unknown-field':plan['switchPlan']['inspection']['unexpected']='untrusted'
+                else:plan['switchPlan']['inspection']['nodeId']=''
+                self.add_redis_plan(plan)
+                fresh=self.root/('invalid-redis-'+mutate);fresh.mkdir(mode=0o700);fd=os.open(fresh,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                try:
+                    with self.assertRaisesRegex(backup.CaptureError,'Encryption verification failed'):
+                        backup._capture_quiescent(self.source_fd,fd,self.node_fd,source_uid=1000,reader_gid=65534)
+                finally:os.close(fd)
+                self.assertFalse((fresh/'manifest.json').exists())
+                for table in ('restore_volume_bindings','restore_retained_volumes','redis_restore_plans','restore_operations'):
+                    self.agent.execute('DELETE FROM '+table)
+                self.agent.commit()
 
     def test_capture_rejects_private_cgroup_before_fork_or_copy(self):
         with mock.patch.object(backup,'_visible_cgroup_v2',return_value=('/sys/fs/cgroup','',False)),mock.patch.object(backup.os,'fork') as fork:
@@ -355,15 +461,19 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         with self.assertRaises(backup.CaptureError): self.capture()
 
     def test_v4_snapshot_restores_and_migrates_without_changing_source(self):
+        for table in ('volume_restores','volume_backups','volume_backup_settings','api_tokens','database_backups','database_backup_settings','compose_domains','compose_actions','compose_workloads','two_factor_auth','deployment_webhooks'):
+            self.panel.execute('DROP TABLE '+table)
         self.panel.execute('ALTER TABLE service_secret_refs DROP COLUMN purpose')
         self.panel.execute('PRAGMA user_version=4');self.panel.commit();self.fix_permissions()
         self.capture()
         restored_dir=self.root/'restored-v4';shutil.copytree(self.dst,restored_dir)
-        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==5)process.exit(2);s.close()"
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8)process.exit(2);s.close()"
         subprocess.run([NODE,'--input-type=module','-e',script,str(restored_dir)],check=True,timeout=20)
         self.assertEqual(self.panel.execute('PRAGMA user_version').fetchone(),(4,))
 
     def test_v4_capture_stages_verified_restore_and_preserves_source(self):
+        for table in ('volume_restores','volume_backups','volume_backup_settings','api_tokens','database_backups','database_backup_settings','compose_domains','compose_actions','compose_workloads','two_factor_auth','deployment_webhooks'):
+            self.panel.execute('DROP TABLE '+table)
         self.panel.execute('ALTER TABLE service_secret_refs DROP COLUMN purpose')
         self.panel.execute('PRAGMA user_version=4');self.panel.commit();self.fix_permissions()
         self.capture()
@@ -404,7 +514,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
                     self.assertEqual(journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('consumed',))
                     self.assertEqual(journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('starting',))
             finally:os.close(lock);journal.close()
-            script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==5||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+            script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
             subprocess.run([NODE,'--input-type=module','-e',script,destination,self.ref],check=True,timeout=20)
             self.assertEqual(self.panel.execute('PRAGMA user_version').fetchone(),(4,))
             self.assertEqual((pathlib.Path(destination)/'panel.sqlite').stat().st_uid,1000)
@@ -682,7 +792,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         self.assertFalse((self.dst/'manifest.json').exists())
 
     def test_legacy_agent_without_restore_table_is_supported(self):
-        for table in ('restore_switch_intents','restore_retained_volumes','restore_volume_bindings','restore_upload_locks','restore_review_phases','restore_operations'):
+        for table in ('redis_restore_plans','restore_switch_intents','restore_retained_volumes','restore_volume_bindings','restore_upload_locks','restore_review_phases','restore_operations'):
             self.agent.execute(f'DROP TABLE IF EXISTS {table}')
         self.agent.commit();self.fix_permissions();self.capture()
         with sqlite3.connect(self.dst/'agent.sqlite') as restored:

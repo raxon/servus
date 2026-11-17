@@ -39,6 +39,8 @@ import type {
 import { api, errorMessage } from "./api.js";
 import { SourcePanel } from "./SourcePanel.js";
 import { DatabaseRestore } from "./DatabaseRestore.js";
+import { BackupSettings } from "./BackupSettings.js";
+import { VolumeBackupSettings } from "./VolumeBackupSettings.js";
 import { combineEnvironment, formatEnvironment } from "./environment.js";
 import { TerminalBoundary } from "./TerminalBoundary.js";
 import {
@@ -57,6 +59,7 @@ export type ServiceTab =
   | "environment"
   | "domains"
   | "storage"
+  | "backups"
   | "resources"
   | "logs"
   | "console";
@@ -67,6 +70,7 @@ export const serviceTabs: { id: ServiceTab; label: string }[] = [
   { id: "environment", label: "Environment" },
   { id: "domains", label: "Domains" },
   { id: "storage", label: "Storage" },
+  { id: "backups", label: "Backups" },
   { id: "resources", label: "Resources" },
   { id: "logs", label: "Logs" },
   { id: "console", label: "Console" },
@@ -76,12 +80,15 @@ export function ServiceConfigurationPanel({
   service,
   tab,
   admin,
+  canWrite = admin,
 }: {
   service: Service;
   tab: ServiceTab;
   admin: boolean;
+  canWrite?: boolean;
 }) {
   if (tab === "source") return <SourcePanel service={service} admin={admin} />;
+  if (tab === "backups") return (service.kind??'app')==='app'?<VolumeBackupSettings service={service} canWrite={canWrite}/>:<BackupSettings service={service} canWrite={canWrite} />;
   if (tab === "environment") return <EnvironmentPanel service={service} />;
   if (tab === "domains") return <DomainsPanel service={service} />;
   if (tab === "storage")
@@ -316,6 +323,7 @@ function DomainsPanel({ service }: { service: Service }) {
       ).map((domain) => ({ ...domain, rowId: crypto.randomUUID() })),
   );
   const save = useServiceSave(service);
+  const runtime = useQuery({queryKey:["runtime"],queryFn:()=>api<{online:boolean;httpsConfigured?:boolean;httpsAccess?:'direct'|'external'}>("/runtime"),refetchInterval:15_000});
   const update = (id: string, patch: Partial<DomainConfig>) =>
     setDomains((rows) =>
       rows.map((row) => (row.rowId === id ? { ...row, ...patch } : row)),
@@ -342,7 +350,7 @@ function DomainsPanel({ service }: { service: Service }) {
           <h2>Domains</h2>
         </div>
         <p>
-          Route HTTP hostnames to this service. Select one primary hostname for
+          Route hostnames to this service. Select one primary hostname for
           the Open app action.
         </p>
       </div>
@@ -351,7 +359,7 @@ function DomainsPanel({ service }: { service: Service }) {
         disabled={save.isPending}
       >
         {domains.map((row) => (
-          <div className="domain-editor-row" key={row.rowId}>
+          <div className="domain-editor-group" key={row.rowId}><div className="domain-editor-row">
             <label className="domain-primary">
               <input
                 type="radio"
@@ -373,7 +381,7 @@ function DomainsPanel({ service }: { service: Service }) {
               <input
                 value={row.hostname}
                 onChange={(event) =>
-                  update(row.rowId, { hostname: event.target.value })
+                  update(row.rowId, { hostname: event.target.value, redirectHttps: false })
                 }
                 placeholder="web.localhost"
                 required
@@ -409,6 +417,7 @@ function DomainsPanel({ service }: { service: Service }) {
               <Trash2 size={17} />
             </button>
           </div>
+          <DomainChecks row={row} service={service} runtime={runtime} update={update} /></div>
         ))}
         <button
           type="button"
@@ -443,6 +452,69 @@ function DomainsPanel({ service }: { service: Service }) {
       </fieldset>
       <SaveFooter pending={save.isPending} saved={save.isSuccess} />
     </form>
+  );
+}
+
+function DomainChecks({row,service,runtime,update}:{row:DomainConfig & {rowId:string};service:Service;runtime:{data?:{httpsConfigured?:boolean;httpsAccess?:'direct'|'external'}};update:(id:string,patch:Partial<DomainConfig>)=>void}) {
+  const [copiedDomain, setCopiedDomain] = useState<string | null>(null);
+  const dns = useMutation({mutationFn: ({hostname}: {hostname:string; rowId:string}) => api<{hostname:string; checkedAt:string; ipv4:string[]; ipv6:string[]; status:'resolved'|'not_found'|'unavailable'|'partial'}>(`/services/${service.id}/check-domain-dns`,{method:'POST',body:{hostname}})});
+  const tls = useMutation({mutationFn: ({hostname}: {hostname:string; rowId:string}) => api<{hostname:string;checkedAt:string;status:'valid'|'unavailable'|'untrusted'|'unsafe_address'|'dns_unavailable';expiresAt?:string}>(`/services/${service.id}/check-domain-tls`,{method:'POST',body:{hostname}})});
+  const managed = useMutation({mutationFn: ({hostname}: {hostname:string; rowId:string}) => api<{hostname:string;checkedAt:string;status:'active'|'expired'|'not_yet_valid'|'not_found';expiresAt?:string;eventsAvailable:boolean;lastFailure?:{observedAt:string;operation:'issuance'|'renewal';category:'dns'|'rate_limit'|'contact'|'challenge'|'other'}}>(`/services/${service.id}/check-managed-certificate`,{method:'POST',body:{hostname}})});
+  const retryCertificate = useMutation({mutationFn:({hostname}:{hostname:string;rowId:string})=>api<{accepted:true;requestedAt:string}>(`/services/${service.id}/retry-certificate`,{method:'POST',body:{hostname}})});
+  const previousHost=useRef(row.hostname);
+  useEffect(()=>{
+    if(previousHost.current===row.hostname)return;
+    previousHost.current=row.hostname;
+    dns.reset();tls.reset();managed.reset();retryCertificate.reset();setCopiedDomain(null);
+  },[row.hostname]);
+  const dnsObserved=dns.variables?.hostname===row.hostname;
+  const tlsObserved=tls.variables?.hostname===row.hostname;
+  const managedObserved=managed.variables?.hostname===row.hostname;
+  const dnsState=!dnsObserved?'Not checked':dns.isPending?'Checking':dns.isError?'Check failed':dns.data?.status==='resolved'?'Records found':dns.data?.status==='not_found'?'No records found':dns.data?.status==='partial'?'Partial result':'Unavailable';
+  const httpsState=tlsObserved && tls.isPending || managedObserved && managed.isPending?'Checking'
+    :tlsObserved && tls.data?.status==='valid'?'Public certificate trusted'
+    :tlsObserved && tls.isError?'Check failed'
+    :tlsObserved && tls.data?'Public HTTPS unavailable or untrusted'
+    :managedObserved && managed.isError?'Managed certificate check failed'
+    :managedObserved && managed.data?.status==='active'?'Stored certificate valid; public HTTPS not checked'
+    :managedObserved && managed.data?.status==='expired'?'Stored certificate expired'
+    :managedObserved && managed.data?.status==='not_yet_valid'?'Stored certificate not yet valid'
+    :managedObserved && managed.data?.status==='not_found'?'No stored certificate; issuance may be pending'
+    :row.https?'Not checked':'Automatic HTTPS off';
+  return (
+          <div className="domain-dns-check">
+            <div className="domain-health-summary"><span>DNS: {dnsState}</span><span>HTTPS: {httpsState}</span></div>
+            <div className="domain-guidance">
+              <small>Create an A record for this hostname pointing to your server's public IPv4 address. Add an AAAA record only if the server is reachable over IPv6. With Cloudflare or another proxy, ensure HTTP validation and TLS forwarding reach this installation.</small>
+              {row.hostname ? <div><button type="button" className="button button-small" onClick={()=>{if(!navigator.clipboard){setCopiedDomain('Copy unavailable');return;} void navigator.clipboard.writeText(row.hostname).then(()=>setCopiedDomain(`Copied ${row.hostname}`),()=>setCopiedDomain('Copy unavailable'));}}><Copy size={14} /> Copy hostname</button><span role="status">{copiedDomain === `Copied ${row.hostname}` || copiedDomain === 'Copy unavailable' ? copiedDomain : ''}</span></div> : null}
+            </div>
+            <div className="domain-https-options">
+              <label className="checkbox-label"><input type="checkbox" checked={!!row.https} disabled={!runtime.data?.httpsConfigured && !row.https} onChange={event => update(row.rowId,{https:event.target.checked, ...(!event.target.checked ? {redirectHttps:false} : {})})} /> Automatic HTTPS</label>
+              {!runtime.data?.httpsConfigured ? <small>Automatic HTTPS ingress is not configured on this installation.</small> : <small>Certificate issuance starts after deployment and requires public DNS and port 80.</small>}
+              {row.https ? <><label className="checkbox-label"><input type="checkbox" checked={!!row.redirectHttps} onChange={event=>update(row.rowId,{redirectHttps:event.target.checked})} /> Redirect HTTP to HTTPS</label><small>First deploy HTTPS and check its certificate. When deploying this change, every public DNS address must serve the managed certificate; otherwise the existing route is preserved.</small></> : null}
+              {runtime.data?.httpsAccess==='external' ? <small>The external proxy must forward this domain's TLS traffic to the local HTTPS ingress.</small> : null}
+            </div>
+            <div className="domain-check-actions">
+            <button type="button" className="button button-small" aria-label={`Check DNS for ${row.hostname || 'domain'}`} disabled={!row.hostname || dns.isPending} onClick={() => dns.mutate({hostname:row.hostname,rowId:row.rowId})}>Check DNS</button>
+            <button type="button" className="button button-small" aria-label={`Check HTTPS for ${row.hostname || 'domain'}`} disabled={!row.hostname || tls.isPending} onClick={() => tls.mutate({hostname:row.hostname,rowId:row.rowId})}>Check HTTPS</button>
+            {row.https && service.domains?.some(domain=>domain.hostname===row.hostname && domain.https) ? <button type="button" className="button button-small" aria-label={`Check managed certificate for ${row.hostname}`} disabled={managed.isPending} onClick={()=>managed.mutate({hostname:row.hostname,rowId:row.rowId})}>Check managed certificate</button> : null}
+            {managed.variables?.rowId===row.rowId && managed.variables.hostname===row.hostname && managed.data?.status==='not_found' ? <button type="button" className="button button-small" aria-label={`Retry certificate issuance for ${row.hostname}`} disabled={retryCertificate.isPending} onClick={()=>retryCertificate.mutate({hostname:row.hostname,rowId:row.rowId})}>{retryCertificate.isPending && retryCertificate.variables?.rowId===row.rowId ? 'Requesting retry...' : 'Retry issuance'}</button> : null}
+            </div>
+            {managed.variables?.rowId === row.rowId && managed.variables.hostname === row.hostname && managed.isPending ? <small>Checking managed certificate...</small> : null}
+            <div aria-live="polite" aria-atomic="true">
+              {managed.variables?.rowId === row.rowId && managed.variables.hostname === row.hostname && !managed.isPending ? managed.isError ? <FeatureError error={managed.error}/> : managed.data ? <small>Managed certificate checked {new Date(managed.data.checkedAt).toLocaleString()}. {managed.data.status==='not_found' ? 'No certificate is stored yet. If HTTPS was just enabled, issuance may still be pending; check DNS and retry.' : managed.data.status==='active' ? `Stored certificate is within its validity period until ${new Date(managed.data.expiresAt!).toLocaleString()}. Check HTTPS to verify what the public endpoint serves.` : managed.data.status==='expired' ? 'The stored certificate has expired. Check renewal and DNS.' : 'The stored certificate is not valid yet; check the server clock.'}</small> : null : null}
+              {managed.variables?.rowId === row.rowId && managed.variables.hostname === row.hostname && !managed.isPending && managed.data?.lastFailure ? <small> Last observed {managed.data.lastFailure.operation} error: {({dns:'DNS problem',rate_limit:'certificate authority rate limit',contact:'invalid ACME contact',challenge:'domain validation problem',other:'certificate authority or proxy error'} as const)[managed.data.lastFailure.category]} ({new Date(managed.data.lastFailure.observedAt).toLocaleString()}). Logs may be incomplete and a later attempt may have succeeded.</small> : null}
+              {managed.variables?.rowId === row.rowId && managed.variables.hostname === row.hostname && !managed.isPending && managed.data && !managed.data.eventsAvailable ? <small> Recent certificate errors could not be checked.</small> : null}
+              {retryCertificate.variables?.rowId===row.rowId && retryCertificate.variables.hostname===row.hostname && retryCertificate.isSuccess ? <small> Retry requested {new Date(retryCertificate.data.requestedAt).toLocaleString()}. Issuance can take time; check the managed certificate again for the result.</small> : null}
+              {retryCertificate.variables?.rowId===row.rowId && retryCertificate.variables.hostname===row.hostname && retryCertificate.isError ? <FeatureError error={retryCertificate.error}/> : null}
+            </div>
+            {tls.variables?.rowId === row.rowId && tls.variables.hostname === row.hostname ? <div aria-live="polite">
+              {tls.isPending ? <small>Checking HTTPS...</small> : tls.isError ? <FeatureError error={tls.error} /> : tls.data ? <small>Checked {new Date(tls.data.checkedAt).toLocaleString()}. {tls.data.status === 'valid' ? `Trusted certificate for ${tls.data.hostname}; expires ${new Date(tls.data.expiresAt!).toLocaleDateString()}. This checks the public endpoint, which may be a proxy.` : tls.data.status === 'untrusted' ? 'The certificate is not trusted or does not match the hostname.' : tls.data.status === 'unsafe_address' ? 'The hostname resolves to a private or reserved address.' : tls.data.status === 'dns_unavailable' ? 'DNS could not provide a complete public address.' : 'HTTPS is unavailable on the observed endpoint.'}</small> : null}
+            </div> : null}
+            {dns.variables?.rowId === row.rowId && dns.variables.hostname === row.hostname ? <div aria-live="polite">
+              {dns.isPending ? <small>Checking DNS...</small> : dns.isError ? <FeatureError error={dns.error} /> : dns.data ? <small>Checked {new Date(dns.data.checkedAt).toLocaleString()}. {dns.data.status === 'not_found' ? 'No A or AAAA records found.' : dns.data.status === 'unavailable' ? 'DNS lookup is unavailable. Try again.' : `${dns.data.status === 'partial' ? 'Partial result. ' : ''}A: ${dns.data.ipv4.join(', ') || 'none'}; AAAA: ${dns.data.ipv6.join(', ') || 'none'}. Compare these addresses with your server. Proxies may show different addresses.`}</small> : null}
+            </div> : null}
+          </div>
   );
 }
 
@@ -793,7 +865,7 @@ export function ServiceMetricsPanel({ service }: { service: Service }) {
   );
 }
 
-export function DatabaseConnection({ service, admin }: { service: Service; admin: boolean }) {
+export function DatabaseConnection({ service, admin, canWrite=admin }: { service: Service; admin: boolean; canWrite?:boolean }) {
   const [visible, setVisible] = useState(false);
   const [revealed, setRevealed] = useState<ConnectionInfo | null>(null);
   const connection = useQuery({
@@ -919,7 +991,7 @@ export function DatabaseConnection({ service, admin }: { service: Service; admin
             </button>
           </div>
           <p className="feature-helper">Exports up to 2 GiB of database data. Application files are not included.</p>
-          {(service.kind === "postgres" || service.kind === "mariadb") && <DatabaseRestore service={service} admin={admin} />}
+          {canWrite && (service.kind === "postgres" || service.kind === "mariadb" || service.kind === "redis") && <DatabaseRestore service={service} admin={admin} />}
         </>
       ) : null}
     </section>
@@ -1104,13 +1176,14 @@ export function DestroyService({
   return (
     <>
       <button
-          className="button button-danger"
+          className="icon-button"
           type="button"
+          aria-label="Delete service"
+          title="Delete service"
           disabled={busy}
           onClick={() => setShow(true)}
         >
           <Trash2 size={16} />
-          Delete service
       </button>
       {show ? (
         <FeatureModal

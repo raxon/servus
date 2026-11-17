@@ -81,15 +81,27 @@ The website deployment is independent of the VPS panel. A successful local build
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
 | Access             | One-time administrator setup, cookie sessions, CSRF and origin checks, project access checks                                |
 | Projects           | Create, list, rename, edit descriptions and delete empty projects                                                           |
-| Applications       | Public Docker images or public Git repositories with a Dockerfile, branch/ref and build context                             |
-| Configuration      | Saved and deployed revisions, environment variables, multiple HTTP domains, CPU/RAM limits and replicas                     |
+| Applications       | Public or private Docker images, HTTPS Git credentials and administrator-managed SSH deploy keys with pinned host keys      |
+| Configuration      | Saved and deployed revisions, encrypted secrets, optional generated env files, multiple domains, CPU/RAM limits and replicas |
 | Storage            | Named volumes, immutable read-only configuration files and administrator-approved bind paths                                |
 | Databases          | PostgreSQL 17, Redis 7 and MariaDB 11.4 presets with private project networking and persistent data                         |
 | Operations         | Deploy, start, stop, restart and destroy actions with durable events and failure details                                    |
 | Runtime inspection | Current CPU, RAM and network samples, container lists, recent logs, live log streaming and an interactive `/bin/sh` console |
 | Recovery           | Durable agent operation journal and restoration of the previous application specification after a failed deployment         |
 
-Automatic application HTTPS, private Git credentials, Compose application imports, backups, historical monitoring, templates, CLI/MCP and multi-node management are outside this implementation. The repository's own Docker Compose package runs Servus components. It does not add Compose workload support.
+Application HTTPS, private Git credentials, GitHub repository and branch selection, Force Rebuild, database backups and project API tokens are implemented. The CLI and stdio MCP server use the same HTTP operations and project permissions. See [automation](docs/automation.md) for setup.
+
+Database backups support names, UTC cron schedules and retention, with history and completed archive downloads available for local storage and S3-compatible destinations. Choose Database restore for PostgreSQL, MariaDB or Redis, prepare an isolated candidate and confirm the switch only after its checks succeed. Redis retains the previous volume. Its restore journal also records interrupted preparation or switching so recovery can continue after the agent restarts, while an explicit rollback returns the service to the retained volume. Provider acceptance uses MinIO. R2 account testing remains pending. Use a separate server or object-storage account for a copy that remains available after the panel's disk fails.
+
+On a single-node Swarm, application volume backups stop the application, capture one writable named volume and restore its previous replica count before marking the backup complete. Restores use a fresh volume. Confirm the switch in Backups after preparation succeeds. Servus retains the original volume for rollback, which requires the runtime specification to still match the recorded operation. Archives preserve file content, modes and numeric ownership, with regular file timestamps and confined relative symlinks also checked during recovery. Each archive is limited to 2 GiB and covers the selected application volume, while database volumes and panel configuration require their own backup and recovery procedures.
+
+Compose accepts inline YAML or public HTTPS Git sources and keeps named volumes after removal. With Git, builds use a pinned checkout and support relative context paths, Dockerfiles, build arguments and targets, while inline definitions can supply a Dockerfile for an empty build context. Each operation records the built image. Restart and rollback reuse that image without fetching the repository or rebuilding, and domains use the same Traefik ingress and certificate retry flow as application services. Private Git remains unsupported. So do published ports, host mounts and privileged Compose settings. Starter templates create WordPress, n8n, Uptime Kuma, Grafana and MinIO through the same deployment path.
+
+Local accounts can enable an authenticator and receive ten one-use recovery codes. Central sign-in uses its identity provider's authentication policy. Git deployment webhooks support GitHub signatures, branch matching and server-generated credential rotation. Settings now shows release notes before an update is confirmed.
+
+Administrators can request a named installation backup in Settings on a configured supervised host. The host stops the control plane, captures panel configuration and encrypted secrets, then checks the restarted processes before reporting completion. Back up application data separately. Interrupted operations require explicit recovery on the host, and history, retention and signed-release acceptance remain pending.
+
+Historical monitoring, additional builders, managed MySQL/MongoDB and multi-node management remain unfinished. The [parity backlog](spec/parity/backlog.md) tracks these gaps and release verification.
 
 ## Requirements
 
@@ -138,6 +150,8 @@ curl -H 'Host: welcome.localhost' http://127.0.0.1:18080
 
 For Git, select a public HTTPS repository, branch or ref, build context such as `.` and Dockerfile path such as `Dockerfile`. Build paths must remain inside the repository. Successful Git deployments record the source commit and image identifier.
 
+SSH deploy keys require an administrator. Save an `ssh://git@host/owner/repository.git` source with a verified Ed25519 `known_hosts` entry, then add the generated public key to the repository before deploying. Host-key changes create an encrypted reference while existing deployment snapshots retain their previous reference. Each service keeps its own registry credentials. When pulling an image or recovering a deployment, Servus checks its registry against the original credential record and sends authentication separately from the Docker specification. API responses contain references.
+
 **Save** records desired settings. **Deploy** applies them. Start and restart use the deployed configuration, while stop sets runtime replicas to zero and retains the saved settings. A failed application update can restore the preceding runtime specification. It cannot undo database migrations or external side effects.
 
 ## Configuration and data
@@ -146,7 +160,9 @@ Environment entries have unique names. The text editor accepts `KEY=value`, blan
 
 Secret entries are stored encrypted and returned as `secretRef` identifiers. Existing values stay masked until explicitly replaced. Keep those references when submitting a complete environment array through the API. Removing an entry from that array removes it from desired configuration. Secret values reach the running workload, so operators with Docker access can inspect its environment.
 
-Each domain maps a hostname to a container port, with at most one primary domain. HTTP only. An empty domain list keeps the application on its private project network, and configuration file mounts contain ordinary settings that can be inspected by operators with runtime access.
+Each domain maps a hostname to a container port, with at most one primary domain. Automatic application HTTPS requires configured ingress and a reachable public domain. The panel provides DNS and TLS checks, certificate status and retry actions. Test production issuance and renewal on your deployment before depending on them. An empty domain list keeps the application on its private project network.
+
+Force Rebuild bypasses the Docker build cache for that deployment. Its option is recorded with the action, so a recovered action keeps the same request. Later start, restart and historical image deployments do not inherit it. An optional generated env file is written inside the Git build context, and can contain secrets included in the built image. Keep it out of final image layers unless the application requires it.
 
 Writable volumes and database services require one replica. Application CPU limits accept 0.1 to 64 cores, memory limits 32 to 131072 MiB, and stateless application replicas 1 to 5. Bind mount sources must be existing paths nested under `PANEL_MANAGED_BIND_ROOT`, which defaults to `/var/lib/panel/mounts`, on the Docker host. Configure the same approved root in the API and agent.
 

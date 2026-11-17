@@ -15,7 +15,7 @@ const cleanup:(()=>unknown|Promise<unknown>)[]=[];
 afterEach(async()=>{for(const fn of cleanup.splice(0).reverse())await fn();vi.unstubAllEnvs();});
 it('pins Git source across retries, passes commit metadata and never persists streamed secret output',async()=>{
   const root=mkdtempSync(join(tmpdir(),'panel-git-build-'));cleanup.push(()=>rmSync(root,{recursive:true,force:true}));
-  const source=join(root,'source'),httpRoot=join(root,'http'),bare=join(httpRoot,'control.git'),bin=join(root,'bin'),dataDir=join(root,'data'),calls=join(root,'calls');
+  const source=join(root,'source'),httpRoot=join(root,'http'),bare=join(httpRoot,'control.git'),bin=join(root,'bin'),dataDir=join(root,'data'),calls=join(root,'calls'),envCapture=join(root,'env-capture');
   for(const directory of[source,httpRoot,bin,dataDir])mkdirSync(directory,{recursive:true});
   const git=(args:string[],cwd=source)=>execFileSync('git',args,{cwd,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
   git(['init','-b','main']);writeFileSync(join(source,'Dockerfile'),'FROM scratch\nARG SOURCE_COMMIT\n');git(['add','.']);git(['-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-m','first']);
@@ -27,13 +27,13 @@ it('pins Git source across retries, passes commit metadata and never persists st
   });
   await new Promise<void>(resolvePromise=>server.listen(0,'127.0.0.1',resolvePromise));cleanup.push(()=>new Promise<void>((resolvePromise,reject)=>server.close(error=>error?reject(error):resolvePromise())));
   const port=(server.address() as {port:number}).port;
-  const script=`#!${process.execPath}\nconst fs=require('node:fs');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');const ref=args.find(value=>value.startsWith('id='));if(ref){const value=fs.readFileSync(ref.split('src=')[1]);process.stdout.write(value.subarray(0,5));setTimeout(()=>process.stdout.write(Buffer.concat([value.subarray(5),Buffer.from('\\n')])),10);}else console.log('build complete');`;
+  const script=`#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');const envPath=path.join(args.at(-1),'config/.env.production');const env=fs.readFileSync(envPath,'utf8');fs.writeFileSync(${JSON.stringify(envCapture)},JSON.stringify({content:env,mode:fs.statSync(envPath).mode&0o777}));process.stdout.write(env);const ref=args.find(value=>value.startsWith('id='));if(ref){const value=fs.readFileSync(ref.split('src=')[1]);process.stdout.write(value.subarray(0,5));setTimeout(()=>process.stdout.write(Buffer.concat([value.subarray(5),Buffer.from('\\n')])),10);}else console.log('build complete');`;
   writeFileSync(join(bin,'docker'),script,{mode:0o755});
   vi.stubEnv('PATH',bin+delimiter+(process.env.PATH||''));
   vi.stubEnv('PANEL_GIT_HTTP_HOSTS','127.0.0.1');
-  const vault=new SecretVault(dataDir),secret='sensitive-build-token',reference=vault.put(secret),operationId=randomUUID();
+  const vault=new SecretVault(dataDir),secret='sensitive-build-token\nsecond"line',reference=vault.put(secret),operationId=randomUUID();
   const service:Service={id:randomUUID(),projectId:randomUUID(),name:'git',image:'unused',hostname:'git.localhost',port:80,replicas:1,revision:1,deployedRevision:null,state:'pending',createdAt:'now',updatedAt:'now',lastError:null,
-    source:{type:'git',repository:`http://127.0.0.1:${port}/control.git`,branch:'main',context:'.',dockerfile:'Dockerfile'},environment:[{name:'BUILD_SECRET',secret:true,secretRef:reference}]};
+    source:{type:'git',repository:`http://127.0.0.1:${port}/control.git`,branch:'main',context:'.',dockerfile:'Dockerfile',envFile:'config/.env.production'},environment:[{name:'BUILD_SECRET',secret:true,secretRef:reference}]};
   const metadata=new Database(join(dataDir,'panel.sqlite'));metadata.exec('CREATE TABLE service_secret_refs(reference TEXT PRIMARY KEY,service_id TEXT NOT NULL,purpose TEXT NOT NULL); PRAGMA user_version=5');metadata.prepare('INSERT INTO service_secret_refs VALUES (?,?,?)').run(reference,service.id,'environment');cleanup.push(()=>metadata.close());
   const agent=await createAgent({dataDir,token:'fixture-agent-token',socketPath:join(root,'agent.sock'),dockerSocket:'/unused',ingressPort:18080,ingressImage:'unused'},{} as never);
   cleanup.push(()=>agent.close());
@@ -53,13 +53,14 @@ it('pins Git source across retries, passes commit metadata and never persists st
     const result=await agent.inject({method:'POST',url:'/services/check-source',headers:{authorization:'Bearer fixture-agent-token'},payload:{service:{...service,source}}});
     expect(result.statusCode).toBe(422);expect(result.json().error.code).toBe(code);expect(result.body).not.toContain(root);
   }
-  const built=await buildSource(service,operationId,dataDir,'/unused',vault);expect(built.sourceCommit).toBe(first);
-  const logs=readFileSync(buildLogPath(dataDir,service.id,operationId),'utf8');expect(logs).toContain('[REDACTED]');expect(logs).not.toContain(secret);
+  const built=await buildSource(service,operationId,dataDir,'/unused',vault,{forceRebuild:true});expect(built.sourceCommit).toBe(first);
+  expect(JSON.parse(readFileSync(envCapture,'utf8'))).toEqual({content:`BUILD_SECRET=${JSON.stringify(secret)}\n`,mode:0o600});
+  const logs=readFileSync(buildLogPath(dataDir,service.id,operationId),'utf8');expect(logs).toContain('[REDACTED]');expect(logs).not.toContain(secret);expect(logs).not.toContain(JSON.stringify(secret).slice(1,-1));
   writeFileSync(join(source,'new-file'),'second');git(['add','.']);git(['-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-m','second']);git(['--git-dir',bare,'fetch',source,'main:main'],root);git(['--git-dir',bare,'update-server-info'],root);
   expect(git(['rev-parse','HEAD'])).not.toBe(first);
   git(['--git-dir',bare,'update-ref','-d','refs/heads/main'],root);git(['--git-dir',bare,'update-server-info'],root);
-  const retried=await buildSource(service,operationId,dataDir,'/unused',vault);expect(retried.sourceCommit).toBe(first);
+  const retried=await buildSource(service,operationId,dataDir,'/unused',vault,{forceRebuild:true});expect(retried.sourceCommit).toBe(first);
   const args=readFileSync(calls,'utf8').trim().split('\n').map(line=>JSON.parse(line) as string[]);expect(args).toHaveLength(2);
-  for(const call of args){expect(call).toContain(`SOURCE_COMMIT=${first}`);expect(call).toContain(`panel.source.commit=${first}`);expect(JSON.stringify(call)).not.toContain(secret);}
+  for(const call of args){expect(call).toContain('--no-cache');expect(call).toContain('--pull');expect(call).toContain(`SOURCE_COMMIT=${first}`);expect(call).toContain(`panel.source.commit=${first}`);expect(JSON.stringify(call)).not.toContain(secret);}
   expect(statSync(join(dataDir,'source-revisions',operationId)).mode&0o777).toBe(0o600);
 });

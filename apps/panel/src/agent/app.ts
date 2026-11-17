@@ -9,6 +9,10 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { agentConfig } from './config.js';
 import { buildSource, SourceCheckError } from './build.js';
+import { readBuildLog } from './build-log.js';
+import { registerComposeAgent } from './compose.js';
+import { registerVolumeBackupAgent } from './volume-backups.js';
+import { applyRegistryService, registryAuthFromSpec } from './registry-credentials.js';
 import { DockerRuntime, message, isUncertainRuntimeError, type RecoveryContext } from './runtime.js';
 import type { Service } from '../shared/types.js';
 import { consoleExecStopped, type AgentMaintenanceGate } from './maintenance.js';
@@ -19,6 +23,7 @@ import { discardInterruptedRestoreArchive, readRestoreArchive } from './restore-
 import { uploadRestoreArchive } from './restore-upload.js';
 import { cancelStagedRestore } from './restore-cancel.js';
 import { cancelPreparedRestore } from './restore-candidate-cancel.js';
+import { RedisRestore } from './redis-restore.js';
 import { loadRestoreSource } from './restore-source.js';
 import { prepareRestoreCandidate } from './restore-preparation.js';
 import { createRestoreCandidate } from './restore-candidate.js';
@@ -48,13 +53,16 @@ const input = z.object({
     state: z.enum(['pending', 'running', 'stopped', 'deploying', 'failed', 'unknown']),
     createdAt: z.string(), updatedAt: z.string(), lastError: z.string().nullable(),
     kind: z.enum(['app','postgres','redis','mariadb']).optional(),
-    source: z.discriminatedUnion('type', [z.object({type:z.literal('image')}), z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256),credential:z.object({username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().optional()})]).optional(),
+    source: z.discriminatedUnion('type', [z.object({type:z.literal('image')}), z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256),envFile:z.string().max(255).optional(),credential:z.object({username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().optional(),ssh:z.object({knownHosts:z.string().min(1).max(16384),secretRef:z.string().uuid(),publicKey:z.string().max(1000)}).strict().optional()})]).optional(),
+    registry:z.object({server:z.string().min(1).max(253),username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().nullable().optional(),
     environment: z.array(z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32768).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).refine(value=>!value.secret||Boolean(value.secretRef)&&value.value===undefined)).max(100).optional(),
     domains: z.array(z.object({hostname,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional()})).max(20).optional(),
     mounts: z.array(z.object({type:z.enum(['volume','file','bind']),name:z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/),target:z.string().startsWith('/').max(256),readOnly:z.boolean().optional(),content:z.string().max(32768).optional(),source:z.string().max(512).optional()})).max(20).optional(),
     resources: z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).optional(),
     database: z.object({database:z.string().min(1).max(63),user:z.string().min(1).max(63),passwordSecretRef:z.string().uuid().optional()}).strict().optional(),
     imageDigest:z.string().nullable().optional(),sourceCommit:z.string().nullable().optional(),deletedAt:z.string().nullable().optional(),
+    rollbackImage:z.string().max(512).regex(/^(?:sha256:[a-f0-9]{64}|[a-zA-Z0-9][a-zA-Z0-9._/:@-]*@sha256:[a-f0-9]{64})$/).optional(),rollbackCommit:z.string().regex(/^[a-f0-9]{40,64}$/).optional(),
+    deploymentOptions:z.object({forceRebuild:z.boolean().optional()}).strict().optional(),
   }),
 });
 
@@ -90,7 +98,9 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
   const cancellingRestores = new Set<string>();
   const locks = new Set<string>();
   const consoles = new Map<string, number>(), uncertainConsoles = new Set<string>();
-  const restores = new RestoreJournal(journal, serviceId => locks.has(serviceId) || (consoles.get(serviceId) ?? 0) > 0 || uncertainConsoles.has(serviceId));
+  let volumeBackups:ReturnType<typeof registerVolumeBackupAgent>|undefined;
+  const restores = new RestoreJournal(journal, serviceId => locks.has(serviceId) || (consoles.get(serviceId) ?? 0) > 0 || uncertainConsoles.has(serviceId) || Boolean(volumeBackups?.hasUnresolved(serviceId)));
+  const redisRestore=new RedisRestore({db:journal,journal:restores,docker:new Docker({socketPath:config.dockerSocket,timeout:30_000}),dockerSocket:config.dockerSocket,dataDir:config.dataDir,vault});
   const ingressJournal=new HttpsMigrationJournal(journal,value=>vault.seal(value),value=>vault.open(value));
   let ingressRecoveryError=false;
   let ingressBusy=false;
@@ -101,7 +111,13 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       await recoverHttpsMigration(ingressJournal,dockerIngressMigrationDriver(runtime.docker,'panel-ingress'));
     }
   } catch { ingressRecoveryError=true; }
-  maintenance?.bindJournal(scope => (scope ? !restores.onlyUnresolvedLegacyUpload(scope.legacyUploadId) || restores.get(scope.legacyUploadId)?.service_id!==scope.serviceId : restores.hasUnresolved()) || Boolean(journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get()));
+  volumeBackups=registerVolumeBackupAgent(app,{config,maintenance,withServiceLock:async(serviceId,operationId,task)=>{
+    if(ingressBusy||ingressRecoveryError||ingressJournal.load())throw Object.assign(new Error('Recover or finish the ingress operation before changing application volumes.'),{code:'SERVICE_BUSY'});
+    if(locks.has(serviceId)||(consoles.get(serviceId)??0)>0||uncertainConsoles.has(serviceId)||restores.hasUnresolved(serviceId)||volumeBackups?.hasUnresolved(serviceId,operationId)||journal.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(serviceId))throw Object.assign(new Error('Another operation is changing this service.'),{code:'SERVICE_BUSY'});
+    locks.add(serviceId);try{return await task();}finally{locks.delete(serviceId);}
+  }});
+  const composeRunning=()=>Boolean(journal.prepare("SELECT 1 FROM compose_operations WHERE state='running' LIMIT 1").get());
+  maintenance?.bindJournal(scope => (scope ? !restores.onlyUnresolvedLegacyUpload(scope.legacyUploadId) || restores.get(scope.legacyUploadId)?.service_id!==scope.serviceId : restores.hasUnresolved()) || Boolean(volumeBackups?.hasUnresolved()) || composeRunning() || Boolean(journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get()));
   app.addHook('onRequest', async (req, reply) => {
     const value = req.headers.authorization?.replace(/^Bearer /, '') || '';
     const left = createHash('sha256').update(value).digest();
@@ -121,7 +137,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if(ingressBusy){release?.();return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'An ingress operation is already running.'}});}
     ingressBusy=true;
     const quiescent=()=>{
-      if(active.size||locks.size||restores.hasUnresolved()||journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get())throw new Error('Another operation must finish before changing the ingress.');
+      if(active.size||locks.size||restores.hasUnresolved()||volumeBackups?.hasUnresolved()||composeRunning()||journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get())throw new Error('Another operation must finish before changing the ingress.');
     };
     const task=(async()=>{
       if(action!=='recover') {
@@ -154,7 +170,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     if(ingressBusy){release?.();return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'An ingress operation is already running.'}});}
     ingressBusy=true;
-    const quiescent=()=>{if(active.size||locks.size||restores.hasUnresolved()||journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get())throw new Error('Another operation must finish before changing the host ingress.');};
+    const quiescent=()=>{if(active.size||locks.size||restores.hasUnresolved()||volumeBackups?.hasUnresolved()||composeRunning()||journal.prepare("SELECT 1 FROM operations WHERE state='running' LIMIT 1").get())throw new Error('Another operation must finish before changing the host ingress.');};
     const task=configureHostDomain(runtime,ingressJournal,quiescent,parsed.data);ingressTask=task;
     try {await task;return {ok:true};}
     catch(error){try{ingressRecoveryError=Boolean(ingressJournal.load());}catch{ingressRecoveryError=true;}return reply.code(ingressRecoveryError?503:422).send({error:{code:ingressRecoveryError?'INGRESS_RECOVERY_REQUIRED':'HOST_INGRESS_FAILED',message:vault.redact(message(error))}});}
@@ -186,7 +202,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     const release=maintenance?.admit();
     if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     const {serviceId,hostname:host}=parsed.data;
-    if(locks.has(serviceId)||restores.hasUnresolved(serviceId)||journal.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(serviceId)) {
+    if(locks.has(serviceId)||restores.hasUnresolved(serviceId)||volumeBackups?.hasUnresolved(serviceId)||journal.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(serviceId)) {
       release?.();return reply.code(409).send({error:{code:'RETRY_BUSY',message:'Another operation is changing this service.'}});
     }
     locks.add(serviceId);
@@ -196,7 +212,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       const target=planCertificateRetry(current.Spec,serviceId,host);
       const certificate=await inspectManagedCertificate(runtime.docker,host);
       if(certificate.status!=='not_found')throw new CertificateRetryError('RETRY_UNAVAILABLE','A managed certificate already exists. Renewal is handled automatically by the HTTPS ingress.');
-      await service.update({...target,version:current.Version.Index});
+      await applyRegistryService(runtime.docker,target,current.Version.Index,registryAuthFromSpec(serviceId,target,vault),`panel-app-${serviceId}`);
       const key=Object.keys(target.Labels??{}).find(value=>value.startsWith('panel.acme-retry-') && target.Labels?.[value]!==current.Spec.Labels?.[value]);
       if(!key || !target.Labels?.[key])throw new Error('Retry timestamp could not be recorded.');
       return {accepted:true,requestedAt:target.Labels[key]};
@@ -225,7 +241,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     const finish=()=>{if(finished)return;finished=true;artifact?.close();if(held)locks.delete(req.params.id);release?.();};
     try{
       const unresolved=journal.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(req.params.id);
-      if(unresolved||restores.hasUnresolved(req.params.id)||locks.has(req.params.id))return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'Another operation is changing this service.'}});
+      if(unresolved||restores.hasUnresolved(req.params.id)||volumeBackups?.hasUnresolved(req.params.id)||locks.has(req.params.id))return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'Another operation is changing this service.'}});
       locks.add(req.params.id);held=true;
       if(!runtime.consoleContainer)throw new Error('Database export is unavailable.');
       const container=await runtime.consoleContainer(req.params.id);
@@ -249,7 +265,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     scope.post<{Params:{id:string};Querystring:{operationId?:string;kind?:string};Body:Readable}>('/services/:id/database-restore/upload', async (req,reply) => {
       const id = req.params.id, operationId = req.query.operationId, kind = req.query.kind;
       const length = req.headers['content-length'];
-      if (!z.string().uuid().safeParse(id).success || !operationId || !/^[a-f0-9]{32}$/.test(operationId) || !['postgres','mariadb'].includes(kind || '') || !length || !/^[1-9][0-9]*$/.test(length) || Number(length) > 2 * 1024 * 1024 * 1024 || !(req.body instanceof Readable)) {
+      if (!z.string().uuid().safeParse(id).success || !operationId || !/^[a-f0-9]{32}$/.test(operationId) || !['postgres','mariadb','redis'].includes(kind || '') || !length || !/^[1-9][0-9]*$/.test(length) || Number(length) > 2 * 1024 * 1024 * 1024 || !(req.body instanceof Readable)) {
         return reply.code(400).send({ error: { code: 'INVALID_UPLOAD', message: 'Invalid database restore upload.' } });
       }
       const release = maintenance?.admit();
@@ -265,7 +281,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       req.raw.once('aborted', abort);
       const timeout = setTimeout(abort, 30 * 60_000); timeout.unref();
       try {
-        const result = await uploadRestoreArchive({ journal: restores, operationId, serviceId: id, kind: kind as 'postgres'|'mariadb', dataDir: config.dataDir, key: vault.restoreArchiveKey(operationId), input: () => req.body, signal: controller.signal, sizeLimit: Number(length), expectedSize: Number(length) });
+        const result = await uploadRestoreArchive({ journal: restores, operationId, serviceId: id, kind: kind as 'postgres'|'mariadb'|'redis', dataDir: config.dataDir, key: vault.restoreArchiveKey(operationId), input: () => req.body, signal: controller.signal, sizeLimit: Number(length), expectedSize: Number(length) });
         return { operationId, size: result.size, sha256: result.record.archive_sha256, phase: result.record.phase };
       } finally { uploads--; clearTimeout(timeout); req.raw.off('aborted', abort); if(activeUploads.get(operationId)===entry)activeUploads.delete(operationId); resolveDone(); release?.(); }
     });
@@ -279,7 +295,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     const rolledBack=record.phase==='cancelled' && restores.retainedVolume(record.id)?.reason==='rollback_candidate';
     const recoveryReason=record.phase==='uploading' && record.archive_sha256==='0'.repeat(64)?'legacy_upload_unverified'
       :record.phase==='importing' && !cancellingRestores.has(record.id)?'preparation_unverified':undefined;
-    return {operation:{operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{}),...(reviewPhase?{reviewPhase}:{}),...(rolledBack?{rolledBack:true}:{}),...(recoveryReason?{recoveryReason}:{})}};
+    return {operation:{operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{}),...(reviewPhase?{reviewPhase}:{}),...(rolledBack?{rolledBack:true}:{}),...(recoveryReason?{recoveryReason}:{}),...redisRestore.metadata(record.service_id,record.id)}};
   });
   app.get<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId', async (req,reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
@@ -289,7 +305,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     const reviewPhase=record.phase==='needs_review'?restores.reviewPhase(record.id):undefined;
     const recoveryReason=record.phase==='uploading' && record.archive_sha256==='0'.repeat(64)?'legacy_upload_unverified'
       :record.phase==='importing' && !cancellingRestores.has(record.id)?'preparation_unverified':undefined;
-    return {operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{}),...(reviewPhase?{reviewPhase}:{}),...(recoveryReason?{recoveryReason}:{})};
+    return {operationId:record.id,phase:record.phase,kind:record.kind,...(stage?{stage}:{}),...(reviewPhase?{reviewPhase}:{}),...(recoveryReason?{recoveryReason}:{}),...redisRestore.metadata(record.service_id,record.id)};
   });
   app.post<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/cancel', async (req,reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
@@ -323,7 +339,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       }
       const current=restores.get(record.id);
       if(!current||current.service_id!==req.params.id||!['reserved','discarding','prepared','discarding_candidate','cancelled'].includes(current.phase))throw new RestoreCommitUncertainError('Restore upload cleanup requires recovery.');
-      const result = ['prepared','discarding_candidate'].includes(current.phase)
+      const result = current.kind==='redis'?await redisRestore.cancel(req.params.id,record.id):['prepared','discarding_candidate'].includes(current.phase)
       ? await cancelPreparedRestore({journal:restores,docker:new Docker({socketPath:config.dockerSocket}),dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId})
       : cancelStagedRestore({journal:restores,dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId}); return {operationId:result.id,phase:result.phase}; }
     finally { cancellingRestores.delete(record.id);release?.(); }
@@ -332,12 +348,13 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
     const record = restores.get(req.params.operationId);
     if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
-    if (record.phase !== 'reserved' || !['postgres','mariadb'].includes(record.kind) || cancellingRestores.has(record.id)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be prepared now.'}});
+    if ((record.phase !== 'reserved'&&!(record.kind==='redis'&&record.phase==='prepared')) || !['postgres','mariadb','redis'].includes(record.kind) || cancellingRestores.has(record.id)||locks.has(record.service_id)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be prepared now.'}});
     const release = maintenance?.admit();
     if (maintenance && !release) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     cancellingRestores.add(record.id);
     try {
       if (!runtime.consoleContainer) throw new Error('Database restore is unavailable.');
+      if(record.kind==='redis'){try{return await redisRestore.prepare(req.params.id,record.id,(await runtime.consoleContainer(req.params.id)).id);}catch(error){if(error instanceof DatabaseImportError&&restores.get(record.id)?.phase==='cancelled')return reply.code(422).send({error:{code:'RESTORE_IMPORT_FAILED',message:'The Redis RDB could not be verified. The current database was not changed.'}});throw error;}}
       const kind = record.kind as 'postgres'|'mariadb';
       const source = loadRestoreSource({dataDir:config.dataDir,serviceId:req.params.id,kind,vault});
       const sourceContainer = await runtime.consoleContainer(req.params.id);
@@ -360,12 +377,21 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if(!z.string().uuid().safeParse(req.params.id).success||!/^[a-f0-9]{32}$/.test(req.params.operationId)||!z.object({}).strict().safeParse(req.body??{}).success)return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore request.'}});
     const record=restores.get(req.params.operationId);
     if(!record||record.service_id!==req.params.id)return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
-    if(!['prepared','switching','completed','cancelled'].includes(record.phase)||cancellingRestores.has(record.id))return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be committed now.'}});
+    if(!['prepared','switching','completed','cancelled'].includes(record.phase)||cancellingRestores.has(record.id)||locks.has(record.service_id))return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be committed now.'}});
     const release=maintenance?.admit();
     if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     cancellingRestores.add(record.id);
-    try{return await commitPreparedRestore({docker:new Docker({socketPath:config.dockerSocket}),journal:restores,vault,dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId});}
+    try{return record.kind==='redis'?await redisRestore.commit(req.params.id,record.id):await commitPreparedRestore({docker:new Docker({socketPath:config.dockerSocket}),journal:restores,vault,dataDir:config.dataDir,serviceId:req.params.id,operationId:req.params.operationId});}
     finally{cancellingRestores.delete(record.id);release?.();}
+  });
+  for(const action of ['rollback','recover'] as const)app.post<{Params:{id:string;operationId:string}}>(`/services/:id/database-restore/:operationId/${action}`,async(req,reply)=>{
+    if(!z.string().uuid().safeParse(req.params.id).success||!/^[a-f0-9]{32}$/.test(req.params.operationId)||!z.object({}).strict().safeParse(req.body??{}).success)return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid Redis restore identity.'}});
+    const record=restores.get(req.params.operationId);if(!record||record.kind!=='redis'||record.service_id!==req.params.id)return reply.code(404).send({error:{code:'NOT_FOUND',message:'Redis restore operation not found.'}});
+    if(cancellingRestores.has(record.id)||activeUploads.has(record.id)||locks.has(record.service_id)||(consoles.get(record.service_id)??0)>0||uncertainConsoles.has(record.service_id)||volumeBackups?.hasUnresolved(record.service_id)||journal.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(record.service_id))return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'Another operation is changing this service.'}});
+    const release=maintenance?.admit();if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    cancellingRestores.add(record.id);locks.add(record.service_id);
+    try{return action==='rollback'?await redisRestore.rollback(record.service_id,record.id):await redisRestore.recover(record.service_id,record.id);}
+    finally{locks.delete(record.service_id);cancellingRestores.delete(record.id);release?.();}
   });
   app.get<{Params:{id:string;operationId:string}}>('/services/:id/database-restore/:operationId/switch-inspection', async (req,reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
@@ -377,14 +403,14 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if(!z.string().uuid().safeParse(req.params.id).success||!['/bin/sh','/bin/bash'].includes(req.query.shell||'/bin/sh')||(req.query.containerId&&!/^[a-f0-9]{12,64}$/.test(req.query.containerId)))return reply.code(400).send({error:{code:'INVALID_CONSOLE',message:'Invalid console target.'}});
     const release=maintenance?.admit();
     if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
-    if(restores.hasUnresolved(req.params.id)){release?.();return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'Another operation is changing this service.'}});}
+    if(restores.hasUnresolved(req.params.id)||volumeBackups?.hasUnresolved(req.params.id)||locks.has(req.params.id)){release?.();return reply.code(409).send({error:{code:'SERVICE_BUSY',message:'Another operation is changing this service.'}});}
     try { await runtime.consoleContainer!(req.params.id,req.query.containerId); }
     catch { return reply.code(404).send({error:{code:'CONTAINER_NOT_FOUND',message:'No permitted running container is available.'}}); }
     finally { release?.(); }
   }}, (socket,req)=>{
     const release=maintenance?.admit();
     if(maintenance&&!release){socket.close(1012,'Agent is draining');return;}
-    if(restores.hasUnresolved(req.params.id)){release?.();socket.close(1013,'Service is busy');return;}
+    if(restores.hasUnresolved(req.params.id)||volumeBackups?.hasUnresolved(req.params.id)||locks.has(req.params.id)){release?.();socket.close(1013,'Service is busy');return;}
     consoles.set(req.params.id,(consoles.get(req.params.id)??0)+1);
     let closed=false, started=false, startUncertain=false, containerId='', exec: Docker.Exec|undefined, stream:Duplex|undefined;
     let endSession: () => void = () => {};
@@ -421,6 +447,13 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       const remaining=(consoles.get(req.params.id)??1)-1;if(remaining)consoles.set(req.params.id,remaining);else consoles.delete(req.params.id);
       unregister?.();release?.();
     });
+  });
+  app.get<{Params:{serviceId:string;operationId:string}}>('/services/:serviceId/build-log/:operationId', (req,reply) => {
+    const {serviceId,operationId}=req.params;
+    if(!z.string().uuid().safeParse(serviceId).success || !z.string().uuid().safeParse(operationId).success)return reply.code(400).send({error:{code:'INVALID_ID',message:'Invalid build identity.'}});
+    const row=journal.prepare('SELECT service_id FROM operations WHERE id=?').get(operationId) as {service_id:string|null}|undefined;
+    if(!row || row.service_id!==serviceId)return reply.code(404).send({error:{code:'NOT_FOUND',message:'Build operation not found.'}});
+    return readBuildLog(config.dataDir,serviceId,operationId,vault);
   });
   app.get<{Params:{id:string}}>('/operations/:id', (req, reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success) return reply.code(400).send({ error: { code: 'INVALID_ID', message: 'Invalid operation identity.' } });
@@ -466,7 +499,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (active.has(body.operationId)) return active.get(body.operationId);
     const acquired = journal.transaction(() => {
       const unresolved = journal.prepare("SELECT id FROM operations WHERE service_id=? AND state='running' AND id!=? LIMIT 1").get(body.service.id, body.operationId);
-      if (unresolved || restores.hasUnresolved(body.service.id) || locks.has(body.service.id)) return false;
+      if (unresolved || restores.hasUnresolved(body.service.id) || volumeBackups?.hasUnresolved(body.service.id) || locks.has(body.service.id)) return false;
       journal.prepare("INSERT INTO operations(id,request_hash,state,updated_at,service_id) VALUES(?,?,'running',?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,service_id=excluded.service_id").run(body.operationId, hash, new Date().toISOString(), body.service.id);
       return true;
     }).immediate();
@@ -504,7 +537,14 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     return await operation;
     } finally { release?.(); }
   });
+  registerComposeAgent(app,{config,maintenance,beforeMutation:()=>{if(ingressBusy||ingressRecoveryError||ingressJournal.load())throw new Error('Recover or finish the ingress operation before changing Compose workloads.');},ensureIngress:async()=>{
+    if(!(runtime instanceof DockerRuntime))throw new Error('Managed ingress is unavailable.');
+    if(ingressBusy||ingressRecoveryError||ingressJournal.load()||active.size||locks.size||restores.hasUnresolved()||volumeBackups?.hasUnresolved()||composeRunning())throw new Error('Another operation must finish before preparing the shared ingress.');
+    ingressBusy=true;
+    try {const task=runtime.ensureInfrastructure();ingressTask=task;await task;}finally{ingressTask=undefined;ingressBusy=false;}
+  }});
   app.setErrorHandler((error, _request, reply) => {
+    if((error as {code?:string}).code==='REDIS_RESTORE_BUSY')return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'The Redis restore cannot continue in its current state.'}});
     if (error instanceof RestoreCommitUncertainError) return reply.code(503).send({error:{code:'RESTORE_UNCERTAIN',message:'Database restore requires recovery before further changes.'}});
     if (isUncertainRuntimeError(error)) return reply.code(503).send({ error: { code: 'OPERATION_UNCERTAIN', message: 'Docker connection interrupted. Reconcile the same operation before making another change.' } });
     return reply.code(422).send({ error: { code: 'RUNTIME_FAILED', message: vault.redact(message(error)) } });

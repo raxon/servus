@@ -3,12 +3,20 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Action, ActionEvent, ActionType, ClaimedJob, Project, Service, ServiceInput, ServicePatch, ServiceState, User } from '../shared/types.js';
+import { isDeepStrictEqual } from 'node:util';
+import type { Action, ActionEvent, ActionType, ClaimedJob, DomainConfig, Project, Service, ServiceInput, ServicePatch, ServiceState, User } from '../shared/types.js';
 import { AppError } from './errors.js';
 import * as schema from './schema.js';
 import { SecretVault } from '../shared/secrets.js';
 import { configurationOf, validateConfiguration } from './configuration.js';
 import { assertHostDomainOwnership } from './host-domain.js';
+import { API_TOKEN_SCHEMA_SQL } from './api-tokens.js';
+import { BACKUP_SCHEMA_SQL } from '../shared/backups.js';
+import { COMPOSE_SCHEMA_SQL } from '../shared/compose.js';
+import { TWO_FACTOR_SCHEMA_SQL } from './two-factor.js';
+import { WEBHOOK_SCHEMA_SQL } from './deploy-webhooks.js';
+import { VOLUME_BACKUP_SCHEMA_SQL } from '../shared/volume-backups.js';
+import { protectGitSshCredential, protectRegistryCredential } from './source-credentials.js';
 
 const now = () => new Date().toISOString();
 const startupPause = new Int32Array(new SharedArrayBuffer(4));
@@ -43,7 +51,7 @@ export class Store {
     retryStartupLock(()=>this.db.pragma('journal_mode = WAL'));
     this.db.pragma('foreign_keys = ON');
     const version = this.db.pragma('user_version', { simple: true }) as number;
-    if (version > 5) throw new Error('This database requires a newer panel release');
+    if (version > 8) throw new Error('This database requires a newer panel release');
     if (version === 0) this.db.transaction(() => {
       const currentVersion = this.db.pragma('user_version', { simple: true }) as number;
       if(currentVersion>=1)return;
@@ -135,6 +143,34 @@ export class Store {
       }
       this.db.pragma('user_version = 5');
     }).immediate();
+    this.db.transaction(()=>{
+      if(Number(this.db.pragma('user_version',{simple:true}))>=6)return;
+      this.db.exec(`CREATE TABLE service_secret_refs_v6 (reference TEXT PRIMARY KEY, service_id TEXT NOT NULL REFERENCES services(id), purpose TEXT NOT NULL CHECK(purpose IN ('unclassified','environment','database','git','legacy_shared','backup-storage')));
+        INSERT INTO service_secret_refs_v6 SELECT reference,service_id,purpose FROM service_secret_refs;
+        DROP TABLE service_secret_refs;
+        ALTER TABLE service_secret_refs_v6 RENAME TO service_secret_refs;`);
+      this.db.exec(API_TOKEN_SCHEMA_SQL);
+      this.db.exec(BACKUP_SCHEMA_SQL);
+      this.db.exec(COMPOSE_SCHEMA_SQL);
+      this.db.exec(TWO_FACTOR_SCHEMA_SQL);
+      this.db.exec(WEBHOOK_SCHEMA_SQL);
+      this.db.pragma('user_version = 6');
+    }).immediate();
+    this.db.transaction(()=>{
+      if(Number(this.db.pragma('user_version',{simple:true}))>=7)return;
+      this.db.exec(`CREATE TABLE service_secret_refs_v7 (reference TEXT PRIMARY KEY, service_id TEXT NOT NULL REFERENCES services(id), purpose TEXT NOT NULL CHECK(purpose IN ('unclassified','environment','database','git','legacy_shared','backup-storage','registry','git-ssh')));
+        INSERT INTO service_secret_refs_v7 SELECT reference,service_id,purpose FROM service_secret_refs;
+        DROP TABLE service_secret_refs;
+        ALTER TABLE service_secret_refs_v7 RENAME TO service_secret_refs;`);
+      this.db.exec(VOLUME_BACKUP_SCHEMA_SQL);
+      this.db.pragma('user_version = 7');
+    }).immediate();
+    this.db.transaction(()=>{
+      if(Number(this.db.pragma('user_version',{simple:true}))>=8)return;
+      // Older agents do not understand committed Redis volume bindings. Keep
+      // the control plane from reopening those configurations with old code.
+      this.db.pragma('user_version = 8');
+    }).immediate();
     this.orm = drizzle(this.db, { schema });
     this.vault = new SecretVault(dataDir);
   }
@@ -207,10 +243,10 @@ export class Store {
     return !!member && (!write || member.role === 'editor');
   }
   listProjects(user?: User): Project[] {
-    const rows = this.db.prepare(`SELECT p.id,COALESCE(p.display_name,p.name) AS name,p.description,p.created_at AS createdAt,(SELECT count(*) FROM services s WHERE s.project_id=p.id AND s.deleted_at IS NULL) AS serviceCount FROM projects p WHERE p.deleted_at IS NULL ORDER BY p.created_at DESC`).all() as Project[];
+    const rows = this.db.prepare(`SELECT p.id,COALESCE(p.display_name,p.name) AS name,p.description,p.created_at AS createdAt,((SELECT count(*) FROM services s WHERE s.project_id=p.id AND s.deleted_at IS NULL)+(SELECT count(*) FROM compose_workloads c WHERE c.project_id=p.id AND c.deleted_at IS NULL)) AS serviceCount FROM projects p WHERE p.deleted_at IS NULL ORDER BY p.created_at DESC`).all() as Project[];
     return user ? rows.filter(p => this.canAccess(user, p.id)) : rows;
   }
-  getProject(id: string, includeDeleted=false): Project | undefined { return this.db.prepare(`SELECT p.id,COALESCE(p.display_name,p.name) AS name,p.description,p.created_at AS createdAt,(SELECT count(*) FROM services s WHERE s.project_id=p.id AND s.deleted_at IS NULL) AS serviceCount FROM projects p WHERE p.id=? ${includeDeleted?'':'AND p.deleted_at IS NULL'}`).get(id) as Project|undefined; }
+  getProject(id: string, includeDeleted=false): Project | undefined { return this.db.prepare(`SELECT p.id,COALESCE(p.display_name,p.name) AS name,p.description,p.created_at AS createdAt,((SELECT count(*) FROM services s WHERE s.project_id=p.id AND s.deleted_at IS NULL)+(SELECT count(*) FROM compose_workloads c WHERE c.project_id=p.id AND c.deleted_at IS NULL)) AS serviceCount FROM projects p WHERE p.id=? ${includeDeleted?'':'AND p.deleted_at IS NULL'}`).get(id) as Project|undefined; }
   createProject(name: string, description = '', actorId?:string): Project {
     return this.db.transaction(()=>{
       const project = { id: randomUUID(), name, description, createdAt: now(), serviceCount: 0 };
@@ -232,7 +268,7 @@ export class Store {
   deleteProject(id:string, actorId?:string) {
     this.db.transaction(()=>{
       if(!this.getProject(id))throw new AppError('NOT_FOUND','Project not found',404);
-      if(this.listServices(id).length)throw new AppError('PROJECT_NOT_EMPTY','Destroy all services before deleting this project',409);
+      if(this.listServices(id).length||this.db.prepare('SELECT 1 FROM compose_workloads WHERE project_id=? AND deleted_at IS NULL LIMIT 1').get(id))throw new AppError('PROJECT_NOT_EMPTY','Destroy all services before deleting this project',409);
       this.db.prepare('UPDATE projects SET display_name=name,name=?,deleted_at=? WHERE id=?').run(`archived-${id}`,now(),id);
       if(actorId)this.recordAudit(actorId,'project.delete',id);
     }).immediate();
@@ -305,11 +341,12 @@ export class Store {
       return this.getService(id)!;
     }).immediate();
   }
-  createAction(serviceId: string, type: ActionType, actorId: string, key: string): Action {
+  createAction(serviceId: string, type: ActionType, actorId: string, key: string, deploymentOptions?: import('../shared/types.js').DeploymentOptions): Action {
     return this.db.transaction(() => {
       const service = this.getService(serviceId,true);
       if (!service) throw new AppError('NOT_FOUND', 'Service not found', 404);
-      const requestHash = hashToken(JSON.stringify({ serviceId, type }));
+      if(deploymentOptions?.forceRebuild && (type!=='deploy' || service.source?.type!=='git'))throw new AppError('BUILD_UNSUPPORTED','Force rebuild requires a Git deployment',400);
+      const requestHash = hashToken(JSON.stringify({ serviceId, type, ...(deploymentOptions?.forceRebuild?{forceRebuild:true}:{}) }));
       const previous = this.db.prepare('SELECT request_hash,action_id FROM idempotency WHERE actor_id=? AND key=?').get(actorId,key) as { request_hash: string; action_id: string } | undefined;
       if (previous) {
         if (previous.request_hash !== requestHash) throw new AppError('IDEMPOTENCY_CONFLICT', 'This idempotency key was used for a different operation', 409);
@@ -344,9 +381,42 @@ export class Store {
           this.db.prepare('UPDATE services SET config=? WHERE id=?').run(JSON.stringify(config),serviceId);
         }
       }
+      if(deploymentOptions?.forceRebuild)snapshot={...snapshot,deploymentOptions:{forceRebuild:true}};
       this.db.prepare('INSERT INTO jobs (id,action_id,service_id,snapshot,status,created_at) VALUES (?,?,?,?,?,?)').run(randomUUID(),action.id,serviceId,JSON.stringify(snapshot),'queued',now());
       this.db.prepare('INSERT INTO idempotency VALUES (?,?,?,?)').run(actorId,key,requestHash,action.id);
       this.appendEvent(action.id,'info',`${type[0]!.toUpperCase()}${type.slice(1)} queued for configuration revision ${service.revision}`);
+      return action;
+    }).immediate();
+  }
+  createHistoricalDeploy(serviceId:string,originalActionId:string,actorId:string,key:string):Action {
+    return this.db.transaction(()=>{
+      const service=this.getService(serviceId);
+      if(!service)throw new AppError('NOT_FOUND','Service not found',404);
+      if(service.kind && service.kind!=='app')throw new AppError('HISTORY_UNSUPPORTED','Historical deployment is available only for applications',400);
+      const requestHash=hashToken(JSON.stringify({serviceId,type:'historical-deploy',originalActionId}));
+      const previous=this.db.prepare('SELECT request_hash,action_id FROM idempotency WHERE actor_id=? AND key=?').get(actorId,key) as {request_hash:string;action_id:string}|undefined;
+      if(previous) {if(previous.request_hash!==requestHash)throw new AppError('IDEMPOTENCY_CONFLICT','This idempotency key was used for a different operation',409);return this.getAction(previous.action_id)!;}
+      if(this.db.prepare("SELECT id FROM jobs WHERE service_id=? AND status IN ('queued','running')").get(serviceId))throw new AppError('SERVICE_BUSY','Another operation is already queued or running for this service',409);
+      const original=this.getAction(originalActionId);
+      if(!original || original.serviceId!==serviceId || original.type!=='deploy' || original.status!=='succeeded')throw new AppError('NOT_FOUND','Successful deployment not found',404);
+      const job=this.db.prepare('SELECT snapshot FROM jobs WHERE action_id=? AND service_id=?').get(originalActionId,serviceId) as {snapshot:string}|undefined;
+      if(!job)throw new AppError('HISTORY_UNAVAILABLE','The deployment configuration is unavailable',409);
+      const historical=JSON.parse(job.snapshot) as Service;
+      if(historical.id!==serviceId || historical.projectId!==service.projectId || (historical.kind && historical.kind!=='app'))throw new AppError('HISTORY_UNAVAILABLE','The deployment configuration cannot be verified',409);
+      const events=this.getEvents(originalActionId);
+      const image=events.find(event=>event.message.startsWith('Deployed image: '))?.message.slice('Deployed image: '.length);
+      const commit=events.find(event=>/^Source commit: [a-f0-9]{40,64}$/.test(event.message))?.message.slice('Source commit: '.length);
+      if(!image || !/^(?:sha256:[a-f0-9]{64}|[a-zA-Z0-9][a-zA-Z0-9._/:@-]*@sha256:[a-f0-9]{64})$/.test(image))throw new AppError('HISTORY_UNAVAILABLE','This deployment does not have a verified immutable image',409);
+      if(historical.source?.type==='git' && !commit)throw new AppError('HISTORY_UNAVAILABLE','The source commit for this deployment is unavailable',409);
+      const action:Action={id:randomUUID(),projectId:service.projectId,serviceId,type:'deploy',status:'queued',phase:'queued',error:null,createdAt:now(),updatedAt:now(),finishedAt:null};
+      const snapshot:Service={...historical,state:service.state,deployedRevision:service.deployedRevision,rollbackImage:image,...(commit?{rollbackCommit:commit}:{})};
+      delete snapshot.deploymentOptions;
+      this.db.prepare('INSERT INTO actions VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(action.id,action.projectId,serviceId,actorId,action.type,action.status,action.phase,null,action.createdAt,action.updatedAt,null);
+      this.db.prepare('INSERT INTO jobs (id,action_id,service_id,snapshot,status,created_at) VALUES (?,?,?,?,?,?)').run(randomUUID(),action.id,serviceId,JSON.stringify(snapshot),'queued',now());
+      this.db.prepare('INSERT INTO idempotency VALUES (?,?,?,?)').run(actorId,key,requestHash,action.id);
+      this.reserveDomains(service);
+      this.appendEvent(action.id,'info',`Historical deployment queued from operation ${originalActionId}; application data and database migrations are not reverted.`);
+      this.recordAudit(actorId,'service.deploy.historical',serviceId);
       return action;
     }).immediate();
   }
@@ -356,6 +426,23 @@ export class Store {
     if (projectId) { where.push('project_id=?'); params.push(projectId); }
     if (serviceId) { where.push('service_id=?'); params.push(serviceId); }
     return this.db.prepare(`SELECT ${actionColumns} FROM actions ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at DESC LIMIT 200`).all(...params) as Action[];
+  }
+  configurationChanges(serviceId:string): {status:'not_deployed'|'unavailable'|'available';sections:string[];deployedPrimaryDomain?:DomainConfig|null} {
+    const service=this.getService(serviceId);
+    if(!service)throw new AppError('NOT_FOUND','Service not found',404);
+    if(service.deployedRevision===null)return {status:'not_deployed',sections:[]};
+    const rows=this.db.prepare(`SELECT j.snapshot FROM jobs j JOIN actions a ON a.id=j.action_id WHERE j.service_id=? AND a.type='deploy' AND a.status='succeeded' ORDER BY a.finished_at DESC,a.rowid DESC`).all(serviceId) as {snapshot:string}[];
+    const deployed=rows.map(row=>JSON.parse(row.snapshot) as Service).find(snapshot=>snapshot.revision===service.deployedRevision);
+    if(!deployed)return {status:'unavailable',sections:[]};
+    const sections: [string,(value:Service)=>unknown][]=[
+      ['Source',value=>({image:value.image,source:value.source})],
+      ['Domains',value=>({hostname:value.hostname,port:value.port,domains:value.domains})],
+      ['Environment',value=>value.environment??[]],['Storage',value=>value.mounts??[]],
+      ['Resources',value=>({resources:value.resources,replicas:value.replicas})],['Database',value=>value.database],
+    ];
+    const domains=deployed.domains??[{hostname:deployed.hostname,port:deployed.port,primary:true}];
+    const deployedPrimaryDomain=domains.find(domain=>domain.primary)??domains[0]??null;
+    return {status:'available',sections:sections.filter(([,select])=>!isDeepStrictEqual(select(service),select(deployed))).map(([label])=>label),deployedPrimaryDomain};
   }
   getEvents(actionId: string): ActionEvent[] { return this.db.prepare('SELECT id,action_id AS actionId,sequence,level,message,created_at AS createdAt FROM action_events WHERE action_id=? ORDER BY sequence DESC LIMIT 500').all(actionId).reverse() as ActionEvent[]; }
   appendEvent(actionId: string, level: ActionEvent['level'], message: string) {
@@ -390,6 +477,8 @@ export class Store {
       this.db.prepare("UPDATE jobs SET status='succeeded',lease_until=NULL WHERE action_id=?").run(actionId);
       if (runtime) this.updateServiceRuntime(action.serviceId,runtime);
       if(action.type==='deploy') {
+        if(runtime?.sourceCommit && /^[a-f0-9]{40,64}$/.test(runtime.sourceCommit)) this.appendEvent(actionId,'info',`Source commit: ${runtime.sourceCommit}`);
+        if(runtime?.imageDigest && runtime.imageDigest.length <= 512 && /^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$/.test(runtime.imageDigest)) this.appendEvent(actionId,'info',`Deployed image: ${runtime.imageDigest}`);
         const job=this.db.prepare('SELECT snapshot FROM jobs WHERE action_id=?').get(actionId) as {snapshot:string};
         if((JSON.parse(job.snapshot) as Service).source?.type!=='git')this.db.prepare('UPDATE services SET source_commit=NULL WHERE id=?').run(action.serviceId);
         const service=this.getService(action.serviceId);
@@ -426,19 +515,31 @@ export class Store {
       return true;
     }).immediate();
   }
-  private requireOwnedSecret(serviceId:string,reference:string,purpose:'environment'|'database'|'git') {
+  private requireOwnedSecret(serviceId:string,reference:string,purpose:'environment'|'database'|'git'|'backup-storage'|'registry'|'git-ssh') {
     const row=this.db.prepare('SELECT purpose FROM service_secret_refs WHERE reference=? AND service_id=?').get(reference,serviceId) as {purpose:string}|undefined;
-    if(!row||!(row.purpose===purpose||(row.purpose==='legacy_shared'&&purpose!=='git')))throw new AppError('SECRET_REFERENCE','This secret reference is not valid for this purpose',403);
+    if(!row||!(row.purpose===purpose||(row.purpose==='legacy_shared'&&(purpose==='environment'||purpose==='database'))))throw new AppError('SECRET_REFERENCE','This secret reference is not valid for this purpose',403);
     try{this.vault.get(reference);}catch{throw new AppError('SECRET_REFERENCE','This secret is unavailable',400);}
     return reference;
   }
-  private putServiceSecret(serviceId:string,value:string,purpose:'environment'|'database'|'git') {
+  putBackupDestinationSecret(serviceId:string,value:string): string {
+    if(!this.getService(serviceId))throw new AppError('NOT_FOUND','Service not found',404);
+    return this.db.transaction(()=>this.putServiceSecret(serviceId,value,'backup-storage')).immediate();
+  }
+  private putServiceSecret(serviceId:string,value:string,purpose:'environment'|'database'|'git'|'backup-storage'|'registry'|'git-ssh') {
     const reference=this.vault.put(value);
     this.db.prepare('INSERT INTO service_secret_refs(reference,service_id,purpose) VALUES (?,?,?)').run(reference,serviceId,purpose);
     return reference;
   }
   private protectConfiguration(serviceId:string,input:Service):import('../shared/types.js').ServiceConfiguration {
     const config=configurationOf(input);
+    config.registry=protectRegistryCredential(serviceId,input.image,config.registry,{
+      vault:this.vault,put:(value,purpose)=>this.putServiceSecret(serviceId,value,purpose),
+      requireOwned:(reference,purpose)=>this.requireOwnedSecret(serviceId,reference,purpose),
+    });
+    if(config.source?.type==='git'&&config.source.ssh)config.source={...config.source,ssh:protectGitSshCredential(serviceId,config.source.repository,config.source.ssh,{
+      vault:this.vault,put:(value,purpose)=>this.putServiceSecret(serviceId,value,purpose),
+      requireOwned:(reference,purpose)=>this.requireOwnedSecret(serviceId,reference,purpose),
+    })};
     if(config.source?.type==='git' && config.source.sharedGithub && !config.source.credential) {
       const connection=this.vault.githubConnection();
       if(!connection)throw new AppError('GITHUB_CONNECTION_REQUIRED','Configure the shared GitHub connection first',409);
@@ -489,7 +590,10 @@ export class Store {
       }
     }
     this.db.prepare('DELETE FROM domain_reservations WHERE service_id=?').run(service.id);
-    try{for(const hostname of names)this.db.prepare('INSERT INTO domain_reservations(hostname,service_id) VALUES (?,?)').run(hostname,service.id);}
+    try{for(const hostname of names){
+      if(this.db.prepare('SELECT 1 FROM compose_domains WHERE hostname=?').get(hostname))throw new AppError('DOMAIN_CONFLICT','This hostname is already reserved by a Compose workload',409);
+      this.db.prepare('INSERT INTO domain_reservations(hostname,service_id) VALUES (?,?)').run(hostname,service.id);
+    }}
     catch(error){this.constraintError(error);}
   }
   connectionInfo(serviceId:string,reveal=false):import('../shared/types.js').ConnectionInfo {
