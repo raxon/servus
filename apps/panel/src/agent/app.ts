@@ -8,12 +8,13 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { agentConfig } from './config.js';
-import { buildSource, SourceCheckError } from './build.js';
+import { BuildCancelledError, buildSource, cancelActiveBuild, SourceCheckError } from './build.js';
 import { readBuildLog } from './build-log.js';
 import { registerComposeAgent } from './compose.js';
 import { registerVolumeBackupAgent } from './volume-backups.js';
 import { applyRegistryService, registryAuthFromSpec } from './registry-credentials.js';
 import { DockerRuntime, message, isUncertainRuntimeError, type RecoveryContext } from './runtime.js';
+import { collectHostMetrics } from './observability.js';
 import type { Service } from '../shared/types.js';
 import { consoleExecStopped, type AgentMaintenanceGate } from './maintenance.js';
 import { DatabaseExportUncertainError, exportDatabase } from './database-export.js';
@@ -54,14 +55,15 @@ const input = z.object({
     state: z.enum(['pending', 'running', 'stopped', 'deploying', 'failed', 'unknown']),
     createdAt: z.string(), updatedAt: z.string(), lastError: z.string().nullable(),
     kind: z.enum(['app','postgres','redis','mariadb']).optional(),
-    source: z.discriminatedUnion('type', [z.object({type:z.literal('image')}), z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256),envFile:z.string().max(255).optional(),credential:z.object({username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().optional(),ssh:z.object({knownHosts:z.string().min(1).max(16384),secretRef:z.string().uuid(),publicKey:z.string().max(1000)}).strict().optional()})]).optional(),
+    source: z.discriminatedUnion('type', [z.object({type:z.literal('image')}), z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256),envFile:z.string().max(255).optional(),buildResources:z.object({cpuQuotaPercent:z.number().int().min(10).max(1600).optional(),memoryMb:z.number().int().min(128).max(65536).optional(),timeoutSeconds:z.number().int().min(30).max(1800).optional()}).strict().optional(),credential:z.object({username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().optional(),ssh:z.object({knownHosts:z.string().min(1).max(16384),secretRef:z.string().uuid(),publicKey:z.string().max(1000)}).strict().optional()})]).optional(),
     registry:z.object({server:z.string().min(1).max(253),username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().nullable().optional(),
     environment: z.array(z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32768).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).refine(value=>!value.secret||Boolean(value.secretRef)&&value.value===undefined)).max(100).optional(),
-    domains: z.array(z.object({hostname,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional()})).max(20).optional(),
+    domains: z.array(z.object({hostname,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional(),pathPrefix:z.string().min(1).max(128).optional(),stripPrefix:z.boolean().optional(),ipAllowList:z.array(z.string().min(3).max(64)).min(1).max(32).optional(),basicAuth:z.object({users:z.array(z.string().min(10).max(200)).min(1).max(20)}).strict().optional(),redirectTarget:z.string().url().max(500).optional(),redirectPermanent:z.boolean().optional()})).max(20).optional(),
     mounts: z.array(z.object({type:z.enum(['volume','file','bind']),name:z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/),target:z.string().startsWith('/').max(256),readOnly:z.boolean().optional(),content:z.string().max(32768).optional(),source:z.string().max(512).optional()})).max(20).optional(),
     resources: z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).optional(),
     database: z.object({database:z.string().min(1).max(63),user:z.string().min(1).max(63),passwordSecretRef:z.string().uuid().optional()}).strict().optional(),
     databaseAccess: databaseAccessSchema.optional(),
+    notes: z.string().max(4000).optional(),
     imageDigest:z.string().nullable().optional(),sourceCommit:z.string().nullable().optional(),deletedAt:z.string().nullable().optional(),
     rollbackImage:z.string().max(512).regex(/^(?:sha256:[a-f0-9]{64}|[a-zA-Z0-9][a-zA-Z0-9._/:@-]*@sha256:[a-f0-9]{64})$/).optional(),rollbackCommit:z.string().regex(/^[a-f0-9]{40,64}$/).optional(),
     deploymentOptions:z.object({forceRebuild:z.boolean().optional()}).strict().optional(),
@@ -164,6 +166,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     try {unresolved ||= Boolean(ingressJournal.load());}catch {unresolved=true;}
     return {...await runtime.status(),ingressRecoveryRequired:unresolved,ingressBusy};
   });
+  app.get('/host/metrics', async () => collectHostMetrics(config.dataDir));
   app.post('/host-domain/configure',async(req,reply)=>{
     const parsed=hostCertificateSchema.safeParse(req.body);
     if(!parsed.success)return reply.code(400).send({error:{code:'INVALID_HOST_CERTIFICATE',message:'Invalid host certificate request.'}});
@@ -546,13 +549,19 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       return result;
     }).catch(error => {
       if (isUncertainRuntimeError(error)) throw error;
-      const failure = { error: { code: 'RUNTIME_FAILED', message: vault.redact(message(error)) } };
+      const code = error instanceof BuildCancelledError ? 'BUILD_CANCELLED' : 'RUNTIME_FAILED';
+      const failure = { error: { code, message: vault.redact(message(error)) } };
       journal.prepare("UPDATE operations SET state='failed',response=?,updated_at=? WHERE id=?").run(JSON.stringify(failure), new Date().toISOString(), body.operationId);
       throw error;
     }).finally(() => { active.delete(body.operationId); locks.delete(body.service.id); });
     active.set(body.operationId, operation);
     return await operation;
     } finally { release?.(); }
+  });
+  app.post<{ Params: { id: string; operationId: string } }>('/services/:id/cancel-build/:operationId', async (req, reply) => {
+    const valid = z.object({ id: z.string().uuid(), operationId: z.string().uuid() }).safeParse(req.params);
+    if (!valid.success) return reply.code(400).send({ error: { code: 'INVALID_REQUEST', message: 'Invalid cancellation identity.' } });
+    return { cancelled: cancelActiveBuild(valid.data.id, valid.data.operationId) };
   });
   registerComposeAgent(app,{config,maintenance,beforeMutation:()=>{if(ingressBusy||ingressRecoveryError||ingressJournal.load())throw new Error('Recover or finish the ingress operation before changing Compose workloads.');},ensureIngress:async()=>{
     if(!(runtime instanceof DockerRuntime))throw new Error('Managed ingress is unavailable.');
@@ -564,6 +573,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if((error as {code?:string}).code==='REDIS_RESTORE_BUSY')return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'The Redis restore cannot continue in its current state.'}});
     if (error instanceof RestoreCommitUncertainError) return reply.code(503).send({error:{code:'RESTORE_UNCERTAIN',message:'Database restore requires recovery before further changes.'}});
     if (isUncertainRuntimeError(error)) return reply.code(503).send({ error: { code: 'OPERATION_UNCERTAIN', message: 'Docker connection interrupted. Reconcile the same operation before making another change.' } });
+    if (error instanceof BuildCancelledError) return reply.code(422).send({ error: { code: 'BUILD_CANCELLED', message: vault.redact(message(error)) } });
     return reply.code(422).send({ error: { code: 'RUNTIME_FAILED', message: vault.redact(message(error)) } });
   });
   app.addHook('onClose', async () => { await Promise.allSettled([...active.values(),...(ingressTask?[ingressTask]:[])]); journal.close(); });

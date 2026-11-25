@@ -7,11 +7,11 @@ import {Store} from '../../src/server/store.js';
 import type {InstallationBackupApproval,InstallationBackupApprovalFields} from '../../src/server/installation-backup-approval.js';
 
 // Only the privileged key reader/signer is replaced. Sessions, Store, routes and Unix transport are real.
-const {signer,cancelSigner}=vi.hoisted(()=>({signer:vi.fn(),cancelSigner:vi.fn()}));
-vi.mock('../../src/server/installation-backup-approval.js',async original=>({...await original<typeof import('../../src/server/installation-backup-approval.js')>(),signInstallationBackupApproval:signer,signInstallationBackupCancellation:cancelSigner}));
+const {signer,cancelSigner,deleteSigner}=vi.hoisted(()=>({signer:vi.fn(),cancelSigner:vi.fn(),deleteSigner:vi.fn()}));
+vi.mock('../../src/server/installation-backup-approval.js',async original=>({...await original<typeof import('../../src/server/installation-backup-approval.js')>(),signInstallationBackupApproval:signer,signInstallationBackupCancellation:cancelSigner,signInstallationBackupDeletion:deleteSigner}));
 const operationId='12345678-1234-4123-8123-123456789abc',input={operationId,name:'Installation backup'},origin='https://panel.example.test';
 const cleanup:(()=>Promise<void>)[]=[];
-beforeEach(()=>{signer.mockReset();signer.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'a'.repeat(64)}));cancelSigner.mockReset();cancelSigner.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'b'.repeat(64)}));});
+beforeEach(()=>{signer.mockReset();signer.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'a'.repeat(64)}));cancelSigner.mockReset();cancelSigner.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'b'.repeat(64)}));deleteSigner.mockReset();deleteSigner.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'c'.repeat(64)}));});
 afterEach(async()=>{for(const close of cleanup.splice(0).reverse())await close();});
 type UpdaterRequest={version:number;action:string;approval?:InstallationBackupApproval;operationId?:string};
 
@@ -107,5 +107,44 @@ describe('installation backup routes through createApp',()=>{
   it.each(['submit','status'] as const)('rechecks a downgraded administrator after awaited %s transport',async operation=>{
     const f=await fixture();f.respond(socket=>{f.store.db.prepare("UPDATE users SET role='member' WHERE id=?").run(f.admin.id);socket.end(`${JSON.stringify({ok:true,operation:f.operation})}\n`);});
     const response=operation==='submit'?await f.post():await f.get();expect(response.statusCode).toBe(403);expect(response.body).not.toContain(input.name);expect(f.requests).toHaveLength(1);
+  });
+  it('deletes and verifies completed installation backups with distinct delete signing and live admin rechecks',async()=>{
+    const f=await fixture();
+    const digest=`sha256:${'d'.repeat(64)}`;
+    f.respond((socket,request)=>{
+      if(request.action==='installation_backup_delete'){
+        socket.end(`${JSON.stringify({ok:true,operation:{operationId,name:input.name,deleted:true,remainingSnapshots:1}})}\n`);
+        return;
+      }
+      if(request.action==='installation_backup_verify'){
+        socket.end(`${JSON.stringify({ok:true,operation:{operationId,name:input.name,verified:true,manifestDigest:digest}})}\n`);
+        return;
+      }
+      socket.end(`${JSON.stringify({ok:false,error:'invalid_request'})}\n`);
+    });
+    // Unauthorized / non-admin / bearer rejected before signing
+    for(const headers of[{},f.member('editor'),{...f.headers,'x-csrf-token':''},{...f.headers,origin:'https://foreign.example.test'},{authorization:`Bearer ${await f.token('deploy')}`}]){
+      expect((await f.post(headers,{name:input.name},`/api/v1/installation-backups/${operationId}/delete`)).statusCode).toBeGreaterThanOrEqual(400);
+      expect((await f.post(headers,{},`/api/v1/installation-backups/${operationId}/verify`)).statusCode).toBeGreaterThanOrEqual(400);
+    }
+    expect(deleteSigner).not.toHaveBeenCalled();
+    expect(f.requests).toEqual([]);
+
+    const del=await f.post(f.headers,{name:input.name},`/api/v1/installation-backups/${operationId}/delete`);
+    expect(del.statusCode).toBe(200);
+    expect(del.json()).toEqual({ok:true,result:{operationId,name:input.name,deleted:true,remainingSnapshots:1}});
+    expect(deleteSigner).toHaveBeenCalledWith({...input,actorId:f.admin.id,issuedAt:expect.any(Number)},'/synthetic/not-read/role-api-key');
+    expect(signer).not.toHaveBeenCalled();
+    expect(cancelSigner).not.toHaveBeenCalled();
+    expect(del.body).not.toContain('proof');
+    expect(del.body).not.toContain('/synthetic');
+
+    const verify=await f.post(f.headers,{},`/api/v1/installation-backups/${operationId}/verify`);
+    expect(verify.statusCode).toBe(200);
+    expect(verify.json()).toEqual({ok:true,verification:{operationId,name:input.name,verified:true,manifestDigest:digest}});
+
+    // Revoked session after await must fail closed
+    f.respond(socket=>{f.store.deleteSession(f.adminToken);socket.end(`${JSON.stringify({ok:true,operation:{operationId,name:input.name,verified:true,manifestDigest:digest}})}\n`);});
+    expect((await f.post(f.headers,{},`/api/v1/installation-backups/${operationId}/verify`)).statusCode).toBe(401);
   });
 });

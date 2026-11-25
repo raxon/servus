@@ -31,16 +31,17 @@ export class ApiTokens {
     if(!row)throw new AppError('UNAUTHORIZED','API token is invalid, expired or revoked',401);
     const user:User={id:row.userId,email:row.email,role:row.role,createdAt:row.createdAt};
     const route=request.routeOptions.url??'',params=request.params as Record<string,string>;
-    const read=request.method==='GET'||(request.method==='HEAD'&&route==='/api/v1/compose/:id/actions'),write=request.method==='POST';
+    const read=request.method==='GET'||(request.method==='HEAD'&&route==='/api/v1/compose/:id/actions'),write=request.method==='POST'||request.method==='PATCH';
     let projectId:string|undefined;
     if(read&&route==='/api/v1/projects')projectId=row.projectId;
     else if(read&&['/api/v1/projects/:id','/api/v1/projects/:id/services','/api/v1/projects/:id/compose'].includes(route))projectId=params.id;
     else if(read&&route==='/api/v1/openapi.json')projectId=row.projectId;
-    else if((read&&['/api/v1/services/:id','/api/v1/services/:id/actions','/api/v1/services/:id/metrics','/api/v1/services/:id/containers','/api/v1/services/:id/logs'].includes(route))||
-      (write&&['/api/v1/services/:id/deploy','/api/v1/services/:id/start','/api/v1/services/:id/stop','/api/v1/services/:id/restart'].includes(route)))
+    else if((read&&['/api/v1/services/:id','/api/v1/services/:id/actions','/api/v1/services/:id/metrics','/api/v1/services/:id/metrics/history','/api/v1/services/:id/containers','/api/v1/services/:id/logs','/api/v1/services/:id/backups'].includes(route))||
+      (request.method==='POST'&&['/api/v1/services/:id/deploy','/api/v1/services/:id/start','/api/v1/services/:id/stop','/api/v1/services/:id/restart','/api/v1/services/:id/backups'].includes(route))||
+      (request.method==='PATCH'&&route==='/api/v1/services/:id'))
       projectId=this.store.getService(params.id!)?.projectId;
-    else if(read&&['/api/v1/actions/:id','/api/v1/actions/:id/build-log'].includes(route))projectId=this.store.getAction(params.id!)?.projectId;
-    else if((read&&['/api/v1/compose/:id','/api/v1/compose/:id/actions','/api/v1/compose/:id/logs'].includes(route))||
+    else if((read&&['/api/v1/actions/:id','/api/v1/actions/:id/build-log'].includes(route))||(request.method==='POST'&&route==='/api/v1/actions/:id/cancel'))projectId=this.store.getAction(params.id!)?.projectId;
+    else if((read&&['/api/v1/compose/:id','/api/v1/compose/:id/actions','/api/v1/compose/:id/logs','/api/v1/compose/:id/metrics'].includes(route))||
       (write&&['/api/v1/compose/:id/deploy','/api/v1/compose/:id/start','/api/v1/compose/:id/stop','/api/v1/compose/:id/restart'].includes(route)))
       projectId=(this.store.db.prepare(`SELECT project_id FROM compose_workloads WHERE id=? ${read&&route==='/api/v1/compose/:id/actions'?'':'AND deleted_at IS NULL'}`).get(params.id!) as {project_id:string}|undefined)?.project_id;
     else throw new AppError('TOKEN_SCOPE','This endpoint requires an interactive session',403);
@@ -88,9 +89,13 @@ export function publicApiDocument() {
     '/projects/{id}/services':{get:get('List project services',[parameter('id')])},
     '/projects/{id}/compose':{get:get('List project Compose workloads with source contents omitted',[parameter('id')])},
   };
-  for(const suffix of ['', '/actions','/metrics','/containers','/logs'])paths[`/services/{id}${suffix}`]={get:get(`Read service${suffix||' configuration'}`,[parameter('id')])};
+  for(const suffix of ['', '/actions','/metrics','/containers','/logs','/backups'])paths[`/services/{id}${suffix}`]={get:get(`Read service${suffix||' configuration'}`,[parameter('id')])};
+  paths['/services/{id}']={...(paths['/services/{id}'] as Record<string,unknown>),patch:{summary:'Update saved service configuration with optimistic locking; requires deploy scope',security:[{bearerAuth:[]}],parameters:[parameter('id')],responses:{'200':{description:'Updated service configuration'},'403':{description:'Insufficient scope'},'409':{description:'Revision or domain conflict'}}}};
+  paths['/services/{id}/backups']={...(paths['/services/{id}/backups'] as Record<string,unknown>),post:{summary:'Queue a manual database backup; requires deploy scope',security:[{bearerAuth:[]}],parameters:[parameter('id'),{name:'Idempotency-Key',in:'header',required:true,schema:{type:'string',minLength:1,maxLength:128}}],responses:{'202':{description:'Durable database backup queued'},'403':{description:'Insufficient scope'},'409':{description:'Idempotency conflict or backup busy'}}}};
+  paths['/services/{id}/metrics/history']={get:get('Read historical service metrics',[parameter('id'),{name:'window',in:'query',required:false,schema:{type:'string',enum:['1h','6h','24h'],default:'1h'}}])};
   for(const suffix of ['', '/build-log'])paths[`/actions/{id}${suffix}`]={get:get('Inspect deployment action',[parameter('id')])};
-  for(const suffix of ['', '/actions','/logs'])paths[`/compose/{id}${suffix}`]={get:get(`Read Compose workload${suffix||' metadata; source contents omitted'}`,[parameter('id')])};
+  paths['/actions/{id}/cancel']={post:{summary:'Cancel a queued action or active build; requires deploy scope',security:[{bearerAuth:[]}],parameters:[parameter('id')],responses:{'200':{description:'Queued action cancelled'},'202':{description:'Active build cancellation requested'},'403':{description:'Insufficient scope'},'409':{description:'Action can no longer be cancelled'}}}};
+  for(const suffix of ['', '/actions','/logs','/metrics'])paths[`/compose/{id}${suffix}`]={get:get(`Read Compose workload${suffix||' metadata; source contents omitted'}`,[parameter('id')])};
   for(const operation of ['deploy','start','stop','restart'])paths[`/compose/{id}/${operation}`]={post:{summary:`Queue Compose ${operation}; requires deploy scope`,security:[{bearerAuth:[]}],parameters:[parameter('id'),{name:'Idempotency-Key',in:'header',required:true,schema:{type:'string',minLength:1,maxLength:128}}],responses:{'202':{description:'Durable Compose action; poll /compose/{id}/actions'},'403':{description:'Insufficient scope'},'404':{description:'Resource unavailable'},'409':{description:'Idempotency conflict or workload busy'}}}};
   for(const operation of ['deploy','start','stop','restart'])paths[`/services/{id}/${operation}`]={post:{summary:`Queue ${operation}; requires deploy scope`,security:[{bearerAuth:[]}],parameters:[parameter('id'),{name:'Idempotency-Key',in:'header',required:true,schema:{type:'string',minLength:1,maxLength:128}}],...(operation==='deploy'?{requestBody:{required:false,content:{'application/json':{schema:{type:'object',additionalProperties:false,properties:{forceRebuild:{type:'boolean'}}}}}}}:{}),responses:{'202':{description:'Durable action; poll /actions/{id}'},'403':{description:'Insufficient scope'},'409':{description:'Idempotency conflict or service busy'}}}};
   return {openapi:'3.1.0',info:{title:'Servus project API',version:'1.0.0'},servers:[{url:'/api/v1'}],components:{securitySchemes:{bearerAuth:{type:'http',scheme:'bearer',description:'Project-scoped read or deploy token. The owner must retain project access.'}}},paths};

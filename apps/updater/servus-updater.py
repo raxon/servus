@@ -1119,6 +1119,47 @@ class InstallationBackupProxy:
     def cancel(self, approval):
         return self.submit(approval, cancel=True)
 
+    def delete(self, approval):
+        fields = {'version', 'operationId', 'actorId', 'name', 'issuedAt', 'proof'}
+        if (not isinstance(approval, dict) or set(approval) != fields or type(approval['version']) is not int or approval['version'] != 1 or
+            not valid_uuid(approval['operationId']) or not valid_uuid(approval['actorId']) or not self._name(approval['name']) or
+            type(approval['issuedAt']) is not int or approval['issuedAt'] < 0 or not isinstance(approval['proof'], str) or
+            not re.fullmatch(r'[a-f0-9]{64}', approval['proof'])):
+            raise ProtocolError('invalid_request')
+        result = self._request({'version': 1, 'type': 'installation_backup_delete', 'receipt': approval})
+        if result == {'version': 1, 'status': 'not_found'} and type(result.get('version')) is int:
+            raise ProtocolError('not_found')
+        if result == {'version': 1, 'status': 'failed'} and type(result.get('version')) is int:
+            raise ProtocolError('operation_in_progress')
+        if (not isinstance(result, dict) or set(result) != {'version', 'status', 'result'} or
+                type(result['version']) is not int or result['version'] != 1 or result['status'] != 'deleted'):
+            raise ProtocolError('unavailable')
+        item = result['result']
+        if (not isinstance(item, dict) or set(item) != {'operationId', 'name', 'deleted', 'remainingSnapshots'} or
+                item['operationId'] != approval['operationId'] or item['name'] != approval['name'] or
+                item['deleted'] is not True or type(item['remainingSnapshots']) is not int or item['remainingSnapshots'] < 0):
+            raise ProtocolError('unavailable')
+        return item
+
+    def verify(self, operation_id):
+        if not valid_uuid(operation_id):
+            raise ProtocolError('invalid_request')
+        result = self._request({'version': 1, 'type': 'installation_backup_verify', 'operationId': operation_id})
+        if result == {'version': 1, 'status': 'not_found'} and type(result.get('version')) is int:
+            raise ProtocolError('not_found')
+        if result == {'version': 1, 'status': 'failed'} and type(result.get('version')) is int:
+            raise ProtocolError('recovery_required')
+        if (not isinstance(result, dict) or set(result) != {'version', 'status', 'verification'} or
+                type(result['version']) is not int or result['version'] != 1 or result['status'] != 'verified'):
+            raise ProtocolError('unavailable')
+        item = result['verification']
+        if (not isinstance(item, dict) or set(item) != {'operationId', 'name', 'verified', 'manifestDigest'} or
+                item['operationId'] != operation_id or not self._name(item['name']) or
+                item['verified'] is not True or not isinstance(item['manifestDigest'], str) or
+                not DIGEST_PATTERN.fullmatch(item['manifestDigest'])):
+            raise ProtocolError('unavailable')
+        return item
+
     def status(self, operation_id):
         if not valid_uuid(operation_id):
             raise ProtocolError('invalid_request')
@@ -1498,6 +1539,12 @@ def process(journal, request, *, allow_apply=False, discovery=None, recovery=Non
     if action == 'installation_backup_cancel' and set(request) == {'version', 'action', 'approval'}:
         if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
         return installation_backups.cancel(request['approval'])
+    if action == 'installation_backup_delete' and set(request) == {'version', 'action', 'approval'}:
+        if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
+        return installation_backups.delete(request['approval'])
+    if action == 'installation_backup_verify' and set(request) == {'version', 'action', 'operationId'}:
+        if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
+        return installation_backups.verify(request['operationId'])
     if action == 'apply' and set(request) == {'version', 'action', 'operationId'}:
         # Reject the readiness probe locally: backup admission can need the
         # installation lock already held by the initial-generation coordinator.

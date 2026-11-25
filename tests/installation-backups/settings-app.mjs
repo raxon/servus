@@ -21,6 +21,14 @@ try{
       if(path==='/api/v1/installation-backups'&&request.method()==='POST'){
         assert.equal(role,'admin');assert.equal(request.headers()['x-csrf-token'],'settings-csrf');operation={...request.postDataJSON(),actorId:'12345678-1234-4123-8123-123456789abc',state:'requested',createdAt:1794916800000,updatedAt:1794916800000,errorCode:null};return route.fulfill({status:202,json:{ok:true,operation}});
       }
+      if(path.endsWith('/verify')&&request.method()==='POST'){
+        assert.equal(role,'admin');assert.equal(request.headers()['x-csrf-token'],'settings-csrf');
+        return route.fulfill({json:{ok:true,verification:{operationId:historyOperations[0].operationId,name:historyOperations[0].name,verified:true,manifestDigest:`sha256:${'a'.repeat(64)}`}}});
+      }
+      if(path.endsWith('/delete')&&request.method()==='POST'){
+        assert.equal(role,'admin');assert.equal(request.headers()['x-csrf-token'],'settings-csrf');
+        return route.fulfill({json:{ok:true,result:{operationId:historyOperations[0].operationId,name:historyOperations[0].name,deleted:true,remainingSnapshots:1}}});
+      }
       if(path==='/api/v1/installation-backups/history'){
         if(historyMode==='error')return route.fulfill({status:503,json:{error:{code:'INSTALLATION_BACKUP_UNAVAILABLE',message:'Unavailable'}}});
         if(historyMode==='empty')return route.fulfill({json:{available:true,operations:[],nextCursor:null}});
@@ -78,6 +86,12 @@ try{
       await expect(history.getByRole('row').nth(1)).toContainText('Completed');
       await history.getByText('Details for Interrupted installation backup',{exact:true}).click();
       await expect(history).toContainText('--recover-installation-backup 42345678-1234-4123-8123-123456789abc');
+      await history.getByText('Details for Recent installation backup',{exact:true}).click();
+      await history.getByRole('button',{name:'Verify archive',exact:true}).click();
+      await expect(history).toContainText('Archive verified (sha256:aaaaaaaaaaaaaaaa');
+      await history.getByRole('button',{name:'Delete snapshot',exact:true}).click();
+      await history.getByRole('button',{name:'Confirm snapshot deletion',exact:true}).click();
+      await expect(history).toContainText('Snapshot archive deleted. 1 verified snapshot(s) remain on disk.');
       await section.getByRole('button',{name:'Load older backups',exact:true}).click();
       await expect(history).toContainText('Earlier failed backup');
       await section.getByRole('textbox',{name:'Find by operation ID',exact:true}).fill(historyOperations[0].operationId);

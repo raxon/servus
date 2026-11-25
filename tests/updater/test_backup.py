@@ -309,6 +309,30 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         with self.assertRaisesRegex(backup.CaptureError,'sidecar'):
             backup._validate_staging(self.destination_fd,self.node_fd)
 
+    def test_metrics_cache_sidecars_are_excluded_from_snapshot_and_restore_starts_empty(self):
+        self.panel.close(); self.agent.close()
+        script=r'''import {Store} from '/app/dist/server/store.js';import {MetricsHistory} from '/app/dist/server/metrics-history.js';
+const d=process.argv[1],id=process.argv[2];const s=new Store(d);
+const h=new MetricsHistory({store:s,serviceAccess:()=>{throw new Error('unused');},startCollector:false});
+h.db.prepare("INSERT INTO service_metrics_samples(service_id,project_id,sampled_at,status,cpu_percent,memory_bytes,memory_limit_bytes,containers,generation,deployed_revision) VALUES(?,?,1700000000000,'ok',12.5,1024,2048,1,'aaaaaaaaaaaaaaaa',1)").run(id,id);
+h.db.pragma('wal_autocheckpoint = 0');
+await h.close();s.close();'''
+        subprocess.run([NODE,'--input-type=module','-e',script,str(self.src),UUID],check=True,timeout=20)
+        (self.src/'metrics.sqlite-wal').touch(mode=0o600)
+        (self.src/'metrics.sqlite-shm').touch(mode=0o600)
+        self.fix_permissions()
+        self.capture()
+        backup._validate_staging(self.destination_fd, self.node_fd)
+        self.assertFalse((self.dst/'metrics.sqlite').exists())
+        self.assertFalse((self.dst/'metrics.sqlite-wal').exists())
+        restored=self.root/'restored-empty-metrics'; shutil.copytree(self.dst,restored)
+        verify=r'''import {Store} from '/app/dist/server/store.js';import {MetricsHistory} from '/app/dist/server/metrics-history.js';
+const d=process.argv[1],id=process.argv[2];const s=new Store(d);
+const h=new MetricsHistory({store:s,serviceAccess:()=>{throw new Error('unused');},startCollector:false});
+const count=h.db.prepare('SELECT COUNT(*) AS n FROM service_metrics_samples').get().n;
+await h.close();s.close();if(count!==0)process.exit(2);'''
+        subprocess.run([NODE,'--input-type=module','-e',verify,str(restored),UUID],check=True,timeout=20)
+
     def _downgrade_v9_to_v8(self):
         for table, column in (('database_backup_settings','profile_id'),('database_backup_settings','encrypted'),('database_backup_settings','retention_policy'),('database_backups','encrypted'),('database_backups','plaintext_size'),('volume_backup_settings','profile_id')):
             self.panel.execute(f'ALTER TABLE {table} DROP COLUMN {column}')

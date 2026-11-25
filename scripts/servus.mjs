@@ -9,13 +9,21 @@ Set SERVUS_URL and SERVUS_TOKEN (a project-scoped API token).
   services PROJECT_ID           List project services
   service SERVICE_ID            Read service configuration
   action ACTION_ID              Read deployment status and events
+  action-cancel ACTION_ID       Cancel a queued action or active build
   logs SERVICE_ID               Read recent runtime logs
+  metrics SERVICE_ID            Read current runtime metrics
+  metrics-history SERVICE_ID [--window 1h|6h|24h]
+                                Read historical service metrics
+  backups SERVICE_ID            List managed database backups
+  backup-create SERVICE_ID [--name NAME] [--idempotency-key KEY]
+                                Queue a manual managed database backup
   deploy SERVICE_ID [--force-rebuild] [--idempotency-key KEY]
   start|stop|restart SERVICE_ID [--idempotency-key KEY]
   compose PROJECT_ID            List project Compose workloads
   compose-workload WORKLOAD_ID   Read Compose workload metadata
   compose-actions WORKLOAD_ID    Read Compose action history and status
   compose-logs WORKLOAD_ID       Read Compose runtime logs
+  compose-metrics WORKLOAD_ID    Read Compose runtime metrics
   compose-deploy|compose-start|compose-stop|compose-restart WORKLOAD_ID [--idempotency-key KEY]
 
 Output is JSON. Mutations return an action ID; poll with action ACTION_ID.
@@ -40,9 +48,28 @@ try {
         }
         if(key&&key.length>128)throw new Error('Idempotency keys cannot exceed 128 characters.');
         key||=randomUUID();method='POST';body=command==='deploy'?{forceRebuild}:{};path=composeOperation?`/compose/${id}/${composeOperation}`:`/services/${id}/${command}`;
+      } else if(command==='metrics-history'){
+        let window='1h';
+        for(let index=0;index<flags.length;index++){
+          if(flags[index]==='--window'&&['1h','6h','24h'].includes(flags[index+1]))window=flags[++index];
+          else throw new Error('Unknown or invalid --window option. Use 1h, 6h or 24h.');
+        }
+        path=`/services/${id}/metrics/history?window=${window}`;
+      } else if(command==='backup-create'){
+        let name;
+        for(let index=0;index<flags.length;index++){
+          if(flags[index]==='--name'&&flags[index+1])name=flags[++index];
+          else if(flags[index]==='--idempotency-key'&&flags[index+1])key=flags[++index];
+          else throw new Error('Unknown or incomplete option. Use --help.');
+        }
+        if(key&&key.length>128)throw new Error('Idempotency keys cannot exceed 128 characters.');
+        key||=randomUUID();method='POST';body=name?{name}:{};path=`/services/${id}/backups`;
+      } else if(command==='action-cancel'){
+        if(flags.length)throw new Error('Unknown option. Use --help.');
+        method='POST';body={};path=`/actions/${id}/cancel`;
       } else {
         if(flags.length)throw new Error('Unknown option. Use --help.');
-        path=command==='services'?`/projects/${id}/services`:command==='service'?`/services/${id}`:command==='action'?`/actions/${id}`:command==='logs'?`/services/${id}/logs`:command==='compose'?`/projects/${id}/compose`:command==='compose-workload'?`/compose/${id}`:command==='compose-actions'?`/compose/${id}/actions`:command==='compose-logs'?`/compose/${id}/logs`:undefined;
+        path=command==='services'?`/projects/${id}/services`:command==='service'?`/services/${id}`:command==='action'?`/actions/${id}`:command==='logs'?`/services/${id}/logs`:command==='metrics'?`/services/${id}/metrics`:command==='backups'?`/services/${id}/backups`:command==='compose'?`/projects/${id}/compose`:command==='compose-workload'?`/compose/${id}`:command==='compose-actions'?`/compose/${id}/actions`:command==='compose-logs'?`/compose/${id}/logs`:command==='compose-metrics'?`/compose/${id}/metrics`:undefined;
         if(!path)throw new Error('Unknown command. Use --help.');
       }
     }

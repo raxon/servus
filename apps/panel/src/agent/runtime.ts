@@ -6,6 +6,7 @@ import { SecretVault } from '../shared/secrets.js';
 import { buildSource } from './build.js';
 import { withComposeProvider } from './compose-ingress.js';
 import { httpsRouteLabels, httpsRedirectLabels, supportsManagedHttps, httpsIngressOptions } from './https-routing.js';
+import { compileDomainLabels } from './route-labels.js';
 import { LOCAL_TLS_FORWARDER, verifyLocalTlsForwarder } from './https-local-forwarder.js';
 import { inspectManagedCertificate } from './managed-certificate.js';
 import { inspectHostCertificate } from './host-certificate.js';
@@ -242,7 +243,7 @@ export class DockerRuntime {
         if(!domain.https)throw new Error('HTTP redirect requires HTTPS. Existing application routes were not changed.');
         const labels=existing?.Spec.Labels??{};
         const prefix=`traefik.http.routers.${service.id.replaceAll('-','')}-`;
-        const existingRoute=Object.entries(labels).some(([key,value])=>key.startsWith(prefix) && key.endsWith('-https.rule') && value===`Host(\`${domain.hostname}\`)`);
+        const existingRoute=Object.entries(labels).some(([key,value])=>key.startsWith(prefix) && key.endsWith('-https.rule') && (value===`Host(\`${domain.hostname}\`)` || value.startsWith(`Host(\`${domain.hostname}\`) && `)));
         if(!existingRoute)throw new Error(`Deploy HTTPS for ${domain.hostname} and verify the certificate before enabling its redirect.`);
         const cert=inspectHostCertificate(this.dataDir,domain.hostname)??await inspectManagedCertificate(this.docker,domain.hostname);
         if(cert.status!=='active' || !await verifyRedirectEndpoints(domain.hostname,cert.fingerprint))throw new Error(`The managed certificate for ${domain.hostname} is not active and publicly served at every DNS address. Existing application routes were not changed.`);
@@ -318,14 +319,9 @@ export class DockerRuntime {
           labels['panel.volume-reservation'] = reservation;
         }
         const domains = databaseKind(service) ? [] : service.domains ?? [{ hostname: service.hostname, port: service.port }];
+        const host = this.vault.hostConnection()?.hostname;
         domains.forEach((domain, index) => {
-          const route = `${key}-${index}`;
-          Object.assign(labels, { 'traefik.enable': 'true', [`traefik.http.routers.${route}.rule`]: `Host(\`${domain.hostname}\`)`,
-            [`traefik.http.routers.${route}.entrypoints`]: 'web', [`traefik.http.routers.${route}.service`]: route,
-            [`traefik.http.services.${route}.loadbalancer.server.port`]: String(domain.port) });
-          const host=this.vault.hostConnection()?.hostname;
-          if ('https' in domain && domain.https) Object.assign(labels,httpsRouteLabels(service.id,index,domain.hostname,domain.port,Boolean(host&&isHostApplication(domain.hostname,host))));
-          if ('redirectHttps' in domain && domain.redirectHttps) Object.assign(labels,httpsRedirectLabels(service.id,index,domain.hostname,domain.port));
+          Object.assign(labels, compileDomainLabels(service.id, index, domain, Boolean(host && isHostApplication(domain.hostname, host))));
         });
         const limits = service.resources || { cpu: 1, memoryMb: 256 };
         let placement;
@@ -583,14 +579,14 @@ function matchesTask(task: RuntimeTask, expected: Docker.ServiceSpec): boolean {
   return ['panel.revision', 'panel.operation'].every(key => !target.Labels?.[key] || actual.Labels?.[key] === target.Labels[key]);
 }
 
-function routeHostnames(spec: Docker.ServiceSpec): string[] {
-  return [...new Set(Object.entries(spec.Labels || {}).filter(([key]) => key.startsWith('traefik.http.routers.') && key.endsWith('.rule')).map(([,rule]) => rule.match(/^Host\(`([^`]+)`\)$/)?.[1]).filter((host): host is string => Boolean(host)))];
+export function routeHostnames(spec: Docker.ServiceSpec): string[] {
+  return [...new Set(Object.entries(spec.Labels || {}).filter(([key]) => key.startsWith('traefik.http.routers.') && key.endsWith('.rule')).map(([,rule]) => rule.match(/^Host\(`([^`]+)`\)/)?.[1]).filter((host): host is string => Boolean(host)))];
 }
-function redirectedRouteHostnames(spec:Docker.ServiceSpec):Set<string> {
+export function redirectedRouteHostnames(spec:Docker.ServiceSpec):Set<string> {
   const labels=spec.Labels??{},hosts=new Set<string>();
   for(const [key,value] of Object.entries(labels)) {
     if(!key.startsWith('traefik.http.routers.')||!key.endsWith('.middlewares'))continue;
-    const prefix=key.slice(0,-'.middlewares'.length),host=labels[`${prefix}.rule`]?.match(/^Host\(`([^`]+)`\)$/)?.[1];
+    const prefix=key.slice(0,-'.middlewares'.length),host=labels[`${prefix}.rule`]?.match(/^Host\(`([^`]+)`\)/)?.[1];
     if(host && value.split(',').some(name=>labels[`traefik.http.middlewares.${name}.redirectscheme.scheme`]==='https'))hosts.add(host);
   }
   return hosts;

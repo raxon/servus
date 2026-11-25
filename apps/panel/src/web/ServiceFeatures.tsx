@@ -43,6 +43,7 @@ import { SourcePanel } from "./SourcePanel.js";
 import { DatabaseRestore } from "./DatabaseRestore.js";
 import { DatabaseConnectionString, DatabaseExternalAccess } from "./DatabaseExternalAccess.js";
 import { BackupSettings } from "./BackupSettings.js";
+import { ServiceMetricsHistoryPanel } from "./ServiceMetricsHistory.js";
 import { VolumeBackupSettings } from "./VolumeBackupSettings.js";
 import { combineEnvironment, formatEnvironment } from "./environment.js";
 import { TerminalBoundary } from "./TerminalBoundary.js";
@@ -344,7 +345,21 @@ function DomainsPanel({ service, canWrite }: { service: Service; canWrite: boole
       onSubmit={(event) => {
         event.preventDefault();
         if (!canWrite) return;
-        const clean = domains.map(({ rowId, ...domain }) => domain);
+        const clean = domains.map(({ rowId, ...domain }) => {
+          const next: DomainConfig = { hostname: domain.hostname, port: domain.port };
+          if (domain.primary) next.primary = true;
+          if (domain.https) next.https = true;
+          if (domain.redirectHttps) next.redirectHttps = true;
+          if (domain.pathPrefix?.trim()) next.pathPrefix = domain.pathPrefix.trim();
+          if (domain.stripPrefix && next.pathPrefix && next.pathPrefix !== '/') next.stripPrefix = true;
+          if (domain.ipAllowList?.length) next.ipAllowList = domain.ipAllowList;
+          if (domain.basicAuth?.users.length) next.basicAuth = domain.basicAuth;
+          if (domain.redirectTarget?.trim()) {
+            next.redirectTarget = domain.redirectTarget.trim();
+            next.redirectPermanent = domain.redirectPermanent ?? true;
+          }
+          return next;
+        });
         const primary = clean.find((domain) => domain.primary) ?? clean[0];
         save.mutate({
           domains: clean,
@@ -369,7 +384,7 @@ function DomainsPanel({ service, canWrite }: { service: Service; canWrite: boole
         disabled={save.isPending || !canWrite}
       >
         {domains.map((row) => (
-          <div className="domain-editor-group" key={row.rowId}><h3 className="domain-route-title">{row.hostname || "New domain"}{row.primary ? " · Primary" : ""}</h3><details className="domain-settings" open={editingDomains[row.rowId] ?? false} onToggle={event => { const open = event.currentTarget.open; setEditingDomains(value => value[row.rowId] === open ? value : { ...value, [row.rowId]: open }); }}><summary>Edit hostname and port</summary><div className="domain-editor-row">
+          <div className="domain-editor-group" key={row.rowId}><h3 className="domain-route-title">{row.hostname || "New domain"}{row.pathPrefix && row.pathPrefix !== "/" ? row.pathPrefix : ""}{row.primary ? " · Primary" : ""}</h3><details className="domain-settings" open={editingDomains[row.rowId] ?? false} onToggle={event => { const open = event.currentTarget.open; setEditingDomains(value => value[row.rowId] === open ? value : { ...value, [row.rowId]: open }); }}><summary>Edit hostname and port</summary><div className="domain-editor-row">
             <label className="domain-primary">
               <input
                 type="radio"
@@ -511,6 +526,45 @@ function DomainChecks({row,service,runtime,update}:{row:DomainConfig & {rowId:st
               <small>Create an A record for this hostname pointing to your server's public IPv4 address. Add an AAAA record only if the server is reachable over IPv6. With Cloudflare or another proxy, ensure HTTP validation and TLS forwarding reach this installation.</small>
               {row.hostname ? <div><button type="button" className="button button-small" onClick={()=>{if(!navigator.clipboard){setCopiedDomain('Copy unavailable');return;} void navigator.clipboard.writeText(row.hostname).then(()=>setCopiedDomain(`Copied ${row.hostname}`),()=>setCopiedDomain('Copy unavailable'));}}><Copy size={14} /> Copy hostname</button><span role="status">{copiedDomain === `Copied ${row.hostname}` || copiedDomain === 'Copy unavailable' ? copiedDomain : ''}</span></div> : null}
             </div>
+            <details className="domain-settings"><summary>Routing rules &amp; middleware</summary><div className="domain-https-options">
+              <label>
+                Path prefix (optional)
+                <input className="mono" value={row.pathPrefix ?? ''} placeholder="/api" maxLength={128} autoCapitalize="none" onChange={event => {
+                  const val = event.target.value;
+                  update(row.rowId, { pathPrefix: val || undefined, ...(val && val !== '/' ? {} : { stripPrefix: false }) });
+                }} />
+              </label>
+              <label className="checkbox-label">
+                <input type="checkbox" checked={!!row.stripPrefix} disabled={!row.pathPrefix || row.pathPrefix === '/' || !!row.redirectTarget} onChange={event => update(row.rowId, { stripPrefix: event.target.checked || undefined })} />
+                Strip path prefix before forwarding to container
+              </label>
+              <label>
+                IP allow-list (one IP or CIDR per line)
+                <textarea className="mono" rows={2} placeholder={"203.0.113.0/24\n198.51.100.10"} value={(row.ipAllowList ?? []).join('\n')} onChange={event => {
+                  const list = event.target.value.split('\n').map(item => item.trim()).filter(Boolean);
+                  update(row.rowId, { ipAllowList: list.length ? list : undefined });
+                }} />
+              </label>
+              <label>
+                Basic auth users (hashed htpasswd lines: user:$2y$...)
+                <textarea className="mono" rows={2} placeholder="admin:$2y$10$..." value={(row.basicAuth?.users ?? []).join('\n')} onChange={event => {
+                  const users = event.target.value.split('\n').map(item => item.trim()).filter(Boolean);
+                  update(row.rowId, { basicAuth: users.length ? { users } : undefined });
+                }} />
+                <small>Plaintext passwords are rejected; generate bcrypt or apr1 hashes with htpasswd.</small>
+              </label>
+              <label>
+                Redirect target URL (optional)
+                <input className="mono" type="url" placeholder="https://example.com" value={row.redirectTarget ?? ''} onChange={event => {
+                  const target = event.target.value;
+                  update(row.rowId, { redirectTarget: target || undefined, ...(target ? { stripPrefix: false } : { redirectPermanent: undefined }) });
+                }} />
+              </label>
+              {row.redirectTarget ? <label className="checkbox-label">
+                <input type="checkbox" checked={row.redirectPermanent ?? true} onChange={event => update(row.rowId, { redirectPermanent: event.target.checked })} />
+                Permanent redirect (HTTP 301)
+              </label> : null}
+            </div></details>
             <details className="domain-settings"><summary>HTTPS settings</summary><div className="domain-https-options">
               <label className="checkbox-label"><input type="checkbox" checked={!!row.https} disabled={!runtime.data?.httpsConfigured && !row.https} onChange={event => update(row.rowId,{https:event.target.checked, ...(!event.target.checked ? {redirectHttps:false} : {})})} /> Automatic HTTPS</label>
               {!runtime.data?.httpsConfigured ? <small>Automatic HTTPS ingress is not configured on this installation.</small> : <small>Certificate issuance starts after deployment and requires public DNS and port 80.</small>}
@@ -885,6 +939,7 @@ export function ServiceMetricsPanel({ service }: { service: Service }) {
           </div>
         </div>
       ) : null}
+      <ServiceMetricsHistoryPanel service={service} />
     </section>
   );
 }

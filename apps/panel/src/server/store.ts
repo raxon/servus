@@ -526,6 +526,35 @@ export class Store {
       this.appendEvent(actionId,'error',error); return true;
     }).immediate();
   }
+  cancelQueuedAction(actionId: string, actorId: string): Action | null {
+    return this.db.transaction(() => {
+      const action = this.getAction(actionId);
+      if (!action || action.status !== 'queued') return null;
+      const changed = this.db.prepare("UPDATE jobs SET status='cancelled',lease_until=NULL WHERE action_id=? AND status='queued'").run(actionId).changes;
+      if (!changed) return null;
+      const ts = now();
+      this.db.prepare("UPDATE actions SET status='cancelled',phase='cancelled',error='Cancelled before execution',updated_at=?,finished_at=? WHERE id=?").run(ts, ts, actionId);
+      const service = this.getService(action.serviceId);
+      if (service && action.type === 'deploy') this.reserveDomains(service);
+      this.appendEvent(actionId, 'warn', 'Action cancelled before execution.');
+      this.recordAudit(actorId, 'action.cancel', actionId);
+      return this.getAction(actionId)!;
+    }).immediate();
+  }
+  cancelRunningAction(actionId: string, workerId: string, reason: string): boolean {
+    return this.db.transaction(() => {
+      if (!this.ownedAction(actionId, workerId)) return false;
+      const safeReason = this.vault.redact(reason).slice(0, 2000);
+      const action = this.getAction(actionId)!;
+      const ts = now();
+      this.db.prepare("UPDATE actions SET status='cancelled',phase='cancelled',error=?,updated_at=?,finished_at=? WHERE id=?").run(safeReason, ts, ts, actionId);
+      this.db.prepare("UPDATE jobs SET status='cancelled',lease_until=NULL WHERE action_id=?").run(actionId);
+      const service = this.getService(action.serviceId);
+      if (service && action.type === 'deploy') this.reserveDomains(service);
+      this.appendEvent(actionId, 'warn', safeReason);
+      return true;
+    }).immediate();
+  }
   updateServiceRuntime(serviceId: string, runtime: { state: ServiceState; deployedRevision?: number; lastError?: string | null;sourceCommit?:string|null;imageDigest?:string|null }, guardActionId?: string) {
     return this.db.transaction(()=>{
       const service = this.getService(serviceId); if (!service) return false;

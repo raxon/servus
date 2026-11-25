@@ -15,6 +15,20 @@ export class SourceCheckError extends Error {
   constructor(readonly code:'SOURCE_REPOSITORY_OR_BRANCH'|'SOURCE_CONTEXT'|'SOURCE_DOCKERFILE',message:string) {super(message);this.name='SourceCheckError';}
 }
 
+export class BuildCancelledError extends Error {
+  readonly code = 'BUILD_CANCELLED';
+  constructor(message = 'Build cancelled by operator.') { super(message); this.name = 'BuildCancelledError'; }
+}
+
+const activeBuilds = new Map<string, { serviceId: string; cancel: () => void }>();
+
+export function cancelActiveBuild(serviceId: string, operationId: string): boolean {
+  const entry = activeBuilds.get(operationId);
+  if (!entry || entry.serviceId !== serviceId) return false;
+  entry.cancel();
+  return true;
+}
+
 export async function resolveRepository(repository: string): Promise<{url:URL;resolve?:string}> {
   const url = new URL(repository);
   if (url.username || url.password || url.search || url.hash) throw new Error('Git URLs must not contain credentials, query strings or fragments.');
@@ -42,7 +56,7 @@ export function buildLogPath(dataDir: string, serviceId: string, operationId: st
   return join(directory, `${operationId}.log`);
 }
 
-async function run(command: string, args: string[], cwd: string, log: string, vault: SecretVault, secrets: string[], timeoutMs: number, env: NodeJS.ProcessEnv = process.env, suppressOutput=false): Promise<string> {
+async function run(command: string, args: string[], cwd: string, log: string, vault: SecretVault, secrets: string[], timeoutMs: number, env: NodeJS.ProcessEnv = process.env, suppressOutput=false, track?: { serviceId: string; operationId: string }): Promise<string> {
   const redact = (value: string) => {
     let result = vault.redact(value);
     for (const secret of secrets) if (secret) result = result.replaceAll(secret, '[REDACTED]');
@@ -50,7 +64,17 @@ async function run(command: string, args: string[], cwd: string, log: string, va
   };
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
-    let output = '', pending = '', line = '', failed = false, written = 0;
+    let output = '', pending = '', line = '', failed = false, cancelled = false, written = 0;
+    const killGroup = () => {
+      try { if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch { /* Process already exited. */ }
+    };
+    if (track) {
+      activeBuilds.set(track.operationId, {
+        serviceId: track.serviceId,
+        cancel: () => { cancelled = true; killGroup(); },
+      });
+    }
+    const cleanupTrack = () => { if (track) activeBuilds.delete(track.operationId); };
     const limit = 8 * 1024 * 1024;
     const emit = (text:string) => {
       if(written>=limit)return;
@@ -76,14 +100,12 @@ async function run(command: string, args: string[], cwd: string, log: string, va
     };
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', write); child.stderr.on('data', write);
-    const timer = setTimeout(() => {
-      failed = true;
-      try { if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch { /* Process already exited. */ }
-    }, timeoutMs);
-    child.once('error', error => { clearTimeout(timer); reject(new Error(`Unable to start ${command}: ${error.message}`)); });
+    const timer = setTimeout(() => { failed = true; killGroup(); }, timeoutMs);
+    child.once('error', error => { clearTimeout(timer); cleanupTrack(); reject(new Error(`Unable to start ${command}: ${error.message}`)); });
     child.once('close', code => {
-      clearTimeout(timer); if(!suppressOutput)emit(redact(pending)+'\n');
-      if (failed) reject(new Error(`${command} exceeded its execution deadline.`));
+      clearTimeout(timer); cleanupTrack(); if(!suppressOutput)emit(redact(pending)+'\n');
+      if (cancelled) reject(new BuildCancelledError('Build cancelled by operator.'));
+      else if (failed) reject(new Error(`${command} exceeded its execution deadline.`));
       else if (code !== 0) reject(new Error(suppressOutput?`${command} failed with exit code ${code}.`:`${command} failed with exit code ${code}. ${redact(output).slice(-2000)}`));
       else resolvePromise(output.trim());
     });
@@ -166,6 +188,10 @@ export async function buildSource(service: Service, operationId: string, dataDir
     const image = `panel-build:${operationId}`;
     const args = ['--host', `unix://${dockerSocket}`, 'buildx', 'build', '--load', '--progress=plain', '--label', 'panel.owner=self-hosted-panel', '--label', `panel.service=${service.id}`, '-t', image, '-f', dockerfile];
     if (options.forceRebuild) args.push('--no-cache', '--pull');
+    const buildResources = source.buildResources;
+    if (buildResources?.memoryMb) args.push('--memory', `${buildResources.memoryMb}m`);
+    if (buildResources?.cpuQuotaPercent) args.push('--cpu-period', '100000', '--cpu-quota', String(buildResources.cpuQuotaPercent * 1000));
+    const buildTimeoutMs = (buildResources?.timeoutSeconds ?? 600) * 1000;
     for (const item of service.environment || []) {
       if (item.secretRef) {
         const file = join(workspace, `secret-${item.name}`); writeFileSync(file, vault.getServiceSecret(item.secretRef,service.id,'environment'), { mode: 0o600 });
@@ -174,7 +200,7 @@ export async function buildSource(service: Service, operationId: string, dataDir
     }
     args.push('--build-arg', `SOURCE_COMMIT=${sourceCommit}`, '--label', `panel.source.commit=${sourceCommit}`, context);
     appendFileSync(log, `${new Date().toISOString()} [servus] Building immutable source ${sourceCommit}\n`);
-    await run('docker', args, checkout, log, vault, credentials, 600000, { ...process.env, DOCKER_BUILDKIT: '1' });
+    await run('docker', args, checkout, log, vault, credentials, buildTimeoutMs, { ...process.env, DOCKER_BUILDKIT: '1' }, false, { serviceId: service.id, operationId });
     appendFileSync(log, `${new Date().toISOString()} [servus] Build completed\n`);
     return { image, sourceCommit };
   } finally { if(helper)await helper.close();sshHelper?.close();rmSync(workspace, { recursive: true, force: true });if(options.checkOnly)rmSync(log,{force:true}); }

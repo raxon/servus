@@ -85,6 +85,7 @@ import { HostDomainSettings } from "./HostDomainSettings.js";
 import { UpdateSettings, useUpdateDiscovery } from "./UpdateSettings.js";
 import { InstallationBackupSettings } from "./InstallationBackupSettings.js";
 import { BackupStorageSettings } from "./BackupStorageSettings.js";
+import { HostMetricsCard } from "./HostMetricsCard.js";
 import { ProjectAccess } from "./ProjectAccess.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
@@ -1645,6 +1646,7 @@ function SettingsPage() {
                 <strong className="capitalize">{user.role}</strong>
               </div>
             </section>
+            {admin ? <HostMetricsCard /> : null}
             {admin ? <UpdateSettings /> : null}
           </div>
         </div>

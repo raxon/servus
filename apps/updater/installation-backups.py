@@ -44,9 +44,11 @@ def approval_message(receipt, *, purpose='submit'):
         not _name(receipt['name']) or type(receipt['issuedAt']) is not int or receipt['issuedAt'] < 0 or
         not isinstance(receipt['proof'], str) or not HEX.fullmatch(receipt['proof'])):
         raise BackupError('Invalid administrator approval')
-    if purpose not in ('submit', 'cancel'):
+    if purpose not in ('submit', 'cancel', 'delete'):
         raise BackupError('Invalid administrator approval purpose')
-    prefix = 'servus-installation-backup-v1\0' if purpose == 'submit' else 'servus-installation-backup-cancel-v1\0'
+    prefix = ('servus-installation-backup-v1\0' if purpose == 'submit' else
+              'servus-installation-backup-cancel-v1\0' if purpose == 'cancel' else
+              'servus-installation-backup-delete-v1\0')
     return (prefix + receipt['operationId'] + '\0' + receipt['actorId'] + '\0' +
             str(receipt['issuedAt']) + '\0' + receipt['name']).encode('utf-8')
 
@@ -365,6 +367,174 @@ class BackupJournal:
         self.assert_untouched()
         os.unlink('active.json', dir_fd=self.directory)
         os.fsync(self.directory)
+
+    def _deletion_audit_dir(self, *, create=False):
+        if create:
+            try:
+                os.mkdir('installation-backup-deletions', 0o700, dir_fd=self.maintenance.journal)
+                os.fsync(self.maintenance.journal)
+            except FileExistsError:
+                pass
+        directory = os.open('installation-backup-deletions',
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=self.maintenance.journal)
+        info = os.fstat(directory)
+        if info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+            os.close(directory)
+            raise BackupError('Unsafe deletion audit directory')
+        return directory
+
+    def is_deleted(self, operation_id):
+        if not _uuid(operation_id):
+            raise BackupError('Invalid backup identity')
+        self._locked()
+        try:
+            directory = self._deletion_audit_dir(create=False)
+        except FileNotFoundError:
+            return False
+        try:
+            try:
+                fd = self.supervisor._open_root_file(directory, operation_id + '.json', 0o600)
+            except FileNotFoundError:
+                return False
+            os.close(fd)
+            return True
+        finally:
+            os.close(directory)
+
+    def _live_completed_snapshots(self, backup_fd, backup_root):
+        names = os.listdir(self.directory)
+        if len(names) > 10000:
+            raise BackupError('Installation backup history exceeds its limit')
+        normalized_root = os.path.normpath(backup_root)
+        live = []
+        for name in names:
+            if name == 'active.json' or re.fullmatch(r'\.servus-[a-f0-9]{32}', name):
+                continue
+            if not name.endswith('.json') or not _uuid(name[:-5]):
+                raise BackupError('Unexpected installation backup journal entry')
+            record = self.get(name[:-5])
+            if record['state'] != 'completed' or record['snapshotPath'] is None:
+                continue
+            expected_name = 'installation-' + record['operationId']
+            if os.path.normpath(record['snapshotPath']) != os.path.join(normalized_root, expected_name):
+                continue
+            try:
+                info = os.stat(expected_name, dir_fd=backup_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                live.append(record['operationId'])
+        return live
+
+    def delete_snapshot(self, receipt, api_token, backup_root, *, now_ms=None):
+        """Delete one completed snapshot archive while protecting the last verified copy."""
+        approved = verify_approval(receipt, api_token, now_ms=now_ms, purpose='delete')
+        self._locked()
+        self.assert_untouched()
+        if self.active() is not None:
+            raise BackupError('Another installation backup requires completion or recovery')
+        current = self.get(approved['operationId'])
+        if current['name'] != approved['name']:
+            raise BackupError('Deletion does not match the backup')
+        if current['state'] != 'completed' or current['snapshotPath'] is None:
+            raise BackupError('Only completed installation backups can be deleted')
+        expected_dir = 'installation-' + current['operationId']
+        expected_path = os.path.join(os.path.normpath(backup_root), expected_dir)
+        if os.path.normpath(current['snapshotPath']) != expected_path:
+            raise BackupError('Backup snapshot path does not match the configured backup root')
+        backup_fd = self.supervisor._trusted_directory(backup_root, 0o700)
+        try:
+            directory = self._deletion_audit_dir(create=True)
+            try:
+                audit_name = current['operationId'] + '.json'
+                already_audited = False
+                try:
+                    fd = self.supervisor._open_root_file(directory, audit_name, 0o600)
+                except FileNotFoundError:
+                    live = self._live_completed_snapshots(backup_fd, backup_root)
+                    if current['operationId'] not in live:
+                        raise BackupError('Installation backup archive is already missing') from None
+                    if len(live) <= 1:
+                        raise BackupError('Cannot delete the last remaining verified installation backup') from None
+                    self.supervisor._atomic_file(
+                        directory,
+                        audit_name,
+                        (json.dumps({'version': 1, 'receipt': receipt, 'deletedAt': int(time.time() * 1000)},
+                                    separators=(',', ':'), ensure_ascii=False) + '\n').encode('utf-8'),
+                        0o600,
+                    )
+                else:
+                    try:
+                        raw = os.read(fd, MAX_RECORD + 1)
+                        audit = json.loads(raw, object_pairs_hook=_pairs)
+                        if (len(raw) > MAX_RECORD or not isinstance(audit, dict) or
+                            set(audit) != {'version', 'receipt', 'deletedAt'} or type(audit['version']) is not int or
+                            audit['version'] != 1 or type(audit['deletedAt']) is not int or audit['deletedAt'] < 0):
+                            raise BackupError('Invalid deletion audit receipt')
+                        approval_message(audit['receipt'], purpose='delete')
+                        previous = verify_approval(audit['receipt'], api_token, now_ms=audit['receipt']['issuedAt'], purpose='delete')
+                        if previous['operationId'] != current['operationId'] or previous['name'] != current['name']:
+                            raise BackupError('Deletion audit identity changed')
+                        already_audited = True
+                    finally:
+                        os.close(fd)
+            finally:
+                os.close(directory)
+            try:
+                _remove_snapshot_tree(backup_fd, expected_dir)
+            except FileNotFoundError:
+                if not already_audited:
+                    raise BackupError('Installation backup archive disappeared during deletion') from None
+            remaining = len(self._live_completed_snapshots(backup_fd, backup_root))
+            return {'operationId': current['operationId'], 'name': current['name'], 'deleted': True, 'remainingSnapshots': remaining}
+        finally:
+            os.close(backup_fd)
+
+
+def _remove_snapshot_tree(parent_fd, name, *, depth=0):
+    """Safely remove a root-owned snapshot directory without following symlinks."""
+    if depth > 8 or not name or '/' in name or name in ('.', '..'):
+        raise BackupError('Unsafe snapshot directory structure')
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        raise BackupError('Snapshot entry is not a directory')
+    child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    try:
+        for entry in os.listdir(child_fd):
+            entry_info = os.stat(entry, dir_fd=child_fd, follow_symlinks=False)
+            if stat.S_ISLNK(entry_info.st_mode):
+                raise BackupError('Unexpected symbolic link inside snapshot directory')
+            if stat.S_ISDIR(entry_info.st_mode):
+                _remove_snapshot_tree(child_fd, entry, depth=depth + 1)
+            elif stat.S_ISREG(entry_info.st_mode):
+                os.unlink(entry, dir_fd=child_fd)
+            else:
+                raise BackupError('Unexpected special file inside snapshot directory')
+        os.fsync(child_fd)
+    finally:
+        os.close(child_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def verify_completed_snapshot(journal, operation_id, backup_module, update_module, node_fd, supervisor):
+    """Verify one completed installation backup's manifest, SQLite integrity and secrets."""
+    if not isinstance(journal, BackupJournal):
+        raise BackupError('A protected backup journal is required')
+    journal._locked()
+    record = journal.get(operation_id)
+    if record['state'] != 'completed' or record['snapshotPath'] is None or record['manifestDigest'] is None:
+        raise BackupError('Installation backup is not a completed verified snapshot')
+    if journal.is_deleted(operation_id):
+        raise BackupError('Installation backup archive was deleted')
+    update_module.verify_snapshot(record['snapshotPath'], record['manifestDigest'], backup_module, node_fd, supervisor)
+    return {
+        'operationId': record['operationId'],
+        'name': record['name'],
+        'verified': True,
+        'manifestDigest': record['manifestDigest'],
+    }
 
 
 def capture_stopped_snapshot(journal, operation_id, lease, backup_root, node_fd,

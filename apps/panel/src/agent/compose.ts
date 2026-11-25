@@ -14,6 +14,7 @@ import {buildComposeImages,composeBuildIds,composeBuildPath,verifyComposeBuiltIm
 import type { agentConfig } from './config.js';
 import type { AgentMaintenanceGate } from './maintenance.js';
 import { assertComposeHttpsIngress, configuredComposeHttps, composeCertificateStatus, ComposeTlsError, type ComposeTlsOptions } from './compose-tls.js';
+import { composeMetrics } from './observability.js';
 
 export const AGENT_COMPOSE_SCHEMA_SQL = `CREATE TABLE IF NOT EXISTS compose_operations(id TEXT PRIMARY KEY,workload_id TEXT NOT NULL,project_id TEXT NOT NULL,type TEXT NOT NULL,request_hash TEXT NOT NULL,state TEXT NOT NULL,process_group INTEGER,snapshot TEXT NOT NULL,response TEXT,error TEXT,updated_at TEXT NOT NULL); CREATE UNIQUE INDEX IF NOT EXISTS compose_running_workload ON compose_operations(workload_id) WHERE state='running';`;
 const requestSchema = z.object({ operationId: z.string().uuid(), workloadId: z.string().uuid(), projectId: z.string().uuid(), revision: z.number().int().positive(), type: z.enum(['deploy','start','stop','restart','destroy']), configuration: composeConfigSchema, certificateRetry:z.object({hostname:z.string().min(1).max(253)}).strict().optional() }).strict().refine(value=>!value.certificateRetry||value.type==='deploy');
@@ -240,6 +241,12 @@ export class ComposeRuntime {
       return { containers: output.trim().split('\n').filter(Boolean).flatMap(line => { const parsed = JSON.parse(line); return (Array.isArray(parsed) ? parsed : [parsed]).map(item => ({ id:item.ID,service:item.Service,state:item.State,health:item.Health })); }) };
     } finally { rmSync(directory,{recursive:true,force:true}); }
   }
+  async metrics(workloadId: string, projectId: string) {
+    z.string().uuid().parse(workloadId); z.string().uuid().parse(projectId);
+    const snapshot = this.latest(workloadId, projectId), compiled = compileComposeDefinition(snapshot.definition!, snapshot.request.configuration, workloadId, projectId, snapshot.retries, composeBuildIds(snapshot.images));
+    await this.verifyOwnership(compiled.prefix, compiled.definition, workloadId, projectId);
+    return composeMetrics(this.docker, workloadId, projectId);
+  }
 }
 
 export function registerComposeAgent(app: FastifyInstance, options: { config: ReturnType<typeof agentConfig>; maintenance?: AgentMaintenanceGate; beforeMutation?:()=>void }&ComposeTlsOptions) {
@@ -266,6 +273,12 @@ export function registerComposeAgent(app: FastifyInstance, options: { config: Re
     const release=options.maintenance?.admit();if(options.maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     try { return await track(runtime.read(request.params.id,request.query.projectId,type)); }
     catch { return reply.code(409).send({error:{code:'COMPOSE_UNAVAILABLE',message:'Compose runtime details are unavailable'}}); }
+    finally{release?.();}
+  });
+  app.get<{ Params:{id:string}; Querystring:{projectId:string} }>('/compose/:id/metrics', async (request,reply) => {
+    const release=options.maintenance?.admit();if(options.maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
+    try { return await track(runtime.metrics(request.params.id,request.query.projectId)); }
+    catch { return reply.code(409).send({error:{code:'COMPOSE_UNAVAILABLE',message:'Compose runtime metrics are unavailable'}}); }
     finally{release?.();}
   });
   return runtime;

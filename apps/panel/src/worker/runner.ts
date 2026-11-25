@@ -97,12 +97,14 @@ export class Worker {
         } catch(error) {
           if(!renew()) return true;
           if(error instanceof AgentRequestError && error.certainty === 'definitive') {
-            const accepted = this.store.failAction(job.actionId,this.id,error.message);
+            const accepted = error.code === 'BUILD_CANCELLED'
+              ? this.store.cancelRunningAction(job.actionId,this.id,error.message)
+              : this.store.failAction(job.actionId,this.id,error.message);
             if(accepted) {
               this.uncertainActions.delete(job.actionId);
               try {
                 const observed = await this.readState(job.serviceId);
-                this.store.updateServiceRuntime(job.serviceId,{...observed,lastError:error.message},job.actionId);
+                this.store.updateServiceRuntime(job.serviceId,{...observed,lastError:error.code === 'BUILD_CANCELLED' ? null : error.message},job.actionId);
               } catch { /* Preserve the recorded terminal failure if runtime observation is unavailable. */ }
             }
             return true;

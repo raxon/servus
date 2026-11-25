@@ -30,6 +30,7 @@ import { registerUpdates } from './updates.js';
 import { registerInstallationBackups } from './installation-backups.js';
 import { ApiTokens } from './api-tokens.js';
 import { registerBackups } from './backups.js';
+import { registerMetricsHistory } from './metrics-history.js';
 import { registerVolumeBackups } from './volume-backups.js';
 import { registerGithubRepositories } from './github-repositories.js';
 import { registerReleaseNotes } from './release-notes.js';
@@ -66,6 +67,7 @@ export interface AppOptions {
   updaterCurrentVersion?: string;
   installationBackupApprovalSecretPath?: string;
   hostDomains?:HostDomainOptions;
+  metricsCollector?: { start?: boolean; intervalMs?: number; now?: () => Date; maxRows?: number };
 }
 export async function createApp(options: AppOptions) {
   if(options.trustedProxySecret!==undefined && !/^[a-f0-9]{64}$/.test(options.trustedProxySecret))throw new Error('Invalid trusted proxy secret configuration');
@@ -209,6 +211,7 @@ export async function createApp(options: AppOptions) {
   });
   apiTokens.register(app,session);
   registerBackups(app,{store,serviceAccess,session,agentConnection:options.agentConnection,databaseExport:options.databaseExport,maintenance});
+  registerMetricsHistory(app,{store,serviceAccess,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance,startCollector:options.metricsCollector?.start,intervalMs:options.metricsCollector?.intervalMs,now:options.metricsCollector?.now,maxRows:options.metricsCollector?.maxRows});
   registerVolumeBackups(app,{store,serviceAccess,agentConnection:options.agentConnection,agentRequest:runtimeRequest,maintenance});
   const compose=registerCompose(app,{store,session:req=>session(req,!['GET','HEAD','OPTIONS'].includes(req.method)),projectAccess,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance});
   registerTemplates(app,{session,projectAccess,createWorkload:compose.createWorkload});
@@ -453,6 +456,25 @@ export async function createApp(options: AppOptions) {
     if(!action||!store.canReadAudit(user,action.projectId))throw new AppError('NOT_FOUND','Action not found',404);
     return {action,events:store.getEvents(action.id)};
   });
+  app.post<{Params:{id:string}}>(`${prefix}/actions/:id/cancel`, async (req, reply) => {
+    const {user}=session(req,true),action=store.getAction(req.params.id);
+    if(!action||!store.canAccess(user,action.projectId,true))throw new AppError('NOT_FOUND','Action not found',404);
+    if(action.status==='cancelled')return {action,cancelled:true};
+    if(action.status==='queued') {
+      const cancelled=store.cancelQueuedAction(action.id,user.id);
+      if(cancelled)return {action:cancelled,cancelled:true};
+    }
+    const latest=store.getAction(action.id);
+    if(latest?.status==='running'&&latest.type==='deploy') {
+      const res=await runtimeRequest<{cancelled:boolean}>(`/services/${latest.serviceId}/cancel-build/${latest.id}`,{},{...options.agentConnection,timeoutMs:10_000});
+      if(res.cancelled) {
+        store.recordAudit(user.id,'action.cancel.requested',latest.id);
+        store.appendEvent(latest.id,'warn','Build cancellation requested.');
+        return reply.code(202).send({action:latest,cancellationRequested:true});
+      }
+    }
+    throw new AppError('ACTION_NOT_CANCELLABLE','This action can no longer be cancelled.',409);
+  });
   app.get(`${prefix}/runtime`, async req => {session(req);return options.runtimeStatus ? options.runtimeStatus() : {online:false,error:'Runtime agent is not connected'};});
   async function databaseConnection(service:import('../shared/types.js').Service) {
     const result=store.connectionInfo(service.id);
@@ -658,6 +680,10 @@ export async function createApp(options: AppOptions) {
   });
   app.get<{Params:{id:string}}>(`${prefix}/services/:id/containers`,async req=>{serviceAccess(req,req.params.id);return runtimeRequest<import('../shared/types.js').ContainerInfo[]>(`/services/${req.params.id}/containers`);});
   app.get<{Params:{id:string}}>(`${prefix}/services/:id/metrics`,async req=>{serviceAccess(req,req.params.id);return runtimeRequest<import('../shared/types.js').ServiceMetrics>(`/services/${req.params.id}/metrics`);});
+  app.get(`${prefix}/host/metrics`,async req=>{
+    administrator(req);
+    return runtimeRequest<import('../shared/types.js').HostMetrics>('/host/metrics',undefined,{...options.agentConnection,timeoutMs:10_000});
+  });
   registerConsole(app,{store,allowedOrigins,serviceAccess,agentConnection:options.agentConnection,runtimeRequest,maintenance,
     onUpgrade:req=>{upgrades.add(req);requestReleases.get(req)?.();},onReadOnlyStream:req=>{readOnlyStreams.add(req);}});
 

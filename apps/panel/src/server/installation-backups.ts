@@ -3,9 +3,9 @@ import { z } from 'zod';
 import { AppError } from './errors.js';
 import {
   installationBackupApprovalSchema, installationBackupId, installationBackupInputSchema,
-  signInstallationBackupApproval, signInstallationBackupCancellation, type InstallationBackupApproval, type InstallationBackupApprovalFields,
+  signInstallationBackupApproval, signInstallationBackupCancellation, signInstallationBackupDeletion, type InstallationBackupApproval, type InstallationBackupApprovalFields,
 } from './installation-backup-approval.js';
-import { cancelInstallationBackup, installationBackupCapability, installationBackupHistory, installationBackupStatus, submitInstallationBackup, UpdaterClientError } from './updater-client.js';
+import { cancelInstallationBackup, deleteInstallationBackup, installationBackupCapability, installationBackupHistory, installationBackupStatus, submitInstallationBackup, UpdaterClientError, verifyInstallationBackup } from './updater-client.js';
 
 export interface InstallationBackupRoutesOptions {
   administrator: (request: FastifyRequest, mutation?: boolean) => {id: string};
@@ -14,6 +14,7 @@ export interface InstallationBackupRoutesOptions {
   approvalSecretPath?: string;
   signApproval?: (input: InstallationBackupApprovalFields) => InstallationBackupApproval;
   signCancellation?: (input: InstallationBackupApprovalFields) => InstallationBackupApproval;
+  signDeletion?: (input: InstallationBackupApprovalFields) => InstallationBackupApproval;
   now?: () => number;
 }
 
@@ -106,5 +107,27 @@ export function registerInstallationBackups(app: FastifyInstance, options: Insta
     }catch{throw new AppError('INSTALLATION_BACKUP_UNAVAILABLE','Installation backup approval is unavailable',503);}
     let operation;try{operation=await cancelInstallationBackup(approval,socket);}catch(error){backupError(error);}
     administrator(request,true);return reply.code(202).send({ok:true,operation});
+  });
+
+  app.post('/api/v1/installation-backups/:operationId/delete',{bodyLimit:2048,config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async request=>{
+    const actor=administrator(request,true),{operationId}=z.strictObject({operationId:installationBackupId}).parse(request.params);
+    const {name}=installationBackupInputSchema.pick({name:true}).parse(request.body);z.strictObject({}).parse(request.query);
+    const socket=endpoint();let approval:InstallationBackupApproval;
+    try{
+      const fields={operationId,name,actorId:actor.id,issuedAt:(options.now??Date.now)()};
+      approval=installationBackupApprovalSchema.parse(options.signDeletion?options.signDeletion(fields):signInstallationBackupDeletion(fields,options.approvalSecretPath!));
+      if(approval.operationId!==fields.operationId||approval.actorId!==fields.actorId||approval.name!==fields.name||approval.issuedAt!==fields.issuedAt)throw new Error('Deletion identity changed');
+    }catch{throw new AppError('INSTALLATION_BACKUP_UNAVAILABLE','Installation backup approval is unavailable',503);}
+    let result;try{result=await deleteInstallationBackup(approval,socket);}catch(error){backupError(error);}
+    administrator(request,true);return{ok:true,result};
+  });
+
+  app.post('/api/v1/installation-backups/:operationId/verify',{bodyLimit:512,config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async request=>{
+    administrator(request,true);
+    const {operationId}=z.strictObject({operationId:installationBackupId}).parse(request.params);
+    z.strictObject({}).parse(request.body??{});z.strictObject({}).parse(request.query);
+    const socket=endpoint();
+    let verification;try{verification=await verifyInstallationBackup(operationId,socket);}catch(error){backupError(error);}
+    administrator(request,true);return{ok:true,verification};
   });
 }

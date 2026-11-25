@@ -17,12 +17,49 @@ const description:Record<InstallationBackupOperation['state'],string>={requested
 const validName=(value:string)=>value===value.trim()&&Array.from(value).length>0&&Array.from(value).length<=100&&!/[\u0000-\u001f\u007f\ud800-\udfff]/u.test(value)&&!value.startsWith('\u0085')&&!value.endsWith('\u0085');
 function remembered(key:string){try{const value=localStorage.getItem(key);return value&&uuid.test(value)?value:null;}catch{return null;}}
 
-function BackupDetails({operation}:{operation:InstallationBackupOperation}){
+function BackupDetails({operation,onChanged}:{operation:InstallationBackupOperation;onChanged?:()=>void}){
+  const [busy,setBusy]=useState<'verify'|'delete'|null>(null);
+  const [confirmDelete,setConfirmDelete]=useState(false);
+  const [notice,setNotice]=useState<{kind:'ok'|'error';text:string}|null>(null);
+
+  async function verify(){
+    setBusy('verify');setNotice(null);
+    try{
+      const res=await api<{verification:{manifestDigest:string}}>(`/installation-backups/${operation.operationId}/verify`,{method:'POST',body:{}});
+      setNotice({kind:'ok',text:`Archive verified (${res.verification.manifestDigest.slice(0,23)}...).`});
+    }catch(error){
+      setNotice({kind:'error',text:error instanceof RequestError?error.message:'Archive verification could not be completed.'});
+    }finally{setBusy(null);}
+  }
+
+  async function remove(){
+    setBusy('delete');setNotice(null);
+    try{
+      const res=await api<{result:{remainingSnapshots:number}}>(`/installation-backups/${operation.operationId}/delete`,{method:'POST',body:{name:operation.name}});
+      setConfirmDelete(false);
+      setNotice({kind:'ok',text:`Snapshot archive deleted. ${res.result.remainingSnapshots} verified snapshot(s) remain on disk.`});
+      onChanged?.();
+    }catch(error){
+      setNotice({kind:'error',text:error instanceof RequestError?error.message:'Snapshot deletion was rejected. The last remaining verified snapshot cannot be deleted.'});
+    }finally{setBusy(null);}
+  }
+
   return <div className="installation-backup-details">
     <p>{description[operation.state]}</p>
     <dl><div><dt>Operation ID</dt><dd><code>{operation.operationId}</code></dd></div>
       <div><dt>Last confirmed</dt><dd><time dateTime={new Date(operation.updatedAt).toISOString()}>{new Date(operation.updatedAt).toLocaleString()}</time></dd></div>
       {operation.errorCode?<div><dt>Host result</dt><dd>{operation.errorCode==='resume_required'?'The original installation needs a verified restart. Reconcile it on the host.':'The host reported a capture failure. Check the host before retrying.'}</dd></div>:null}</dl>
+    {operation.state==='completed'?<>
+      <div className="heading-actions" style={{flexWrap:'wrap'}}>
+        <button className="button" type="button" disabled={busy!==null} onClick={()=>void verify()}>{busy==='verify'?'Verifying...':'Verify archive'}</button>
+        {!confirmDelete?<button className="button button-danger" type="button" disabled={busy!==null} onClick={()=>setConfirmDelete(true)}>Delete snapshot</button>:<>
+          <button className="button button-danger" type="button" disabled={busy!==null} onClick={()=>void remove()}>{busy==='delete'?'Deleting...':'Confirm snapshot deletion'}</button>
+          <button className="button" type="button" disabled={busy!==null} onClick={()=>setConfirmDelete(false)}>Keep snapshot</button>
+        </>}
+      </div>
+      <p className="feature-helper">Host CLI verification: run supervisor-daemon with its existing systemd flags plus <code>--verify-installation-backup {operation.operationId}</code>. The last remaining verified snapshot on disk is protected from deletion.</p>
+      {notice?<p role={notice.kind==='error'?'alert':'status'} className={notice.kind==='error'?'error-notice':'feature-helper'}>{notice.text}</p>:null}
+    </>:null}
     {operation.state==='recovery_required'?<p className="feature-helper">Ask the server operator to stop the standard supervisor, then run supervisor-daemon with its existing systemd service configuration and the additional flag <code>--recover-installation-backup {operation.operationId}</code>. This flag is not a complete standalone command. Recovery must verify the original installation before normal work resumes.</p>:null}
   </div>;
 }
@@ -106,7 +143,7 @@ export function InstallationBackupSettings({userId}:{userId:string}){
           <tbody>{historyOperations.map(item=><tr key={item.operationId}>
             <td><time dateTime={new Date(item.createdAt).toISOString()}>{new Date(item.createdAt).toLocaleString()}</time></td>
             <th scope="row">{item.name}</th><td>{stateLabel(item.state)}</td>
-            <td><details><summary>Details for {item.name}</summary><BackupDetails operation={item}/></details></td>
+            <td><details><summary>Details for {item.name}</summary><BackupDetails operation={item} onChanged={()=>void history.refetch()}/></details></td>
           </tr>)}</tbody></table>
       </div>:null}
       {history.hasNextPage?<button className="button" type="button" disabled={history.isFetching} onClick={()=>void history.fetchNextPage()}>{history.isFetchingNextPage?'Loading older backups...':'Load older backups'}</button>:null}
@@ -118,7 +155,7 @@ export function InstallationBackupSettings({userId}:{userId:string}){
       </form>
       {lookupId&&lookupResult.isPending?<p role="status">Checking operation...</p>:null}
       {lookupResult.isError?<p className="error-notice" role="alert">{lookupResult.error instanceof RequestError&&lookupResult.error.status===404?'No operation with this ID was found on the host.':'The operation could not be read. Check your administrator session and host availability, then try again.'}</p>:null}
-      {lookupResult.data?<div className="installation-backup-lookup"><h4>{lookupResult.data.operation.name}: {stateLabel(lookupResult.data.operation.state)}</h4><BackupDetails operation={lookupResult.data.operation}/></div>:null}
+      {lookupResult.data?<div className="installation-backup-lookup"><h4>{lookupResult.data.operation.name}: {stateLabel(lookupResult.data.operation.state)}</h4><BackupDetails operation={lookupResult.data.operation} onChanged={()=>void history.refetch()}/></div>:null}
     </div>
     {failure?<p className="error-notice" role="alert">{failure}</p>:null}
     {!operationId&&!available?<button className="button" type="button" disabled={capability.isFetching} onClick={()=>void capability.refetch()}>Check availability</button>:null}

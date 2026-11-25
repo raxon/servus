@@ -33,3 +33,13 @@ export function signInstallationBackupCancellation(input:InstallationBackupAppro
   const value=installationBackupApprovalFieldsSchema.parse(input);
   return{...value,version:1,proof:signSupervisorRoleMessage(secretPath,installationBackupCancellationMessage(value))};
 }
+
+/** Deletion receipts cannot authorize creating, resuming or cancelling an installation backup. */
+export function installationBackupDeletionMessage(input:InstallationBackupApprovalFields):string{
+  const value=installationBackupApprovalFieldsSchema.parse(input);
+  return `servus-installation-backup-delete-v1\0${value.operationId}\0${value.actorId}\0${value.issuedAt}\0${value.name}`;
+}
+export function signInstallationBackupDeletion(input:InstallationBackupApprovalFields,secretPath:string):InstallationBackupApproval{
+  const value=installationBackupApprovalFieldsSchema.parse(input);
+  return{...value,version:1,proof:signSupervisorRoleMessage(secretPath,installationBackupDeletionMessage(value))};
+}

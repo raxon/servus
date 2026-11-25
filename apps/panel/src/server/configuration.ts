@@ -13,16 +13,61 @@ const imageSchema = z.string().min(1).max(300).regex(/^[a-zA-Z0-9][a-zA-Z0-9._/:
 export const hostnameSchema = z.string().min(1).max(253).toLowerCase().refine(value=>value.split('.').every(label=>/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)),'Enter valid DNS labels without protocol or port');
 const targetSchema = z.string().min(2).max(255).refine(value=>value.startsWith('/')&&!value.includes('\0')&&!value.split('/').includes('..')&&value!=='/'&&!value.startsWith('/var/run/docker.sock')&&!value.startsWith('/proc')&&!value.startsWith('/sys'),'Use an absolute container path outside protected directories');
 const kindSchema = z.enum(['app','postgres','redis','mariadb']);
+const buildResourcesSchema = z.object({
+  cpuQuotaPercent: z.number().int().min(10).max(1600).optional(),
+  memoryMb: z.number().int().min(128).max(65536).optional(),
+  timeoutSeconds: z.number().int().min(30).max(1800).optional(),
+}).strict();
 const sourceSchema = z.discriminatedUnion('type',[
   z.object({type:z.literal('image')}).strict(),
-  z.object({type:z.literal('git'),repository:z.string().url().max(1000),branch:z.string().min(1).max(200).regex(/^[^\s\x00-\x1f~^:?*\[\\]+$/),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),envFile:z.string().refine(validEnvFilePath,'Use a relative file path outside Git and build configuration files').optional(),sharedGithub:z.boolean().optional(),ssh:gitSshCredentialSchema.optional(),credential:z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),secretRef:z.string().uuid().optional()}).strict().refine(v=>Boolean(v.token)!==Boolean(v.secretRef)).optional()}).strict(),
+  z.object({type:z.literal('git'),repository:z.string().url().max(1000),branch:z.string().min(1).max(200).regex(/^[^\s\x00-\x1f~^:?*\[\\]+$/),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),envFile:z.string().refine(validEnvFilePath,'Use a relative file path outside Git and build configuration files').optional(),buildResources:buildResourcesSchema.optional(),sharedGithub:z.boolean().optional(),ssh:gitSshCredentialSchema.optional(),credential:z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),secretRef:z.string().uuid().optional()}).strict().refine(v=>Boolean(v.token)!==Boolean(v.secretRef)).optional()}).strict(),
 ]);
 const envSchema = z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32000).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).strict();
-const domainSchema = z.object({hostname:hostnameSchema,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional()}).strict();
+const pathPrefixSchema = z.string().min(1).max(128).refine(
+  value => value === '/' || (/^\/[A-Za-z0-9._~/-]*[A-Za-z0-9._~-]$/.test(value) && !value.includes('//') && !value.split('/').includes('..')),
+  'Path prefix must start with / and contain no traversal or double slashes',
+);
+function validIpOrCidr(entry: string): boolean {
+  const parts = entry.split('/');
+  if (parts.length > 2) return false;
+  const addr = parts[0]!;
+  const version = isIP(addr);
+  if (version === 0) return false;
+  if (parts.length === 1) return true;
+  if (!/^(?:0|[1-9][0-9]*)$/.test(parts[1]!)) return false;
+  const prefix = Number(parts[1]);
+  return version === 4 ? prefix >= 0 && prefix <= 32 : prefix >= 0 && prefix <= 128;
+}
+const ipAllowEntrySchema = z.string().min(3).max(64).refine(validIpOrCidr, 'Enter a valid IPv4/IPv6 address or CIDR block');
+const htpasswdEntrySchema = z.string().min(10).max(200).regex(
+  /^[A-Za-z0-9._-]{1,64}:(?:\$(?:2[aby]|apr1)\$[A-Za-z0-9./$]{10,120}|\{SHA\}[A-Za-z0-9+/=]{20,64})$/,
+  'Basic auth entries must use hashed htpasswd credentials (bcrypt, apr1 or {SHA})',
+);
+const redirectTargetSchema = z.string().url().max(500).refine(value => {
+  if (value.includes('$') || value.includes('`') || /[\x00-\x20\x7f]/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password;
+  } catch { return false; }
+}, 'Redirect target must be an http(s) URL without credentials or regex variables');
+const domainSchema = z.object({
+  hostname: hostnameSchema,
+  port: z.number().int().min(1).max(65535),
+  primary: z.boolean().optional(),
+  https: z.boolean().optional(),
+  redirectHttps: z.boolean().optional(),
+  pathPrefix: pathPrefixSchema.optional(),
+  stripPrefix: z.boolean().optional(),
+  ipAllowList: z.array(ipAllowEntrySchema).min(1).max(32).optional(),
+  basicAuth: z.object({ users: z.array(htpasswdEntrySchema).min(1).max(20) }).strict().optional(),
+  redirectTarget: redirectTargetSchema.optional(),
+  redirectPermanent: z.boolean().optional(),
+}).strict();
 const mountSchema = z.object({type:z.enum(['volume','file','bind']),name:nameSchema,target:targetSchema,readOnly:z.boolean().optional(),content:z.string().max(32000).optional(),source:z.string().max(1000).optional()}).strict();
 const resourcesSchema = z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).strict();
 const databaseSchema = z.object({database:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),user:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),password:z.string().min(12).max(128).optional(),passwordSecretRef:z.string().uuid().optional()}).strict();
-const fields={kind:kindSchema.optional(),source:sourceSchema.optional(),environment:z.array(envSchema).max(100).optional(),domains:z.array(domainSchema).max(20).optional(),mounts:z.array(mountSchema).max(20).optional(),resources:resourcesSchema.optional(),database:databaseSchema.optional(),databaseAccess:databaseAccessSchema.optional(),registry:registryCredentialSchema.nullable().optional()};
+const notesSchema = z.string().max(4000).refine(value => !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value), 'Notes cannot contain control characters');
+const fields={kind:kindSchema.optional(),source:sourceSchema.optional(),environment:z.array(envSchema).max(100).optional(),domains:z.array(domainSchema).max(20).optional(),mounts:z.array(mountSchema).max(20).optional(),resources:resourcesSchema.optional(),database:databaseSchema.optional(),databaseAccess:databaseAccessSchema.optional(),registry:registryCredentialSchema.nullable().optional(),notes:notesSchema.optional()};
 export const newServiceSchema=z.object({name:nameSchema,image:imageSchema.optional(),port:z.number().int().min(1).max(65535).optional(),hostname:hostnameSchema.optional(),replicas:z.number().int().min(1).max(5).default(1),...fields}).strict();
 export const servicePatchSchema=z.object({expectedRevision:z.number().int().positive(),image:imageSchema.optional(),port:z.number().int().min(1).max(65535).optional(),hostname:hostnameSchema.optional(),replicas:z.number().int().min(1).max(5).optional(),...fields}).strict();
 
@@ -50,11 +95,16 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
   if(config.registry){if(kind!=='app'||config.source?.type==='git')throw new AppError('REGISTRY_SOURCE','Private registry credentials are available for application image sources');if('image'in config&&canonicalRegistry(config.registry.server)!==imageRegistry(String(config.image)))throw new AppError('REGISTRY_MISMATCH','Registry credentials must match the image registry');}
   const unique=(values:string[],name:string)=>{if(new Set(values).size!==values.length)throw new AppError('DUPLICATE_CONFIG',`${name} must be unique`);};
   unique((config.environment??[]).map(item=>item.name),'Environment names');
-  unique((config.domains??[]).map(item=>item.hostname),'Domain hostnames');
+  unique((config.domains??[]).map(item=>`${item.hostname}:${item.pathPrefix??'/'}`),'Domain routes');
   unique((config.mounts??[]).map(item=>item.name),'Mount names');
   unique((config.mounts??[]).map(item=>item.target),'Mount target paths');
   if((config.domains??[]).filter(domain=>domain.primary).length>1)throw new AppError('MULTIPLE_PRIMARY_DOMAINS','Only one domain can be primary');
   if((config.domains??[]).some(domain=>domain.redirectHttps&&!domain.https))throw new AppError('HTTPS_REDIRECT_REQUIRES_HTTPS','HTTP redirects require automatic HTTPS for the same domain');
+  for(const domain of config.domains??[]) {
+    if(domain.stripPrefix && (!domain.pathPrefix || domain.pathPrefix === '/')) throw new AppError('STRIP_PREFIX_REQUIRES_PATH','Strip prefix requires a non-root path prefix',400);
+    if(domain.redirectTarget && domain.stripPrefix) throw new AppError('INVALID_REDIRECT_RULE','Redirect target cannot be combined with strip prefix',400);
+    if(domain.redirectPermanent !== undefined && !domain.redirectTarget) throw new AppError('INVALID_REDIRECT_RULE','Redirect status requires a redirect target URL',400);
+  }
   for(const domain of config.domains??[]) if(domain.https) { try { if(canonicalDnsName(domain.hostname)!==domain.hostname || domain.hostname.endsWith('.localhost'))throw new Error(); } catch { throw new AppError('INVALID_HTTPS_DOMAIN','Automatic HTTPS requires a valid public hostname',400); } }
   if(kind!=='app'&&(config.replicas??1)!==1)throw new AppError('STATEFUL_REPLICAS','Database services require exactly one replica');
   if((config.replicas??1)>1&&(config.mounts??[]).some(mount=>!(mount.readOnly??(mount.type==='file'))))throw new AppError('STATEFUL_REPLICAS','Writable mounts require exactly one replica');
@@ -95,7 +145,7 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
 }
 
 export function configurationOf(input: ServiceConfiguration): ServiceConfiguration {
-  return {kind:input.kind??'app',source:input.source??{type:'image'},environment:input.environment??[],domains:input.domains,mounts:(input.mounts??[]).map(mount=>({...mount,readOnly:mount.readOnly??mount.type==='file'})),resources:input.resources,database:input.database,databaseAccess:input.databaseAccess,registry:input.registry};
+  return {kind:input.kind??'app',source:input.source??{type:'image'},environment:input.environment??[],domains:input.domains,mounts:(input.mounts??[]).map(mount=>({...mount,readOnly:mount.readOnly??mount.type==='file'})),resources:input.resources,database:input.database,databaseAccess:input.databaseAccess,registry:input.registry,notes:input.notes};
 }
 
 export function parseServicePatch(value:unknown): ServicePatch { return servicePatchSchema.parse(value); }

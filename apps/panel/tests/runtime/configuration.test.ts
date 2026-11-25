@@ -373,7 +373,7 @@ describe('runtime observation and console authorization',()=>{
   it('computes real container metrics and handles missing previous CPU counters',async()=>{
     const f=fixture();f.client.listContainers=async()=>[{Id:'a',Names:['/web'],State:'running'}];
     f.client.getContainer=()=>({stats:async()=>({cpu_stats:{cpu_usage:{total_usage:200},system_cpu_usage:2000,online_cpus:2},precpu_stats:{cpu_usage:{total_usage:100},system_cpu_usage:1000},memory_stats:{usage:1000,limit:2000,stats:{inactive_file:100}},networks:{eth0:{rx_bytes:50,tx_bytes:75}}})});
-    expect(await f.runtime.metrics(f.service.id)).toEqual({cpuPercent:20,memoryBytes:900,memoryLimitBytes:2000,networkRxBytes:50,networkTxBytes:75,containers:1});
+    expect(await f.runtime.metrics(f.service.id)).toMatchObject({cpuPercent:20,memoryBytes:900,memoryLimitBytes:2000,networkRxBytes:50,networkTxBytes:75,containers:1,generation:expect.stringMatching(/^[a-f0-9]{16}$/),sampledAt:expect.any(String)});
     f.client.getContainer=()=>({stats:async()=>({cpu_stats:{cpu_usage:{total_usage:200},system_cpu_usage:2000},precpu_stats:{},memory_stats:{},networks:{}})});
     expect((await f.runtime.metrics(f.service.id)).cpuPercent).toBe(0);
   });

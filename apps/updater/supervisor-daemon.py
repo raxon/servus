@@ -381,6 +381,36 @@ class HostApply:
         except module.BackupError as error:
             raise supervisor.SupervisorError('Installation backup cancellation was rejected') from error
 
+    def delete_installation_backup(self, receipt, api_token, maintenance):
+        module = self._backup_module()
+        try:
+            self.ownership.assert_held(os.readlink('/proc/self/fd/' + str(self.ownership.directory)))
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                return journal.delete_snapshot(receipt, api_token, self.config['backupRoot'])
+        except module.BackupError as error:
+            raise supervisor.SupervisorError('Installation backup deletion was rejected') from error
+
+    def verify_installation_backup(self, operation_id, maintenance):
+        module = self._backup_module()
+        node_fd = None
+        modules = {}
+        try:
+            modules = {name: self._load('servus_verify_backup_' + name.replace('-', '_'), name + '.py', 0o644)
+                       for name in ('backup', 'update-coordinator')}
+            node_fd = self._node()
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                return module.verify_completed_snapshot(journal, operation_id, modules['backup'],
+                                                        modules['update-coordinator'], node_fd, supervisor)
+        except FileNotFoundError:
+            raise
+        except Exception as error:
+            if isinstance(error, self._backup_errors(module, *modules.values())):
+                raise supervisor.SupervisorError('Installation backup verification failed') from error
+            raise
+        finally:
+            if node_fd is not None:
+                os.close(node_fd)
+
     def recover_installation_backup(self, operation_id, maintenance):
         """Explicit root CLI only; the public socket never dispatches recovery."""
         module = self._backup_module()
@@ -957,11 +987,14 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
         deadline = time.monotonic() + 5
         request = supervisor._read_message(connection, deadline)
         kind = request.get('type')
-        if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_status', 'installation_backup_active', 'installation_backup_history'):
-            fields = {'version', 'type', 'receipt'} if kind in ('installation_backup_submit', 'installation_backup_cancel') else {'version', 'type', 'operationId'} if kind == 'installation_backup_status' else {'version', 'type', 'cursor'} if kind == 'installation_backup_history' else {'version', 'type'}
+        if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_delete', 'installation_backup_verify', 'installation_backup_status', 'installation_backup_active', 'installation_backup_history'):
+            fields = ({'version', 'type', 'receipt'} if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_delete')
+                      else {'version', 'type', 'operationId'} if kind in ('installation_backup_status', 'installation_backup_verify')
+                      else {'version', 'type', 'cursor'} if kind == 'installation_backup_history'
+                      else {'version', 'type'})
             if (set(request) != fields or type(request.get('version')) is not int or request['version'] != 1 or
                     not isinstance(apply, HostApply) or
-                    (kind == 'installation_backup_status' and not supervisor._uuid4(request.get('operationId'))) or
+                    (kind in ('installation_backup_status', 'installation_backup_verify') and not supervisor._uuid4(request.get('operationId'))) or
                     (kind == 'installation_backup_history' and request.get('cursor') is not None and not supervisor._uuid4(request['cursor']))):
                 raise supervisor.SupervisorError('Invalid or unavailable installation backup command')
             history_request = kind == 'installation_backup_history'
@@ -981,6 +1014,20 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
                 elif kind == 'installation_backup_cancel':
                     record = apply.cancel_installation_backup(request['receipt'], api_token, operation)
                     response = {'version': 1, 'status': record['state'], 'backup': record}
+                elif kind == 'installation_backup_delete':
+                    try:
+                        deleted = apply.delete_installation_backup(request['receipt'], api_token, operation)
+                    except FileNotFoundError:
+                        response = {'version': 1, 'status': 'not_found'}
+                    else:
+                        response = {'version': 1, 'status': 'deleted', 'result': deleted}
+                elif kind == 'installation_backup_verify':
+                    try:
+                        verified = apply.verify_installation_backup(request['operationId'], operation)
+                    except FileNotFoundError:
+                        response = {'version': 1, 'status': 'not_found'}
+                    else:
+                        response = {'version': 1, 'status': 'verified', 'verification': verified}
                 else:
                     try:
                         record = apply.installation_backup_status(request['operationId'], operation)
@@ -1107,6 +1154,21 @@ def run(args):
     signal.signal(signal.SIGINT, stop)
     try:
         recovery_id = getattr(args, 'recover_installation_backup', None)
+        verify_id = getattr(args, 'verify_installation_backup', None)
+        if recovery_id is not None and verify_id is not None:
+            raise supervisor.SupervisorError('Choose either backup verification or backup recovery')
+        if verify_id is not None:
+            if not supervisor._uuid4(verify_id):
+                raise supervisor.SupervisorError('Invalid backup identity')
+            apply_config = getattr(args, 'apply_config', None)
+            if not apply_config:
+                raise supervisor.SupervisorError('Installation backup verification requires protected host configuration')
+            active_env = getattr(args, 'active_env', None)
+            host_apply = HostApply(apply_config, args.approval_journal, active_env, None)
+            with supervisor.MaintenanceSupervisor(args.install_dir, args.gate_dir, args.journal_dir) as operation:
+                result = host_apply.verify_installation_backup(verify_id, operation)
+            print(json.dumps(result, separators=(',', ':'), ensure_ascii=False))
+            return
         ownership = (DaemonOwnership(args.socket_dir, args.journal_dir, args.gid, recovery_operation_id=recovery_id)
                      if recovery_id is not None else DaemonOwnership(args.socket_dir, args.journal_dir, args.gid))
         active_env = getattr(args, 'active_env', None)
@@ -1217,6 +1279,7 @@ def main():
     parser.add_argument('--active-env')
     parser.add_argument('--apply-config')
     parser.add_argument('--recover-installation-backup', metavar='UUID')
+    parser.add_argument('--verify-installation-backup', metavar='UUID')
     parser.add_argument('--uid', type=int, required=True)
     parser.add_argument('--gid', type=int, required=True)
     try:

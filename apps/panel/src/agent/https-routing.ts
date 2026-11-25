@@ -1,17 +1,20 @@
 import { canonicalDnsName } from './acme/dns01.js';
 
 /** Add a distinct HTTPS router without changing the existing HTTP router. */
-export function httpsRouteLabels(serviceId:string, index:number, hostname:string, port:number,centralCertificate=false):Record<string,string> {
+export function httpsRouteLabels(serviceId:string, index:number, hostname:string, port:number,centralCertificate=false, pathPrefix?:string):Record<string,string> {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(serviceId) || !Number.isSafeInteger(index) || index < 0 || index > 19 || !Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error('Invalid HTTPS route identity.');
   const canonical=canonicalDnsName(hostname);
   if(canonical!==hostname || canonical.endsWith('.localhost'))throw new Error('HTTPS hostname must be public and canonical.');
   const route=`${serviceId.replaceAll('-','')}-${index}`;
   const secure=`${route}-https`;
+  const hasPath=Boolean(pathPrefix && pathPrefix !== '/');
+  const rule=hasPath ? `Host(\`${canonical}\`) && PathPrefix(\`${pathPrefix}\`)` : `Host(\`${canonical}\`)`;
   return {
-    [`traefik.http.routers.${secure}.rule`]:`Host(\`${canonical}\`)`,
+    [`traefik.http.routers.${secure}.rule`]:rule,
     [`traefik.http.routers.${secure}.entrypoints`]:'websecure',
     [`traefik.http.routers.${secure}.service`]:route,
     [`traefik.http.routers.${secure}.tls`]:'true',
+    ...(hasPath ? {[`traefik.http.routers.${secure}.priority`]:String(1000 + pathPrefix!.length)} : {}),
     ...(!centralCertificate?{[`traefik.http.routers.${secure}.tls.certresolver`]:'servus'}:{}),
     [`traefik.http.services.${route}.loadbalancer.server.port`]:String(port),
   };

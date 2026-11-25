@@ -9,9 +9,23 @@ export type ServiceKind = 'app' | 'postgres' | 'redis' | 'mariadb';
 export interface GitCredential { username: string; token?: string; secretRef?: string }
 export type {RegistryCredential,GitSshCredential} from './source-credentials.js';
 export interface DeploymentOptions { forceRebuild?: boolean }
-export type SourceConfig = { type: 'image' } | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string; envFile?: string; credential?: GitCredential; sharedGithub?: boolean;ssh?:import('./source-credentials.js').GitSshCredential };
+export interface BuildResourceConfig { cpuQuotaPercent?: number; memoryMb?: number; timeoutSeconds?: number }
+export type SourceConfig = { type: 'image' } | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string; envFile?: string; buildResources?: BuildResourceConfig; credential?: GitCredential; sharedGithub?: boolean;ssh?:import('./source-credentials.js').GitSshCredential };
 export interface EnvironmentVariable { name: string; value?: string; secret?: boolean; secretRef?: string }
-export interface DomainConfig { hostname: string; port: number; primary?: boolean; https?: boolean; redirectHttps?: boolean }
+export interface DomainBasicAuth { users: string[] }
+export interface DomainConfig {
+  hostname: string;
+  port: number;
+  primary?: boolean;
+  https?: boolean;
+  redirectHttps?: boolean;
+  pathPrefix?: string;
+  stripPrefix?: boolean;
+  ipAllowList?: string[];
+  basicAuth?: DomainBasicAuth;
+  redirectTarget?: string;
+  redirectPermanent?: boolean;
+}
 export interface MountConfig { type: 'volume' | 'file' | 'bind'; name: string; target: string; readOnly?: boolean; content?: string; source?: string }
 export interface ResourceConfig { cpu: number; memoryMb: number }
 export interface DatabaseConfig { database: string; user: string; password?: string; passwordSecretRef?: string }
@@ -20,6 +34,7 @@ export interface ServiceConfiguration {
   domains?: DomainConfig[]; mounts?: MountConfig[]; resources?: ResourceConfig; database?: DatabaseConfig;
   databaseAccess?: import('./database-access.js').DatabaseAccess;
   registry?:import('./source-credentials.js').RegistryCredential|null;
+  notes?: string;
 }
 export interface Service extends ServiceConfiguration {
   id: string; projectId: string; name: string; image: string; port: number; hostname: string;
@@ -46,7 +61,8 @@ export interface ApiError { error: { code: string; message: string } }
 export interface ServiceInput extends ServiceConfiguration { name: string; image: string; port: number; hostname: string; replicas?: number }
 export interface ServicePatch extends ServiceConfiguration { expectedRevision: number; image?: string; port?: number; hostname?: string; replicas?: number }
 export interface ContainerInfo { id: string; name: string; state: string }
-export interface ServiceMetrics { cpuPercent: number; memoryBytes: number; memoryLimitBytes: number; networkRxBytes: number; networkTxBytes: number; containers: number }
+export interface ServiceMetrics { cpuPercent: number; memoryBytes: number; memoryLimitBytes: number; networkRxBytes: number; networkTxBytes: number; containers: number; sampledAt?: string; generation?: string | null }
+export type { HostMetrics, MetricsWindow, ServiceMetricPoint, ServiceMetricsHistory } from './metrics.js';
 export interface ServiceLogs { lines: string[] }
 export interface ConnectionInfo {
   host: string; port: number; database: string; user: string; password?: string;
