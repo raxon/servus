@@ -887,6 +887,40 @@ await h.close();s.close();if(count!==0)process.exit(2);'''
         with closing(sqlite3.connect(f'file:{self.dst}/agent.sqlite?mode=ro&immutable=1',uri=True)) as agent:
             self.assertEqual(agent.execute('SELECT state,operation_stage FROM operations WHERE id=?',(old,)).fetchone(),('failed','rolling_back'))
 
+    def test_capture_preserves_destroyed_stateful_service_failed_deployment(self):
+        old='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        destroy='cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+        snapshot=json.dumps({'id':UUID,'kind':'app','mounts':[{'type':'volume','name':'data','target':'/data','readOnly':False}]})
+        self.panel.execute("UPDATE services SET deleted_at='2026-01-01T00:05:00.000Z' WHERE id=?",(UUID,))
+        self.panel.execute('INSERT INTO actions(id,project_id,service_id,actor_id,type,status,phase,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                           (old,UUID,UUID,self.actor,'deploy','failed','failed','2026-01-01T00:00:00.000Z','2026-01-01T00:01:00.000Z','2026-01-01T00:01:00.000Z'))
+        self.panel.execute('INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)',
+                           (old,old,UUID,snapshot,'failed',1,'2026-01-01T00:00:00.000Z'))
+        self.agent.execute('INSERT INTO operations(id,request_hash,state,response,updated_at,service_id,operation_stage) VALUES(?,?,?,?,?,?,?)',
+                           (old,'a'*64,'failed',json.dumps({'error':{'code':'RUNTIME_FAILED'}}),'2026-01-01T00:01:00.000Z',UUID,'applying'))
+        self.panel.execute('INSERT INTO actions(id,project_id,service_id,actor_id,type,status,phase,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                           (destroy,UUID,UUID,self.actor,'destroy','succeeded','complete','2026-01-01T00:02:00.000Z','2026-01-01T00:03:00.000Z','2026-01-01T00:03:00.000Z'))
+        self.panel.execute('INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)',
+                           (destroy,destroy,UUID,snapshot,'succeeded',1,'2026-01-01T00:02:00.000Z'))
+        self.agent.execute('INSERT INTO operations(id,request_hash,state,response,updated_at,service_id,operation_stage) VALUES(?,?,?,?,?,?,?)',
+                           (destroy,'b'*64,'succeeded',json.dumps({'state':'deleted'}),'2026-01-01T00:03:00.000Z',UUID,'applying'))
+        self.panel.commit(); self.agent.commit(); self.fix_permissions()
+        self.capture()
+
+    def test_capture_allows_cancelled_actions_and_builds(self):
+        queued='dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+        active='eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+        snapshot=json.dumps({'id':UUID,'kind':'app','mounts':[]})
+        for ident,ts in ((queued,'2026-01-01T00:00:00.000Z'),(active,'2026-01-01T00:02:00.000Z')):
+            self.panel.execute('INSERT INTO actions(id,project_id,service_id,actor_id,type,status,phase,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                               (ident,UUID,UUID,self.actor,'deploy','cancelled','cancelled',ts,ts,ts))
+            self.panel.execute('INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)',
+                               (ident,ident,UUID,snapshot,'cancelled',1,ts))
+        self.agent.execute('INSERT INTO operations(id,request_hash,state,response,updated_at,service_id,operation_stage) VALUES(?,?,?,?,?,?,?)',
+                           (active,'c'*64,'failed',json.dumps({'error':{'code':'BUILD_CANCELLED'}}),'2026-01-01T00:02:01.000Z',UUID,'building'))
+        self.panel.commit(); self.agent.commit(); self.fix_permissions()
+        self.capture()
+
     def test_malformed_legacy_json_is_refused(self):
         self.agent.execute("UPDATE operations SET previous_spec='not-json'");self.agent.commit();self.fix_permissions()
         with self.assertRaisesRegex(backup.CaptureError,'Agent snapshot is invalid'): self.capture()

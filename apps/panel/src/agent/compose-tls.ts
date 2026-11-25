@@ -3,6 +3,7 @@ import { canonicalDnsName } from './acme/dns01.js';
 import { supportsManagedHttps } from './https-routing.js';
 import { composeProviderArguments } from './compose-ingress.js';
 import { inspectManagedCertificate, type ManagedCertificate } from './managed-certificate.js';
+import { inspectHostCertificate } from './host-certificate.js';
 import { inspectAcmeFailure } from './managed-certificate-events.js';
 import { verifyRedirectEndpoints, verifyPublicHttpsRoute } from '../server/domain-tls.js';
 import type { ComposeConfiguration } from '../shared/compose.js';
@@ -11,6 +12,7 @@ export class ComposeTlsError extends Error {
   constructor(readonly code:'HTTPS_NOT_CONFIGURED'|'CERTIFICATE_DOMAIN'|'CERTIFICATE_UNAVAILABLE'|'RETRY_UNAVAILABLE'|'RETRY_COOLDOWN'|'HTTPS_REDIRECT_UNVERIFIED',message:string) {super(message);}
 }
 export interface ComposeTlsOptions {
+  dataDir?:string;
   ensureIngress?:()=>Promise<void>;
   verifyEndpoints?:(hostname:string,fingerprint:string)=>Promise<boolean>;
   inspectCertificate?:(docker:Docker,hostname:string)=>Promise<ManagedCertificate>;
@@ -53,12 +55,13 @@ export async function assertComposeHttpsRoute(docker:Docker,workloadId:string,pr
 export async function composeCertificateStatus(docker:Docker,workloadId:string,projectId:string,configuration:ComposeConfiguration,hostname:string,options:ComposeTlsOptions={}) {
   await assertComposeHttpsIngress(docker);
   await assertComposeHttpsRoute(docker,workloadId,projectId,configuration,hostname);
-  const certificate=await (options.inspectCertificate??inspectManagedCertificate)(docker,hostname);
+  const hostCertificate=options.dataDir?inspectHostCertificate(options.dataDir,hostname):undefined;
+  const certificate=hostCertificate??await (options.inspectCertificate??inspectManagedCertificate)(docker,hostname);
   let publicVerified=false;
   if(certificate.status==='active') {
     const verify=options.verifyEndpoints??(async(host,fingerprint)=>await verifyRedirectEndpoints(host,fingerprint)&&await verifyPublicHttpsRoute(host));
     try {publicVerified=await verify(hostname,certificate.fingerprint);} catch {publicVerified=false;}
   }
-  const events=await inspectAcmeFailure(docker,hostname);
+  const events=hostCertificate?{available:false}:await inspectAcmeFailure(docker,hostname);
   return {hostname,checkedAt:new Date().toISOString(),...certificate,publicVerified,eventsAvailable:events.available,...(events.failure?{lastFailure:events.failure}:{})};
 }

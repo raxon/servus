@@ -624,18 +624,33 @@ def _config_references(config, refs, service_id, owners, purposes=None, git_requ
             refs.add(reference)
 
 def _validate_operation_history(panel, agent):
-    # A failed operation remains historical evidence. A later full deployment
-    # can supersede it only when both durable journals agree on the outcome.
-    if panel.execute("SELECT 1 FROM jobs WHERE status NOT IN ('succeeded','failed') OR status IS NULL LIMIT 1").fetchone():
+    # A failed or cancelled operation remains historical evidence. A later full
+    # deployment or clean destroy can supersede a failed deploy when both
+    # durable journals agree on the outcome.
+    if panel.execute("SELECT 1 FROM jobs WHERE status NOT IN ('succeeded','failed','cancelled') OR status IS NULL LIMIT 1").fetchone():
         raise CaptureError('Unresolved panel jobs require recovery')
-    if panel.execute("SELECT 1 FROM actions WHERE status NOT IN ('succeeded','failed') OR status IS NULL LIMIT 1").fetchone():
+    if panel.execute("SELECT 1 FROM actions WHERE status NOT IN ('succeeded','failed','cancelled') OR status IS NULL LIMIT 1").fetchone():
         raise CaptureError('Unresolved panel actions require recovery')
     if agent.execute("SELECT 1 FROM operations WHERE state NOT IN ('succeeded','failed') OR state IS NULL LIMIT 1").fetchone():
         raise CaptureError('Unresolved agent operations require recovery')
 
+    cancelled_actions = {
+        action: service
+        for action, service in panel.execute("SELECT id,service_id FROM actions WHERE status='cancelled'").fetchall()
+        if service is not None
+    }
+    for action, service, lease in panel.execute("SELECT action_id,service_id,lease_until FROM jobs WHERE status='cancelled'").fetchall():
+        if service is None or action not in cancelled_actions or cancelled_actions[action] != service or lease is not None:
+            raise CaptureError('Unresolved panel jobs require recovery')
+
     failures = panel.execute("SELECT id,service_id,type,phase,finished_at FROM actions WHERE status='failed'").fetchall()
     failed_jobs = panel.execute("SELECT action_id,service_id,lease_until,snapshot FROM jobs WHERE status='failed'").fetchall()
-    failed_agent = agent.execute("SELECT id,service_id FROM operations WHERE state='failed'").fetchall()
+    raw_failed_agent = agent.execute("SELECT id,service_id FROM operations WHERE state='failed'").fetchall()
+    failed_agent = [
+        (action, service)
+        for action, service in raw_failed_agent
+        if not (service is not None and action in cancelled_actions and cancelled_actions[action] == service)
+    ]
     # Unmatched or inconsistent terminal records do not establish a safe state.
     if len(failures) != len(failed_jobs) or len(failures) != len(failed_agent):
         raise CaptureError('Unresolved failed operations require recovery')
@@ -643,30 +658,43 @@ def _validate_operation_history(panel, agent):
     agents = {action: service for action, service in failed_agent}
     if len(jobs) != len(failures) or len(agents) != len(failures):
         raise CaptureError('Unresolved failed operations require recovery')
+    def valid_snapshot(raw, service):
+        try: value = json.loads(raw)
+        except (TypeError, ValueError): return False
+        return isinstance(value, dict) and value.get('id') == service
+
     def stateless_snapshot(raw, service):
         try: value = json.loads(raw)
         except (TypeError, ValueError): return False
         return (isinstance(value, dict) and value.get('id') == service and value.get('kind', 'app') == 'app'
                 and value.get('mounts', []) == [] and value.get('database') is None)
 
+    has_services = bool(panel.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='services'").fetchone())
     for action, service, kind, phase, finished in failures:
         job = jobs.get(action)
         if (not service or kind != 'deploy' or phase != 'failed' or not finished or not job or
-                job[:2] != (service, None) or not stateless_snapshot(job[2], service) or agents.get(action) != service):
+                job[:2] != (service, None) or not valid_snapshot(job[2], service) or agents.get(action) != service):
             raise CaptureError('Unresolved failed operations require recovery')
-        candidates = panel.execute("""SELECT a.id,j.snapshot FROM actions a JOIN jobs j ON j.action_id=a.id
-            WHERE a.service_id=? AND j.service_id=a.service_id AND a.type='deploy'
+        service_row = panel.execute("SELECT deleted_at FROM services WHERE id=?", (service,)).fetchone() if has_services else None
+        service_deleted = bool(service_row and service_row[0] is not None)
+        is_stateless = stateless_snapshot(job[2], service)
+        if not is_stateless and not service_deleted:
+            raise CaptureError('Unresolved failed operations require recovery')
+        candidates = panel.execute("""SELECT a.id,a.type,j.snapshot FROM actions a JOIN jobs j ON j.action_id=a.id
+            WHERE a.service_id=? AND j.service_id=a.service_id AND a.type IN ('deploy','destroy')
               AND a.status='succeeded' AND a.phase='complete' AND j.status='succeeded'
               AND j.lease_until IS NULL AND a.created_at>? AND a.finished_at IS NOT NULL
               AND a.finished_at>=a.created_at""", (service, finished)).fetchall()
         recovered = False
-        for candidate, snapshot in candidates:
-            if not stateless_snapshot(snapshot, service): continue
+        for candidate, candidate_type, snapshot in candidates:
             row = agent.execute("SELECT state,service_id,response FROM operations WHERE id=?", (candidate,)).fetchone()
             if not row or row[0] != 'succeeded' or row[1] != service: continue
             try: response = json.loads(row[2])
             except (TypeError, ValueError): continue
-            if isinstance(response, dict) and response.get('state') == 'running':
+            if candidate_type == 'deploy' and is_stateless and stateless_snapshot(snapshot, service) and isinstance(response, dict) and response.get('state') == 'running':
+                recovered = True
+                break
+            if candidate_type == 'destroy' and service_deleted and valid_snapshot(snapshot, service) and isinstance(response, dict) and response.get('state') == 'deleted':
                 recovered = True
                 break
         if not recovered: raise CaptureError('Unresolved failed operations require recovery')

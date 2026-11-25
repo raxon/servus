@@ -124,10 +124,13 @@ export class ComposeRuntime {
     const previous=snapshot.previous;
     await this.execute(previous??snapshot,request,directory,previous?['up','--detach','--no-build','--wait','--wait-timeout','120','--remove-orphans']:['down','--remove-orphans','--timeout','20'],'rollback.json');
   }
+  private tlsOptions(): ComposeTlsOptions {
+    return { ...this.options, dataDir: this.options.dataDir ?? this.config.dataDir };
+  }
   async certificate(workloadId:string,projectId:string,hostname:string) {
     z.string().uuid().parse(workloadId);z.string().uuid().parse(projectId);
     const snapshot=this.latest(workloadId,projectId);
-    return composeCertificateStatus(this.docker,workloadId,projectId,snapshot.request.configuration,hostname,this.options);
+    return composeCertificateStatus(this.docker,workloadId,projectId,snapshot.request.configuration,hostname,this.tlsOptions());
   }
   async apply(value: unknown): Promise<ComposeApplyResult> {
     const request = requestSchema.parse(value), hash = createHash('sha256').update(JSON.stringify(request)).digest('hex');
@@ -175,7 +178,7 @@ export class ComposeRuntime {
       if(request.certificateRetry&&!snapshot.retryPrepared) {
         const host=request.certificateRetry.hostname;
         configuredComposeHttps(snapshot.request.configuration,host);
-        const certificate=await composeCertificateStatus(this.docker,request.workloadId,request.projectId,snapshot.request.configuration,host,this.options);
+        const certificate=await composeCertificateStatus(this.docker,request.workloadId,request.projectId,snapshot.request.configuration,host,this.tlsOptions());
         if(certificate.status!=='not_found')throw new ComposeTlsError('RETRY_UNAVAILABLE','A managed certificate already exists. The shared ingress renews it automatically.');
         const prior=snapshot.retries?.[host],now=Date.now();
         if(prior&&(!Number.isFinite(Date.parse(prior.requestedAt))||Date.parse(prior.requestedAt)>now))throw new ComposeTlsError('RETRY_UNAVAILABLE','The previous certificate retry time cannot be verified.');
@@ -186,7 +189,7 @@ export class ComposeRuntime {
       if(request.type==='deploy')for(const domain of domains.filter(item=>item.redirectHttps)) {
         const prior=snapshot.previous?.request.configuration.domains.find(item=>item.hostname===domain.hostname&&item.https&&item.service===domain.service&&item.port===domain.port);
         if(!prior)throw new ComposeTlsError('HTTPS_REDIRECT_UNVERIFIED','Deploy HTTPS without its redirect first, then verify the certificate and public application route.');
-        const certificate=await composeCertificateStatus(this.docker,request.workloadId,request.projectId,snapshot.previous!.request.configuration,domain.hostname,this.options);
+        const certificate=await composeCertificateStatus(this.docker,request.workloadId,request.projectId,snapshot.previous!.request.configuration,domain.hostname,this.tlsOptions());
         if(certificate.status!=='active'||!certificate.publicVerified)throw new ComposeTlsError('HTTPS_REDIRECT_UNVERIFIED','The active certificate and public HTTPS application route could not be verified. Existing HTTP routes were not changed.');
       }
       if(request.type==='deploy'&&!request.certificateRetry&&Object.values(snapshot.definition!.services).some(item=>item.build)) {
@@ -205,7 +208,7 @@ export class ComposeRuntime {
       let output=(snapshot.commit?`Source commit: ${snapshot.commit}\n`:'')+buildLogs+'\n'+await this.execute(snapshot,request,directory,operation);
       if(!['stop','destroy'].includes(request.type))for(const domain of domains.filter(item=>item.redirectHttps)) {
         const deadline=Date.now()+30_000;let verified=false;
-        do {try {const certificate=await composeCertificateStatus(this.docker,request.workloadId,request.projectId,snapshot.request.configuration,domain.hostname,this.options);verified=certificate.status==='active'&&certificate.publicVerified;}catch{}
+        do {try {const certificate=await composeCertificateStatus(this.docker,request.workloadId,request.projectId,snapshot.request.configuration,domain.hostname,this.tlsOptions());verified=certificate.status==='active'&&certificate.publicVerified;}catch{}
           if(!verified)await new Promise(resolve=>setTimeout(resolve,1000));
         }while(!verified&&Date.now()<deadline);
         if(!verified)throw new ComposeTlsError('HTTPS_REDIRECT_UNVERIFIED','The updated public HTTPS route did not become ready. Restoring the previous Compose configuration.');
