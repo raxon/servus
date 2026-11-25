@@ -543,9 +543,46 @@ function DomainChecks({row,service,runtime,update}:{row:DomainConfig & {rowId:st
                 IP allow-list (one IP or CIDR per line)
                 <textarea className="mono" rows={2} placeholder={"203.0.113.0/24\n198.51.100.10"} value={(row.ipAllowList ?? []).join('\n')} onChange={event => {
                   const list = event.target.value.split('\n').map(item => item.trim()).filter(Boolean);
-                  update(row.rowId, { ipAllowList: list.length ? list : undefined });
+                  update(row.rowId, { ipAllowList: list.length ? list : undefined, ...(list.length ? {} : { trustedProxies: undefined }) });
                 }} />
               </label>
+              {row.ipAllowList?.length ? (
+                <div className="trusted-proxies-fields">
+                  <label>
+                    Trusted proxy depth (optional X-Forwarded-For hops, 1-10)
+                    <input
+                      type="number"
+                      min={1}
+                      max={10}
+                      placeholder="1 (e.g. Cloudflare)"
+                      value={row.trustedProxies?.depth ?? ''}
+                      onChange={event => {
+                        const raw = event.target.value.trim();
+                        if (!raw) {
+                          update(row.rowId, { trustedProxies: row.trustedProxies?.excludedIps?.length ? { excludedIps: row.trustedProxies.excludedIps } : undefined });
+                          return;
+                        }
+                        const depth = Math.min(10, Math.max(1, Number(raw) || 1));
+                        update(row.rowId, { trustedProxies: { depth } });
+                      }}
+                    />
+                  </label>
+                  <label>
+                    Or trusted proxy IPs / CIDRs to exclude (one per line)
+                    <textarea
+                      className="mono"
+                      rows={2}
+                      placeholder={"173.245.48.0/20\n103.21.244.0/22"}
+                      value={(row.trustedProxies?.excludedIps ?? []).join('\n')}
+                      onChange={event => {
+                        const list = event.target.value.split('\n').map(item => item.trim()).filter(Boolean);
+                        update(row.rowId, { trustedProxies: list.length ? { excludedIps: list } : undefined });
+                      }}
+                    />
+                    <small>Specify either hop depth or excluded proxy CIDRs so Traefik evaluates the real client IP behind Cloudflare or another reverse proxy.</small>
+                  </label>
+                </div>
+              ) : null}
               <label>
                 Basic auth users (hashed htpasswd lines: user:$2y$...)
                 <textarea className="mono" rows={2} placeholder="admin:$2y$10$..." value={(row.basicAuth?.users ?? []).join('\n')} onChange={event => {
@@ -946,8 +983,11 @@ export function ServiceMetricsPanel({ service }: { service: Service }) {
 }
 
 export function DatabaseConnection({ service, admin, canWrite }: { service: Service; admin: boolean; canWrite: boolean }) {
+  const client = useQueryClient();
   const [visible, setVisible] = useState(false);
   const [revealed, setRevealed] = useState<ConnectionInfo | null>(null);
+  const [rotateOpen, setRotateOpen] = useState(false);
+  const [customPassword, setCustomPassword] = useState("");
   const connection = useQuery({
     queryKey: ["connection", service.id, service.deployedRevision],
     queryFn: () => api<ConnectionInfo>(`/services/${service.id}/connection`),
@@ -961,6 +1001,23 @@ export function DatabaseConnection({ service, admin, canWrite }: { service: Serv
     onSuccess: (value) => {
       setRevealed(value);
       setVisible(true);
+    },
+  });
+  const rotate = useMutation({
+    mutationFn: () =>
+      api<{ service: Service; action: Action; rotatedAt: string }>(`/services/${service.id}/database/rotate-password`, {
+        method: "POST",
+        body: { confirm: true, ...(customPassword.trim() ? { password: customPassword.trim() } : {}) },
+      }),
+    onSuccess: () => {
+      setRotateOpen(false);
+      setCustomPassword("");
+      setVisible(false);
+      setRevealed(null);
+      void client.invalidateQueries({ queryKey: ["service", service.id] });
+      void client.invalidateQueries({ queryKey: ["services", service.projectId] });
+      void client.invalidateQueries({ queryKey: ["actions"] });
+      void client.invalidateQueries({ queryKey: ["connection", service.id] });
     },
   });
   useEffect(() => {
@@ -1043,7 +1100,46 @@ export function DatabaseConnection({ service, admin, canWrite }: { service: Serv
                 </>
               )}
             </button>}
+            {canWrite && service.state === "running" && <button
+              className="button button-small"
+              type="button"
+              disabled={rotate.isPending}
+              onClick={() => setRotateOpen(true)}
+            >
+              <RefreshCw size={15} />
+              Rotate password
+            </button>}
           </div>
+          {rotate.isSuccess ? <p className="feature-helper" role="status">Password rotated and runtime secret refresh queued. Reveal the new password once the deployment finishes.</p> : null}
+          {rotateOpen ? (
+            <FeatureModal
+              title="Rotate database password"
+              description="Updates the live database user password and queues a runtime secret refresh so future restarts and backups use the new credential. Existing applications using the old password will need updating."
+              onClose={() => setRotateOpen(false)}
+            >
+              <form onSubmit={(event) => { event.preventDefault(); rotate.mutate(); }}>
+                <label>
+                  New password (optional - leave blank to auto-generate)
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    minLength={12}
+                    maxLength={128}
+                    value={customPassword}
+                    onChange={(event) => setCustomPassword(event.target.value)}
+                    placeholder="Auto-generated 32-character secret"
+                  />
+                </label>
+                <FeatureError error={rotate.error} />
+                <div className="modal-footer">
+                  <button type="button" className="button" onClick={() => setRotateOpen(false)}>Cancel</button>
+                  <button type="submit" className="button button-primary" disabled={rotate.isPending}>
+                    {rotate.isPending ? "Rotating..." : "Rotate password"}
+                  </button>
+                </div>
+              </form>
+            </FeatureModal>
+          ) : null}
           {canWrite && <DatabaseConnectionString label="Internal connection URL" kind={service.kind} connection={connection.data} host={connection.data.host} port={connection.data.port} password={password} />}
           <p className="feature-helper">
             Use this address inside the project network.{canWrite ? " Revealed credentials are hidden after one minute." : ""}

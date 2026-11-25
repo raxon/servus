@@ -7,7 +7,7 @@ import { pipeline } from 'node:stream/promises';
 const maximumBytes = 2 * 1024 * 1024 * 1024;
 const reserveBytes = 512 * 1024 * 1024;
 const identity = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
-export type BackupExtension = 'dump' | 'sql' | 'rdb';
+export type BackupExtension = 'dump' | 'sql' | 'rdb' | 'archive';
 export type BackupArtifactExtension = BackupExtension | 'tar';
 
 /** Local application-data dumps only. This does not capture the control plane. */
@@ -27,7 +27,7 @@ export class LocalDatabaseBackupStorage {
   }
   private path(id: string, extension: BackupArtifactExtension | 'partial') {
     this.assertRoot();
-    if (!identity.test(id) || !['dump','sql','rdb','tar','partial'].includes(extension)) throw new Error('Invalid backup artifact identity.');
+    if (!identity.test(id) || !['dump','sql','rdb','archive','tar','partial'].includes(extension)) throw new Error('Invalid backup artifact identity.');
     return join(this.root, `${id}.${extension}`);
   }
   private syncDirectory() {

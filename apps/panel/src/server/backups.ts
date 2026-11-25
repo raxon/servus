@@ -36,7 +36,7 @@ const leaseMs = 15 * 60_000;
 const toBackup = (row:BackupRow):DatabaseBackup => ({id:row.id,serviceId:row.service_id,name:row.name,status:row.status,trigger:row.trigger,createdAt:row.created_at,finishedAt:row.finished_at,size:row.size,sha256:row.sha256,extension:row.extension,error:row.error,destination:row.destination_ref?'s3':'local',encrypted:Boolean(row.encrypted)});
 
 function requireDatabase(service:Service) {
-  if (!['postgres','mariadb','redis'].includes(service.kind ?? '')) throw new AppError('BACKUP_DATABASE_REQUIRED','Backups are available for managed databases.',400);
+  if (!['postgres','mariadb','redis','mysql','mongodb'].includes(service.kind ?? '')) throw new AppError('BACKUP_DATABASE_REQUIRED','Backups are available for managed databases.',400);
   if (service.deployedRevision === null) throw new AppError('BACKUP_DATABASE_NOT_DEPLOYED','Deploy the database before creating a backup.',409);
 }
 
@@ -86,7 +86,7 @@ export class DatabaseBackups {
       if(this.options.store.db.prepare("SELECT 1 FROM database_backups WHERE service_id=? AND status IN ('queued','running')").get(service.id)) throw new AppError('BACKUP_BUSY','A database backup is already queued or running.',409);
       const id=randomUUID(),now=this.now().toISOString(),name=value.name ?? `Backup ${now}`,reference=this.settingsRow(service.id)?.destination_ref??null;
       const destination=reference?loadBackupDestination(this.options.store,service.id,reference):null;
-      const extension={postgres:'dump',mariadb:'sql',redis:'rdb'}[service.kind as 'postgres'|'mariadb'|'redis'];
+      const extension={postgres:'dump',mariadb:'sql',mysql:'sql',redis:'rdb',mongodb:'archive'}[service.kind as 'postgres'|'mariadb'|'mysql'|'redis'|'mongodb'];
       const objectKey=destination?`${destination.prefix?`${destination.prefix}/`:''}servus/${service.id}/${id}.${extension}`:null;
       this.options.store.db.prepare(`INSERT INTO database_backups (id,service_id,actor_id,name,status,trigger,idempotency_key,request_hash,created_at,destination_ref,object_key) VALUES (?,?,?,?,'queued',?,?,?,?,?,?)`)
         .run(id,service.id,actor.id,name,trigger,key,hash,now,reference,objectKey);
@@ -104,7 +104,7 @@ export class DatabaseBackups {
   private actor(id:string) {return this.options.store.db.prepare('SELECT id,email,role,created_at AS createdAt FROM users WHERE id=?').get(id) as User|undefined;}
   private discard(row:BackupRow) {
     this.storage.remove(row.id,'partial');
-    for(const extension of ['dump','sql','rdb'] as const)this.storage.remove(row.id,extension);
+    for(const extension of ['dump','sql','rdb','archive'] as const)this.storage.remove(row.id,extension);
   }
   private remoteIdentity(row:BackupRow) {
     if(!row.object_key||!row.size||!row.sha256)throw new Error('Remote backup identity is incomplete.');
@@ -176,10 +176,10 @@ export class DatabaseBackups {
       if(!service||!actor||!store.canAccess(actor,service.projectId,true))throw new Error('Backup access is no longer available.');
       requireDatabase(service);
       const connection=store.connectionInfo(service.id);
-      const upstream=await (this.options.databaseExport??agentDatabaseExport)(service.id,{kind:service.kind as 'postgres'|'mariadb'|'redis',database:connection.database,user:connection.user},this.options.agentConnection);
+      const upstream=await (this.options.databaseExport??agentDatabaseExport)(service.id,{kind:service.kind as 'postgres'|'mariadb'|'redis'|'mysql'|'mongodb',database:connection.database,user:connection.user},this.options.agentConnection);
       try {
         controller.signal.throwIfAborted();
-        const extension={postgres:'dump',mariadb:'sql',redis:'rdb'}[service.kind as 'postgres'|'mariadb'|'redis'] as BackupExtension;
+        const extension={postgres:'dump',mariadb:'sql',mysql:'sql',redis:'rdb',mongodb:'archive'}[service.kind as 'postgres'|'mariadb'|'mysql'|'redis'|'mongodb'] as BackupExtension;
         const length=upstream.headers['content-length'];
         if(typeof length!=='string'||!/^[1-9][0-9]*$/.test(length)||upstream.headers['x-export-extension']!==extension)throw new Error('Invalid export metadata.');
         if(!this.owns(row.id))throw new Error('Backup lease was lost.');

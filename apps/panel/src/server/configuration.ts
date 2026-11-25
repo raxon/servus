@@ -12,7 +12,7 @@ export const nameSchema = z.string().min(1).max(63).regex(/^[a-z0-9][a-z0-9-]*$/
 const imageSchema = z.string().min(1).max(300).regex(/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$/,'Enter a valid image reference');
 export const hostnameSchema = z.string().min(1).max(253).toLowerCase().refine(value=>value.split('.').every(label=>/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)),'Enter valid DNS labels without protocol or port');
 const targetSchema = z.string().min(2).max(255).refine(value=>value.startsWith('/')&&!value.includes('\0')&&!value.split('/').includes('..')&&value!=='/'&&!value.startsWith('/var/run/docker.sock')&&!value.startsWith('/proc')&&!value.startsWith('/sys'),'Use an absolute container path outside protected directories');
-const kindSchema = z.enum(['app','postgres','redis','mariadb']);
+const kindSchema = z.enum(['app','postgres','redis','mariadb','mysql','mongodb']);
 const buildResourcesSchema = z.object({
   cpuQuotaPercent: z.number().int().min(10).max(1600).optional(),
   memoryMb: z.number().int().min(128).max(65536).optional(),
@@ -50,6 +50,13 @@ const redirectTargetSchema = z.string().url().max(500).refine(value => {
     return (url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password;
   } catch { return false; }
 }, 'Redirect target must be an http(s) URL without credentials or regex variables');
+const trustedProxiesSchema = z.object({
+  depth: z.number().int().min(1).max(10).optional(),
+  excludedIps: z.array(ipAllowEntrySchema).min(1).max(32).optional(),
+}).strict().refine(
+  value => (value.depth !== undefined) !== (value.excludedIps !== undefined),
+  'Trusted proxies must specify either a hop depth or excluded proxy IP/CIDR ranges, not both',
+);
 const domainSchema = z.object({
   hostname: hostnameSchema,
   port: z.number().int().min(1).max(65535),
@@ -59,6 +66,7 @@ const domainSchema = z.object({
   pathPrefix: pathPrefixSchema.optional(),
   stripPrefix: z.boolean().optional(),
   ipAllowList: z.array(ipAllowEntrySchema).min(1).max(32).optional(),
+  trustedProxies: trustedProxiesSchema.optional(),
   basicAuth: z.object({ users: z.array(htpasswdEntrySchema).min(1).max(20) }).strict().optional(),
   redirectTarget: redirectTargetSchema.optional(),
   redirectPermanent: z.boolean().optional(),
@@ -92,7 +100,7 @@ export const servicePatchSchema=z.object({expectedRevision:z.number().int().posi
 
 export function normalizeServiceInput(value: unknown): ServiceInput {
   const parsed=newServiceSchema.parse(value),kind=parsed.kind??'app';
-  const defaults={postgres:{image:'postgres:17-alpine',port:5432},redis:{image:'redis:7-alpine',port:6379},mariadb:{image:'mariadb:11.4',port:3306}};
+  const defaults={postgres:{image:'postgres:17-alpine',port:5432},redis:{image:'redis:7-alpine',port:6379},mariadb:{image:'mariadb:11.4',port:3306},mysql:{image:'mysql:8.4',port:3306},mongodb:{image:'mongo:7',port:27017}};
   const db=kind==='app'?undefined:defaults[kind];
   if(kind==='app'&&!parsed.image&&parsed.source?.type!=='git')throw new AppError('IMAGE_REQUIRED','An application image or Git source is required');
   const primary=parsed.domains?.find(domain=>domain.primary)??parsed.domains?.[0];
@@ -123,6 +131,7 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
     if(domain.stripPrefix && (!domain.pathPrefix || domain.pathPrefix === '/')) throw new AppError('STRIP_PREFIX_REQUIRES_PATH','Strip prefix requires a non-root path prefix',400);
     if(domain.redirectTarget && domain.stripPrefix) throw new AppError('INVALID_REDIRECT_RULE','Redirect target cannot be combined with strip prefix',400);
     if(domain.redirectPermanent !== undefined && !domain.redirectTarget) throw new AppError('INVALID_REDIRECT_RULE','Redirect status requires a redirect target URL',400);
+    if(domain.trustedProxies && !domain.ipAllowList?.length) throw new AppError('TRUSTED_PROXIES_REQUIRES_ALLOWLIST','Trusted proxy IP strategy requires an IP allow-list on the same domain',400);
   }
   for(const domain of config.domains??[]) if(domain.https) { try { if(canonicalDnsName(domain.hostname)!==domain.hostname || domain.hostname.endsWith('.localhost'))throw new Error(); } catch { throw new AppError('INVALID_HTTPS_DOMAIN','Automatic HTTPS requires a valid public hostname',400); } }
   if(kind!=='app'&&(config.replicas??1)!==1)throw new AppError('STATEFUL_REPLICAS','Database services require exactly one replica');
@@ -144,7 +153,7 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
   if(kind!=='app'&&config.source?.type==='git')throw new AppError('DATABASE_SOURCE','Database services use managed images');
   for(const env of config.environment??[]) {
     if(env.secretRef&&!env.secret)throw new AppError('SECRET_REFERENCE','Secret references require secret mode');
-    if(kind!=='app'&&/^(POSTGRES_|MARIADB_|MYSQL_|REDIS_)/.test(env.name))throw new AppError('RESERVED_VARIABLE','Database connection variables are managed by the panel');
+    if(kind!=='app'&&/^(POSTGRES_|MARIADB_|MYSQL_|REDIS_|MONGO_)/.test(env.name))throw new AppError('RESERVED_VARIABLE','Database connection variables are managed by the panel');
   }
   for(const mount of config.mounts??[]) {
     if(mount.type==='file'&&mount.content===undefined)throw new AppError('FILE_CONTENT_REQUIRED','File mounts need content');

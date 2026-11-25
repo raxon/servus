@@ -55,6 +55,20 @@ const kinds: {
     image: "mariadb:11.4",
     port: 3306,
   },
+  {
+    kind: "mysql",
+    label: "MySQL",
+    description: "Persistent SQL database",
+    image: "mysql:8.4",
+    port: 3306,
+  },
+  {
+    kind: "mongodb",
+    label: "MongoDB",
+    description: "Persistent document store",
+    image: "mongo:7",
+    port: 27017,
+  },
 ];
 
 export function CreateService({
@@ -207,6 +221,19 @@ export function CreateService({
           </label>
           {kind === "app" ? <SourceChoiceFields value={sourceType} onChange={setSourceType} /> : null}
           {sourceType === "image" ? (<>
+            {kind === "postgres" ? (
+              <label>
+                PostgreSQL major version
+                <select
+                  value={image || "postgres:17-alpine"}
+                  onChange={(event) => setImage(event.target.value)}
+                >
+                  <option value="postgres:17-alpine">PostgreSQL 17 (default - postgres:17-alpine)</option>
+                  <option value="postgres:18-alpine">PostgreSQL 18 (postgres:18-alpine)</option>
+                </select>
+                <small>Major-version upgrades after deployment use backup and restore into a fresh service.</small>
+              </label>
+            ) : null}
             <label>
               Docker image
               <input

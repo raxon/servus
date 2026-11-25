@@ -46,12 +46,23 @@ describe('Compose project API tokens',()=>{
     }
     expect(f.store.db.prepare('SELECT count(*) AS n FROM compose_actions WHERE workload_id=?').get(f.workload.id)).toEqual({n:5});
   });
-  it('keeps source revelation, creation, configuration, destruction and certificates interactive',async()=>{
+  it('allows deploy-scoped Compose CRUD while keeping source revelation and certificates interactive',async()=>{
     const f=await fixture(),headers=f.headers();
     for(const suffix of ['configuration','containers'])expect((await f.app.inject({url:`/api/v1/compose/${f.workload.id}/${suffix}`,headers})).statusCode).toBe(403);
-    for(const suffix of ['destroy','check-managed-certificate','retry-certificate'])expect((await f.app.inject({method:'POST',url:`/api/v1/compose/${f.workload.id}/${suffix}`,headers,payload:{confirm:true}})).statusCode).toBe(403);
-    expect((await f.app.inject({method:'PATCH',url:`/api/v1/compose/${f.workload.id}`,headers,payload:{}})).statusCode).toBe(403);
-    expect((await f.app.inject({method:'POST',url:`/api/v1/projects/${f.project.id}/compose`,headers,payload:{}})).statusCode).toBe(403);
+    for(const suffix of ['check-managed-certificate','retry-certificate'])expect((await f.app.inject({method:'POST',url:`/api/v1/compose/${f.workload.id}/${suffix}`,headers,payload:{hostname:'app.example.test'}})).statusCode).toBe(403);
+    expect((await f.app.inject({method:'POST',url:`/api/v1/projects/${f.project.id}/compose`,headers:f.headers(f.readToken.token),payload:{name:'blocked',source:{type:'inline',yaml:'services: {web: {image: nginx:alpine}}'},domains:[]}})).statusCode).toBe(403);
+    const created=await f.app.inject({method:'POST',url:`/api/v1/projects/${f.project.id}/compose`,headers:f.headers(),payload:{name:'api-created',source:{type:'inline',yaml:'services:\n  web:\n    image: nginx:alpine\n'},domains:[]}});
+    expect(created.statusCode).toBe(202);
+    await f.settled();
+    const createdId=created.json().workload.id as string;
+    const patched=await f.app.inject({method:'PATCH',url:`/api/v1/compose/${createdId}`,headers:f.headers(),payload:{expectedRevision:1,source:{type:'inline',yaml:'services:\n  web:\n    image: nginx:1.27-alpine\n'},domains:[]}});
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().revision).toBe(2);
+    expect((await f.app.inject({method:'PATCH',url:`/api/v1/compose/${f.foreign.id}`,headers:f.headers(),payload:{expectedRevision:1,source:{type:'inline',yaml:'services: {web: {image: nginx:alpine}}'},domains:[]}})).statusCode).toBe(404);
+    expect((await f.app.inject({method:'POST',url:`/api/v1/compose/${createdId}/destroy`,headers:f.headers(f.readToken.token),payload:{confirm:true}})).statusCode).toBe(403);
+    const destroyed=await f.app.inject({method:'POST',url:`/api/v1/compose/${createdId}/destroy`,headers:f.headers(),payload:{confirm:true}});
+    expect(destroyed.statusCode).toBe(202);
+    await f.settled();
   });
   it('uses current membership for every bearer request and denies a downgraded editor',async()=>{
     const f=await fixture();f.store.db.prepare("UPDATE users SET role='member' WHERE id=?").run(f.user.id);f.store.addMember(f.project.id,f.user.id,'editor');
@@ -70,10 +81,13 @@ describe('Compose project API tokens',()=>{
     else f.store.db.prepare(`UPDATE api_tokens SET ${mode==='revoked'?'revoked_at':'expires_at'}=? WHERE id=?`).run('2000-01-01T00:00:00.000Z',f.readToken.id);
     release({logs:'must-not-be-returned'});const result=await response;expect(result.statusCode).toBe(mode==='membership'?404:401);expect(result.body).not.toContain('must-not-be-returned');
   });
-  it('documents the bounded Compose bearer surface and action polling',async()=>{
+  it('documents the Compose bearer surface and action polling',async()=>{
     const f=await fixture(),document=(await f.app.inject({url:'/api/v1/openapi.json',headers:f.headers(f.readToken.token)})).json();
     expect(document.paths['/projects/{id}/compose'].get).toBeDefined();
+    expect(document.paths['/projects/{id}/compose'].post).toBeDefined();
+    expect(document.paths['/compose/{id}'].patch).toBeDefined();
+    expect(document.paths['/compose/{id}/destroy'].post).toBeDefined();
     for(const operation of ['deploy','start','stop','restart'])expect(document.paths[`/compose/{id}/${operation}`].post.responses['202'].description).toContain('/compose/{id}/actions');
-    for(const suffix of ['configuration','destroy','check-managed-certificate','retry-certificate'])expect(document.paths[`/compose/{id}/${suffix}`]).toBeUndefined();
+    for(const suffix of ['configuration','check-managed-certificate','retry-certificate'])expect(document.paths[`/compose/{id}/${suffix}`]).toBeUndefined();
   });
 });

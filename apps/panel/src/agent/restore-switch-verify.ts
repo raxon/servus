@@ -5,15 +5,17 @@ import { execOutput } from './observability.js';
 import type { RestoreSwitchPlan } from './restore-switch-intent.js';
 
 /** Verify Swarm convergence, exclusive volume use and authenticated database readiness. */
-export async function verifyRestoreDatabase(options:{docker:Docker;plan:RestoreSwitchPlan;side:'source'|'target';kind:'postgres'|'mariadb'|'redis';attempts?:number;delayMs?:number}):Promise<void> {
+export async function verifyRestoreDatabase(options:{docker:Docker;plan:RestoreSwitchPlan;side:'source'|'target';kind:'postgres'|'mariadb'|'redis'|'mysql'|'mongodb';attempts?:number;delayMs?:number}):Promise<void> {
   const {inspection}=options.plan,expected=options.side==='source'?options.plan.previousSpec:options.plan.targetSpec;
   const volumeName=options.side==='source'?inspection.sourceVolume:inspection.candidateVolume,otherVolume=options.side==='source'?inspection.candidateVolume:inspection.sourceVolume;
-  const dataPath=options.kind==='postgres'?'/var/lib/postgresql/data':options.kind==='redis'?'/data':'/var/lib/mysql',name=`panel-app-${inspection.serviceId}`;
+  const dataPath=options.kind==='postgres'?'/var/lib/postgresql/data':options.kind==='redis'?'/data':options.kind==='mongodb'?'/data/db':'/var/lib/mysql',name=`panel-app-${inspection.serviceId}`;
   const attempts=options.attempts??60,delayMs=options.delayMs??1000;
   if(!Number.isInteger(attempts)||attempts<1||attempts>120||!Number.isInteger(delayMs)||delayMs<0||delayMs>5000)throw new Error('Invalid restore verification limits.');
   const command=options.kind==='postgres'
     ? 'PGCONNECT_TIMEOUT=3 PGPASSWORD="$(cat /run/secrets/panel-db-password)" exec psql --host=127.0.0.1 --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --no-password --tuples-only --command="SELECT 1"'
     : options.kind==='redis' ? 'REDISCLI_AUTH="$(cat /run/secrets/panel-db-password)" exec redis-cli --no-auth-warning -h 127.0.0.1 ping'
+    : options.kind==='mysql' ? 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" exec mysql --connect-timeout=3 --protocol=TCP --host=127.0.0.1 --user="$MYSQL_USER" --database="$MYSQL_DATABASE" --batch --skip-column-names --execute="SELECT 1"'
+    : options.kind==='mongodb' ? 'MONGO_PASS="$(cat /run/secrets/panel-db-password)" exec mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_PASS" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok"'
     : 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" exec mariadb --connect-timeout=3 --protocol=TCP --host=127.0.0.1 --user="$MARIADB_USER" --database="$MARIADB_DATABASE" --batch --skip-column-names --execute="SELECT 1"';
   for(let attempt=0;attempt<attempts;attempt++){
     const service=await options.docker.getService(name).inspect(),node=(await options.docker.info()).Swarm?.NodeID;

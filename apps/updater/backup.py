@@ -515,7 +515,7 @@ def _agent_schema(db):
             raise CaptureError('Unresolved database restore requires recovery')
         if (not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or
             not isinstance(service,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service) or
-            kind not in ('postgres','mariadb','redis') or not isinstance(digest,str) or not re.fullmatch(r'[a-f0-9]{64}',digest) or
+            kind not in ('postgres','mariadb','redis','mysql','mongodb') or not isinstance(digest,str) or not re.fullmatch(r'[a-f0-9]{64}',digest) or
             not isinstance(updated,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',updated)):
             raise CaptureError('Database restore journal is invalid')
     if has_upload_locks:
@@ -523,7 +523,7 @@ def _agent_schema(db):
         for ident,lock_id in db.execute('SELECT operation_id,lock_id FROM restore_upload_locks'):
             if (not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or ident in seen_operations or
                 not isinstance(lock_id,str) or not re.fullmatch(r'[a-f0-9]{32}',lock_id) or lock_id in seen_locks or
-                not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND kind IN ('postgres','mariadb','redis') AND phase IN ('completed','cancelled')",(ident,)).fetchone()):
+                not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND kind IN ('postgres','mariadb','redis','mysql','mongodb') AND phase IN ('completed','cancelled')",(ident,)).fetchone()):
                 raise CaptureError('Upload lock journal is invalid')
             seen_operations.add(ident);seen_locks.add(lock_id)
     if has_review_phases and db.execute('SELECT 1 FROM restore_review_phases LIMIT 1').fetchone():
@@ -549,7 +549,7 @@ def _agent_schema(db):
         for service,ident,volume,kind,created in db.execute('SELECT service_id,operation_id,volume_name,kind,created_at FROM restore_volume_bindings'):
             if (not isinstance(service,str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',service) or service in seen_services or
                 not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{32}',ident) or ident in seen_operations or
-                volume!='panel-restore-'+ident or volume in seen_volumes or kind not in ('postgres','mariadb','redis') or
+                volume!='panel-restore-'+ident or volume in seen_volumes or kind not in ('postgres','mariadb','redis','mysql','mongodb') or
                 not isinstance(created,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z',created) or
                 not db.execute("SELECT 1 FROM restore_operations WHERE id=? AND service_id=? AND kind=? AND phase='completed'",(ident,service,kind)).fetchone() or
                 not has_retained or volume in retained_volumes or not db.execute("SELECT 1 FROM restore_retained_volumes WHERE operation_id=? AND service_id=? AND reason='pre_restore_source'",(ident,service)).fetchone()):

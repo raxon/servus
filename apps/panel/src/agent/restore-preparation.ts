@@ -10,14 +10,14 @@ export async function prepareRestoreCandidate(options: {
   importCandidate: typeof importDatabaseCandidate;
 } & ({ target: CandidateTarget; allocateTarget?: never } | { target?: never; allocateTarget: () => Promise<CandidateTarget> })): Promise<RestoreRecord> {
   const record = options.journal.get(options.operationId);
-  if (!record || record.service_id !== options.serviceId || record.phase !== 'reserved' || !['postgres', 'mariadb'].includes(record.kind)) {
+  if (!record || record.service_id !== options.serviceId || record.phase !== 'reserved' || !['postgres', 'mariadb', 'mysql', 'mongodb'].includes(record.kind)) {
     throw new Error('Restore preparation does not match a reserved database operation.');
   }
   options.journal.advance(record.id, 'reserved', 'importing');
   try {
     const target = options.target ?? await options.allocateTarget!();
     try {
-      await options.importCandidate({ ...target, operationId: record.id, kind: record.kind as 'postgres' | 'mariadb', archiveSha256: record.archive_sha256 });
+      await options.importCandidate({ ...target, operationId: record.id, kind: record.kind as 'postgres' | 'mariadb' | 'mysql' | 'mongodb', archiveSha256: record.archive_sha256 });
     } catch(error) {
       if(error instanceof DatabaseImportError)options.journal.advance(record.id,'importing','discarding_candidate');
       throw error;

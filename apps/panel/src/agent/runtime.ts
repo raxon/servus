@@ -88,7 +88,7 @@ export class DockerRuntime {
   async databaseNetwork(serviceId: string): Promise<DatabaseNetworkStatus> {
     const current = await this.docker.getService(`panel-app-${serviceId}`).inspect();
     const spec = current.Spec as Docker.ServiceSpec;
-    if (spec.Labels?.['panel.owner'] !== OWNER || spec.Labels['panel.service'] !== serviceId || !['postgres','mariadb','redis'].includes(spec.Labels['panel.kind'] ?? '')) throw new Error('Managed database ownership cannot be verified.');
+    if (spec.Labels?.['panel.owner'] !== OWNER || spec.Labels['panel.service'] !== serviceId || !['postgres','mariadb','redis','mysql','mongodb'].includes(spec.Labels['panel.kind'] ?? '')) throw new Error('Managed database ownership cannot be verified.');
     const projectId = spec.Labels['panel.project'];
     if (!projectId || !/^[a-f0-9-]{36}$/.test(projectId)) throw new Error('Database project identity cannot be verified.');
     const networkName = `panel-project-${projectId}`, network = await this.docker.getNetwork(networkName).inspect();
@@ -197,15 +197,17 @@ export class DockerRuntime {
   async apply(service: Service, type: string, operationId: string, recovery?: RecoveryContext): Promise<ApplyResult> {
     if(service.databaseAccess!==undefined && !databaseKind(service))throw new Error('External TCP access is available only for managed databases.');
     const name = `panel-app-${service.id}`;
-    const binding=service.kind==='postgres'||service.kind==='mariadb'||service.kind==='redis'?readRestoreBinding(this.dataDir,service.id,service.kind):undefined;
+    const dbKinds = ['postgres','mariadb','redis','mysql','mongodb'] as const;
+    const isDb = Boolean(service.kind && (dbKinds as readonly string[]).includes(service.kind));
+    const binding=isDb?readRestoreBinding(this.dataDir,service.id,service.kind as (typeof dbKinds)[number]):undefined;
     const volumeBindings=readVolumeBindings(this.dataDir,service.id);
     const verifyBinding=async (...specs:(Docker.ServiceSpec|null|undefined)[])=>{
       for(const spec of specs)await verifyBoundRuntime(this.docker,spec,volumeBindings);
-      if(service.kind!=='postgres'&&service.kind!=='mariadb'&&service.kind!=='redis')return;
+      if(!isDb)return;
       for(const spec of specs){
         if(!spec)continue;
         if(!binding){if(spec.Labels?.['panel.restore.operation'])throw new Error('Restored database volume binding is unavailable.');continue;}
-        const mounts=containerSpec(spec)?.Mounts??[],target=binding.kind==='postgres'?'/var/lib/postgresql/data':binding.kind==='redis'?'/data':'/var/lib/mysql';
+        const mounts=containerSpec(spec)?.Mounts??[],target=binding.kind==='postgres'?'/var/lib/postgresql/data':binding.kind==='redis'?'/data':binding.kind==='mongodb'?'/data/db':'/var/lib/mysql';
         if(spec.Labels?.['panel.restore.operation']!==binding.operation_id||mounts.length!==1||mounts[0]?.Type!=='volume'||mounts[0].Source!==binding.volume_name||mounts[0].Target!==target||mounts[0].ReadOnly)throw new Error('Restored database service does not match its committed volume.');
       }
       if(binding)await verifyRestoredVolume(this.docker,binding);
@@ -272,7 +274,7 @@ export class DockerRuntime {
     if (!spec) {
       if (type === 'deploy') {
         if(service.rollbackImage && service.kind && service.kind!=='app')throw new Error('Historical deployment is only available for applications.');
-        if(service.kind==='postgres'&&!previousSpec&&service.deployedRevision===null&&(service.image!=='postgres:17-alpine'||service.source?.type==='git'))throw new Error('New PostgreSQL services require the managed postgres:17-alpine image.');
+        if(service.kind==='postgres'&&!previousSpec&&service.deployedRevision===null&&(!['postgres:17-alpine','postgres:18-alpine'].includes(service.image)||service.source?.type==='git'))throw new Error('New PostgreSQL services require the managed postgres:17-alpine or postgres:18-alpine image.');
         if (service.kind==='postgres'&&previousSpec?.Labels?.['panel.postgres-auth']===postgresScramVersion) {
           imageDigest=containerSpec(previousSpec)?.Image;
           if(!imageDigest||!/(?:^|@)sha256:[a-f0-9]{64}$/.test(imageDigest))throw new Error('The previous PostgreSQL image is not pinned. Back up the database and use an explicit upgrade procedure.');
@@ -433,7 +435,7 @@ export class DockerRuntime {
   }
   private async verifyService(spec: Docker.ServiceSpec, serviceId: string): Promise<void> {
     const kind = spec.Labels?.['panel.kind'];
-    if (kind && ['postgres', 'mariadb', 'redis'].includes(kind)) {
+    if (kind && ['postgres', 'mariadb', 'redis', 'mysql', 'mongodb'].includes(kind)) {
       for (let attempt = 0; attempt < 60; attempt++) {
         const container = (await this.containers(serviceId)).find(item => item.state === 'running');
         if (container) {
@@ -441,7 +443,11 @@ export class DockerRuntime {
             ? 'PGCONNECT_TIMEOUT=3 PGPASSWORD="$(cat /run/secrets/panel-db-password)" exec psql --host=127.0.0.1 --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --no-password --tuples-only --command="SELECT 1"'
             : kind === 'mariadb'
               ? 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" exec mariadb --connect-timeout=3 --protocol=TCP --host=127.0.0.1 --user="$MARIADB_USER" --database="$MARIADB_DATABASE" --batch --skip-column-names --execute="SELECT 1"'
-              : 'REDISCLI_AUTH="$(cat /run/secrets/panel-db-password)" exec redis-cli --no-auth-warning -h 127.0.0.1 ping';
+              : kind === 'mysql'
+                ? 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" exec mysql --connect-timeout=3 --protocol=TCP --host=127.0.0.1 --user="$MYSQL_USER" --database="$MYSQL_DATABASE" --batch --skip-column-names --execute="SELECT 1"'
+                : kind === 'mongodb'
+                  ? 'MONGO_PASS="$(cat /run/secrets/panel-db-password)" exec mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_PASS" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok"'
+                  : 'REDISCLI_AUTH="$(cat /run/secrets/panel-db-password)" exec redis-cli --no-auth-warning -h 127.0.0.1 ping';
           try {
             const result = await execOutput(this.docker, container.id, ['/bin/sh', '-c', command]);
             if (result.code === 0 && result.output.split('\n').some(line => line.trim() === (kind === 'redis' ? 'PONG' : '1'))) return;

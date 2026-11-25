@@ -44,6 +44,42 @@ export function registerCompose(app: FastifyInstance, options: Options) {
       db.prepare('INSERT OR IGNORE INTO compose_domains VALUES(?,?)').run(domain.hostname,id);
     }
   };
+  const redactConfig = (configuration: ComposeConfiguration) => {
+    if (configuration.source.type !== 'git' || !configuration.source.credential) return configuration;
+    return {
+      ...configuration,
+      source: {
+        ...configuration.source,
+        credential: { username: configuration.source.credential.username, hasToken: Boolean(configuration.source.credential.token) },
+      },
+    };
+  };
+  const resolveGitCredentials = (configuration: ComposeConfiguration, previous?: ComposeConfiguration): ComposeConfiguration => {
+    if (configuration.source.type !== 'git') return configuration;
+    const source = configuration.source;
+    const url = new URL(source.repository);
+    if (source.sharedGithub) {
+      if (url.protocol !== 'https:' || url.host.toLowerCase() !== 'github.com') {
+        throw new AppError('INVALID_COMPOSE', 'Shared GitHub connection can only be used with https://github.com repositories', 400);
+      }
+      if (source.credential) {
+        throw new AppError('INVALID_COMPOSE', 'Choose either shared GitHub connection or explicit Git credentials, not both', 400);
+      }
+      const connection = store.vault.githubConnection();
+      if (!connection) throw new AppError('GITHUB_CONNECTION_REQUIRED', 'Configure the shared GitHub connection first', 409);
+      return { ...configuration, source: { ...source, repository: url.href, credential: { username: connection.username, token: connection.token } } };
+    }
+    if (source.credential) {
+      if (url.protocol !== 'https:') throw new AppError('INVALID_COMPOSE', 'Authenticated Compose Git repositories require HTTPS', 400);
+      if (source.credential.token) return { ...configuration, source: { ...source, repository: url.href } };
+      const prevGit = previous?.source.type === 'git' ? previous.source : undefined;
+      if (prevGit?.credential?.token && prevGit.repository === url.href && prevGit.credential.username === source.credential.username) {
+        return { ...configuration, source: { ...source, repository: url.href, credential: { username: source.credential.username, token: prevGit.credential.token } } };
+      }
+      throw new AppError('SECRET_REQUIRED', 'Enter a Git access token for this private repository', 400);
+    }
+    return configuration;
+  };
   const validate = (configuration:ComposeConfiguration) => {
     for(const domain of configuration.domains.filter(item=>item.https)) {
       try{if(canonicalDnsName(domain.hostname)!==domain.hostname||domain.hostname.endsWith('.localhost'))throw new Error();}
@@ -110,9 +146,10 @@ export function registerCompose(app: FastifyInstance, options: Options) {
   app.addHook('onClose',async()=>{closing=true;clearInterval(timer);await active;});
 
   const createWorkload=(input:ComposeCreateInput)=>{
-    const projectId=z.string().uuid().parse(input.projectId),user=input.user,name=composeName.parse(input.name),configuration=composeConfigSchema.parse(input.configuration),key=z.string().min(1).max(128).parse(input.key);
-    options.projectAccess(user,projectId,true);validate(configuration);
-    const creationHash=input.requestHash?z.string().regex(/^[a-f0-9]{64}$/).parse(input.requestHash):createHash('sha256').update(JSON.stringify({projectId,name,configuration})).digest('hex');
+    const projectId=z.string().uuid().parse(input.projectId),user=input.user,name=composeName.parse(input.name),rawConfig=composeConfigSchema.parse(input.configuration),key=z.string().min(1).max(128).parse(input.key);
+    options.projectAccess(user,projectId,true);validate(rawConfig);
+    const configuration=resolveGitCredentials(rawConfig);
+    const creationHash=input.requestHash?z.string().regex(/^[a-f0-9]{64}$/).parse(input.requestHash):createHash('sha256').update(JSON.stringify({projectId,name,configuration:redactConfig(configuration)})).digest('hex');
     const result=db.transaction(()=>{
       const duplicate=db.prepare('SELECT * FROM compose_actions WHERE actor_id=? AND idempotency_key=?').get(user.id,key) as ActionRow|undefined;
       if(duplicate){if(duplicate.request_hash!==creationHash)throw new AppError('IDEMPOTENCY_CONFLICT','This key was used for another Compose request',409);return{workload:workload(db.prepare('SELECT * FROM compose_workloads WHERE id=?').get(duplicate.workload_id) as Row),action:action(duplicate)};}
@@ -128,7 +165,7 @@ export function registerCompose(app: FastifyInstance, options: Options) {
     return reply.code(202).send(createWorkload({projectId:request.params.id,user,name,configuration,key:z.string().min(1).max(128).parse(request.headers['idempotency-key'])}));
   });
   app.get<{Params:{id:string}}>('/api/v1/compose/:id',async request=>workload(get(request.params.id,request).row));
-  app.get<{Params:{id:string}}>('/api/v1/compose/:id/configuration',async request=>{const{row,user}=get(request.params.id,request,true);store.recordAudit(user.id,'compose.configuration.reveal',row.id);return config(row);});
+  app.get<{Params:{id:string}}>('/api/v1/compose/:id/configuration',async request=>{const{row,user}=get(request.params.id,request,true);store.recordAudit(user.id,'compose.configuration.reveal',row.id);return redactConfig(config(row));});
   const deployedConfiguration=(id:string)=>{
     const latest=db.prepare("SELECT snapshot,revision FROM compose_actions WHERE workload_id=? AND type='deploy' AND status='succeeded' ORDER BY updated_at DESC,rowid DESC LIMIT 1").get(id) as {snapshot:string;revision:number}|undefined;
     if(!latest)throw new AppError('COMPOSE_NOT_DEPLOYED','Deploy the HTTPS domain before checking or retrying its certificate',409);
@@ -156,10 +193,11 @@ export function registerCompose(app: FastifyInstance, options: Options) {
     const queued=enqueue(row,'deploy',user,key,hash,{snapshot,revision:deployed.revision});wake();return reply.code(202).send(queued);
   });
   app.patch<{Params:{id:string}}>('/api/v1/compose/:id',async request=>{
-    const{row}=get(request.params.id,request,true),input=composeConfigSchema.extend({expectedRevision:z.number().int().positive()}).strict().parse(request.body),{expectedRevision,...configuration}=input;validate(configuration);
+    const{row}=get(request.params.id,request,true),input=composeConfigSchema.extend({expectedRevision:z.number().int().positive()}).strict().parse(request.body),{expectedRevision,...rawConfiguration}=input;validate(rawConfiguration);
     return db.transaction(()=>{
       const latest=db.prepare('SELECT * FROM compose_workloads WHERE id=?').get(row.id) as Row;
       if(latest.revision!==expectedRevision)throw new AppError('REVISION_CONFLICT','Configuration changed. Reload before saving.',409);
+      const configuration=resolveGitCredentials(rawConfiguration,config(latest));
       reserve(row.id,configuration.domains);db.prepare('UPDATE compose_workloads SET configuration=?,revision=revision+1,updated_at=? WHERE id=?').run(store.vault.seal(JSON.stringify(configuration)),now(),row.id);
       return workload(db.prepare('SELECT * FROM compose_workloads WHERE id=?').get(row.id) as Row);
     }).immediate();

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Store } from '../server/store.js';
+import { readBuildConcurrency } from '../server/workspace-extras.js';
 import { AgentRequestError, agentRequest, applyService, type ApplyResult } from '../agent/client.js';
 import type { ActionType, Service, ServiceState } from '../shared/types.js';
 
@@ -10,6 +11,7 @@ export interface WorkerOptions {
   readState?: (serviceId: string) => Promise<{state:ServiceState;deployedRevision?:number}>;
   wait?: (milliseconds: number) => Promise<void>;
   retryDelayMs?: number;
+  maxConcurrency?: () => number;
 }
 export type WorkerDrainResult = {status:'drained'|'uncertain'|'timeout'|'stopped'};
 function freezeSnapshot<T extends object>(value:T):T {
@@ -25,8 +27,9 @@ export class Worker {
   private readonly wait;
   private readonly retryDelayMs;
   private readonly allowWork;
+  private readonly maxConcurrency;
   private draining = false;
-  private active: Promise<boolean> | undefined;
+  private readonly activeJobs = new Set<Promise<boolean>>();
   private readonly uncertainActions = new Set<string>();
   private claimUncertain = false;
   constructor(readonly store: Store, readonly leaseMs = 60000, options: WorkerOptions = {}) {
@@ -35,14 +38,22 @@ export class Worker {
     this.wait = options.wait ?? delay;
     this.retryDelayMs = options.retryDelayMs ?? 1000;
     this.allowWork = options.allowWork ?? (() => true);
+    this.maxConcurrency = options.maxConcurrency ?? (() => readBuildConcurrency(store.dataDir));
+  }
+
+  private concurrencyLimit(): number {
+    const raw = this.maxConcurrency();
+    return Number.isInteger(raw) ? Math.min(8, Math.max(1, raw)) : 1;
   }
 
   once(): Promise<boolean> {
-    if(this.active) return this.active;
+    if(this.activeJobs.size >= this.concurrencyLimit()) {
+      return this.activeJobs.values().next().value ?? Promise.resolve(false);
+    }
     if(this.stopping || this.draining) return Promise.resolve(false);
     const active = Promise.resolve().then(() => this.processOne());
-    this.active = active;
-    void active.then(() => { if(this.active===active)this.active=undefined; }, () => { if(this.active===active)this.active=undefined; });
+    this.activeJobs.add(active);
+    void active.then(() => { this.activeJobs.delete(active); }, () => { this.activeJobs.delete(active); });
     return active;
   }
 
@@ -50,11 +61,11 @@ export class Worker {
   async drain(timeoutMs: number): Promise<WorkerDrainResult> {
     if(!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2147483647)throw new Error('Invalid drain timeout');
     this.draining = true;
-    const active = this.active;
-    if(active) {
+    const running = [...this.activeJobs];
+    if(running.length) {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<'timeout'>(resolve => {timer=setTimeout(()=>resolve('timeout'),timeoutMs);});
-      const result = await Promise.race([active.then(()=> 'finished' as const,()=> 'finished' as const),timeout]);
+      const result = await Promise.race([Promise.allSettled(running).then(()=> 'finished' as const),timeout]);
       if(timer)clearTimeout(timer);
       if(result==='timeout')return {status:'timeout'};
     }
@@ -128,7 +139,31 @@ export class Worker {
 
   async run() {
     while(!this.stopping) {
-      try { if(!await this.once()) await delay(500); }
+      try {
+        const limit = this.concurrencyLimit();
+        if (limit <= 1) {
+          if (!await this.once()) await delay(500);
+          continue;
+        }
+        while (!this.stopping && !this.draining && this.activeJobs.size < limit) {
+          let claimed = false;
+          const slot = Promise.resolve().then(async () => {
+            const didWork = await this.processOne();
+            claimed = didWork;
+            return didWork;
+          });
+          this.activeJobs.add(slot);
+          void slot.then(() => { this.activeJobs.delete(slot); }, () => { this.activeJobs.delete(slot); });
+          // Let processOne synchronously claim the next queued job before checking again.
+          await Promise.resolve();
+          if (!claimed && this.activeJobs.size <= 1) break;
+        }
+        if (this.activeJobs.size > 0) {
+          await Promise.race([...this.activeJobs, delay(500)]);
+        } else {
+          await delay(500);
+        }
+      }
       catch(error) { console.error(error instanceof Error ? error.message : 'Worker loop failed'); await delay(1000); }
     }
   }

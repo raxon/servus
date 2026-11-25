@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
-type DatabaseKind = 'postgres' | 'mariadb';
+type DatabaseKind = 'postgres' | 'mariadb' | 'mysql' | 'mongodb';
 const identifier = /^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/;
 const maximumBytes = 2 * 1024 * 1024 * 1024;
 const childEnvironment = () => ({ ...process.env, PATH: `${process.env.PATH || '/usr/bin:/bin'}:/usr/local/bin` });
@@ -20,7 +20,7 @@ export async function importDatabaseCandidate(options: {
 }): Promise<void> {
   if (!/^[a-f0-9]{64}$/.test(options.containerId) || !/^[a-f0-9]{32}$/.test(options.operationId) ||
     !options.dockerSocket.startsWith('/') || options.dockerSocket.includes('\0') ||
-    !['postgres', 'mariadb'].includes(options.kind) || !identifier.test(options.database) || !identifier.test(options.user) || !/^[a-f0-9]{64}$/.test(options.archiveSha256)) {
+    !['postgres', 'mariadb', 'mysql', 'mongodb'].includes(options.kind) || !identifier.test(options.database) || !identifier.test(options.user) || !/^[a-f0-9]{64}$/.test(options.archiveSha256)) {
     throw new DatabaseImportError('Invalid database import target.', false);
   }
   options.signal?.throwIfAborted();
@@ -48,11 +48,11 @@ export async function importDatabaseCandidate(options: {
       info?.HostConfig?.NetworkMode !== 'none' || info.HostConfig.Privileged !== false || info.HostConfig.PidMode === 'host' || info.HostConfig.IpcMode === 'host' ||
       (info.HostConfig.CapAdd?.length ?? 0) > 0 || info?.State?.Running !== true) throw new Error('Candidate isolation not verified.');
     const variables = new Map((info.Config?.Env ?? []).map(value => { const at = value.indexOf('='); return [value.slice(0, at), value.slice(at + 1)]; }));
-    const prefix = options.kind === 'postgres' ? 'POSTGRES' : 'MARIADB';
-    if (variables.get(`${prefix}_DB`) !== options.database && options.kind === 'postgres') throw new Error('Candidate database identity mismatch.');
-    if (variables.get('MARIADB_DATABASE') !== options.database && options.kind === 'mariadb') throw new Error('Candidate database identity mismatch.');
-    if (variables.get(`${prefix}_USER`) !== options.user) throw new Error('Candidate user identity mismatch.');
-    const dataPath = options.kind === 'postgres' ? '/var/lib/postgresql/data' : '/var/lib/mysql';
+    if (options.kind === 'postgres' && (variables.get('POSTGRES_DB') !== options.database || variables.get('POSTGRES_USER') !== options.user)) throw new Error('Candidate database identity mismatch.');
+    if (options.kind === 'mariadb' && (variables.get('MARIADB_DATABASE') !== options.database || variables.get('MARIADB_USER') !== options.user)) throw new Error('Candidate database identity mismatch.');
+    if (options.kind === 'mysql' && (variables.get('MYSQL_DATABASE') !== options.database || variables.get('MYSQL_USER') !== options.user)) throw new Error('Candidate database identity mismatch.');
+    if (options.kind === 'mongodb' && (variables.get('MONGO_INITDB_DATABASE') !== options.database || variables.get('MONGO_INITDB_ROOT_USERNAME') !== options.user)) throw new Error('Candidate database identity mismatch.');
+    const dataPath = options.kind === 'postgres' ? '/var/lib/postgresql/data' : options.kind === 'mongodb' ? '/data/db' : '/var/lib/mysql';
     const volumeName = `panel-restore-${options.operationId}`;
     const mounts = info.Mounts;
     const tmpfs = info.HostConfig.Tmpfs ?? {}, ephemeral = Object.keys(tmpfs).length === 1 && tmpfs['/run/secrets'] === 'rw,noexec,nosuid,nodev,size=1m,mode=0700';
@@ -67,7 +67,14 @@ empty=$(psql -X -w -h 127.0.0.1 -U "$1" -d "$2" -v ON_ERROR_STOP=1 -tA -c "SELEC
   const mariadb = `set -eu; MYSQL_PWD="$(cat /run/secrets/panel-db-password)"; export MYSQL_PWD
 empty=$(mariadb --no-defaults -h 127.0.0.1 -u "$1" "$2" --batch --skip-column-names -e "SELECT (NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE()) AND NOT EXISTS (SELECT 1 FROM information_schema.routines WHERE routine_schema=DATABASE()) AND NOT EXISTS (SELECT 1 FROM information_schema.triggers WHERE trigger_schema=DATABASE()) AND NOT EXISTS (SELECT 1 FROM information_schema.events WHERE event_schema=DATABASE()))")
 [ "$empty" = 1 ]; exec timeout 300 mariadb --no-defaults -h 127.0.0.1 -u "$1" "$2" --default-character-set=utf8mb4`;
-  const child = spawn('docker', ['--host', host, 'exec', '-i', options.containerId, 'sh', '-c', options.kind === 'postgres' ? postgres : mariadb, 'servus-import', options.user, options.database],
+  const mysql = `set -eu; MYSQL_PWD="$(cat /run/secrets/panel-db-password)"; export MYSQL_PWD
+empty=$(mysql --no-defaults -h 127.0.0.1 -u "$1" "$2" --batch --skip-column-names -e "SELECT (NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE()) AND NOT EXISTS (SELECT 1 FROM information_schema.routines WHERE routine_schema=DATABASE()) AND NOT EXISTS (SELECT 1 FROM information_schema.triggers WHERE trigger_schema=DATABASE()) AND NOT EXISTS (SELECT 1 FROM information_schema.events WHERE event_schema=DATABASE()))")
+[ "$empty" = 1 ]; exec timeout 300 mysql --no-defaults -h 127.0.0.1 -u "$1" "$2" --default-character-set=utf8mb4`;
+  const mongodb = `set -eu; MONGO_PASS="$(cat /run/secrets/panel-db-password)"
+empty=$(mongosh --quiet --host 127.0.0.1 --username "$1" --password "$MONGO_PASS" --authenticationDatabase admin --eval "db.getSiblingDB('$2').getCollectionNames().length === 0 ? 1 : 0")
+[ "$empty" = 1 ]; exec timeout 300 mongorestore --host 127.0.0.1 --username "$1" --password "$MONGO_PASS" --authenticationDatabase admin --archive`;
+  const script = options.kind === 'postgres' ? postgres : options.kind === 'mariadb' ? mariadb : options.kind === 'mysql' ? mysql : mongodb;
+  const child = spawn('docker', ['--host', host, 'exec', '-i', options.containerId, 'sh', '-c', script, 'servus-import', options.user, options.database],
     { stdio: ['pipe', 'ignore', 'ignore'], env: childEnvironment() });
   let received = 0; const hash = createHash('sha256');
   const limit = new Transform({ transform(chunk: Buffer, _encoding, callback) { received += chunk.length; if(received > maximumBytes)return callback(new Error('Import exceeds the supported size.'));hash.update(chunk);callback(null,chunk); } });

@@ -7,7 +7,7 @@ import { WorkspaceShowcase } from './WorkspaceShowcase';
 
 const INSTALL_COMMAND = 'curl -fsSL https://servus.run/install.sh | sudo bash';
 const REPO_URL = 'https://github.com/raxon/servus';
-const RELEASE_URL = 'https://github.com/raxon/servus/releases/tag/v0.1.61';
+const RELEASE_URL = 'https://github.com/raxon/servus/releases/tag/v0.2.0';
 
 interface FeatureItem {
   icon: IconName;
@@ -54,32 +54,32 @@ const FEATURES: FeatureItem[] = [
     eyebrow: 'WORKLOADS',
     title: 'Apps, Git repos & Compose',
     description:
-      'Run Docker images, Dockerfile builds, or multi-container Compose stacks from inline YAML or Git. Start faster with verified templates for WordPress, n8n, Uptime Kuma, Grafana, and MinIO.',
-    tags: ['GitHub webhooks', 'SSH & PAT', 'Force rebuild', 'Compose templates'],
+      'Run Docker images, Dockerfile builds, or multi-container Compose stacks from inline YAML or public/private Git. Share project env vars, run saved scripts, and control build concurrency.',
+    tags: ['Private Git Compose', 'Shared env', 'Saved scripts', '5 templates'],
   },
   {
     icon: 'database',
     eyebrow: 'DATA',
     title: 'Private managed databases',
     description:
-      'Provision PostgreSQL 17, MariaDB 11.4, and Redis 7 on isolated project networks with persistent volumes, optional admin-only external TCP access, logical exports, and candidate-verified restore.',
-    tags: ['PostgreSQL 17', 'MariaDB 11.4', 'Redis 7', 'Verified restore'],
+      'Provision PostgreSQL 17/18, MariaDB 11.4, MySQL 8.4, MongoDB 7, and Redis 7 on isolated project networks with optional external TCP access, live password rotation, and verified restore.',
+    tags: ['PostgreSQL 17/18', 'MySQL & MariaDB', 'MongoDB & Redis', 'Password rotation'],
   },
   {
     icon: 'globe',
     eyebrow: 'NETWORKING',
     title: 'Traefik routing & edge controls',
     description:
-      'Configure HTTPS domains with ACME TLS alongside path-prefix matching, strip-prefix, IPv4/IPv6 CIDR allow-lists, htpasswd Basic Auth, redirect rules, and Swarm DNSRR.',
-    tags: ['Automatic HTTPS', 'IP allow-list', 'Basic Auth', 'TCP/UDP ports'],
+      'Configure HTTPS domains with ACME TLS alongside path-prefix matching, strip-prefix, IPv4/IPv6 CIDR allow-lists with Trusted Proxies, htpasswd Basic Auth, redirect rules, and Swarm DNSRR.',
+    tags: ['Automatic HTTPS', 'Trusted Proxies', 'Basic Auth', 'TCP/UDP ports'],
   },
   {
     icon: 'hard-drive',
     eyebrow: 'RECOVERY',
     title: 'Encrypted backups & snapshots',
     description:
-      'Schedule database and volume backups to local storage, S3, or Cloudflare R2 with AES-256-GCM encryption and count, age, or GFS retention. Verify installation snapshots before recovery.',
-    tags: ['S3 & Cloudflare R2', 'AES-256-GCM', 'GFS retention', 'Integrity checks'],
+      'Schedule database and volume backups to local storage, S3, or Cloudflare R2 with AES-256-GCM encryption and count, age, or GFS retention. Verify and download installation snapshots with restore checklists.',
+    tags: ['S3 & Cloudflare R2', 'AES-256-GCM', 'GFS retention', 'Snapshot download'],
   },
   {
     icon: 'activity',
@@ -94,8 +94,8 @@ const FEATURES: FeatureItem[] = [
     eyebrow: 'ACCESS & AUTOMATION',
     title: 'RBAC, CLI, API & MCP server',
     description:
-      'Require TOTP MFA with recovery codes, assign project roles (admin, editor, viewer), mint project-scoped read or deploy tokens, and automate via OpenAPI 3.1, CLI, or stdio MCP.',
-    tags: ['TOTP MFA', 'Project RBAC', 'OpenAPI 3.1', 'CLI & MCP'],
+      'Require TOTP MFA with recovery codes, assign project roles (admin, editor, viewer), mint project-scoped read or deploy tokens, and automate services, Compose, env, and scripts via OpenAPI 3.1, CLI, or MCP.',
+    tags: ['TOTP MFA', 'Compose API/MCP', 'OpenAPI 3.1', 'CLI & MCP'],
   },
 ];
 
@@ -392,7 +392,7 @@ function App() {
           <div className="hero-grid-bg" aria-hidden="true" />
           <div className="shell hero-inner">
             <a className="release-pill" href={RELEASE_URL} target="_blank" rel="noreferrer">
-              <span className="pill-tag">Beta v0.1.61</span>
+              <span className="pill-tag">v0.2.0</span>
               <span className="pill-copy">
                 Signed linux/amd64 releases
                 <Icon name="arrow-up-right" size={14} />
@@ -652,7 +652,7 @@ function App() {
           <div className="status-banner" id="status">
             <div className="status-banner-badge">
               <Icon name="git" size={15} />
-              <span>CURRENT RELEASE · v0.1.61 (BETA)</span>
+              <span>CURRENT RELEASE · v0.2.0</span>
             </div>
             <p>
               Servus is in active beta for single-server Linux (amd64) Docker Swarm hosts. Validate
@@ -700,7 +700,7 @@ function App() {
               GitHub
             </a>
             <a href={RELEASE_URL} target="_blank" rel="noreferrer">
-              v0.1.61 Release
+              v0.2.0 Release
             </a>
             <a href="/install.sh">install.sh</a>
             <a href={`${REPO_URL}/blob/main/LICENSE`} target="_blank" rel="noreferrer">

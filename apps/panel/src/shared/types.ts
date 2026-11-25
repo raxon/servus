@@ -5,7 +5,7 @@ export type ActionStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canc
 export interface User { id: string; email: string; role: 'admin' | 'member'; createdAt: string }
 export interface SessionResponse { user: User; csrfToken: string }
 export interface Project { id: string; name: string; description: string; createdAt: string; serviceCount: number; canWrite?: boolean }
-export type ServiceKind = 'app' | 'postgres' | 'redis' | 'mariadb';
+export type ServiceKind = 'app' | 'postgres' | 'redis' | 'mariadb' | 'mysql' | 'mongodb';
 export interface GitCredential { username: string; token?: string; secretRef?: string }
 export type {RegistryCredential,GitSshCredential} from './source-credentials.js';
 export interface DeploymentOptions { forceRebuild?: boolean }
@@ -13,6 +13,7 @@ export interface BuildResourceConfig { cpuQuotaPercent?: number; memoryMb?: numb
 export type SourceConfig = { type: 'image' } | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string; envFile?: string; buildResources?: BuildResourceConfig; credential?: GitCredential; sharedGithub?: boolean;ssh?:import('./source-credentials.js').GitSshCredential };
 export interface EnvironmentVariable { name: string; value?: string; secret?: boolean; secretRef?: string }
 export interface DomainBasicAuth { users: string[] }
+export interface DomainTrustedProxies { depth?: number; excludedIps?: string[] }
 export interface DomainConfig {
   hostname: string;
   port: number;
@@ -22,6 +23,7 @@ export interface DomainConfig {
   pathPrefix?: string;
   stripPrefix?: boolean;
   ipAllowList?: string[];
+  trustedProxies?: DomainTrustedProxies;
   basicAuth?: DomainBasicAuth;
   redirectTarget?: string;
   redirectPermanent?: boolean;

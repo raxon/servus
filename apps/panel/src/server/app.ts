@@ -33,6 +33,7 @@ import { registerBackups } from './backups.js';
 import { registerMetricsHistory } from './metrics-history.js';
 import { registerLogsHistory } from './logs-history.js';
 import { registerAlerts } from './alerts.js';
+import { registerWorkspaceExtras } from './workspace-extras.js';
 import { registerVolumeBackups } from './volume-backups.js';
 import { registerGithubRepositories } from './github-repositories.js';
 import { registerReleaseNotes } from './release-notes.js';
@@ -49,7 +50,7 @@ const credentials = z.object({ email: z.string().email().max(254), password: z.s
 const restoreStatusSchema = z.object({
   operationId:z.string().regex(/^[a-f0-9]{32}$/),
   phase:z.enum(['uploading','reserved','discarding','discarding_candidate','importing','prepared','switching','needs_review','completed','cancelled']),
-  kind:z.enum(['postgres','mariadb','redis']),
+  kind:z.enum(['postgres','mariadb','redis','mysql','mongodb']),
   stage:z.enum(['pending','candidate_stop','candidate_detached','applying','applied','rolling_back','rolled_back']).optional(),
   reviewPhase:z.enum(['uploading','reserved','discarding','importing','prepared','switching']).optional(),
   recoveryReason:z.enum(['legacy_upload_unverified','preparation_unverified']).optional(),
@@ -231,6 +232,7 @@ export async function createApp(options: AppOptions) {
   registerUpdates(app,{administrator,socketPath:options.updaterSocketPath,applyEnabled:options.updaterApplyEnabled,currentVersion:options.updaterCurrentVersion ?? BUILD_INFO.version});
   registerInstallationBackups(app,{administrator,socketPath:options.updaterSocketPath,applyEnabled:options.updaterApplyEnabled,approvalSecretPath:options.installationBackupApprovalSecretPath});
   registerAlerts(app,{store,administrator,metricsHistory,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance,startEvaluator:options.alertsEvaluator?.start,intervalMs:options.alertsEvaluator?.intervalMs,now:options.alertsEvaluator?.now,fetch:options.alertsEvaluator?.fetch});
+  registerWorkspaceExtras(app,{store,session,projectAccess,administrator,agentRequest:runtimeRequest,agentConnection:options.agentConnection});
   registerReleaseNotes(app,{administrator});
   registerGithubRepositories(app,{store,administrator});
   app.get(`${prefix}/integrations/github`,async req=>{
@@ -505,7 +507,7 @@ export async function createApp(options: AppOptions) {
       administrator(req);
       const result=serviceAccess(req,req.params.id);
       projectAccess(result.auth.user,result.service.projectId,true);
-      if(!['postgres','mariadb','redis'].includes(result.service.kind??''))throw new AppError('DATABASE_REQUIRED','Port suggestions are available only for managed databases',400);
+      if(!['postgres','mariadb','redis','mysql','mongodb'].includes(result.service.kind??''))throw new AppError('DATABASE_REQUIRED','Port suggestions are available only for managed databases',400);
       return result.service;
     };
     const service=authorize();
@@ -528,6 +530,28 @@ export async function createApp(options: AppOptions) {
   });
   app.get<{Params:{id:string}}>(`${prefix}/services/:id/connection`,async req=>{const {service}=serviceAccess(req,req.params.id);const result=await databaseConnection(service);serviceAccess(req,req.params.id);return result;});
   app.post<{Params:{id:string}}>(`${prefix}/services/:id/connection/reveal`,async req=>{const {service}=serviceAccess(req,req.params.id,true);const result=await databaseConnection(service);const {auth}=serviceAccess(req,req.params.id,true);result.password=store.connectionInfo(req.params.id,true).password;store.recordAudit(auth.user.id,'connection.reveal',req.params.id);return result;});
+  app.post<{Params:{id:string}}>(`${prefix}/services/:id/database/rotate-password`,{config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async(req,reply)=>{
+    const {auth,service}=serviceAccess(req,req.params.id,true);
+    if(!service.kind||service.kind==='app')throw new AppError('NOT_FOUND','Managed database not found',404);
+    if(service.deployedRevision===null||service.state!=='running')throw new AppError('DATABASE_NOT_RUNNING','Database must be deployed and running to rotate its password',409);
+    const input=z.object({
+      confirm:z.literal(true),
+      password:z.string().regex(/^[A-Za-z0-9._~@!#%^&*()+-]{12,128}$/,'Password must be 12-128 safe ASCII characters without spaces or quotes').optional(),
+    }).strict().parse(req.body);
+    if(store.db.prepare("SELECT id FROM jobs WHERE service_id=? AND status IN ('queued','running')").get(service.id)) {
+      throw new AppError('SERVICE_BUSY','Another operation is already queued or running for this service',409);
+    }
+    const connection=store.connectionInfo(service.id);
+    const newPassword=input.password ?? randomBytes(24).toString('base64url');
+    try {
+      await runtimeRequest(`/services/${service.id}/database/rotate-password`,{kind:service.kind,database:connection.database,user:connection.user,newPassword},{...options.agentConnection,timeoutMs:45_000});
+    } catch(error) {
+      if(error instanceof AgentRequestError && error.certainty==='definitive')throw new AppError(error.code??'ROTATION_FAILED',store.vault.redact(error.message),error.statusCode??422);
+      throw error;
+    }
+    const rotated=store.rotateDatabasePassword(service.id,newPassword,auth.user.id);
+    return reply.code(202).send({...rotated,rotatedAt:new Date().toISOString()});
+  });
   app.post<{Params:{id:string}}>(`${prefix}/services/:id/database-export`,async(req,reply)=>{
     const {auth,service}=serviceAccess(req,req.params.id,true);
     z.object({}).strict().parse(req.body??{});
@@ -538,7 +562,7 @@ export async function createApp(options: AppOptions) {
     try {
       const upstream=await (options.databaseExport??agentDatabaseExport)(service.id,{kind:service.kind,database:connection.database,user:connection.user},options.agentConnection);
       const length=upstream.headers['content-length'],extension=upstream.headers['x-export-extension'];
-      const expected={postgres:'dump',mariadb:'sql',redis:'rdb'}[service.kind];
+      const expected={postgres:'dump',mariadb:'sql',mysql:'sql',redis:'rdb',mongodb:'archive'}[service.kind];
       if(typeof length!=='string'||! /^[1-9][0-9]*$/.test(length)||Number(length)>2*1024*1024*1024||extension!==expected){
         upstream.destroy();throw new AppError('EXPORT_INVALID','The database export response is invalid',502);
       }
@@ -574,7 +598,7 @@ export async function createApp(options: AppOptions) {
       onRequest: async req => {
         const {service} = serviceAccess(req,req.params.id,true);
         if (!/^[a-f0-9]{32}$/.test(req.params.operationId)) throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
-        if (!['postgres','mariadb','redis'].includes(service.kind || '')) throw new AppError('NOT_FOUND','Managed database not found',404);
+        if (!['postgres','mariadb','redis','mysql','mongodb'].includes(service.kind || '')) throw new AppError('NOT_FOUND','Managed database not found',404);
         store.connectionInfo(service.id);
         const size = req.headers['content-length'];
         if (typeof size !== 'string' || !/^[1-9][0-9]*$/.test(size) || Number(size) > 2*1024*1024*1024 || req.headers['content-type']?.split(';',1)[0]?.trim().toLowerCase() !== 'application/octet-stream') throw new AppError('INVALID_UPLOAD','Invalid database restore upload',400);
@@ -587,7 +611,7 @@ export async function createApp(options: AppOptions) {
       req.raw.once('aborted',abort); reply.raw.once('close',abort);
       store.recordAudit(auth.user.id,'database.restore.upload.started',service.id);
       try {
-        const result = await agentDatabaseUpload(service.id,{operationId:req.params.operationId,kind:service.kind as 'postgres'|'mariadb'|'redis',size:Number(req.headers['content-length']),stream:req.body,signal:controller.signal},options.agentConnection);
+        const result = await agentDatabaseUpload(service.id,{operationId:req.params.operationId,kind:service.kind as 'postgres'|'mariadb'|'redis'|'mysql'|'mongodb',size:Number(req.headers['content-length']),stream:req.body,signal:controller.signal},options.agentConnection);
         store.recordAudit(auth.user.id,'database.restore.upload.staged',service.id);
         return result;
       } finally { req.raw.off('aborted',abort); reply.raw.off('close',abort); }
@@ -659,7 +683,7 @@ export async function createApp(options: AppOptions) {
     app.post<{Params:{id:string;operationId:string}}>(`${prefix}/services/:id/database-restore/:operationId/${action}`,async req => {
       const {auth,service}=serviceAccess(req,req.params.id,true);
       if(!/^[a-f0-9]{32}$/.test(req.params.operationId))throw new AppError('INVALID_RESTORE','Invalid database restore identity',400);
-      if(!['postgres','mariadb','redis'].includes(service.kind || '')||(['rollback','recover'].includes(action)&&service.kind!=='redis'))throw new AppError('NOT_FOUND','Managed database not found',404);
+      if(!['postgres','mariadb','redis','mysql','mongodb'].includes(service.kind || '')||(['rollback','recover'].includes(action)&&service.kind!=='redis'))throw new AppError('NOT_FOUND','Managed database not found',404);
       if(action==='commit'||action==='rollback')z.object({confirm:z.literal(true)}).strict().parse(req.body);
       else z.object({}).strict().parse(req.body ?? {});
       store.connectionInfo(service.id);

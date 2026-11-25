@@ -649,6 +649,26 @@ export class Store {
     }}
     catch(error){this.constraintError(error);}
   }
+  rotateDatabasePassword(serviceId: string, newPassword: string, actorId: string): { service: Service; action: Action } {
+    return this.db.transaction(() => {
+      const service = this.getService(serviceId);
+      if (!service || !service.kind || service.kind === 'app') throw new AppError('NOT_FOUND', 'Managed database not found', 404);
+      if (service.deployedRevision === null) throw new AppError('DATABASE_NOT_DEPLOYED', 'Deploy this database before rotating its password', 409);
+      if (this.db.prepare("SELECT id FROM jobs WHERE service_id=? AND status IN ('queued','running')").get(serviceId)) {
+        throw new AppError('SERVICE_BUSY', 'Another operation is already queued or running for this service', 409);
+      }
+      const nextRevision = service.revision + 1;
+      const newRef = this.putServiceSecret(serviceId, newPassword, 'database');
+      const row = this.db.prepare('SELECT config FROM services WHERE id=?').get(serviceId) as { config: string };
+      const config = JSON.parse(row.config || '{}') as import('../shared/types.js').ServiceConfiguration;
+      const currentDb = config.database ?? { database: 'app', user: 'app' };
+      config.database = { database: currentDb.database, user: currentDb.user, passwordSecretRef: newRef };
+      this.db.prepare('UPDATE services SET revision=?,config=?,updated_at=? WHERE id=?').run(nextRevision, JSON.stringify(config), now(), serviceId);
+      this.recordAudit(actorId, 'database.password.rotated', serviceId);
+      const action = this.createAction(serviceId, 'deploy', actorId, `rotate-db-password:${serviceId}:${nextRevision}`);
+      return { service: this.getService(serviceId)!, action };
+    }).immediate();
+  }
   connectionInfo(serviceId:string,reveal=false):import('../shared/types.js').ConnectionInfo {
     const service=this.getService(serviceId);
     if(!service||!service.kind||service.kind==='app')throw new AppError('NOT_FOUND','Managed database not found',404);

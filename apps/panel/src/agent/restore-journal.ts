@@ -3,11 +3,12 @@ import { validateRestoreBinding } from './restore-binding.js';
 
 export type RestorePhase = 'uploading' | 'reserved' | 'discarding' | 'discarding_candidate' | 'importing' | 'prepared' | 'switching' | 'needs_review' | 'completed' | 'cancelled';
 export type RestoreReviewPhase = 'uploading' | 'reserved' | 'discarding' | 'importing' | 'prepared' | 'switching';
-export type RestoreRecord = { id: string; service_id: string; kind: 'postgres' | 'mariadb' | 'redis'; archive_sha256: string; phase: RestorePhase; updated_at: string };
+export type RestoreDatabaseKind = 'postgres' | 'mariadb' | 'redis' | 'mysql' | 'mongodb';
+export type RestoreRecord = { id: string; service_id: string; kind: RestoreDatabaseKind; archive_sha256: string; phase: RestorePhase; updated_at: string };
 export type RestoreSwitchStage = 'pending'|'candidate_stop'|'candidate_detached'|'applying'|'applied'|'rolling_back'|'rolled_back';
 export type RestoreSwitchIntent = { id:string; service_id:string; service_version:number; sealed_plan:string; created_at:string; stage:RestoreSwitchStage };
 export type RetainedRestoreVolume = {operation_id:string;service_id:string;volume_name:string;reason:'rollback_candidate'|'pre_restore_source';created_at:string};
-export type RestoreVolumeBinding = {service_id:string;operation_id:string;volume_name:string;kind:'postgres'|'mariadb'|'redis';created_at:string};
+export type RestoreVolumeBinding = {service_id:string;operation_id:string;volume_name:string;kind:RestoreDatabaseKind;created_at:string};
 const idPattern = /^[a-f0-9]{32}$/;
 const servicePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
@@ -29,14 +30,14 @@ export class RestoreJournal {
   constructor(db: Database.Database, isLocked: (serviceId: string) => boolean) {
     this.db = db; this.isLocked = isLocked;
     const createTable = `CREATE TABLE restore_operations (
-      id TEXT PRIMARY KEY, service_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('postgres','mariadb','redis')),
+      id TEXT PRIMARY KEY, service_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('postgres','mariadb','redis','mysql','mongodb')),
       archive_sha256 TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('uploading','reserved','discarding','discarding_candidate','importing','prepared','switching','needs_review','completed','cancelled')),
       updated_at TEXT NOT NULL
     )`;
     db.transaction(() => {
       const table = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_operations'").get() as { sql: string } | undefined;
       if (!table) db.exec(createTable);
-      else if (!table.sql.includes("'uploading'") || !table.sql.includes("'discarding'") || !table.sql.includes("'discarding_candidate'")) {
+      else if (!table.sql.includes("'uploading'") || !table.sql.includes("'discarding'") || !table.sql.includes("'discarding_candidate'") || !table.sql.includes("'mysql'") || !table.sql.includes("'mongodb'")) {
         if (!['reserved','importing','prepared','switching','needs_review','completed','cancelled'].every(phase => table.sql.includes(`'${phase}'`))) throw new Error('Unsupported restore journal schema.');
         db.exec('DROP INDEX IF EXISTS restore_one_active_per_service; ALTER TABLE restore_operations RENAME TO restore_operations_old');
         db.exec(createTable);
@@ -56,10 +57,10 @@ export class RestoreJournal {
       const retainedTable=db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_retained_volumes'").get() as {sql:string}|undefined;
       if(!retainedTable)db.exec(retainedSchema);
       else if(!retainedTable.sql.includes("'pre_restore_source'")){db.exec('ALTER TABLE restore_retained_volumes RENAME TO restore_retained_volumes_old');db.exec(retainedSchema);db.exec('INSERT INTO restore_retained_volumes SELECT * FROM restore_retained_volumes_old; DROP TABLE restore_retained_volumes_old');}
-      const bindingSchema="CREATE TABLE restore_volume_bindings (service_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, volume_name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(kind IN ('postgres','mariadb','redis')), created_at TEXT NOT NULL)";
+      const bindingSchema="CREATE TABLE restore_volume_bindings (service_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, volume_name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(kind IN ('postgres','mariadb','redis','mysql','mongodb')), created_at TEXT NOT NULL)";
       const bindingTable=db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_volume_bindings'").get() as {sql:string}|undefined;
       if(!bindingTable)db.exec(bindingSchema);
-      else if(!bindingTable.sql.includes("'redis'")){db.exec('ALTER TABLE restore_volume_bindings RENAME TO restore_volume_bindings_old');db.exec(bindingSchema);db.exec('INSERT INTO restore_volume_bindings SELECT * FROM restore_volume_bindings_old; DROP TABLE restore_volume_bindings_old');}
+      else if(!bindingTable.sql.includes("'redis'") || !bindingTable.sql.includes("'mysql'") || !bindingTable.sql.includes("'mongodb'")){db.exec('ALTER TABLE restore_volume_bindings RENAME TO restore_volume_bindings_old');db.exec(bindingSchema);db.exec('INSERT INTO restore_volume_bindings SELECT * FROM restore_volume_bindings_old; DROP TABLE restore_volume_bindings_old');}
     }).immediate();
   }
   get(id: string): RestoreRecord | undefined { return this.db.prepare('SELECT * FROM restore_operations WHERE id=?').get(id) as RestoreRecord | undefined; }
@@ -82,7 +83,7 @@ export class RestoreJournal {
       !this.db.prepare("SELECT 1 FROM restore_operations WHERE id<>? AND phase NOT IN ('completed','cancelled') LIMIT 1").get(id);
   }
   reserve(input: { id: string; serviceId: string; kind: RestoreRecord['kind']; archiveSha256: string }): RestoreRecord {
-    if (!idPattern.test(input.id) || !servicePattern.test(input.serviceId) || !digestPattern.test(input.archiveSha256) || !['postgres', 'mariadb', 'redis'].includes(input.kind)) throw new Error('Invalid restore intent.');
+    if (!idPattern.test(input.id) || !servicePattern.test(input.serviceId) || !digestPattern.test(input.archiveSha256) || !['postgres', 'mariadb', 'redis', 'mysql', 'mongodb'].includes(input.kind)) throw new Error('Invalid restore intent.');
     return this.db.transaction(() => {
       const existing = this.get(input.id);
       if (existing) {
@@ -95,7 +96,7 @@ export class RestoreJournal {
     }).immediate();
   }
   beginUpload(input: { id: string; serviceId: string; kind: RestoreRecord['kind']; lockId?:string }): RestoreRecord {
-    if (!idPattern.test(input.id) || !servicePattern.test(input.serviceId) || !['postgres', 'mariadb','redis'].includes(input.kind) || (input.lockId!==undefined&&(!idPattern.test(input.lockId)||input.lockId==='0'.repeat(32)))) throw new Error('Invalid restore upload.');
+    if (!idPattern.test(input.id) || !servicePattern.test(input.serviceId) || !['postgres', 'mariadb','redis','mysql','mongodb'].includes(input.kind) || (input.lockId!==undefined&&(!idPattern.test(input.lockId)||input.lockId==='0'.repeat(32)))) throw new Error('Invalid restore upload.');
     return this.db.transaction(() => {
       if (this.get(input.id) || this.isLocked(input.serviceId) || this.hasUnresolved(input.serviceId) || this.db.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(input.serviceId)) throw new Error('Service has an unresolved operation.');
       // During uploading there is no archive digest yet. A repeated, nonzero lock
@@ -147,13 +148,13 @@ export class RestoreJournal {
   }
   retainedVolume(id:string):RetainedRestoreVolume|undefined { return this.db.prepare('SELECT * FROM restore_retained_volumes WHERE operation_id=?').get(id) as RetainedRestoreVolume|undefined; }
   volumeBinding(serviceId:string):RestoreVolumeBinding|undefined { return this.db.prepare('SELECT * FROM restore_volume_bindings WHERE service_id=?').get(serviceId) as RestoreVolumeBinding|undefined; }
-  validatedVolumeBinding(serviceId:string,kind:'postgres'|'mariadb'|'redis'):RestoreVolumeBinding|undefined { return validateRestoreBinding(this.db,serviceId,kind); }
+  validatedVolumeBinding(serviceId:string,kind:RestoreDatabaseKind):RestoreVolumeBinding|undefined { return validateRestoreBinding(this.db,serviceId,kind); }
   completeSwitch(id:string,serviceId:string,sourceVolume:string):RestoreRecord {
     if(!idPattern.test(id)||!servicePattern.test(serviceId))throw new Error('Invalid restore switch identity.');
     return this.db.transaction(()=>{
       const record=this.get(id),binding=this.volumeBinding(serviceId),target=`panel-restore-${id}`;
       if(record?.phase==='completed'&&record.service_id===serviceId&&binding?.operation_id===id&&binding.volume_name===target&&this.retainedVolume(id)?.reason==='pre_restore_source'&&this.retainedVolume(id)?.volume_name===sourceVolume)return record;
-      if(!record||record.service_id!==serviceId||record.phase!=='switching'||!['postgres','mariadb','redis'].includes(record.kind)||this.switchIntent(id)?.stage!=='applied'||this.retainedVolume(id))throw new Error('Restore switch is not ready for completion.');
+      if(!record||record.service_id!==serviceId||record.phase!=='switching'||!['postgres','mariadb','redis','mysql','mongodb'].includes(record.kind)||this.switchIntent(id)?.stage!=='applied'||this.retainedVolume(id))throw new Error('Restore switch is not ready for completion.');
       if(sourceVolume!==(binding?.volume_name??`panel-data-${serviceId}-database`)||sourceVolume===target)throw new Error('Original database volume binding changed.');
       const prior=binding?this.get(binding.operation_id):undefined;
       if(binding&&(binding.kind!==record.kind||binding.volume_name!==`panel-restore-${binding.operation_id}`||prior?.phase!=='completed'||prior.service_id!==serviceId||prior.kind!==record.kind))throw new Error('Previous database volume binding is invalid.');

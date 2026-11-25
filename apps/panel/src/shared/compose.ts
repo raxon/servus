@@ -1,9 +1,20 @@
 import { z } from 'zod';
 
 export const composeName = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,62}$/);
+export const composeGitCredentialSchema = z.object({
+  username: z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),
+  token: z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),
+}).strict();
 export const composeSourceSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('inline'), yaml: z.string().min(1).max(256 * 1024) }).strict(),
-  z.object({ type: z.literal('git'), repository: z.string().url().max(1000), branch: z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/), path: z.string().min(1).max(255).refine(value => !value.startsWith('/') && !/[\\\x00-\x1f]/.test(value) && value.split('/').every(part => part && part !== '.' && part !== '..' && part !== '.git')) }).strict(),
+  z.object({
+    type: z.literal('git'),
+    repository: z.string().url().max(1000),
+    branch: z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/),
+    path: z.string().min(1).max(255).refine(value => !value.startsWith('/') && !/[\\\x00-\x1f]/.test(value) && value.split('/').every(part => part && part !== '.' && part !== '..' && part !== '.git')),
+    sharedGithub: z.boolean().optional(),
+    credential: composeGitCredentialSchema.optional(),
+  }).strict(),
 ]);
 export const composeDomainSchema = z.object({ hostname: z.string().min(1).max(253).toLowerCase().refine(value => value.split('.').every(part => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(part))), service: composeName, port: z.number().int().min(1).max(65535), https: z.boolean().default(false), redirectHttps: z.boolean().optional() }).strict().refine(value=>!value.redirectHttps||value.https,{message:'HTTP redirects require HTTPS for the same domain',path:['redirectHttps']});
 export const composeConfigSchema = z.object({ source: composeSourceSchema, domains: z.array(composeDomainSchema).max(20).default([]) }).strict();

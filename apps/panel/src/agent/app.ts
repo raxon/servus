@@ -54,11 +54,11 @@ const input = z.object({
     revision: z.number().int().positive(), deployedRevision: z.number().int().nullable(),
     state: z.enum(['pending', 'running', 'stopped', 'deploying', 'failed', 'unknown']),
     createdAt: z.string(), updatedAt: z.string(), lastError: z.string().nullable(),
-    kind: z.enum(['app','postgres','redis','mariadb']).optional(),
+    kind: z.enum(['app','postgres','redis','mariadb','mysql','mongodb']).optional(),
     source: z.discriminatedUnion('type', [z.object({type:z.literal('image')}), z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256),envFile:z.string().max(255).optional(),buildResources:z.object({cpuQuotaPercent:z.number().int().min(10).max(1600).optional(),memoryMb:z.number().int().min(128).max(65536).optional(),timeoutSeconds:z.number().int().min(30).max(1800).optional()}).strict().optional(),credential:z.object({username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().optional(),ssh:z.object({knownHosts:z.string().min(1).max(16384),secretRef:z.string().uuid(),publicKey:z.string().max(1000)}).strict().optional()})]).optional(),
     registry:z.object({server:z.string().min(1).max(253),username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().nullable().optional(),
     environment: z.array(z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32768).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).refine(value=>!value.secret||Boolean(value.secretRef)&&value.value===undefined)).max(100).optional(),
-    domains: z.array(z.object({hostname,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional(),pathPrefix:z.string().min(1).max(128).optional(),stripPrefix:z.boolean().optional(),ipAllowList:z.array(z.string().min(3).max(64)).min(1).max(32).optional(),basicAuth:z.object({users:z.array(z.string().min(10).max(200)).min(1).max(20)}).strict().optional(),redirectTarget:z.string().url().max(500).optional(),redirectPermanent:z.boolean().optional()})).max(20).optional(),
+    domains: z.array(z.object({hostname,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional(),pathPrefix:z.string().min(1).max(128).optional(),stripPrefix:z.boolean().optional(),ipAllowList:z.array(z.string().min(3).max(64)).min(1).max(32).optional(),trustedProxies:z.object({depth:z.number().int().min(1).max(10).optional(),excludedIps:z.array(z.string().min(3).max(64)).min(1).max(32).optional()}).strict().optional(),basicAuth:z.object({users:z.array(z.string().min(10).max(200)).min(1).max(20)}).strict().optional(),redirectTarget:z.string().url().max(500).optional(),redirectPermanent:z.boolean().optional()})).max(20).optional(),
     mounts: z.array(z.object({type:z.enum(['volume','file','bind']),name:z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/),target:z.string().startsWith('/').max(256),readOnly:z.boolean().optional(),content:z.string().max(32768).optional(),source:z.string().max(512).optional()})).max(20).optional(),
     resources: z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).optional(),
     database: z.object({database:z.string().min(1).max(63),user:z.string().min(1).max(63),passwordSecretRef:z.string().uuid().optional()}).strict().optional(),
@@ -256,8 +256,102 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if(operation==='logs') { const parsed=query.safeParse(req.query); if(!parsed.success)return reply.code(400).send({error:{code:'INVALID_QUERY',message:'Invalid log query.'}}); return runtime.logs!(req.params.id,parsed.data.tail,parsed.data.since); }
     return runtime[operation]!(req.params.id);
   });
+  app.post<{Params:{id:string}}>('/services/:id/exec', async (req, reply) => {
+    if (!z.string().uuid().safeParse(req.params.id).success) return reply.code(400).send({ error: { code: 'INVALID_ID', message: 'Invalid service identity.' } });
+    const parsed = z.object({ command: z.string().min(1).max(2000).refine(v => !v.includes('\0')), timeoutSeconds: z.number().int().min(1).max(60).default(30) }).strict().safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: { code: 'INVALID_EXEC', message: 'Invalid script execution request.' } });
+    const release = maintenance?.admit();
+    if (maintenance && !release) return reply.code(503).send({ error: { code: 'MAINTENANCE', message: 'Agent is draining.' } });
+    try {
+      if (!runtime.consoleContainer) return reply.code(503).send({ error: { code: 'RUNTIME_UNAVAILABLE', message: 'Container execution is unavailable.' } });
+      const container = await runtime.consoleContainer(req.params.id);
+      const startedAt = Date.now();
+      const exec = await container.exec({ Cmd: ['/bin/sh', '-c', parsed.data.command], AttachStdout: true, AttachStderr: true, AttachStdin: false, Tty: true });
+      const stream = await exec.start({ Detach: false, Tty: true });
+      const chunks: Buffer[] = [];
+      let total = 0, truncated = false, timedOut = false;
+      const limit = 65536;
+      const timer = setTimeout(() => { timedOut = true; stream.destroy(); }, parsed.data.timeoutSeconds * 1000);
+      timer.unref();
+      try {
+        for await (const raw of stream) {
+          const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+          if (total < limit) {
+            const take = buf.subarray(0, limit - total);
+            chunks.push(take);
+            total += take.length;
+          }
+          if (total >= limit && buf.length > 0) truncated = true;
+        }
+      } catch { /* stream destroyed on timeout */ }
+      finally { clearTimeout(timer); }
+      let exitCode = timedOut ? 124 : 0;
+      if (!timedOut) {
+        try {
+          const inspect = await exec.inspect();
+          exitCode = typeof inspect.ExitCode === 'number' ? inspect.ExitCode : 0;
+        } catch { exitCode = 1; }
+      }
+      const rawOutput = Buffer.concat(chunks).toString('utf8');
+      const output = timedOut ? `${rawOutput}\n[Timed out after ${parsed.data.timeoutSeconds}s]`.trim() : rawOutput;
+      return { exitCode, output: vault.redact(output), truncated, durationMs: Date.now() - startedAt };
+    } finally { release?.(); }
+  });
+  app.post<{Params:{id:string}}>('/services/:id/database/rotate-password', async (req, reply) => {
+    if (!z.string().uuid().safeParse(req.params.id).success) return reply.code(400).send({ error: { code: 'INVALID_ID', message: 'Invalid service identity.' } });
+    const parsed = z.object({
+      kind: z.enum(['postgres', 'mariadb', 'redis', 'mysql', 'mongodb']),
+      database: z.string().regex(/^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/),
+      user: z.string().regex(/^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/),
+      newPassword: z.string().regex(/^[A-Za-z0-9._~@!#%^&*()+-]{12,128}$/),
+    }).strict().safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: { code: 'INVALID_ROTATION', message: 'Invalid database password rotation request.' } });
+    const release = maintenance?.admit();
+    if (maintenance && !release) return reply.code(503).send({ error: { code: 'MAINTENANCE', message: 'Agent is draining.' } });
+    let held = false;
+    try {
+      const unresolved = journal.prepare("SELECT 1 FROM operations WHERE service_id=? AND state='running' LIMIT 1").get(req.params.id);
+      if (unresolved || restores.hasUnresolved(req.params.id) || volumeBackups?.hasUnresolved(req.params.id) || locks.has(req.params.id)) {
+        return reply.code(409).send({ error: { code: 'SERVICE_BUSY', message: 'Another operation is changing this service.' } });
+      }
+      locks.add(req.params.id); held = true;
+      if (!runtime.consoleContainer) return reply.code(503).send({ error: { code: 'RUNTIME_UNAVAILABLE', message: 'Database password rotation is unavailable.' } });
+      const container = await runtime.consoleContainer(req.params.id);
+      const { kind, database, user, newPassword } = parsed.data;
+      let script = '';
+      if (kind === 'postgres') {
+        script = `set -eu; PGPASSWORD="$(cat /run/secrets/panel-db-password)"; export PGPASSWORD; exec psql -X -w -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -v db_user="$ROTATE_DB_USER" -v new_pass="$ROTATE_NEW_PASSWORD" -c "SELECT format('ALTER USER %I WITH PASSWORD %L', :'db_user', :'new_pass') \\gexec"`;
+      } else if (kind === 'mariadb') {
+        script = `set -eu; MYSQL_PWD="$(cat /run/secrets/panel-db-root-password)"; export MYSQL_PWD; exec mariadb --no-defaults -h 127.0.0.1 -u root -e "ALTER USER '\${ROTATE_DB_USER}'@'%' IDENTIFIED BY '\${ROTATE_NEW_PASSWORD}'; FLUSH PRIVILEGES;"`;
+      } else if (kind === 'mysql') {
+        script = `set -eu; MYSQL_PWD="$(cat /run/secrets/panel-db-root-password)"; export MYSQL_PWD; exec mysql --no-defaults -h 127.0.0.1 -u root -e "ALTER USER '\${ROTATE_DB_USER}'@'%' IDENTIFIED BY '\${ROTATE_NEW_PASSWORD}'; FLUSH PRIVILEGES;"`;
+      } else if (kind === 'redis') {
+        script = `set -eu; REDISCLI_AUTH="$(cat /run/secrets/panel-db-password)"; export REDISCLI_AUTH; exec redis-cli --no-auth-warning -h 127.0.0.1 CONFIG SET requirepass "$ROTATE_NEW_PASSWORD"`;
+      } else {
+        script = `set -eu; MONGO_PASS="$(cat /run/secrets/panel-db-password)"; exec mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_PASS" --authenticationDatabase admin --eval 'db.getSiblingDB("admin").changeUserPassword(process.env.ROTATE_DB_USER, process.env.ROTATE_NEW_PASSWORD)'`;
+      }
+      const exec = await container.exec({
+        Cmd: ['/bin/sh', '-c', script],
+        Env: [`ROTATE_DB_USER=${user}`, `ROTATE_DB_NAME=${database}`, `ROTATE_NEW_PASSWORD=${newPassword}`],
+        AttachStdout: true, AttachStderr: true, AttachStdin: false, Tty: false,
+      });
+      const stream = await exec.start({ Detach: false });
+      const timer = setTimeout(() => stream.destroy(), 30_000);
+      timer.unref();
+      try { for await (const _chunk of stream) { /* consume */ } }
+      finally { clearTimeout(timer); }
+      const inspect = await exec.inspect();
+      if (inspect.ExitCode !== 0) {
+        return reply.code(422).send({ error: { code: 'ROTATION_FAILED', message: 'The database rejected the password update.' } });
+      }
+      return { rotated: true };
+    } finally {
+      if (held) locks.delete(req.params.id);
+      release?.();
+    }
+  });
   app.post<{Params:{id:string}}>('/services/:id/database-export',async(req,reply)=>{
-    const parsed=z.object({kind:z.enum(['postgres','mariadb','redis']),database:z.string().min(1).max(63),user:z.string().min(1).max(63)}).strict().safeParse(req.body);
+    const parsed=z.object({kind:z.enum(['postgres','mariadb','redis','mysql','mongodb']),database:z.string().min(1).max(63),user:z.string().min(1).max(63)}).strict().safeParse(req.body);
     if(!z.string().uuid().safeParse(req.params.id).success||!parsed.success)return reply.code(400).send({error:{code:'INVALID_EXPORT',message:'Invalid database export request.'}});
     const release=maintenance?.admit();
     if(maintenance&&!release)return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
@@ -273,6 +367,8 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       const values=new Map((info.Config.Env||[]).map(item=>{const index=item.indexOf('=');return [item.slice(0,index),item.slice(index+1)];}));
       if(parsed.data.kind==='postgres'&&(values.get('POSTGRES_DB')!==parsed.data.database||values.get('POSTGRES_USER')!==parsed.data.user))throw new Error('Database identity does not match the running service.');
       if(parsed.data.kind==='mariadb'&&(values.get('MARIADB_DATABASE')!==parsed.data.database||values.get('MARIADB_USER')!==parsed.data.user))throw new Error('Database identity does not match the running service.');
+      if(parsed.data.kind==='mysql'&&(values.get('MYSQL_DATABASE')!==parsed.data.database||values.get('MYSQL_USER')!==parsed.data.user))throw new Error('Database identity does not match the running service.');
+      if(parsed.data.kind==='mongodb'&&(values.get('MONGO_INITDB_DATABASE')!==parsed.data.database||values.get('MONGO_INITDB_ROOT_USERNAME')!==parsed.data.user))throw new Error('Database identity does not match the running service.');
       try { artifact=await exportDatabase({containerId:container.id,dockerSocket:config.dockerSocket,...parsed.data}); }
       catch(error){if(error instanceof DatabaseExportUncertainError)maintenance?.markUncertain();throw error;}
       if(reply.raw.destroyed)return;
@@ -289,7 +385,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     scope.post<{Params:{id:string};Querystring:{operationId?:string;kind?:string};Body:Readable}>('/services/:id/database-restore/upload', async (req,reply) => {
       const id = req.params.id, operationId = req.query.operationId, kind = req.query.kind;
       const length = req.headers['content-length'];
-      if (!z.string().uuid().safeParse(id).success || !operationId || !/^[a-f0-9]{32}$/.test(operationId) || !['postgres','mariadb','redis'].includes(kind || '') || !length || !/^[1-9][0-9]*$/.test(length) || Number(length) > 2 * 1024 * 1024 * 1024 || !(req.body instanceof Readable)) {
+      if (!z.string().uuid().safeParse(id).success || !operationId || !/^[a-f0-9]{32}$/.test(operationId) || !['postgres','mariadb','redis','mysql','mongodb'].includes(kind || '') || !length || !/^[1-9][0-9]*$/.test(length) || Number(length) > 2 * 1024 * 1024 * 1024 || !(req.body instanceof Readable)) {
         return reply.code(400).send({ error: { code: 'INVALID_UPLOAD', message: 'Invalid database restore upload.' } });
       }
       const release = maintenance?.admit();
@@ -305,7 +401,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       req.raw.once('aborted', abort);
       const timeout = setTimeout(abort, 30 * 60_000); timeout.unref();
       try {
-        const result = await uploadRestoreArchive({ journal: restores, operationId, serviceId: id, kind: kind as 'postgres'|'mariadb'|'redis', dataDir: config.dataDir, key: vault.restoreArchiveKey(operationId), input: () => req.body, signal: controller.signal, sizeLimit: Number(length), expectedSize: Number(length) });
+        const result = await uploadRestoreArchive({ journal: restores, operationId, serviceId: id, kind: kind as 'postgres'|'mariadb'|'redis'|'mysql'|'mongodb', dataDir: config.dataDir, key: vault.restoreArchiveKey(operationId), input: () => req.body, signal: controller.signal, sizeLimit: Number(length), expectedSize: Number(length) });
         return { operationId, size: result.size, sha256: result.record.archive_sha256, phase: result.record.phase };
       } finally { uploads--; clearTimeout(timeout); req.raw.off('aborted', abort); if(activeUploads.get(operationId)===entry)activeUploads.delete(operationId); resolveDone(); release?.(); }
     });
@@ -372,14 +468,14 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     if (!z.string().uuid().safeParse(req.params.id).success || !/^[a-f0-9]{32}$/.test(req.params.operationId)) return reply.code(400).send({error:{code:'INVALID_RESTORE',message:'Invalid database restore identity.'}});
     const record = restores.get(req.params.operationId);
     if (!record || record.service_id !== req.params.id) return reply.code(404).send({error:{code:'NOT_FOUND',message:'Database restore operation not found.'}});
-    if ((record.phase !== 'reserved'&&!(record.kind==='redis'&&record.phase==='prepared')) || !['postgres','mariadb','redis'].includes(record.kind) || cancellingRestores.has(record.id)||locks.has(record.service_id)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be prepared now.'}});
+    if ((record.phase !== 'reserved'&&!(record.kind==='redis'&&record.phase==='prepared')) || !['postgres','mariadb','redis','mysql','mongodb'].includes(record.kind) || cancellingRestores.has(record.id)||locks.has(record.service_id)) return reply.code(409).send({error:{code:'RESTORE_BUSY',message:'This database restore cannot be prepared now.'}});
     const release = maintenance?.admit();
     if (maintenance && !release) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Agent is draining.'}});
     cancellingRestores.add(record.id);
     try {
       if (!runtime.consoleContainer) throw new Error('Database restore is unavailable.');
       if(record.kind==='redis'){try{return await redisRestore.prepare(req.params.id,record.id,(await runtime.consoleContainer(req.params.id)).id);}catch(error){if(error instanceof DatabaseImportError&&restores.get(record.id)?.phase==='cancelled')return reply.code(422).send({error:{code:'RESTORE_IMPORT_FAILED',message:'The Redis RDB could not be verified. The current database was not changed.'}});throw error;}}
-      const kind = record.kind as 'postgres'|'mariadb';
+      const kind = record.kind as 'postgres'|'mariadb'|'mysql'|'mongodb';
       const source = loadRestoreSource({dataDir:config.dataDir,serviceId:req.params.id,kind,vault});
       const sourceContainer = await runtime.consoleContainer(req.params.id);
       const result = await prepareRestoreCandidate({journal:restores,operationId:record.id,serviceId:req.params.id,importCandidate:importDatabaseCandidate,

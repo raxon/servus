@@ -15,7 +15,7 @@ export function BackupSettings({service,canWrite=true,admin=false}:{service:Serv
   const settings=useQuery({queryKey:['database-backup-settings',service.id],queryFn:()=>api<{settings:DatabaseBackupSettings}>(`${prefix}/backup-settings`)});
   const create=useMutation({mutationFn:()=>api(`${prefix}/backups`,{method:'POST',body:name.trim()?{name:name.trim()}:{},idempotent:true}),onSuccess:()=>{setName('');void client.invalidateQueries({queryKey:['database-backups',service.id]});}});
   const remove=useMutation({mutationFn:(backupId:string)=>api(`${prefix}/backups/${encodeURIComponent(backupId)}`,{method:'DELETE'}),onSuccess:()=>{setDeleting(null);void client.invalidateQueries({queryKey:['database-backups',service.id]});}});
-  if(!['postgres','mariadb','redis'].includes(service.kind??''))return <p>Backups are available for managed databases.</p>;
+  if(!['postgres','mariadb','redis','mysql','mongodb'].includes(service.kind??''))return <p>Backups are available for managed databases.</p>;
   const active=history.data?.backups.some(backup=>['queued','running'].includes(backup.status))??false;
   return <div className="database-backups">
     <section className="backup-section">

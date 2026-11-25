@@ -13,8 +13,9 @@ export type DatabaseAccess = z.infer<typeof databaseAccessSchema>;
 export function normalizedDatabaseAccess(value?: DatabaseAccess): DatabaseAccess { return value?.enabled ? value : { enabled: false }; }
 export function databaseTargetPort(kind: string | undefined): number {
   if (kind === 'postgres') return 5432;
-  if (kind === 'mariadb') return 3306;
+  if (kind === 'mariadb' || kind === 'mysql') return 3306;
   if (kind === 'redis') return 6379;
+  if (kind === 'mongodb') return 27017;
   throw new Error('External TCP access is available only for managed databases.');
 }
 export interface DatabaseNetworkStatus { aliases: string[]; publishedPort: number | null; revision: number }

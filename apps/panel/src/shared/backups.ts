@@ -9,7 +9,7 @@ export interface DatabaseBackup {
   finishedAt: string | null;
   size: number | null;
   sha256: string | null;
-  extension: 'dump' | 'sql' | 'rdb' | null;
+  extension: 'dump' | 'sql' | 'rdb' | 'archive' | null;
   error: string | null;
   destination: 'local' | 's3';
   encrypted?: boolean;

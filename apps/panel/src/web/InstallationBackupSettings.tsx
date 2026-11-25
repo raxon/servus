@@ -20,12 +20,15 @@ function remembered(key:string){try{const value=localStorage.getItem(key);return
 function BackupDetails({operation,onChanged}:{operation:InstallationBackupOperation;onChanged?:()=>void}){
   const [busy,setBusy]=useState<'verify'|'download'|'delete'|null>(null);
   const [confirmDelete,setConfirmDelete]=useState(false);
+  const [showRestoreGuide,setShowRestoreGuide]=useState(false);
+  const [verifiedDigest,setVerifiedDigest]=useState<string|null>(null);
   const [notice,setNotice]=useState<{kind:'ok'|'error';text:string}|null>(null);
 
   async function verify(){
     setBusy('verify');setNotice(null);
     try{
       const res=await api<{verification:{manifestDigest:string}}>(`/installation-backups/${operation.operationId}/verify`,{method:'POST',body:{}});
+      setVerifiedDigest(res.verification.manifestDigest);
       setNotice({kind:'ok',text:`Archive verified (${res.verification.manifestDigest.slice(0,23)}...).`});
     }catch(error){
       setNotice({kind:'error',text:error instanceof RequestError?error.message:'Archive verification could not be completed.'});
@@ -73,11 +76,21 @@ function BackupDetails({operation,onChanged}:{operation:InstallationBackupOperat
       <div className="heading-actions" style={{flexWrap:'wrap'}}>
         <button className="button" type="button" disabled={busy!==null} onClick={()=>void verify()}>{busy==='verify'?'Verifying...':'Verify archive'}</button>
         <button className="button" type="button" disabled={busy!==null} onClick={()=>void download()}>{busy==='download'?'Downloading...':'Download archive'}</button>
+        <button className="button" type="button" disabled={busy!==null} onClick={()=>setShowRestoreGuide(value=>!value)}>{showRestoreGuide?'Hide restore checklist':'Restore checklist'}</button>
         {!confirmDelete?<button className="button button-danger" type="button" disabled={busy!==null} onClick={()=>setConfirmDelete(true)}>Delete snapshot</button>:<>
           <button className="button button-danger" type="button" disabled={busy!==null} onClick={()=>void remove()}>{busy==='delete'?'Deleting...':'Confirm snapshot deletion'}</button>
           <button className="button" type="button" disabled={busy!==null} onClick={()=>setConfirmDelete(false)}>Keep snapshot</button>
         </>}
       </div>
+      {showRestoreGuide?<div className="info-notice" style={{flexDirection:'column',alignItems:'flex-start',gap:8,marginTop:10}}>
+        <strong>Operator restore procedure (snapshot <code>{operation.operationId}</code>)</strong>
+        <ol style={{margin:'4px 0 0 18px',padding:0,display:'grid',gap:6}}>
+          <li>Run <strong>Verify archive</strong>{verifiedDigest?<> (verified: <code>{verifiedDigest.slice(0,24)}...</code>)</>:null} and <strong>Download archive</strong> to keep an off-host copy with its <code>X-Backup-SHA256</code> checksum.</li>
+          <li>On the Linux host over SSH, stop the panel control plane and inspect the snapshot with the host supervisor: <code>--verify-installation-backup {operation.operationId}</code>.</li>
+          <li>Back up the current data directory, restore the verified control-plane files from the archive while preserving private ownership and <code>0600/0700</code> permissions, then restart the panel service.</li>
+          <li>Confirm panel health, sign in as administrator, and restore application/database data backups separately if required.</li>
+        </ol>
+      </div>:null}
       <p className="feature-helper">Host CLI verification: run supervisor-daemon with its existing systemd flags plus <code>--verify-installation-backup {operation.operationId}</code>. The last remaining verified snapshot on disk is protected from deletion.</p>
       {notice?<p role={notice.kind==='error'?'alert':'status'} className={notice.kind==='error'?'error-notice':'feature-helper'}>{notice.text}</p>:null}
     </>:null}

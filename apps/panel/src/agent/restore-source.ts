@@ -5,10 +5,10 @@ import { z } from 'zod';
 import type { SecretVault } from '../shared/secrets.js';
 
 const identifier = z.string().regex(/^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/);
-const snapshotSchema = z.object({id:z.string().uuid(),projectId:z.string().uuid(),kind:z.enum(['postgres','mariadb','redis']),database:z.object({database:identifier,user:identifier,passwordSecretRef:z.string().uuid()})});
+const snapshotSchema = z.object({id:z.string().uuid(),projectId:z.string().uuid(),kind:z.enum(['postgres','mariadb','redis','mysql','mongodb']),database:z.object({database:identifier,user:identifier,passwordSecretRef:z.string().uuid()})});
 
 /** Bind preparation to the last successful deployment and its service-owned secrets. */
-export function loadRestoreSource(options:{dataDir:string;serviceId:string;kind:'postgres'|'mariadb'|'redis';vault:SecretVault}):{database:string;user:string;password:string;rootPassword?:string} {
+export function loadRestoreSource(options:{dataDir:string;serviceId:string;kind:'postgres'|'mariadb'|'redis'|'mysql'|'mongodb';vault:SecretVault}):{database:string;user:string;password:string;rootPassword?:string} {
   if (!z.string().uuid().safeParse(options.serviceId).success) throw new Error('Invalid restore service identity.');
   const db = new Database(join(options.dataDir,'panel.sqlite'),{readonly:true,fileMustExist:true});
   let snapshot: z.infer<typeof snapshotSchema>;
@@ -22,7 +22,7 @@ export function loadRestoreSource(options:{dataDir:string;serviceId:string;kind:
     if (snapshot.id !== options.serviceId || snapshot.projectId !== service.project_id || snapshot.kind !== options.kind) throw new Error('Confirmed database identity does not match.');
   } finally { db.close(); }
   const password = options.vault.getServiceSecret(snapshot.database.passwordSecretRef,options.serviceId,'database');
-  if (options.kind !== 'mariadb') return {database:snapshot.database.database,user:snapshot.database.user,password};
+  if (options.kind !== 'mariadb' && options.kind !== 'mysql') return {database:snapshot.database.database,user:snapshot.database.user,password};
   const directory = join(options.dataDir,'database-roots'), path = join(directory,options.serviceId), uid = process.getuid?.();
   const dir = lstatSync(directory), file = lstatSync(path);
   if (!dir.isDirectory() || dir.isSymbolicLink() || (dir.mode & 0o777) !== 0o700 || (uid !== undefined && dir.uid !== uid) || !file.isFile() || file.isSymbolicLink() || file.nlink !== 1 || (file.mode & 0o777) !== 0o600 || (uid !== undefined && file.uid !== uid)) throw new Error('Database root identity cannot be verified.');

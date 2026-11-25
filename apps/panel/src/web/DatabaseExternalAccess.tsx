@@ -50,9 +50,10 @@ export function DatabaseConnectionString({ label, kind, connection, host, port, 
   port: number;
   password?: string;
 }) {
-  const scheme = kind === "postgres" ? "postgresql" : kind === "redis" ? "redis" : "mysql";
+  const scheme = kind === "postgres" ? "postgresql" : kind === "redis" ? "redis" : kind === "mongodb" ? "mongodb" : "mysql";
   const address = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  const url = password === undefined ? undefined : `${scheme}://${encodeURIComponent(connection.user)}:${encodeURIComponent(password)}@${address}:${port}/${encodeURIComponent(connection.database)}`;
+  const suffix = kind === "mongodb" ? "?authSource=admin" : "";
+  const url = password === undefined ? undefined : `${scheme}://${encodeURIComponent(connection.user)}:${encodeURIComponent(password)}@${address}:${port}/${encodeURIComponent(connection.database)}${suffix}`;
   return <label className="database-connection-string">{label}
     <input className="mono" type={url ? "text" : "password"} value={url ?? "************"} readOnly autoComplete="off" spellCheck={false} onFocus={event => { if (url) event.currentTarget.select(); }} />
   </label>;

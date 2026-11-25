@@ -8,7 +8,7 @@ Servus is a self-hosted web panel for Docker apps and databases. Use it to run a
 
 Projects group related services. Build an app from a Git repository with a Dockerfile, pull an image from a registry, or bring a Docker Compose file. WordPress and n8n have templates.
 
-Give an app its own domain and enable automatic HTTPS once DNS and ingress are set up. Run PostgreSQL, MariaDB or Redis on the project's private network and schedule database backups to local storage or an S3-compatible destination.
+Give an app its own domain and enable automatic HTTPS once DNS and ingress are set up. Run PostgreSQL (17 or 18), MariaDB, MySQL, MongoDB, or Redis on the project's private network and schedule encrypted database backups to local storage, Amazon S3, or Cloudflare R2.
 
 When a deployment fails, open the logs in the browser. You can also redeploy an earlier image from the service's deployment history.
 
@@ -56,28 +56,28 @@ SSH deploy keys require an administrator. Save an `ssh://git@host/owner/reposito
 | Access             | One-time administrator setup, cookie sessions, CSRF and origin checks, project access checks                                |
 | Projects           | Create, list, rename, edit descriptions and delete empty projects                                                           |
 | Applications       | Public or private Docker images, HTTPS Git credentials and administrator-managed SSH deploy keys with pinned host keys      |
-| Configuration      | Saved and deployed revisions, encrypted secrets, optional generated env files, multiple domains, CPU/RAM limits and replicas |
+| Configuration      | Saved and deployed revisions, shared project env vars, encrypted secrets, optional generated env files, multiple domains with Traefik middlewares and Trusted Proxies, CPU/RAM limits, build concurrency limits and replicas |
 | Storage            | Named volumes, immutable read-only configuration files and administrator-approved bind paths                                |
-| Databases          | PostgreSQL 17, Redis 7 and MariaDB 11.4 presets with private project networking and persistent data                         |
-| Operations         | Deploy, start, stop, restart and destroy actions with durable events and failure details                                    |
-| Runtime inspection | Current CPU, RAM and network samples, container lists, recent logs, live log streaming and an interactive `/bin/sh` console |
-| Recovery           | Durable agent operation journal and restoration of the previous application specification after a failed deployment         |
+| Databases          | PostgreSQL 17/18, MariaDB 11.4, MySQL 8.4, MongoDB 7 and Redis 7 presets with private project networking, persistent data and live password rotation |
+| Operations         | Deploy, start, stop, restart, destroy and saved operational scripts with durable events and failure details                 |
+| Runtime inspection | 24h CPU/RAM/network history, host resource metrics, 7-day redacted log archive, live log streaming, threshold alerts and an interactive `/bin/sh` console |
+| Recovery           | Durable agent operation journal, automatic rollback after failed deployments and verified installation snapshots            |
 
-Application HTTPS, private Git credentials, GitHub repository and branch selection, Force Rebuild, database backups and project API tokens are implemented. The CLI and stdio MCP server use the same HTTP operations and project permissions. See [automation](docs/automation.md) for setup.
+Application HTTPS (public ACME HTTP-01 issuance and renewal), private Git credentials, GitHub repository and branch selection, Force Rebuild, database/volume backups, shared project environment variables, saved scripts, build concurrency limits and project API tokens are implemented. The CLI and stdio MCP server use the same HTTP operations and project permissions, including Compose workload creation, updates and removal. See [automation](docs/automation.md) for setup.
 
-Create reusable destinations for backups in **Settings > Backup storage**. Database schedules run in UTC. You can keep a fixed number of copies, keep them for a set period, or retain copies across hourly, daily, weekly, monthly and yearly windows. Database backups can be encrypted at rest with the installation's key. Keep the installation key and backup metadata for recovery. Servus verifies and decrypts these files when you download them for restore.
+Create reusable destinations for backups in **Settings > Backup storage**. Database schedules run in UTC. You can keep a fixed number of copies, keep them for a set period, or retain copies across hourly, daily, weekly, monthly and yearly windows. Database backups can be encrypted at rest with the installation's key (AES-256-GCM). Keep the installation key and backup metadata for recovery. Servus verifies and decrypts these files when you download them for restore.
 
-Export and restore are in the database's **Backups** tab. For PostgreSQL, MariaDB or Redis, prepare an isolated candidate and confirm the switch after its checks succeed. Redis retains the previous volume and can roll back to it. Its journal also helps recover an interrupted restore. Provider acceptance uses MinIO. R2 account testing remains pending.
+Export and restore are in the database's **Backups** tab. For PostgreSQL, MariaDB, MySQL, MongoDB and Redis, prepare an isolated candidate and confirm the switch after its checks succeed. Redis retains the previous volume and can roll back to it. Live VPS acceptance verified PostgreSQL, MariaDB, Redis and application volume backups and restores against both local storage and Cloudflare R2.
 
 On a single-node Swarm, application volume backups stop the application, capture one writable named volume and restore its previous replica count before marking the backup complete. Restores use a fresh volume. Confirm the switch in Backups after preparation succeeds. Servus retains the original volume for rollback, which requires the runtime specification to still match the recorded operation. Archives preserve file content, modes and numeric ownership, with regular file timestamps and confined relative symlinks also checked during recovery. Each archive is limited to 2 GiB and covers the selected application volume, while database volumes and panel configuration require their own backup and recovery procedures.
 
-Compose accepts inline YAML or public HTTPS Git sources and keeps named volumes after removal. With Git, builds use a pinned checkout and support relative context paths, Dockerfiles, build arguments and targets, while inline definitions can supply a Dockerfile for an empty build context. Each operation records the built image. Restart and rollback reuse that image without fetching the repository or rebuilding, and domains use the same Traefik ingress and certificate retry flow as application services. Private Git remains unsupported. So do published ports, host mounts and privileged Compose settings. Starter templates create WordPress, n8n, Uptime Kuma, Grafana and MinIO through the same deployment path.
+Compose accepts inline YAML or HTTPS Git sources (public or private via HTTPS credentials or the shared GitHub connection) and keeps named volumes after removal. With Git, builds use a pinned checkout and support relative context paths, Dockerfiles, build arguments and targets, while inline definitions can supply a Dockerfile for an empty build context. Each operation records the built image. Restart and rollback reuse that image without fetching the repository or rebuilding, and domains use the same Traefik ingress and certificate retry flow as application services. Published ports, host mounts and privileged Compose settings remain restricted. Starter templates create WordPress, n8n, Uptime Kuma, Grafana and MinIO through the same deployment path.
 
-Local accounts can enable an authenticator and receive ten one-use recovery codes. Git deployment webhooks support GitHub signatures, branch matching and server-generated credential rotation. Settings now shows release notes before an update is confirmed.
+Local accounts can enable an authenticator and receive ten one-use recovery codes. Git deployment webhooks support GitHub signatures, branch matching and server-generated credential rotation. Settings displays release notes before a signed host update is confirmed.
 
-Administrators can request a named installation backup in Settings on a configured supervised host. The host stops the control plane, captures panel configuration and encrypted secrets, then checks the restarted processes before reporting completion. Back up application data separately. Interrupted operations require explicit recovery on the host, and history, retention and signed-release acceptance remain pending.
+Administrators can request, inspect, verify, download and delete named installation backups in Settings on a configured supervised host, with an operator restore checklist for every completed snapshot. The host stops the control plane, captures panel configuration and encrypted secrets, then checks the restarted processes before reporting completion. Back up application data separately. Interrupted operations require explicit recovery on the host.
 
-Historical monitoring, additional builders, managed MySQL/MongoDB and multi-node management remain unfinished. The [parity backlog](spec/parity/backlog.md) tracks these gaps and release verification.
+Additional non-Dockerfile builders (Railpack/Nixpacks/Buildpacks) and multi-node Swarm management remain out of scope for this release. The [parity backlog](spec/parity/backlog.md) tracks remaining P3 items and verification evidence.
 
 ## Requirements
 
@@ -123,9 +123,9 @@ Force Rebuild bypasses the Docker build cache for that deployment. Its option is
 
 Writable volumes and database services require one replica. Application CPU limits accept 0.1 to 64 cores, memory limits 32 to 131072 MiB, and stateless application replicas 1 to 5. Bind mount sources must be existing paths nested under `PANEL_MANAGED_BIND_ROOT`, which defaults to `/var/lib/panel/mounts`, on the Docker host. Configure the same approved root in the API and agent.
 
-Databases are private by default. The connection panel shows an internal address for other services in the project. An administrator can save an external TCP port there and apply it with **Deploy**. Restrict the port in the host firewall and configure database TLS as needed. PostgreSQL and MariaDB initialize the selected database and user. Redis uses logical database 0 and its default user. Servus generates a password when you leave it blank, and reveals it only on request.
+Databases are private by default. The connection panel shows an internal address for other services in the project. An administrator can save an external TCP port there and apply it with **Deploy**. Restrict the port in the host firewall and configure database TLS as needed. PostgreSQL, MariaDB, MySQL and MongoDB initialize the selected database and user. Redis uses logical database 0 and its default user. Servus generates a password when you leave it blank, reveals it only on request, and supports live password rotation (`POST /api/v1/services/:id/database/rotate-password`) followed by an automatic Swarm secret refresh.
 
-Database names, users and passwords are immutable after creation. Image changes are blocked after a database has been deployed. Credential rotation and database upgrade migrations need separate workflows and are not implemented.
+Database names and users remain immutable after creation, and major-version image changes are blocked after deployment so upgrades use an explicit backup and restore into a new database service.
 
 Destroy removes a service and its HTTP routes while retaining managed volumes and action history. Delete an empty project after removing its services. Retained data needs explicit operator cleanup when it is no longer required.
 

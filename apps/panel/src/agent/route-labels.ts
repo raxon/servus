@@ -37,6 +37,11 @@ export function compileDomainLabels(
   if (domain.ipAllowList?.length) {
     const mw = `${route}-ipallow`;
     labels[`traefik.http.middlewares.${mw}.ipallowlist.sourcerange`] = domain.ipAllowList.join(',');
+    if (domain.trustedProxies?.depth !== undefined) {
+      labels[`traefik.http.middlewares.${mw}.ipallowlist.ipstrategy.depth`] = String(domain.trustedProxies.depth);
+    } else if (domain.trustedProxies?.excludedIps?.length) {
+      labels[`traefik.http.middlewares.${mw}.ipallowlist.ipstrategy.excludedips`] = domain.trustedProxies.excludedIps.join(',');
+    }
     routeMiddlewares.push(mw);
   }
   if (domain.basicAuth?.users.length) {

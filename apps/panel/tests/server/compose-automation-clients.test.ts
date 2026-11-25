@@ -48,7 +48,7 @@ it('preserves Compose CLI idempotency and checks live token revocation',async()=
 it('uses an actual MCP handshake for bounded Compose tools, idempotency and scope',async()=>{
   const f=await fixture(),server=createMcpServer({origin:f.origin,token:f.tokens.deploy!.token}),client=new Client({name:'compose-fixture',version:'1.0.0'}),[a,b]=InMemoryTransport.createLinkedPair();cleanup.push(async()=>{await client.close();await server.close();});await server.connect(b);await client.connect(a);
   const catalog=await client.listTools();expect(catalog.tools.find(tool=>tool.name==='deploy_compose')?.annotations?.destructiveHint).toBe(true);expect(catalog.tools.find(tool=>tool.name==='inspect_compose')?.annotations?.readOnlyHint).toBe(true);
-  expect(catalog.tools.some(tool=>/^(create|configure|destroy)_compose$/.test(tool.name))).toBe(false);
+  for(const name of ['create_compose','update_compose','destroy_compose'])expect(catalog.tools.find(tool=>tool.name===name)?.annotations?.destructiveHint).toBe(true);
   expect(JSON.stringify(await client.callTool({name:'list_compose',arguments:{projectId:f.project.id}}))).toContain(f.workloadId);
   expect((await client.callTool({name:'list_compose',arguments:{projectId:f.other.id}})).isError).toBe(true);
   for(const name of ['inspect_compose','read_compose_actions','read_compose_logs'])expect((await client.callTool({name,arguments:{workloadId:f.workloadId}})).isError).not.toBe(true);

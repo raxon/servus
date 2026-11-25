@@ -68,15 +68,34 @@ export class ComposeRuntime {
     if (source.branch.includes('..') || source.branch.endsWith('/')) throw new Error('Invalid Compose Git branch.');
     const gitConfig = ['-c','protocol.file.allow=never','-c','http.followRedirects=false','-c','core.hooksPath=/dev/null'];
     if (resolved.resolve) gitConfig.push('-c', `http.curloptResolve=${resolved.resolve}`);
-    const env = { GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_ASKPASS: '/bin/false' };
+    const cred = source.credential?.token
+      ? { username: source.credential.username, token: source.credential.token }
+      : source.sharedGithub ? this.vault.githubConnection() : null;
+    let askpass = '/bin/false';
+    const extraEnv: Record<string, string> = {};
+    if (cred) {
+      if (resolved.url.protocol !== 'https:') throw new Error('Authenticated Compose Git repositories require HTTPS.');
+      askpass = join(directory, '.git-askpass.sh');
+      writeFileSync(askpass, '#!/bin/sh\ncase "$1" in\n  *Username*|*username*) printf "%s\\n" "$SERVUS_GIT_USER" ;;\n  *) printf "%s\\n" "$SERVUS_GIT_TOKEN" ;;\nesac\n', { mode: 0o700 });
+      extraEnv.SERVUS_GIT_USER = cred.username;
+      extraEnv.SERVUS_GIT_TOKEN = cred.token;
+    }
+    const env: NodeJS.ProcessEnv = { GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_ASKPASS: askpass, ...extraEnv };
+    const runGit = async (args: string[], cwd: string, timeoutMs: number) => {
+      try { return await this.run('git', args, cwd, request.operationId, env, timeoutMs); }
+      catch (error) {
+        const msg = error instanceof Error ? error.message : 'Git command failed.';
+        throw new Error(cred?.token ? msg.replaceAll(cred.token, '[REDACTED]') : msg);
+      }
+    };
     if(pinnedCommit){
       if(!/^[a-f0-9]{40,64}$/.test(pinnedCommit))throw new Error('The pinned Compose commit is invalid.');
       const checkout=join(directory,'repository');mkdirSync(checkout,{mode:0o700});
-      await this.run('git',[...gitConfig,'init'],checkout,request.operationId,env,10000);
-      await this.run('git',[...gitConfig,'remote','add','origin',source.repository],checkout,request.operationId,env,10000);
-      await this.run('git',[...gitConfig,'fetch',...(resolved.url.protocol==='https:'?['--depth','1']:[]),'origin',pinnedCommit],checkout,request.operationId,env,120000);
-      await this.run('git',[...gitConfig,'checkout','--detach',pinnedCommit],checkout,request.operationId,env,10000);
-    }else await this.run('git', [...gitConfig, 'clone', ...(resolved.url.protocol==='https:'?['--depth','1']:[]),'--single-branch','--branch',source.branch,'--',source.repository,'repository'], directory, request.operationId, env, 120_000);
+      await runGit([...gitConfig,'init'],checkout,10000);
+      await runGit([...gitConfig,'remote','add','origin',source.repository],checkout,10000);
+      await runGit([...gitConfig,'fetch',...(resolved.url.protocol==='https:'?['--depth','1']:[]),'origin',pinnedCommit],checkout,120000);
+      await runGit([...gitConfig,'checkout','--detach',pinnedCommit],checkout,10000);
+    }else await runGit([...gitConfig, 'clone', ...(resolved.url.protocol==='https:'?['--depth','1']:[]),'--single-branch','--branch',source.branch,'--',source.repository,'repository'], directory, 120_000);
     const root = realpathSync(join(directory,'repository')), path = composeBuildPath(root,root,source.path,'file'), inside = relative(root,path);
     if (inside === '..' || inside.startsWith('..' + sep) || isAbsolute(inside) || !statSync(path).isFile() || statSync(path).size > 256 * 1024) throw new Error('Compose file must remain inside the repository and be at most 256 KiB.');
     const commit = (await this.run('git', ['rev-parse','HEAD'], root, request.operationId, env)).trim();

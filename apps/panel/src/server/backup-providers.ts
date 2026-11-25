@@ -81,7 +81,7 @@ export function registerBackupProviders(app:FastifyInstance,options:BackupOption
   app.get<{Params:{id:string}}>(prefix,async req=>{const {service}=options.serviceAccess(req,req.params.id);return currentBackupSelection(options.store,service.id);});
   app.put<{Params:{id:string}}>(prefix,async req=>{
     const {service,auth}=options.serviceAccess(req,req.params.id,true),{store}=options;
-    if(!['postgres','mariadb','redis'].includes(service.kind??''))throw new AppError('BACKUP_DATABASE_REQUIRED','Backup storage is available for managed databases.',400);
+    if(!['postgres','mariadb','redis','mysql','mongodb'].includes(service.kind??''))throw new AppError('BACKUP_DATABASE_REQUIRED','Backup storage is available for managed databases.',400);
     if(req.body&&typeof req.body==='object'&&'profileId' in req.body){
       const {profileId}=z.object({profileId:z.string().uuid().nullable()}).strict().parse(req.body);
       const profile=profileId?store.db.prepare('SELECT * FROM backup_storage_profiles WHERE id=? AND active=1').get(profileId) as ProfileRow|undefined:undefined;

@@ -87,7 +87,9 @@ import { InstallationBackupSettings } from "./InstallationBackupSettings.js";
 import { BackupStorageSettings } from "./BackupStorageSettings.js";
 import { HostMetricsCard } from "./HostMetricsCard.js";
 import { AlertsSettings } from "./AlertsSettings.js";
+import { BuildConcurrencySettings } from "./BuildConcurrencySettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
+import { ProjectExtras } from "./ProjectExtras.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
   DatabaseConnection,
@@ -835,6 +837,7 @@ function ProjectPage() {
       )}
       {projectId?<TemplateProjects projectId={projectId} canWrite={project?.canWrite===true}/>:null}
       {projectId?<ComposeProjects projectId={projectId} canWrite={project?.canWrite===true}/>:null}
+      {projectId?<ProjectExtras projectId={projectId} services={services.data ?? []} canWrite={project?.canWrite===true}/>:null}
       <div className="section-heading activity-heading">
         <div>
           <h2>Project activity</h2>
@@ -1660,6 +1663,7 @@ function SettingsPage() {
           <HttpsSettings configured={runtime.data?.httpsConfigured === true} access={runtime.data?.httpsAccess} recoveryRequired={runtime.data?.ingressRecoveryRequired === true} busy={runtime.data?.ingressBusy === true} />
           <GithubSettings />
           <AlertsSettings />
+          <BuildConcurrencySettings />
         </section>
 
         <section className="settings-group" id="settings-backups" aria-labelledby="settings-backups-heading">

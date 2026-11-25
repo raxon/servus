@@ -7,12 +7,13 @@ import type { Service } from '../shared/types.js';
 import type { RestoreVolumeBinding } from './restore-journal.js';
 import type { VolumeRestoreBinding } from '../shared/volume-backups.js';
 import { validateBoundMounts, verifyApplicationVolume } from './volume-binding.js';
+import { readProjectEnvironment } from '../server/workspace-extras.js';
 
 const helperImage = 'alpine:3.21';
-export const databaseKinds = new Set(['postgres', 'redis', 'mariadb']);
+export const databaseKinds = new Set(['postgres', 'redis', 'mariadb', 'mysql', 'mongodb']);
 export function databaseKind(service: Service) { return databaseKinds.has(service.kind || 'app'); }
 export function stateful(service: Service) { return databaseKind(service) || (service.mounts || []).some(mount => !mount.readOnly && mount.type !== 'file'); }
-export const databasePaths = { postgres: '/var/lib/postgresql/data', mariadb: '/var/lib/mysql', redis: '/data' };
+export const databasePaths = { postgres: '/var/lib/postgresql/data', mariadb: '/var/lib/mysql', mysql: '/var/lib/mysql', redis: '/data', mongodb: '/data/db' };
 export const postgresScramVersion = 'scram-v1';
 const postgresHba = 'local all all scram-sha-256\nhost all all 0.0.0.0/0 scram-sha-256\nhost all all ::/0 scram-sha-256\n';
 
@@ -21,7 +22,16 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
 }> {
   if (stateful(service) && service.replicas !== 1) throw new Error('Writable storage and databases require a single replica.');
   const mounts: Docker.MountSettings[] = [];
-  const environment = (service.environment || []).map(item => `${item.name}=${item.secretRef ? vault.getServiceSecret(item.secretRef,service.id,'environment') : item.value || ''}`);
+  const serviceEnvNames = new Set((service.environment || []).map(item => item.name));
+  const sharedEnv = !databaseKind(service)
+    ? readProjectEnvironment(dataDir, service.projectId, vault)
+        .filter(item => !serviceEnvNames.has(item.name))
+        .map(item => `${item.name}=${item.value}`)
+    : [];
+  const environment = [
+    ...sharedEnv,
+    ...(service.environment || []).map(item => `${item.name}=${item.secretRef ? vault.getServiceSecret(item.secretRef,service.id,'environment') : item.value || ''}`),
+  ];
   const secrets: NonNullable<Docker.ContainerSpec['Secrets']> = [];
   const configured = service.mounts || [];
   validateBoundMounts(service,options.volumeBindings??[]);
@@ -76,7 +86,7 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
         args = ['-c', 'set -eu; PGPASSWORD="$(cat /run/secrets/panel-db-password)"; export PGPASSWORD; exec docker-entrypoint.sh postgres -c hba_file=/run/secrets/panel-pg-hba -c password_encryption=scram-sha-256'];
       }
     }
-    if (kind === 'mariadb') {
+    if (kind === 'mariadb' || kind === 'mysql') {
       const rootDirectory = join(dataDir, 'database-roots'); mkdirSync(rootDirectory, { recursive: true, mode: 0o700 });
       const path = join(rootDirectory, service.id);
       if (!existsSync(path)) {
@@ -86,7 +96,11 @@ export async function compileConfiguration(docker: Docker, service: Service, vau
       const rootReference = readFileSync(path, 'utf8');
       const rootName = secretName('root', service.id, rootReference);
       secrets.push({ SecretID: await swarmSecret(docker, rootName, vault.getDatabaseRootSecret(rootReference), service.id), SecretName: rootName, File: { Name: 'panel-db-root-password', UID: '0', GID: '0', Mode: 0o444 } });
-      environment.push(`MARIADB_DATABASE=${database}`, `MARIADB_USER=${user}`, 'MARIADB_PASSWORD_FILE=/run/secrets/panel-db-password', 'MARIADB_ROOT_PASSWORD_FILE=/run/secrets/panel-db-root-password');
+      const prefix = kind === 'mariadb' ? 'MARIADB' : 'MYSQL';
+      environment.push(`${prefix}_DATABASE=${database}`, `${prefix}_USER=${user}`, `${prefix}_PASSWORD_FILE=/run/secrets/panel-db-password`, `${prefix}_ROOT_PASSWORD_FILE=/run/secrets/panel-db-root-password`);
+    }
+    if (kind === 'mongodb') {
+      environment.push(`MONGO_INITDB_ROOT_USERNAME=${user}`, 'MONGO_INITDB_ROOT_PASSWORD_FILE=/run/secrets/panel-db-password', `MONGO_INITDB_DATABASE=${database}`);
     }
     if (kind === 'redis') { command = ['/bin/sh']; args = ['-c', 'exec docker-entrypoint.sh redis-server --appendonly yes --requirepass "$(cat /run/secrets/panel-db-password)"']; }
   }

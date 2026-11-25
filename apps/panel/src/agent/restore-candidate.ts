@@ -3,7 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type Docker from 'dockerode';
 import type { RestoreJournal } from './restore-journal.js';
 
-type Kind = 'postgres' | 'mariadb';
+type Kind = 'postgres' | 'mariadb' | 'mysql' | 'mongodb';
 const identifier = /^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/;
 const temporarySecrets = 'rw,noexec,nosuid,nodev,size=1m,mode=0700';
 const idPattern = /^[a-f0-9]{64}$/;
@@ -16,17 +16,17 @@ export async function createRestoreCandidate(options: {
 }): Promise<{ containerId: string; volumeName: string }> {
   const record = options.journal.get(options.operationId);
   if (!record || record.phase !== 'importing' || record.service_id !== options.serviceId || record.kind !== options.kind ||
-    !['postgres','mariadb'].includes(options.kind) ||
+    !['postgres','mariadb','mysql','mongodb'].includes(options.kind) ||
     !idPattern.test(options.sourceContainerId) || !identifier.test(options.database) || !identifier.test(options.user) ||
     !options.dockerSocket.startsWith('/') || options.dockerSocket.includes('\0') ||
-    !validPassword(options.password) || (options.kind === 'mariadb' && !validPassword(options.rootPassword))) throw new Error('Invalid restore candidate request.');
+    !validPassword(options.password) || ((options.kind === 'mariadb' || options.kind === 'mysql') && !validPassword(options.rootPassword))) throw new Error('Invalid restore candidate request.');
   options.signal?.throwIfAborted();
   const source = await dockerStep(() => options.docker.getContainer(options.sourceContainerId).inspect(), options.signal);
   const labels = source.Config.Labels || {}, env = new Map((source.Config.Env || []).map(value => { const at = value.indexOf('='); return [value.slice(0, at), value.slice(at + 1)]; }));
-  const prefix = options.kind === 'postgres' ? 'POSTGRES' : 'MARIADB';
-  const databaseName = options.kind === 'postgres' ? env.get('POSTGRES_DB') : env.get('MARIADB_DATABASE');
+  const databaseName = options.kind === 'postgres' ? env.get('POSTGRES_DB') : options.kind === 'mariadb' ? env.get('MARIADB_DATABASE') : options.kind === 'mysql' ? env.get('MYSQL_DATABASE') : env.get('MONGO_INITDB_DATABASE');
+  const userName = options.kind === 'postgres' ? env.get('POSTGRES_USER') : options.kind === 'mariadb' ? env.get('MARIADB_USER') : options.kind === 'mysql' ? env.get('MYSQL_USER') : env.get('MONGO_INITDB_ROOT_USERNAME');
   if (source.Id !== options.sourceContainerId || !source.State.Running || labels['panel.owner'] !== 'self-hosted-panel' ||
-    labels['panel.service'] !== options.serviceId || labels['com.docker.swarm.service.name'] !== `panel-app-${options.serviceId}` || databaseName !== options.database || env.get(`${prefix}_USER`) !== options.user ||
+    labels['panel.service'] !== options.serviceId || labels['com.docker.swarm.service.name'] !== `panel-app-${options.serviceId}` || databaseName !== options.database || userName !== options.user ||
     !/^sha256:[a-f0-9]{64}$/.test(source.Image)) throw new Error('Source database identity cannot be verified.');
   const image = await dockerStep(() => options.docker.getImage(source.Image).inspect(), options.signal);
   if (image.Id !== source.Image) throw new Error('Source database image cannot be verified.');
@@ -37,12 +37,16 @@ export async function createRestoreCandidate(options: {
   await dockerStep(() => options.docker.createVolume({ Name: volumeName, Labels: volumeLabels }), options.signal);
   const volume = await dockerStep(() => options.docker.getVolume(volumeName).inspect(), options.signal);
   if (volume.Name !== volumeName || Object.entries(volumeLabels).some(([key, value]) => volume.Labels?.[key] !== value)) throw new Error('Restore volume ownership cannot be verified.');
-  const dataPath = options.kind === 'postgres' ? '/var/lib/postgresql/data' : '/var/lib/mysql';
+  const dataPath = options.kind === 'postgres' ? '/var/lib/postgresql/data' : options.kind === 'mongodb' ? '/data/db' : '/var/lib/mysql';
   const environment = options.kind === 'postgres'
     ? [`POSTGRES_DB=${options.database}`, `POSTGRES_USER=${options.user}`, 'POSTGRES_PASSWORD_FILE=/run/secrets/panel-db-password', 'PGDATA=/var/lib/postgresql/data', 'POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256', 'POSTGRES_HOST_AUTH_METHOD=scram-sha-256']
-    : [`MARIADB_DATABASE=${options.database}`, `MARIADB_USER=${options.user}`, 'MARIADB_PASSWORD_FILE=/run/secrets/panel-db-password', 'MARIADB_ROOT_PASSWORD_FILE=/run/secrets/panel-db-root-password'];
-  const required = options.kind === 'postgres' ? '[ -s /run/secrets/panel-db-password ]' : '[ -s /run/secrets/panel-db-password ] && [ -s /run/secrets/panel-db-root-password ]';
-  const daemon = options.kind === 'postgres' ? 'postgres' : 'mariadbd';
+    : options.kind === 'mariadb'
+      ? [`MARIADB_DATABASE=${options.database}`, `MARIADB_USER=${options.user}`, 'MARIADB_PASSWORD_FILE=/run/secrets/panel-db-password', 'MARIADB_ROOT_PASSWORD_FILE=/run/secrets/panel-db-root-password']
+      : options.kind === 'mysql'
+        ? [`MYSQL_DATABASE=${options.database}`, `MYSQL_USER=${options.user}`, 'MYSQL_PASSWORD_FILE=/run/secrets/panel-db-password', 'MYSQL_ROOT_PASSWORD_FILE=/run/secrets/panel-db-root-password']
+        : [`MONGO_INITDB_ROOT_USERNAME=${options.user}`, 'MONGO_INITDB_ROOT_PASSWORD_FILE=/run/secrets/panel-db-password', `MONGO_INITDB_DATABASE=${options.database}`];
+  const required = (options.kind === 'mariadb' || options.kind === 'mysql') ? '[ -s /run/secrets/panel-db-password ] && [ -s /run/secrets/panel-db-root-password ]' : '[ -s /run/secrets/panel-db-password ]';
+  const daemon = options.kind === 'postgres' ? 'postgres' : options.kind === 'mariadb' ? 'mariadbd' : options.kind === 'mysql' ? 'mysqld' : 'mongod';
   const command = `set -eu; i=0; until ${required}; do i=$((i+1)); [ "$i" -lt 120 ] || exit 1; sleep 1; done; exec docker-entrypoint.sh ${daemon}`;
   const candidate = await dockerStep(() => options.docker.createContainer({ name, Image: source.Image,
     Labels: { ...volumeLabels, 'panel.owner': 'self-hosted-panel' }, Env: environment, Entrypoint: ['/bin/sh', '-c'], Cmd: [command],
@@ -51,10 +55,14 @@ export async function createRestoreCandidate(options: {
   if (!idPattern.test(candidate.id)) throw new Error('Invalid restore candidate identity.');
   await dockerStep(() => candidate.start(), options.signal);
   await writeSecret(options.dockerSocket, candidate.id, 'panel-db-password', options.password, options.signal);
-  if (options.kind === 'mariadb') await writeSecret(options.dockerSocket, candidate.id, 'panel-db-root-password', options.rootPassword!, options.signal);
+  if (options.kind === 'mariadb' || options.kind === 'mysql') await writeSecret(options.dockerSocket, candidate.id, 'panel-db-root-password', options.rootPassword!, options.signal);
   const ready = options.kind === 'postgres'
     ? 'PGPASSWORD="$(cat /run/secrets/panel-db-password)"; export PGPASSWORD; exec psql -X -w -h 127.0.0.1 -U "$1" -d "$2" -v ON_ERROR_STOP=1 -tA -c "SELECT 1"'
-    : 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)"; export MYSQL_PWD; exec mariadb --no-defaults -h 127.0.0.1 -u "$1" "$2" --connect-timeout=3 -N -e "SELECT 1"';
+    : options.kind === 'mariadb'
+      ? 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)"; export MYSQL_PWD; exec mariadb --no-defaults -h 127.0.0.1 -u "$1" "$2" --connect-timeout=3 -N -e "SELECT 1"'
+      : options.kind === 'mysql'
+        ? 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)"; export MYSQL_PWD; exec mysql --no-defaults -h 127.0.0.1 -u "$1" "$2" --connect-timeout=3 -N -e "SELECT 1"'
+        : 'MONGO_PASS="$(cat /run/secrets/panel-db-password)"; exec mongosh --quiet --host 127.0.0.1 --username "$1" --password "$MONGO_PASS" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok"';
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
     options.signal?.throwIfAborted();

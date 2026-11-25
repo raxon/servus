@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { connection, request } from './servus-client.mjs';
 
 export function createMcpServer(config=connection()) {
-  const server=new McpServer({name:'servus',version:'0.1.61'});
+  const server=new McpServer({name:'servus',version:'0.2.0'});
   const read={readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:true};
   const mutate={readOnlyHint:false,destructiveHint:true,idempotentHint:true,openWorldHint:true};
   const run=async(path,options={})=>{
@@ -32,6 +32,12 @@ export function createMcpServer(config=connection()) {
   server.registerTool('read_compose_metrics',{description:'Read current Compose CPU, memory, network and container count measurements.',inputSchema:{workloadId:z.string().uuid()},annotations:read},({workloadId})=>run(`/compose/${workloadId}/metrics`));
   server.registerTool('deploy_compose',{description:'Deploy saved Compose configuration. May interrupt traffic. Returns a durable action; poll read_compose_actions. Reuse idempotencyKey when retrying the same request.',inputSchema:{workloadId:z.string().uuid(),idempotencyKey:z.string().min(1).max(128)},annotations:mutate},({workloadId,idempotencyKey})=>run(`/compose/${workloadId}/deploy`,{method:'POST',body:{},key:idempotencyKey}));
   server.registerTool('control_compose',{description:'Start, stop or restart the deployed Compose configuration. May interrupt traffic. Reuse idempotencyKey on retries.',inputSchema:{workloadId:z.string().uuid(),operation:z.enum(['start','stop','restart']),idempotencyKey:z.string().min(1).max(128)},annotations:mutate},({workloadId,operation,idempotencyKey})=>run(`/compose/${workloadId}/${operation}`,{method:'POST',body:{},key:idempotencyKey}));
+  server.registerTool('create_compose',{description:'Create and deploy a new inline Compose workload in the authorized project. Reuse idempotencyKey on retries.',inputSchema:{projectId:z.string().uuid(),name:z.string().min(1).max(63),yaml:z.string().min(1).max(262144),idempotencyKey:z.string().min(1).max(128)},annotations:mutate},({projectId,name,yaml,idempotencyKey})=>run(`/projects/${projectId}/compose`,{method:'POST',body:{name,source:{type:'inline',yaml},domains:[]},key:idempotencyKey}));
+  server.registerTool('update_compose',{description:'Update an inline Compose workload using optimistic revision locking.',inputSchema:{workloadId:z.string().uuid(),expectedRevision:z.number().int().positive(),yaml:z.string().min(1).max(262144)},annotations:mutate},({workloadId,expectedRevision,yaml})=>run(`/compose/${workloadId}`,{method:'PATCH',body:{expectedRevision,source:{type:'inline',yaml},domains:[]}}));
+  server.registerTool('destroy_compose',{description:'Destroy a Compose workload and its runtime containers. Requires confirm:true and idempotencyKey.',inputSchema:{workloadId:z.string().uuid(),confirm:z.literal(true),idempotencyKey:z.string().min(1).max(128)},annotations:mutate},({workloadId,confirm,idempotencyKey})=>run(`/compose/${workloadId}/destroy`,{method:'POST',body:{confirm},key:idempotencyKey}));
+  server.registerTool('list_project_env',{description:'List shared project environment variables with secret values masked.',inputSchema:{projectId:z.string().uuid()},annotations:read},({projectId})=>run(`/projects/${projectId}/env`));
+  server.registerTool('list_project_scripts',{description:'List saved operational scripts for the authorized project.',inputSchema:{projectId:z.string().uuid()},annotations:read},({projectId})=>run(`/projects/${projectId}/scripts`));
+  server.registerTool('run_project_script',{description:'Execute a saved operational script inside a running service container (bounded 30s timeout).',inputSchema:{projectId:z.string().uuid(),scriptId:z.string().uuid(),serviceId:z.string().uuid().optional()},annotations:mutate},({projectId,scriptId,serviceId})=>run(`/projects/${projectId}/scripts/${scriptId}/run`,{method:'POST',body:{...(serviceId?{serviceId}:{})}}));
   return server;
 }
 

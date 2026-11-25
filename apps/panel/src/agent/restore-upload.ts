@@ -6,7 +6,7 @@ import { acquireRestoreUploadLock, discardUnregisteredUploadLock } from './resto
 
 /** Fence the service before consuming a stream and publish only its verified digest. */
 export async function uploadRestoreArchive(options: {
-  journal: RestoreJournal; operationId: string; serviceId: string; kind: 'postgres' | 'mariadb' | 'redis';
+  journal: RestoreJournal; operationId: string; serviceId: string; kind: 'postgres' | 'mariadb' | 'redis' | 'mysql' | 'mongodb';
   dataDir: string; key: Buffer; input: () => Readable; signal?: AbortSignal; sizeLimit?: number; expectedSize?: number;
 }): Promise<{ record: RestoreRecord; size: number }> {
   options.signal?.throwIfAborted();

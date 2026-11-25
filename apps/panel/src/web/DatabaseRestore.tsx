@@ -9,7 +9,7 @@ import { FeatureError, FeatureLoading, FeatureModal } from "./feature-ui.js";
 type RestoreOperation = {
   operationId: string;
   phase: "uploading" | "reserved" | "discarding" | "discarding_candidate" | "importing" | "prepared" | "switching" | "needs_review" | "completed" | "cancelled";
-  kind: "postgres" | "mariadb" | "redis";
+  kind: "postgres" | "mariadb" | "redis" | "mysql" | "mongodb";
   reviewPhase?: "uploading" | "reserved" | "discarding" | "importing" | "prepared" | "switching";
   recoveryReason?: "legacy_upload_unverified" | "preparation_unverified";
   rolledBack?: true;

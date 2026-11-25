@@ -150,7 +150,7 @@ describe('service configuration and protected storage',()=>{
   });
   it('rejects a custom image for a new managed PostgreSQL service',async()=>{
     const f=fixture();Object.assign(f.service,{kind:'postgres',image:'example/custom-postgres:latest',database:{database:'app',user:'app',passwordSecretRef:f.putSecret('synthetic-password','database')},domains:[]});
-    await expect(f.runtime.apply(f.service,'deploy',randomUUID())).rejects.toThrow('managed postgres:17-alpine image');
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID())).rejects.toThrow('managed postgres:17-alpine or postgres:18-alpine image');
     expect(f.client.createService).not.toHaveBeenCalled();
   });
   it('refuses a reused volume before changing PostgreSQL runtime',async()=>{
