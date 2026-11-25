@@ -411,6 +411,29 @@ class HostApply:
             if node_fd is not None:
                 os.close(node_fd)
 
+    def download_installation_backup(self, receipt, api_token, maintenance):
+        module = self._backup_module()
+        node_fd = None
+        modules = {}
+        try:
+            self.ownership.assert_held(os.readlink('/proc/self/fd/' + str(self.ownership.directory)))
+            modules = {name: self._load('servus_download_backup_' + name.replace('-', '_'), name + '.py', 0o644)
+                       for name in ('backup', 'update-coordinator')}
+            node_fd = self._node()
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                return module.build_verified_archive(journal, receipt, api_token, self.config['backupRoot'],
+                                                     modules['backup'], modules['update-coordinator'],
+                                                     node_fd, supervisor)
+        except FileNotFoundError:
+            raise
+        except Exception as error:
+            if isinstance(error, self._backup_errors(module, *modules.values())):
+                raise supervisor.SupervisorError('Installation backup download was rejected') from error
+            raise
+        finally:
+            if node_fd is not None:
+                os.close(node_fd)
+
     def recover_installation_backup(self, operation_id, maintenance):
         """Explicit root CLI only; the public socket never dispatches recovery."""
         module = self._backup_module()
@@ -987,8 +1010,8 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
         deadline = time.monotonic() + 5
         request = supervisor._read_message(connection, deadline)
         kind = request.get('type')
-        if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_delete', 'installation_backup_verify', 'installation_backup_status', 'installation_backup_active', 'installation_backup_history'):
-            fields = ({'version', 'type', 'receipt'} if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_delete')
+        if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_delete', 'installation_backup_download', 'installation_backup_verify', 'installation_backup_status', 'installation_backup_active', 'installation_backup_history'):
+            fields = ({'version', 'type', 'receipt'} if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_delete', 'installation_backup_download')
                       else {'version', 'type', 'operationId'} if kind in ('installation_backup_status', 'installation_backup_verify')
                       else {'version', 'type', 'cursor'} if kind == 'installation_backup_history'
                       else {'version', 'type'})
@@ -998,6 +1021,7 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
                     (kind == 'installation_backup_history' and request.get('cursor') is not None and not supervisor._uuid4(request['cursor']))):
                 raise supervisor.SupervisorError('Invalid or unavailable installation backup command')
             history_request = kind == 'installation_backup_history'
+            download_payload = None
             with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
                 if kind == 'installation_backup_active':
                     response = {'version': 1, 'status': 'busy' if apply.installation_backup_active(operation) is not None else 'idle'}
@@ -1021,6 +1045,13 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
                         response = {'version': 1, 'status': 'not_found'}
                     else:
                         response = {'version': 1, 'status': 'deleted', 'result': deleted}
+                elif kind == 'installation_backup_download':
+                    try:
+                        metadata, download_payload = apply.download_installation_backup(request['receipt'], api_token, operation)
+                    except FileNotFoundError:
+                        response = {'version': 1, 'status': 'not_found'}
+                    else:
+                        response = {'version': 1, 'status': 'ready', 'download': metadata}
                 elif kind == 'installation_backup_verify':
                     try:
                         verified = apply.verify_installation_backup(request['operationId'], operation)
@@ -1037,7 +1068,10 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
                         response = {'version': 1, 'status': record['state'], 'backup': record}
             # Queue acknowledgement is sent before any drain. The daemon loop
             # executes the approved operation only after this handler returns.
-            supervisor._send_message(connection, response, time.monotonic() + 1)
+            supervisor._send_message(connection, response, time.monotonic() + 2)
+            if download_payload is not None:
+                connection.settimeout(30)
+                connection.sendall(download_payload)
             return
         if kind=='legacy_recovery_status' and set(request)=={'version','type','operationId','restoreId','serviceId'} and type(request.get('version')) is int and request['version']==1:
             status=legacy_recovery_status(journal_dir,request['operationId'],request['restoreId'],request['serviceId'])

@@ -1,4 +1,5 @@
 import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
+import {createHash} from 'node:crypto';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {createServer,type Server,type Socket} from 'node:net';
 import {join} from 'node:path';
@@ -7,11 +8,11 @@ import {Store} from '../../src/server/store.js';
 import type {InstallationBackupApproval,InstallationBackupApprovalFields} from '../../src/server/installation-backup-approval.js';
 
 // Only the privileged key reader/signer is replaced. Sessions, Store, routes and Unix transport are real.
-const {signer,cancelSigner,deleteSigner}=vi.hoisted(()=>({signer:vi.fn(),cancelSigner:vi.fn(),deleteSigner:vi.fn()}));
-vi.mock('../../src/server/installation-backup-approval.js',async original=>({...await original<typeof import('../../src/server/installation-backup-approval.js')>(),signInstallationBackupApproval:signer,signInstallationBackupCancellation:cancelSigner,signInstallationBackupDeletion:deleteSigner}));
+const {signer,cancelSigner,deleteSigner,downloadSigner}=vi.hoisted(()=>({signer:vi.fn(),cancelSigner:vi.fn(),deleteSigner:vi.fn(),downloadSigner:vi.fn()}));
+vi.mock('../../src/server/installation-backup-approval.js',async original=>({...await original<typeof import('../../src/server/installation-backup-approval.js')>(),signInstallationBackupApproval:signer,signInstallationBackupCancellation:cancelSigner,signInstallationBackupDeletion:deleteSigner,signInstallationBackupDownload:downloadSigner}));
 const operationId='12345678-1234-4123-8123-123456789abc',input={operationId,name:'Installation backup'},origin='https://panel.example.test';
 const cleanup:(()=>Promise<void>)[]=[];
-beforeEach(()=>{signer.mockReset();signer.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'a'.repeat(64)}));cancelSigner.mockReset();cancelSigner.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'b'.repeat(64)}));deleteSigner.mockReset();deleteSigner.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'c'.repeat(64)}));});
+beforeEach(()=>{signer.mockReset();signer.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'a'.repeat(64)}));cancelSigner.mockReset();cancelSigner.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'b'.repeat(64)}));deleteSigner.mockReset();deleteSigner.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'c'.repeat(64)}));downloadSigner.mockReset();downloadSigner.mockImplementation((fields:InstallationBackupApprovalFields)=>({...fields,version:1,proof:'d'.repeat(64)}));});
 afterEach(async()=>{for(const close of cleanup.splice(0).reverse())await close();});
 type UpdaterRequest={version:number;action:string;approval?:InstallationBackupApproval;operationId?:string};
 
@@ -146,5 +147,59 @@ describe('installation backup routes through createApp',()=>{
     // Revoked session after await must fail closed
     f.respond(socket=>{f.store.deleteSession(f.adminToken);socket.end(`${JSON.stringify({ok:true,operation:{operationId,name:input.name,verified:true,manifestDigest:digest}})}\n`);});
     expect((await f.post(f.headers,{},`/api/v1/installation-backups/${operationId}/verify`)).statusCode).toBe(401);
+  });
+
+  it('downloads verified installation backup archives with distinct signing, checksum verification and post-await admin recheck',async()=>{
+    const f=await fixture();
+    const archiveBytes=Buffer.from('synthetic-gzip-tar-archive-payload');
+    const archiveHex=createHash('sha256').update(archiveBytes).digest('hex');
+    const manifestDigest=`sha256:${'e'.repeat(64)}`;
+    const downloadUrl=`/api/v1/installation-backups/${operationId}/download`;
+
+    // Reject anonymous, non-admin, bad CSRF/origin, and bearer tokens before signing
+    for(const headers of[{},f.member('editor'),{...f.headers,'x-csrf-token':''},{...f.headers,origin:'https://foreign.example.test'},{authorization:`Bearer ${await f.token('deploy')}`}]){
+      expect((await f.post(headers,{name:input.name},downloadUrl)).statusCode).toBeGreaterThanOrEqual(400);
+    }
+    expect(downloadSigner).not.toHaveBeenCalled();
+    expect(f.requests).toEqual([]);
+
+    // Valid verified download
+    f.respond((socket,request)=>{
+      expect(request.action).toBe('installation_backup_download');
+      const header=JSON.stringify({ok:true,operation:{operationId,name:input.name,manifestDigest,archiveSha256:`sha256:${archiveHex}`,sizeBytes:archiveBytes.length}});
+      socket.write(`${header}\n`);
+      socket.end(archiveBytes);
+    });
+    const res=await f.post(f.headers,{name:input.name},downloadUrl);
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('application/gzip');
+    expect(res.headers['content-disposition']).toBe(`attachment; filename="servus-installation-backup-${operationId}.tar.gz"`);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+    expect(res.headers['x-backup-sha256']).toBe(archiveHex);
+    expect(res.headers['x-backup-manifest-digest']).toBe(manifestDigest);
+    expect(res.rawPayload.equals(archiveBytes)).toBe(true);
+    expect(downloadSigner).toHaveBeenCalledWith({...input,actorId:f.admin.id,issuedAt:expect.any(Number)},'/synthetic/not-read/role-api-key');
+    expect(signer).not.toHaveBeenCalled();
+    expect(deleteSigner).not.toHaveBeenCalled();
+
+    // Corrupted archive checksum must fail closed
+    f.respond(socket=>{
+      const header=JSON.stringify({ok:true,operation:{operationId,name:input.name,manifestDigest,archiveSha256:`sha256:${'0'.repeat(64)}`,sizeBytes:archiveBytes.length}});
+      socket.write(`${header}\n`);
+      socket.end(archiveBytes);
+    });
+    expect((await f.post(f.headers,{name:input.name},downloadUrl)).statusCode).toBe(503);
+
+    // Revoked admin session mid-flight must fail closed without returning archive bytes
+    f.respond(socket=>{
+      f.store.deleteSession(f.adminToken);
+      const header=JSON.stringify({ok:true,operation:{operationId,name:input.name,manifestDigest,archiveSha256:`sha256:${archiveHex}`,sizeBytes:archiveBytes.length}});
+      socket.write(`${header}\n`);
+      socket.end(archiveBytes);
+    });
+    const revoked=await f.post(f.headers,{name:input.name},downloadUrl);
+    expect(revoked.statusCode).toBe(401);
+    expect(revoked.rawPayload.includes(archiveBytes)).toBe(false);
   });
 });

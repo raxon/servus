@@ -65,6 +65,36 @@ export async function api<T>(
   return data as T;
 }
 
+export async function apiDownload(
+  path: string,
+  options: { method?: string; body?: unknown; signal?: AbortSignal } = {},
+): Promise<{ blob: Blob; headers: Headers }> {
+  const method = options.method ?? "POST";
+  const requestEpoch = sessionEpoch;
+  const headers: Record<string, string> = {};
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if (method !== "GET" && csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  const response = await fetch(`/api/v1${path}`, {
+    method,
+    headers,
+    credentials: "same-origin",
+    signal: options.signal,
+    ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+  });
+  if (!response.ok) {
+    const content = await response.text();
+    options.signal?.throwIfAborted();
+    if (requestEpoch !== sessionEpoch) throw new RequestError(0, "SESSION_CHANGED", "Your session changed. Please try again.");
+    let data: { error?: { code?: string; message?: string } } | undefined;
+    try { data = content ? (JSON.parse(content) as { error?: { code?: string; message?: string } }) : undefined; } catch { /* ignore */ }
+    throw new RequestError(response.status, data?.error?.code ?? "REQUEST_FAILED", data?.error?.message ?? "The download could not be completed.");
+  }
+  const blob = await response.blob();
+  options.signal?.throwIfAborted();
+  if (requestEpoch !== sessionEpoch) throw new RequestError(0, "SESSION_CHANGED", "Your session changed. Please try again.");
+  return { blob, headers: response.headers };
+}
+
 export const errorMessage = (error: unknown) =>
   error instanceof Error
     ? error.message

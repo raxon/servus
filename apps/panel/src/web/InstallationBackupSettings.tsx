@@ -2,7 +2,7 @@ import { randomUuid } from "./random-uuid.js";
 import {useEffect,useId,useRef,useState} from 'react';
 import {useInfiniteQuery,useQuery} from '@tanstack/react-query';
 import {Archive} from 'lucide-react';
-import {api,RequestError} from './api.js';
+import {api,apiDownload,RequestError} from './api.js';
 import './InstallationBackupSettings.css';
 
 type InstallationBackupCapability={available:true}|{available:false;reason:'not_configured'|'host_unavailable'|'host_unsupported'};
@@ -18,7 +18,7 @@ const validName=(value:string)=>value===value.trim()&&Array.from(value).length>0
 function remembered(key:string){try{const value=localStorage.getItem(key);return value&&uuid.test(value)?value:null;}catch{return null;}}
 
 function BackupDetails({operation,onChanged}:{operation:InstallationBackupOperation;onChanged?:()=>void}){
-  const [busy,setBusy]=useState<'verify'|'delete'|null>(null);
+  const [busy,setBusy]=useState<'verify'|'download'|'delete'|null>(null);
   const [confirmDelete,setConfirmDelete]=useState(false);
   const [notice,setNotice]=useState<{kind:'ok'|'error';text:string}|null>(null);
 
@@ -29,6 +29,26 @@ function BackupDetails({operation,onChanged}:{operation:InstallationBackupOperat
       setNotice({kind:'ok',text:`Archive verified (${res.verification.manifestDigest.slice(0,23)}...).`});
     }catch(error){
       setNotice({kind:'error',text:error instanceof RequestError?error.message:'Archive verification could not be completed.'});
+    }finally{setBusy(null);}
+  }
+
+  async function download(){
+    setBusy('download');setNotice(null);
+    try{
+      const {blob,headers}=await apiDownload(`/installation-backups/${operation.operationId}/download`,{method:'POST',body:{name:operation.name}});
+      const url=URL.createObjectURL(blob);
+      try{
+        const link=document.createElement('a');
+        link.href=url;
+        link.download=`servus-installation-backup-${operation.operationId}.tar.gz`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      }finally{URL.revokeObjectURL(url);}
+      const sha=headers.get('x-backup-sha256');
+      setNotice({kind:'ok',text:sha?`Archive downloaded (SHA-256 ${sha.slice(0,16)}...).`:'Archive downloaded.'});
+    }catch(error){
+      setNotice({kind:'error',text:error instanceof RequestError?error.message:'Archive download could not be completed.'});
     }finally{setBusy(null);}
   }
 
@@ -52,6 +72,7 @@ function BackupDetails({operation,onChanged}:{operation:InstallationBackupOperat
     {operation.state==='completed'?<>
       <div className="heading-actions" style={{flexWrap:'wrap'}}>
         <button className="button" type="button" disabled={busy!==null} onClick={()=>void verify()}>{busy==='verify'?'Verifying...':'Verify archive'}</button>
+        <button className="button" type="button" disabled={busy!==null} onClick={()=>void download()}>{busy==='download'?'Downloading...':'Download archive'}</button>
         {!confirmDelete?<button className="button button-danger" type="button" disabled={busy!==null} onClick={()=>setConfirmDelete(true)}>Delete snapshot</button>:<>
           <button className="button button-danger" type="button" disabled={busy!==null} onClick={()=>void remove()}>{busy==='delete'?'Deleting...':'Confirm snapshot deletion'}</button>
           <button className="button" type="button" disabled={busy!==null} onClick={()=>setConfirmDelete(false)}>Keep snapshot</button>

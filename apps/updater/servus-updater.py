@@ -1041,6 +1041,86 @@ class PreparationWorker:
         if self.operation is not None: self.fail()
 
 
+class BinaryStreamResponse:
+    """Envelope for verified binary archive downloads streamed after a JSON metadata line."""
+    def __init__(self, metadata, payload):
+        self.metadata = metadata
+        self.payload = payload
+
+
+MAX_INSTALLATION_BACKUP_DOWNLOAD = 64 * 1024 * 1024
+
+
+def supervisor_stream_request(socket_path, message, timeout):
+    if not isinstance(socket_path, str) or not os.path.isabs(socket_path) or os.path.normpath(socket_path) != socket_path or not isinstance(message, dict) or not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 0 < timeout <= 1800:
+        raise RuntimeError('Invalid supervisor command')
+    path = pathlib.Path(socket_path)
+    trusted_directory(path.parent, 0o750)
+    before = path.lstat()
+    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) != 0o600:
+        raise RuntimeError('Supervisor command socket is not trusted')
+    deadline = time.monotonic() + timeout
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(timeout)
+        peer.connect(socket_path)
+        _pid, uid, _gid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+        after = path.lstat()
+        if uid != 0 or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise RuntimeError('Supervisor command peer is not trusted')
+        peer.sendall(json.dumps(message, separators=(',', ':')).encode() + b'\n')
+        buf = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Supervisor download timed out')
+            peer.settimeout(remaining)
+            chunk = peer.recv(4096)
+            if not chunk:
+                raise RuntimeError('Supervisor closed download stream prematurely')
+            buf.extend(chunk)
+            nl = buf.find(b'\n')
+            if nl != -1:
+                if nl + 1 > 4096:
+                    raise RuntimeError('Supervisor download header exceeded limit')
+                header_raw = bytes(buf[:nl])
+                remainder = bytes(buf[nl + 1:])
+                break
+            if len(buf) > 4096:
+                raise RuntimeError('Supervisor download header exceeded limit')
+        try:
+            header = json.loads(header_raw.decode('utf-8'), object_pairs_hook=no_duplicate_keys)
+        except (ValueError, UnicodeDecodeError, RecursionError) as error:
+            raise RuntimeError('Invalid supervisor download header') from error
+        if not isinstance(header, dict):
+            raise RuntimeError('Invalid supervisor download header')
+        if header.get('status') != 'ready':
+            return header, b''
+        download = header.get('download')
+        if (not isinstance(download, dict) or type(download.get('sizeBytes')) is not int or
+                not 0 < download['sizeBytes'] <= MAX_INSTALLATION_BACKUP_DOWNLOAD):
+            raise RuntimeError('Invalid supervisor download size')
+        expected_size = download['sizeBytes']
+        if len(remainder) > expected_size:
+            raise RuntimeError('Supervisor download exceeded declared size')
+        body = bytearray(remainder)
+        while len(body) < expected_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Supervisor download body timed out')
+            peer.settimeout(remaining)
+            chunk = peer.recv(min(65536, expected_size - len(body)))
+            if not chunk:
+                raise RuntimeError('Supervisor download truncated')
+            body.extend(chunk)
+        # Ensure no unexpected trailing bytes exist
+        remaining = max(0.2, deadline - time.monotonic())
+        peer.settimeout(remaining)
+        extra = peer.recv(1)
+        if extra:
+            raise RuntimeError('Supervisor download contained trailing bytes')
+        return header, bytes(body)
+
+
 def supervisor_request(socket_path,message,timeout):
     if not isinstance(socket_path,str) or not os.path.isabs(socket_path) or os.path.normpath(socket_path)!=socket_path or not isinstance(message,dict) or not isinstance(timeout,(int,float)) or isinstance(timeout,bool) or not 0<timeout<=1800:
         raise RuntimeError('Invalid supervisor command')
@@ -1159,6 +1239,36 @@ class InstallationBackupProxy:
                 not DIGEST_PATTERN.fullmatch(item['manifestDigest'])):
             raise ProtocolError('unavailable')
         return item
+
+    def download(self, approval):
+        fields = {'version', 'operationId', 'actorId', 'name', 'issuedAt', 'proof'}
+        if (not isinstance(approval, dict) or set(approval) != fields or type(approval['version']) is not int or approval['version'] != 1 or
+            not valid_uuid(approval['operationId']) or not valid_uuid(approval['actorId']) or not self._name(approval['name']) or
+            type(approval['issuedAt']) is not int or approval['issuedAt'] < 0 or not isinstance(approval['proof'], str) or
+            not re.fullmatch(r'[a-f0-9]{64}', approval['proof'])):
+            raise ProtocolError('invalid_request')
+        try:
+            result, payload = supervisor_stream_request(self.socket_path, {'version': 1, 'type': 'installation_backup_download', 'receipt': approval}, 60)
+        except (OSError, RuntimeError, ValueError, RecursionError):
+            raise ProtocolError('unavailable') from None
+        if result == {'version': 1, 'status': 'not_found'} and type(result.get('version')) is int:
+            raise ProtocolError('not_found')
+        if result == {'version': 1, 'status': 'failed'} and type(result.get('version')) is int:
+            raise ProtocolError('operation_in_progress')
+        if (not isinstance(result, dict) or set(result) != {'version', 'status', 'download'} or
+                type(result['version']) is not int or result['version'] != 1 or result['status'] != 'ready'):
+            raise ProtocolError('unavailable')
+        item = result['download']
+        if (not isinstance(item, dict) or set(item) != {'operationId', 'name', 'manifestDigest', 'archiveSha256', 'sizeBytes'} or
+                item['operationId'] != approval['operationId'] or item['name'] != approval['name'] or
+                not isinstance(item['manifestDigest'], str) or not DIGEST_PATTERN.fullmatch(item['manifestDigest']) or
+                not isinstance(item['archiveSha256'], str) or not DIGEST_PATTERN.fullmatch(item['archiveSha256']) or
+                type(item['sizeBytes']) is not int or item['sizeBytes'] != len(payload) or
+                not 0 < item['sizeBytes'] <= MAX_INSTALLATION_BACKUP_DOWNLOAD):
+            raise ProtocolError('unavailable')
+        if ('sha256:' + hashlib.sha256(payload).hexdigest()) != item['archiveSha256']:
+            raise ProtocolError('unavailable')
+        return BinaryStreamResponse(item, payload)
 
     def status(self, operation_id):
         if not valid_uuid(operation_id):
@@ -1545,6 +1655,9 @@ def process(journal, request, *, allow_apply=False, discovery=None, recovery=Non
     if action == 'installation_backup_verify' and set(request) == {'version', 'action', 'operationId'}:
         if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
         return installation_backups.verify(request['operationId'])
+    if action == 'installation_backup_download' and set(request) == {'version', 'action', 'approval'}:
+        if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
+        return installation_backups.download(request['approval'])
     if action == 'apply' and set(request) == {'version', 'action', 'operationId'}:
         # Reject the readiness probe locally: backup admission can need the
         # installation lock already held by the initial-generation coordinator.
@@ -1714,18 +1827,26 @@ def run(state_dir, socket_dir, allowed_uid, socket_gid, launcher=None, *, superv
                     continue
                 with client:
                     deadline = time.monotonic() + 2
+                    binary_payload = None
                     try:
                         _pid, uid, _gid = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
                         if uid != allowed_uid:
                             raise ProtocolError('unauthorized')
                         value = process(journal, receive(client, deadline), allow_apply=apply_worker is not None, discovery=discovery_worker,recovery=recovery_journal,preferences=preferences,installation_backups=installation_backups)
-                        response = {'ok': True, 'operation': value}
+                        if isinstance(value, BinaryStreamResponse):
+                            response = {'ok': True, 'operation': value.metadata}
+                            binary_payload = value.payload
+                        else:
+                            response = {'ok': True, 'operation': value}
                     except ProtocolError as error:
                         response = {'ok': False, 'error': error.code}
                     except (OSError, sqlite3.Error):
                         response = {'ok': False, 'error': 'unavailable'}
                     try:
                         client.sendall(json.dumps(response, separators=(',', ':')).encode() + b'\n')
+                        if binary_payload is not None:
+                            client.settimeout(30)
+                            client.sendall(binary_payload)
                     except OSError:
                         pass
         finally:

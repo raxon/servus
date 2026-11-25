@@ -3,9 +3,9 @@ import { z } from 'zod';
 import { AppError } from './errors.js';
 import {
   installationBackupApprovalSchema, installationBackupId, installationBackupInputSchema,
-  signInstallationBackupApproval, signInstallationBackupCancellation, signInstallationBackupDeletion, type InstallationBackupApproval, type InstallationBackupApprovalFields,
+  signInstallationBackupApproval, signInstallationBackupCancellation, signInstallationBackupDeletion, signInstallationBackupDownload, type InstallationBackupApproval, type InstallationBackupApprovalFields,
 } from './installation-backup-approval.js';
-import { cancelInstallationBackup, deleteInstallationBackup, installationBackupCapability, installationBackupHistory, installationBackupStatus, submitInstallationBackup, UpdaterClientError, verifyInstallationBackup } from './updater-client.js';
+import { cancelInstallationBackup, deleteInstallationBackup, downloadInstallationBackup, installationBackupCapability, installationBackupHistory, installationBackupStatus, submitInstallationBackup, UpdaterClientError, verifyInstallationBackup } from './updater-client.js';
 
 export interface InstallationBackupRoutesOptions {
   administrator: (request: FastifyRequest, mutation?: boolean) => {id: string};
@@ -15,6 +15,7 @@ export interface InstallationBackupRoutesOptions {
   signApproval?: (input: InstallationBackupApprovalFields) => InstallationBackupApproval;
   signCancellation?: (input: InstallationBackupApprovalFields) => InstallationBackupApproval;
   signDeletion?: (input: InstallationBackupApprovalFields) => InstallationBackupApproval;
+  signDownload?: (input: InstallationBackupApprovalFields) => InstallationBackupApproval;
   now?: () => number;
 }
 
@@ -129,5 +130,27 @@ export function registerInstallationBackups(app: FastifyInstance, options: Insta
     const socket=endpoint();
     let verification;try{verification=await verifyInstallationBackup(operationId,socket);}catch(error){backupError(error);}
     administrator(request,true);return{ok:true,verification};
+  });
+
+  app.post('/api/v1/installation-backups/:operationId/download',{bodyLimit:2048,config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async(request,reply)=>{
+    const actor=administrator(request,true),{operationId}=z.strictObject({operationId:installationBackupId}).parse(request.params);
+    const {name}=installationBackupInputSchema.pick({name:true}).parse(request.body);z.strictObject({}).parse(request.query);
+    const socket=endpoint();let approval:InstallationBackupApproval;
+    try{
+      const fields={operationId,name,actorId:actor.id,issuedAt:(options.now??Date.now)()};
+      approval=installationBackupApprovalSchema.parse(options.signDownload?options.signDownload(fields):signInstallationBackupDownload(fields,options.approvalSecretPath!));
+      if(approval.operationId!==fields.operationId||approval.actorId!==fields.actorId||approval.name!==fields.name||approval.issuedAt!==fields.issuedAt)throw new Error('Download identity changed');
+    }catch{throw new AppError('INSTALLATION_BACKUP_UNAVAILABLE','Installation backup approval is unavailable',503);}
+    let downloaded;try{downloaded=await downloadInstallationBackup(approval,socket);}catch(error){backupError(error);}
+    administrator(request,true);
+    reply
+      .header('Content-Type','application/gzip')
+      .header('Content-Length',String(downloaded.metadata.sizeBytes))
+      .header('Content-Disposition',`attachment; filename="servus-installation-backup-${downloaded.metadata.operationId}.tar.gz"`)
+      .header('Cache-Control','no-store')
+      .header('X-Content-Type-Options','nosniff')
+      .header('X-Backup-SHA256',downloaded.metadata.archiveSha256.slice(7))
+      .header('X-Backup-Manifest-Digest',downloaded.metadata.manifestDigest);
+    return reply.send(downloaded.archive);
   });
 }

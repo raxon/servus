@@ -1,5 +1,5 @@
 import { createConnection } from 'node:net';
-import {randomUUID} from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { z } from 'zod';
@@ -62,8 +62,18 @@ const installationBackupVerificationSchema = z.strictObject({
   verified: z.literal(true),
   manifestDigest: digest,
 });
+const maxDownloadArchiveBytes = 64 * 1024 * 1024;
+const installationBackupDownloadSchema = z.strictObject({
+  operationId: installationBackupId,
+  name: installationBackupName,
+  manifestDigest: digest,
+  archiveSha256: digest,
+  sizeBytes: z.number().int().positive().max(maxDownloadArchiveBytes),
+});
 export type InstallationBackupDeletion = z.infer<typeof installationBackupDeletionSchema>;
 export type InstallationBackupVerification = z.infer<typeof installationBackupVerificationSchema>;
+export type InstallationBackupDownload = z.infer<typeof installationBackupDownloadSchema>;
+export interface InstallationBackupDownloadResult { metadata: InstallationBackupDownload; archive: Buffer }
 export type InstallationBackupCapability={available:true}|{available:false;reason:'not_configured'|'host_unavailable'|'host_unsupported'};
 
 export type UpdateOperation = z.infer<typeof operationSchema>;
@@ -223,3 +233,81 @@ export function deleteInstallationBackup(approval:InstallationBackupApproval,opt
 export function verifyInstallationBackup(operationId:string,options:UpdaterClientOptions):Promise<InstallationBackupVerification>{return request('installation_backup_verify',{operationId},{timeoutMs:60_000,...options}) as Promise<InstallationBackupVerification>;}
 
 export function installationBackupHistory(cursor: string | null, options: UpdaterClientOptions): Promise<InstallationBackupHistory> { return request('installation_backup_history', {cursor}, options) as Promise<InstallationBackupHistory>; }
+
+export function downloadInstallationBackup(approval: InstallationBackupApproval, options: UpdaterClientOptions): Promise<InstallationBackupDownloadResult> {
+  const validInput = z.strictObject({approval: installationBackupApprovalSchema}).safeParse({approval});
+  const timeout = options.timeoutMs ?? 60_000;
+  if (!validInput.success || typeof options.socketPath !== 'string' || !isAbsolute(options.socketPath) || options.socketPath.includes('\0') || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120000) {
+    return Promise.reject(new UpdaterClientError('invalid_input', 'definitive'));
+  }
+  const payload = Buffer.from(JSON.stringify({ version: 1, action: 'installation_backup_download', approval: validInput.data.approval }) + '\n');
+  return new Promise((resolve, reject) => {
+    let dispatched = false, settled = false;
+    let headerParsed = false;
+    let metadata: InstallationBackupDownload | null = null;
+    let headerBuf = Buffer.alloc(0);
+    const bodyChunks: Buffer[] = [];
+    let bodyLength = 0;
+    const socket = createConnection({ path: options.socketPath });
+    const finish = (error?: UpdaterClientError, result?: InstallationBackupDownloadResult) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); socket.destroy();
+      if (error) reject(error); else resolve(result!);
+    };
+    const fail = (code: UpdateErrorCode) => finish(new UpdaterClientError(code, dispatched ? 'uncertain' : 'definitive'));
+    const timer = setTimeout(() => fail('timeout'), timeout);
+    socket.once('connect', () => { dispatched = true; socket.write(payload); });
+    socket.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      if (!headerParsed) {
+        headerBuf = Buffer.concat([headerBuf, chunk]);
+        const nl = headerBuf.indexOf(10);
+        if (nl === -1) {
+          if (headerBuf.length > maxResponseBytes) fail('invalid_response');
+          return;
+        }
+        if (nl + 1 > maxResponseBytes) { fail('invalid_response'); return; }
+        let data: unknown;
+        try { data = parseUniqueJson(new TextDecoder('utf-8', { fatal: true }).decode(headerBuf.subarray(0, nl))); }
+        catch { fail('invalid_response'); return; }
+        const responseSchema = z.union([
+          z.strictObject({ ok: z.literal(true), operation: installationBackupDownloadSchema }),
+          z.strictObject({ ok: z.literal(false), error: errorCode }),
+        ]);
+        const parsed = responseSchema.safeParse(data);
+        if (!parsed.success) { fail('invalid_response'); return; }
+        if (!parsed.data.ok) {
+          const certainty = parsed.data.error === 'unavailable' ? 'uncertain' : 'definitive';
+          finish(new UpdaterClientError(parsed.data.error, certainty));
+          return;
+        }
+        if (parsed.data.operation.operationId !== validInput.data.approval.operationId || parsed.data.operation.name !== validInput.data.approval.name) {
+          fail('invalid_response'); return;
+        }
+        metadata = parsed.data.operation;
+        headerParsed = true;
+        const remainder = headerBuf.subarray(nl + 1);
+        headerBuf = Buffer.alloc(0);
+        if (remainder.length > 0) {
+          bodyLength += remainder.length;
+          if (bodyLength > metadata.sizeBytes) { fail('invalid_response'); return; }
+          bodyChunks.push(remainder);
+        }
+        return;
+      }
+      bodyLength += chunk.length;
+      if (!metadata || bodyLength > metadata.sizeBytes) { fail('invalid_response'); return; }
+      bodyChunks.push(chunk);
+    });
+    socket.once('end', () => {
+      if (settled) return;
+      if (!headerParsed || !metadata || bodyLength !== metadata.sizeBytes) { fail('invalid_response'); return; }
+      const archive = Buffer.concat(bodyChunks, metadata.sizeBytes);
+      const actualSha = `sha256:${createHash('sha256').update(archive).digest('hex')}`;
+      if (actualSha !== metadata.archiveSha256) { fail('invalid_response'); return; }
+      finish(undefined, { metadata, archive });
+    });
+    socket.once('error', () => fail('connection_failed'));
+    socket.once('close', () => { if (!settled) fail('connection_failed'); });
+  });
+}

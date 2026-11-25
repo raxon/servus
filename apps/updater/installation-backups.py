@@ -5,14 +5,17 @@ The caller holds the installation lock and supplies root-approved policy,
 modules and executables. Public requests supply an identity and a display name,
 never a filesystem path. This module does not restore live application data.
 """
+import gzip
 import hashlib
 import fcntl
 import hmac
+import io
 import json
 import os
 import re
 import select
 import stat
+import tarfile
 import time
 
 UUID = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$')
@@ -21,6 +24,7 @@ DIGEST = re.compile(r'^sha256:[a-f0-9]{64}$')
 TERMINAL = ('completed', 'failed', 'cancelled')
 STATES = ('requested', 'capturing', 'verified', 'starting', 'recovering', 'completed', 'failed', 'cancelled', 'recovery_required')
 MAX_RECORD = 16384
+MAX_DOWNLOAD_ARCHIVE = 64 * 1024 * 1024
 
 
 class BackupError(Exception):
@@ -44,11 +48,12 @@ def approval_message(receipt, *, purpose='submit'):
         not _name(receipt['name']) or type(receipt['issuedAt']) is not int or receipt['issuedAt'] < 0 or
         not isinstance(receipt['proof'], str) or not HEX.fullmatch(receipt['proof'])):
         raise BackupError('Invalid administrator approval')
-    if purpose not in ('submit', 'cancel', 'delete'):
+    if purpose not in ('submit', 'cancel', 'delete', 'download'):
         raise BackupError('Invalid administrator approval purpose')
     prefix = ('servus-installation-backup-v1\0' if purpose == 'submit' else
               'servus-installation-backup-cancel-v1\0' if purpose == 'cancel' else
-              'servus-installation-backup-delete-v1\0')
+              'servus-installation-backup-delete-v1\0' if purpose == 'delete' else
+              'servus-installation-backup-download-v1\0')
     return (prefix + receipt['operationId'] + '\0' + receipt['actorId'] + '\0' +
             str(receipt['issuedAt']) + '\0' + receipt['name']).encode('utf-8')
 
@@ -535,6 +540,122 @@ def verify_completed_snapshot(journal, operation_id, backup_module, update_modul
         'verified': True,
         'manifestDigest': record['manifestDigest'],
     }
+
+
+def _collect_snapshot_files(dir_fd, prefix='', *, depth=0, budget=None):
+    """Read a root-owned verified snapshot directory without following symlinks or writing temp files."""
+    if budget is None:
+        budget = [0]
+    if depth > 8:
+        raise BackupError('Snapshot directory exceeds maximum nesting depth')
+    entries = sorted(os.listdir(dir_fd))
+    if len(entries) > 8192:
+        raise BackupError('Snapshot directory exceeds maximum entry count')
+    collected = []
+    for entry in entries:
+        if not entry or '/' in entry or entry in ('.', '..'):
+            raise BackupError('Unsafe snapshot entry name')
+        info = os.stat(entry, dir_fd=dir_fd, follow_symlinks=False)
+        if info.st_uid != 0 or stat.S_ISLNK(info.st_mode):
+            raise BackupError('Unsafe ownership or symlink inside snapshot directory')
+        rel = f'{prefix}/{entry}' if prefix else entry
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+            try:
+                child_info = os.fstat(child_fd)
+                if child_info.st_uid != 0 or not stat.S_ISDIR(child_info.st_mode):
+                    raise BackupError('Snapshot subdirectory changed during read')
+                collected.extend(_collect_snapshot_files(child_fd, rel, depth=depth + 1, budget=budget))
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_size < 0 or budget[0] + info.st_size > MAX_DOWNLOAD_ARCHIVE:
+                raise BackupError('Snapshot archive exceeds download size limit')
+            file_fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+            try:
+                file_info = os.fstat(file_fd)
+                if file_info.st_uid != 0 or not stat.S_ISREG(file_info.st_mode) or file_info.st_nlink != 1:
+                    raise BackupError('Snapshot file changed during read')
+                chunks = []
+                remaining = MAX_DOWNLOAD_ARCHIVE - budget[0]
+                while True:
+                    chunk = os.read(file_fd, 65536)
+                    if not chunk:
+                        break
+                    if len(chunk) > remaining:
+                        raise BackupError('Snapshot archive exceeds download size limit')
+                    remaining -= len(chunk)
+                    budget[0] += len(chunk)
+                    chunks.append(chunk)
+                data = b''.join(chunks)
+                collected.append((rel, stat.S_IMODE(file_info.st_mode) & 0o600 or 0o600, data))
+            finally:
+                os.close(file_fd)
+        else:
+            raise BackupError('Unexpected special file inside snapshot directory')
+    return collected
+
+
+def build_verified_archive(journal, receipt, api_token, backup_root, backup_module, update_module, node_fd, supervisor, *, now_ms=None):
+    """Verify one completed snapshot and package it deterministically in memory with zero temp files."""
+    if not isinstance(journal, BackupJournal):
+        raise BackupError('A protected backup journal is required')
+    approved = verify_approval(receipt, api_token, now_ms=now_ms, purpose='download')
+    journal._locked()
+    journal.assert_untouched()
+    if journal.active() is not None:
+        raise BackupError('Another installation backup requires completion or recovery')
+    record = journal.get(approved['operationId'])
+    if record['name'] != approved['name']:
+        raise BackupError('Download request does not match the backup')
+    if record['state'] != 'completed' or record['snapshotPath'] is None or record['manifestDigest'] is None:
+        raise BackupError('Only completed verified installation backups can be downloaded')
+    if journal.is_deleted(approved['operationId']):
+        raise BackupError('Installation backup archive was deleted')
+    expected_dir = 'installation-' + record['operationId']
+    expected_path = os.path.join(os.path.normpath(backup_root), expected_dir)
+    if os.path.normpath(record['snapshotPath']) != expected_path:
+        raise BackupError('Backup snapshot path does not match the configured backup root')
+    update_module.verify_snapshot(record['snapshotPath'], record['manifestDigest'], backup_module, node_fd, supervisor)
+    backup_fd = supervisor._trusted_directory(backup_root, 0o700)
+    snap_fd = None
+    try:
+        snap_fd = os.open(expected_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=backup_fd)
+        snap_info = os.fstat(snap_fd)
+        if snap_info.st_uid != 0 or snap_info.st_gid != 0 or stat.S_IMODE(snap_info.st_mode) != 0o700:
+            raise BackupError('Unsafe snapshot directory permissions')
+        files = _collect_snapshot_files(snap_fd)
+    finally:
+        if snap_fd is not None:
+            os.close(snap_fd)
+        os.close(backup_fd)
+    manifest_entry = next((data for rel, _mode, data in files if rel == 'manifest.json'), None)
+    if manifest_entry is None or ('sha256:' + hashlib.sha256(manifest_entry).hexdigest()) != record['manifestDigest']:
+        raise BackupError('Snapshot manifest changed during download packaging')
+    buf = io.BytesIO()
+    with gzip.GzipFile(filename='', mode='wb', fileobj=buf, mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as archive:
+            for rel, mode, data in files:
+                info = tarfile.TarInfo(name=f'{expected_dir}/{rel}')
+                info.size = len(data)
+                info.mode = mode
+                info.uid = 0
+                info.gid = 0
+                info.uname = 'root'
+                info.gname = 'root'
+                info.mtime = 0
+                archive.addfile(info, io.BytesIO(data))
+    archive_bytes = buf.getvalue()
+    if not archive_bytes or len(archive_bytes) > MAX_DOWNLOAD_ARCHIVE:
+        raise BackupError('Packaged installation backup exceeds download size limit')
+    metadata = {
+        'operationId': record['operationId'],
+        'name': record['name'],
+        'manifestDigest': record['manifestDigest'],
+        'archiveSha256': 'sha256:' + hashlib.sha256(archive_bytes).hexdigest(),
+        'sizeBytes': len(archive_bytes),
+    }
+    return metadata, archive_bytes
 
 
 def capture_stopped_snapshot(journal, operation_id, lease, backup_root, node_fd,
