@@ -318,13 +318,13 @@ h.db.prepare("INSERT INTO service_metrics_samples(service_id,project_id,sampled_
 h.db.pragma('wal_autocheckpoint = 0');
 await h.close();s.close();'''
         subprocess.run([NODE,'--input-type=module','-e',script,str(self.src),UUID],check=True,timeout=20)
-        (self.src/'metrics.sqlite-wal').touch(mode=0o600)
-        (self.src/'metrics.sqlite-shm').touch(mode=0o600)
+        for sidecar in ('metrics.sqlite-wal', 'metrics.sqlite-shm', 'logs.sqlite', 'logs.sqlite-wal', 'logs.sqlite-shm', 'alerts.sqlite', 'alerts.sqlite-wal', 'alerts.sqlite-shm'):
+            (self.src/sidecar).touch(mode=0o600)
         self.fix_permissions()
         self.capture()
         backup._validate_staging(self.destination_fd, self.node_fd)
-        self.assertFalse((self.dst/'metrics.sqlite').exists())
-        self.assertFalse((self.dst/'metrics.sqlite-wal').exists())
+        for sidecar in ('metrics.sqlite', 'metrics.sqlite-wal', 'logs.sqlite', 'logs.sqlite-wal', 'alerts.sqlite', 'alerts.sqlite-wal'):
+            self.assertFalse((self.dst/sidecar).exists())
         restored=self.root/'restored-empty-metrics'; shutil.copytree(self.dst,restored)
         verify=r'''import {Store} from '/app/dist/server/store.js';import {MetricsHistory} from '/app/dist/server/metrics-history.js';
 const d=process.argv[1],id=process.argv[2];const s=new Store(d);

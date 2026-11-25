@@ -67,7 +67,26 @@ const mountSchema = z.object({type:z.enum(['volume','file','bind']),name:nameSch
 const resourcesSchema = z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).strict();
 const databaseSchema = z.object({database:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),user:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),password:z.string().min(12).max(128).optional(),passwordSecretRef:z.string().uuid().optional()}).strict();
 const notesSchema = z.string().max(4000).refine(value => !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value), 'Notes cannot contain control characters');
-const fields={kind:kindSchema.optional(),source:sourceSchema.optional(),environment:z.array(envSchema).max(100).optional(),domains:z.array(domainSchema).max(20).optional(),mounts:z.array(mountSchema).max(20).optional(),resources:resourcesSchema.optional(),database:databaseSchema.optional(),databaseAccess:databaseAccessSchema.optional(),registry:registryCredentialSchema.nullable().optional(),notes:notesSchema.optional()};
+const servicePortSchema = z.object({
+  publishedPort: z.number().int().min(1024).max(65535),
+  targetPort: z.number().int().min(1).max(65535),
+  protocol: z.enum(['tcp', 'udp']).default('tcp'),
+}).strict();
+const endpointModeSchema = z.enum(['vip', 'dnsrr']);
+const healthcheckSchema = z.object({
+  command: z.array(z.string().min(1).max(256).refine(v => !v.includes('\0'))).min(1).max(16),
+  intervalSeconds: z.number().int().min(5).max(300).default(30),
+  timeoutSeconds: z.number().int().min(1).max(60).default(5),
+  retries: z.number().int().min(1).max(20).default(3),
+  startPeriodSeconds: z.number().int().min(0).max(300).default(0),
+}).strict();
+const deploymentStrategySchema = z.object({
+  order: z.enum(['start-first', 'stop-first']).default('start-first'),
+  parallelism: z.number().int().min(1).max(5).default(1),
+  failureAction: z.enum(['rollback', 'pause', 'continue']).default('rollback'),
+  monitorSeconds: z.number().int().min(5).max(300).default(15),
+}).strict();
+const fields={kind:kindSchema.optional(),source:sourceSchema.optional(),environment:z.array(envSchema).max(100).optional(),domains:z.array(domainSchema).max(20).optional(),mounts:z.array(mountSchema).max(20).optional(),resources:resourcesSchema.optional(),database:databaseSchema.optional(),databaseAccess:databaseAccessSchema.optional(),registry:registryCredentialSchema.nullable().optional(),ports:z.array(servicePortSchema).max(10).optional(),endpointMode:endpointModeSchema.optional(),healthcheck:healthcheckSchema.optional(),deploymentStrategy:deploymentStrategySchema.optional(),notes:notesSchema.optional()};
 export const newServiceSchema=z.object({name:nameSchema,image:imageSchema.optional(),port:z.number().int().min(1).max(65535).optional(),hostname:hostnameSchema.optional(),replicas:z.number().int().min(1).max(5).default(1),...fields}).strict();
 export const servicePatchSchema=z.object({expectedRevision:z.number().int().positive(),image:imageSchema.optional(),port:z.number().int().min(1).max(65535).optional(),hostname:hostnameSchema.optional(),replicas:z.number().int().min(1).max(5).optional(),...fields}).strict();
 
@@ -109,6 +128,19 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
   if(kind!=='app'&&(config.replicas??1)!==1)throw new AppError('STATEFUL_REPLICAS','Database services require exactly one replica');
   if((config.replicas??1)>1&&(config.mounts??[]).some(mount=>!(mount.readOnly??(mount.type==='file'))))throw new AppError('STATEFUL_REPLICAS','Writable mounts require exactly one replica');
   if(kind!=='app'&&config.domains?.length)throw new AppError('DATABASE_ROUTING','Database services do not expose HTTP domains');
+  if(kind!=='app'&&config.ports?.length)throw new AppError('DATABASE_PORTS','Use external database access settings for managed database ports',400);
+  if(kind!=='app'&&config.endpointMode==='dnsrr')throw new AppError('INVALID_ENDPOINT_MODE','DNSRR endpoint mode is only supported for application services',400);
+  if(config.ports?.length) {
+    if(config.endpointMode==='dnsrr')throw new AppError('INVALID_ENDPOINT_MODE','DNSRR endpoint mode cannot be combined with published host ports',400);
+    const panelPort=Number(process.env.PANEL_PORT??4180),ingressPort=Number(process.env.PANEL_INGRESS_PORT??18080);
+    const reserved=new Set([2375,2376,2377,4789,7946,panelPort,ingressPort]);
+    unique(config.ports.map(p=>`${p.publishedPort}/${p.protocol??'tcp'}`),'Published ports');
+    for(const port of config.ports) {
+      if(reserved.has(port.publishedPort))throw new AppError('PORT_RESERVED',`Published port ${port.publishedPort} is reserved for the panel or Swarm control plane`,400);
+    }
+  }
+  const hasWritableMount=(config.mounts??[]).some(mount=>!(mount.readOnly??(mount.type==='file')));
+  if((kind!=='app'||hasWritableMount)&&config.deploymentStrategy?.order==='start-first')throw new AppError('STATEFUL_DEPLOYMENT_ORDER','Stateful services require stop-first deployment order',400);
   if(kind!=='app'&&config.source?.type==='git')throw new AppError('DATABASE_SOURCE','Database services use managed images');
   for(const env of config.environment??[]) {
     if(env.secretRef&&!env.secret)throw new AppError('SECRET_REFERENCE','Secret references require secret mode');
@@ -145,7 +177,7 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
 }
 
 export function configurationOf(input: ServiceConfiguration): ServiceConfiguration {
-  return {kind:input.kind??'app',source:input.source??{type:'image'},environment:input.environment??[],domains:input.domains,mounts:(input.mounts??[]).map(mount=>({...mount,readOnly:mount.readOnly??mount.type==='file'})),resources:input.resources,database:input.database,databaseAccess:input.databaseAccess,registry:input.registry,notes:input.notes};
+  return {kind:input.kind??'app',source:input.source??{type:'image'},environment:input.environment??[],domains:input.domains,mounts:(input.mounts??[]).map(mount=>({...mount,readOnly:mount.readOnly??mount.type==='file'})),resources:input.resources,database:input.database,databaseAccess:input.databaseAccess,registry:input.registry,ports:input.ports,endpointMode:input.endpointMode,healthcheck:input.healthcheck,deploymentStrategy:input.deploymentStrategy,notes:input.notes};
 }
 
 export function parseServicePatch(value:unknown): ServicePatch { return servicePatchSchema.parse(value); }

@@ -31,6 +31,8 @@ import { registerInstallationBackups } from './installation-backups.js';
 import { ApiTokens } from './api-tokens.js';
 import { registerBackups } from './backups.js';
 import { registerMetricsHistory } from './metrics-history.js';
+import { registerLogsHistory } from './logs-history.js';
+import { registerAlerts } from './alerts.js';
 import { registerVolumeBackups } from './volume-backups.js';
 import { registerGithubRepositories } from './github-repositories.js';
 import { registerReleaseNotes } from './release-notes.js';
@@ -68,6 +70,8 @@ export interface AppOptions {
   installationBackupApprovalSecretPath?: string;
   hostDomains?:HostDomainOptions;
   metricsCollector?: { start?: boolean; intervalMs?: number; now?: () => Date; maxRows?: number };
+  logsCollector?: { start?: boolean; intervalMs?: number; now?: () => Date; maxRows?: number };
+  alertsEvaluator?: { start?: boolean; intervalMs?: number; now?: () => Date; fetch?: typeof fetch };
 }
 export async function createApp(options: AppOptions) {
   if(options.trustedProxySecret!==undefined && !/^[a-f0-9]{64}$/.test(options.trustedProxySecret))throw new Error('Invalid trusted proxy secret configuration');
@@ -211,7 +215,8 @@ export async function createApp(options: AppOptions) {
   });
   apiTokens.register(app,session);
   registerBackups(app,{store,serviceAccess,session,agentConnection:options.agentConnection,databaseExport:options.databaseExport,maintenance});
-  registerMetricsHistory(app,{store,serviceAccess,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance,startCollector:options.metricsCollector?.start,intervalMs:options.metricsCollector?.intervalMs,now:options.metricsCollector?.now,maxRows:options.metricsCollector?.maxRows});
+  const metricsHistory = registerMetricsHistory(app,{store,serviceAccess,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance,startCollector:options.metricsCollector?.start,intervalMs:options.metricsCollector?.intervalMs,now:options.metricsCollector?.now,maxRows:options.metricsCollector?.maxRows});
+  registerLogsHistory(app,{store,serviceAccess,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance,startCollector:options.logsCollector?.start,intervalMs:options.logsCollector?.intervalMs,now:options.logsCollector?.now,maxRows:options.logsCollector?.maxRows});
   registerVolumeBackups(app,{store,serviceAccess,agentConnection:options.agentConnection,agentRequest:runtimeRequest,maintenance});
   const compose=registerCompose(app,{store,session:req=>session(req,!['GET','HEAD','OPTIONS'].includes(req.method)),projectAccess,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance});
   registerTemplates(app,{session,projectAccess,createWorkload:compose.createWorkload});
@@ -225,6 +230,7 @@ export async function createApp(options: AppOptions) {
   }
   registerUpdates(app,{administrator,socketPath:options.updaterSocketPath,applyEnabled:options.updaterApplyEnabled,currentVersion:options.updaterCurrentVersion ?? BUILD_INFO.version});
   registerInstallationBackups(app,{administrator,socketPath:options.updaterSocketPath,applyEnabled:options.updaterApplyEnabled,approvalSecretPath:options.installationBackupApprovalSecretPath});
+  registerAlerts(app,{store,administrator,metricsHistory,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance,startEvaluator:options.alertsEvaluator?.start,intervalMs:options.alertsEvaluator?.intervalMs,now:options.alertsEvaluator?.now,fetch:options.alertsEvaluator?.fetch});
   registerReleaseNotes(app,{administrator});
   registerGithubRepositories(app,{store,administrator});
   app.get(`${prefix}/integrations/github`,async req=>{
@@ -251,6 +257,9 @@ export async function createApp(options: AppOptions) {
   }
   function approveDatabaseAccess(user:User, configuration:import('../shared/types.js').ServiceConfiguration) {
     if(configuration.databaseAccess!==undefined && user.role!=='admin')throw new AppError('FORBIDDEN','Only administrators can configure external database access',403);
+  }
+  function approvePublishedPorts(user:User, configuration:import('../shared/types.js').ServiceConfiguration) {
+    if(configuration.ports?.length && user.role!=='admin')throw new AppError('FORBIDDEN','Only administrators can publish host TCP/UDP ports',403);
   }
   app.get(`${prefix}/settings/https`,async req=>{
     administrator(req);
@@ -324,6 +333,7 @@ export async function createApp(options: AppOptions) {
     approveBindMounts(user,input);
     approveSharedGithub(user,input);
     approveDatabaseAccess(user,input);
+    approvePublishedPorts(user,input);
     const result=store.createService(req.params.id,input,user.id,key);
     return reply.code(202).send(result);
   });
@@ -409,6 +419,7 @@ export async function createApp(options: AppOptions) {
     approveBindMounts(auth.user,input);
     approveSharedGithub(auth.user,input);
     approveDatabaseAccess(auth.user,input);
+    approvePublishedPorts(auth.user,input);
     if (input.source && auth.user.role !== 'admin' && service.source?.type === 'git' && service.source.sharedGithub) throw new AppError('FORBIDDEN','Only administrators can change a source using the shared GitHub connection',403);
     if(input.source&&auth.user.role!=='admin'&&service.source?.type==='git'&&service.source.ssh)throw new AppError('FORBIDDEN','Only administrators can change a source using an SSH deploy key',403);
     if (input.source?.type === 'git' && input.source.credential?.secretRef) {

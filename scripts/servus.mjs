@@ -11,6 +11,8 @@ Set SERVUS_URL and SERVUS_TOKEN (a project-scoped API token).
   action ACTION_ID              Read deployment status and events
   action-cancel ACTION_ID       Cancel a queued action or active build
   logs SERVICE_ID               Read recent runtime logs
+  logs-history SERVICE_ID [--window 1h|6h|24h|7d] [--q TEXT] [--level all|error|warn|info]
+                                Search archived service logs
   metrics SERVICE_ID            Read current runtime metrics
   metrics-history SERVICE_ID [--window 1h|6h|24h]
                                 Read historical service metrics
@@ -48,6 +50,16 @@ try {
         }
         if(key&&key.length>128)throw new Error('Idempotency keys cannot exceed 128 characters.');
         key||=randomUUID();method='POST';body=command==='deploy'?{forceRebuild}:{};path=composeOperation?`/compose/${id}/${composeOperation}`:`/services/${id}/${command}`;
+      } else if(command==='logs-history'){
+        let window='24h',q='',level='all';
+        for(let index=0;index<flags.length;index++){
+          if(flags[index]==='--window'&&['1h','6h','24h','7d'].includes(flags[index+1]))window=flags[++index];
+          else if(flags[index]==='--q'&&flags[index+1]!==undefined)q=flags[++index];
+          else if(flags[index]==='--level'&&['all','error','warn','info'].includes(flags[index+1]))level=flags[++index];
+          else throw new Error('Unknown or invalid logs-history option. Use --help.');
+        }
+        const params=new URLSearchParams({window,level,...(q?{q}:{})});
+        path=`/services/${id}/logs/history?${params.toString()}`;
       } else if(command==='metrics-history'){
         let window='1h';
         for(let index=0;index<flags.length;index++){

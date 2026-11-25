@@ -44,6 +44,7 @@ import { DatabaseRestore } from "./DatabaseRestore.js";
 import { DatabaseConnectionString, DatabaseExternalAccess } from "./DatabaseExternalAccess.js";
 import { BackupSettings } from "./BackupSettings.js";
 import { ServiceMetricsHistoryPanel } from "./ServiceMetricsHistory.js";
+import { ServiceLogsHistory } from "./ServiceLogsHistory.js";
 import { VolumeBackupSettings } from "./VolumeBackupSettings.js";
 import { combineEnvironment, formatEnvironment } from "./environment.js";
 import { TerminalBoundary } from "./TerminalBoundary.js";
@@ -1209,6 +1210,7 @@ function RuntimeLogs({ service }: { service: Service }) {
         Runtime output may contain application data. Pause the stream to inspect
         a fixed snapshot.
       </p>
+      <ServiceLogsHistory serviceId={service.id} />
     </section>
   );
 }

@@ -319,6 +319,7 @@ export class Store {
       const service: Service = { id: randomUUID(), projectId, ...input, replicas: input.replicas ?? 1, revision: 1, deployedRevision: null, state: 'pending', lastError: null, createdAt: now(), updatedAt: now() };
       validateConfiguration(service);
       assertDatabasePortAvailable(this,service);
+      this.assertApplicationPortsAvailable(service);
       assertHostDomainOwnership(this,service);
       if(service.kind&&service.kind!=='app')service.hostname=`${service.id}.internal`;
       if(service.domains?.length===0)service.hostname=`${service.id}.internal`;
@@ -350,6 +351,7 @@ export class Store {
       }
       validateConfiguration(next);
       assertDatabasePortAvailable(this,next);
+      this.assertApplicationPortsAvailable(next);
       assertHostDomainOwnership(this,next);
       if(next.domains?.length) {const primary=next.domains.find(domain=>domain.primary)??next.domains[0]!;next.hostname=primary.hostname;next.port=primary.port;}
       else if(next.domains?.length===0)next.hostname=`${id}.internal`;
@@ -660,6 +662,24 @@ export class Store {
     return result;
   }
   recordAudit(actorId:string,operation:string,resourceId:string) {this.db.prepare('INSERT INTO audit_events(id,actor_id,operation,resource_id,created_at) VALUES (?,?,?,?,?)').run(randomUUID(),actorId,operation,resourceId,now());}
+  private assertApplicationPortsAvailable(service: Service) {
+    if (!service.ports?.length) return;
+    const requested = new Set(service.ports.map(p => `${p.publishedPort}/${p.protocol ?? 'tcp'}`));
+    const rows = this.db.prepare('SELECT id, config FROM services WHERE deleted_at IS NULL AND id != ?').all(service.id) as { id: string; config: string }[];
+    for (const row of rows) {
+      let config: import('../shared/types.js').ServiceConfiguration;
+      try { config = JSON.parse(row.config || '{}') as import('../shared/types.js').ServiceConfiguration; } catch { continue; }
+      if (config.databaseAccess?.enabled && requested.has(`${config.databaseAccess.publishedPort}/tcp`)) {
+        throw new AppError('PORT_CONFLICT', `TCP port ${config.databaseAccess.publishedPort} is already assigned to another service`, 409);
+      }
+      for (const port of config.ports ?? []) {
+        const key = `${port.publishedPort}/${port.protocol ?? 'tcp'}`;
+        if (requested.has(key)) {
+          throw new AppError('PORT_CONFLICT', `Published port ${key} is already assigned to another service`, 409);
+        }
+      }
+    }
+  }
   private constraintError(error: unknown): never {
     if (error instanceof Error && error.message.includes('UNIQUE constraint')) throw new AppError('CONFLICT','A resource with this name or hostname already exists',409);
     throw error;

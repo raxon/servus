@@ -7,6 +7,7 @@ import { buildSource } from './build.js';
 import { withComposeProvider } from './compose-ingress.js';
 import { httpsRouteLabels, httpsRedirectLabels, supportsManagedHttps, httpsIngressOptions } from './https-routing.js';
 import { compileDomainLabels } from './route-labels.js';
+import { compileApplicationEndpointSpec, compileHealthCheck, compileUpdateConfig } from './service-options.js';
 import { LOCAL_TLS_FORWARDER, verifyLocalTlsForwarder } from './https-local-forwarder.js';
 import { inspectManagedCertificate } from './managed-certificate.js';
 import { inspectHostCertificate } from './host-certificate.js';
@@ -330,16 +331,19 @@ export class DockerRuntime {
           if (!node) throw new Error('Stateful services require a known local manager node.');
           placement = existing?.Spec.TaskTemplate?.Placement || { Constraints: [`node.id==${node}`] };
         }
+        const endpointSpec = databaseKind(service) ? databaseEndpoint(service) : compileApplicationEndpointSpec(service);
+        const healthCheck = compileHealthCheck(service.healthcheck);
         spec = {
           Name: name, Labels: labels, Mode: { Replicated: { Replicas: service.replicas } },
-          ...(databaseKind(service) ? {EndpointSpec: databaseEndpoint(service)} : {}),
+          ...(endpointSpec ? { EndpointSpec: endpointSpec } : {}),
           TaskTemplate: { ContainerSpec: { Image: imageDigest, Init: true, Env: configuration.environment, Mounts: configuration.mounts,
               Secrets: configuration.secrets, ...(configuration.command ? { Command: configuration.command, Args: configuration.args } : {}),
+              ...(healthCheck ? { HealthCheck: healthCheck } : {}),
               Labels: { 'panel.owner': OWNER, 'panel.service': service.id, 'panel.revision': String(service.revision), 'panel.operation': operationId } },
             Networks: [{ Target: projectNetwork, Aliases: [service.name] }, ...(!databaseKind(service) && domains.length ? [{ Target: INGRESS_NETWORK }] : [])],
             ...(placement ? { Placement: placement } : {}), RestartPolicy: { Condition: 'any', MaxAttempts: 3 },
             Resources: { Limits: { MemoryBytes: limits.memoryMb * 1024 * 1024, NanoCPUs: Math.round(limits.cpu * 1e9) } } },
-          UpdateConfig: { Parallelism: 1, Order: stateful(service) ? 'stop-first' : 'start-first', FailureAction: 'rollback', Monitor: 15000000000 },
+          UpdateConfig: compileUpdateConfig(service, stateful(service)),
           RollbackConfig: { Parallelism: 1, Order: 'stop-first' },
         };
       } else {

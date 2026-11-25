@@ -86,6 +86,7 @@ import { UpdateSettings, useUpdateDiscovery } from "./UpdateSettings.js";
 import { InstallationBackupSettings } from "./InstallationBackupSettings.js";
 import { BackupStorageSettings } from "./BackupStorageSettings.js";
 import { HostMetricsCard } from "./HostMetricsCard.js";
+import { AlertsSettings } from "./AlertsSettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
@@ -1658,6 +1659,7 @@ function SettingsPage() {
           <HostDomainSettings />
           <HttpsSettings configured={runtime.data?.httpsConfigured === true} access={runtime.data?.httpsAccess} recoveryRequired={runtime.data?.ingressRecoveryRequired === true} busy={runtime.data?.ingressBusy === true} />
           <GithubSettings />
+          <AlertsSettings />
         </section>
 
         <section className="settings-group" id="settings-backups" aria-labelledby="settings-backups-heading">

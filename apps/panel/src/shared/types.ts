@@ -28,12 +28,19 @@ export interface DomainConfig {
 }
 export interface MountConfig { type: 'volume' | 'file' | 'bind'; name: string; target: string; readOnly?: boolean; content?: string; source?: string }
 export interface ResourceConfig { cpu: number; memoryMb: number }
+export interface ServicePortConfig { publishedPort: number; targetPort: number; protocol?: 'tcp' | 'udp' }
+export interface ServiceHealthcheckConfig { command: string[]; intervalSeconds?: number; timeoutSeconds?: number; retries?: number; startPeriodSeconds?: number }
+export interface DeploymentStrategyConfig { order?: 'start-first' | 'stop-first'; parallelism?: number; failureAction?: 'rollback' | 'pause' | 'continue'; monitorSeconds?: number }
 export interface DatabaseConfig { database: string; user: string; password?: string; passwordSecretRef?: string }
 export interface ServiceConfiguration {
   kind?: ServiceKind; source?: SourceConfig; environment?: EnvironmentVariable[];
   domains?: DomainConfig[]; mounts?: MountConfig[]; resources?: ResourceConfig; database?: DatabaseConfig;
   databaseAccess?: import('./database-access.js').DatabaseAccess;
   registry?:import('./source-credentials.js').RegistryCredential|null;
+  ports?: ServicePortConfig[];
+  endpointMode?: 'vip' | 'dnsrr';
+  healthcheck?: ServiceHealthcheckConfig;
+  deploymentStrategy?: DeploymentStrategyConfig;
   notes?: string;
 }
 export interface Service extends ServiceConfiguration {
@@ -63,6 +70,7 @@ export interface ServicePatch extends ServiceConfiguration { expectedRevision: n
 export interface ContainerInfo { id: string; name: string; state: string }
 export interface ServiceMetrics { cpuPercent: number; memoryBytes: number; memoryLimitBytes: number; networkRxBytes: number; networkTxBytes: number; containers: number; sampledAt?: string; generation?: string | null }
 export type { HostMetrics, MetricsWindow, ServiceMetricPoint, ServiceMetricsHistory } from './metrics.js';
+export type { ArchivedLogEntry, LogLevel, LogWindow, ServiceLogHistory } from './logs.js';
 export interface ServiceLogs { lines: string[] }
 export interface ConnectionInfo {
   host: string; port: number; database: string; user: string; password?: string;
