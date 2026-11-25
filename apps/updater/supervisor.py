@@ -179,7 +179,7 @@ def _freeze_json(value):
 
 
 def _normalize_host_config(host):
-    """Normalize Docker's unordered mounts and equivalent default OOM flag."""
+    """Normalize Docker's unordered mounts, default OOM flag, and empty DNS slices."""
     if not isinstance(host, dict):
         raise SupervisorError('Runtime configuration is invalid')
     host = dict(host)
@@ -187,6 +187,11 @@ def _normalize_host_config(host):
     # a container starts. True must remain distinct and is never normalized.
     if 'OomKillDisable' in host and (host['OomKillDisable'] is None or host['OomKillDisable'] is False):
         host['OomKillDisable'] = False
+    # Docker serializes unset DNS slices as null at container creation and as []
+    # after a daemon restart (such as a host reboot). Non-empty values remain distinct.
+    for key in ('Dns', 'DnsOptions', 'DnsSearch'):
+        if key in host and (host[key] is None or host[key] == []):
+            host[key] = []
     binds = host.get('Binds')
     if binds is not None:
         if not isinstance(binds, list):

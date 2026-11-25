@@ -509,6 +509,10 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(supervisor._normalize_host_config(base), supervisor._normalize_host_config({'OomKillDisable': None, 'Privileged': False}))
         self.assertNotEqual(supervisor._normalize_host_config(base), supervisor._normalize_host_config({'OomKillDisable': True, 'Privileged': False}))
         self.assertNotEqual(supervisor._normalize_host_config(base), supervisor._normalize_host_config({'OomKillDisable': None, 'Privileged': True}))
+        dns_null = {'Dns': None, 'DnsOptions': None, 'DnsSearch': None, 'Privileged': False}
+        dns_empty = {'Dns': [], 'DnsOptions': [], 'DnsSearch': [], 'Privileged': False}
+        self.assertEqual(supervisor._normalize_host_config(dns_null), supervisor._normalize_host_config(dns_empty))
+        self.assertNotEqual(supervisor._normalize_host_config(dns_null), supervisor._normalize_host_config({'Dns': ['8.8.8.8'], 'DnsOptions': [], 'DnsSearch': [], 'Privileged': False}))
         self.assertNotEqual(supervisor._normalize_host_config(base), supervisor._normalize_host_config({'Privileged': False}))
 
     def test_bind_order_is_unordered_but_sources_options_and_targets_are_checked(self):
