@@ -1,97 +1,720 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import '@fontsource-variable/inter';
 import './styles.css';
+import { Icon, ServusMark, type IconName } from './icons';
+import { WorkspaceShowcase } from './WorkspaceShowcase';
 
-const installCommand = 'curl -fsSL https://servus.run/install.sh | sudo bash';
-const repository = 'https://github.com/raxon/servus';
+const INSTALL_COMMAND = 'curl -fsSL https://servus.run/install.sh | sudo bash';
+const REPO_URL = 'https://github.com/raxon/servus';
+const RELEASE_URL = 'https://github.com/raxon/servus/releases/tag/v0.1.55';
 
-function Icon({ name, size = 20 }: { name: 'arrow' | 'copy' | 'check' | 'menu' | 'close' | 'box' | 'database' | 'grid' | 'activity' | 'settings' | 'terminal' | 'code' | 'github' | 'chevron'; size?: number }) {
-  const paths = {
-    arrow: 'M5 12h14m-5-5 5 5-5 5',
-    copy: 'M9 9h11v11H9V9ZM15 5V3H3v12h2',
-    check: 'm5 12 4 4L19 6',
-    menu: 'M4 6h16M4 12h16M4 18h16',
-    close: 'm6 6 12 12M6 18 18 6',
-    box: 'm12 3 9 5v8l-9 5-9-5V8l9-5Zm0 9 9-4M12 12 3 8m9 4v9',
-    database: 'M20 6c0 2-4 3-8 3S4 8 4 6s4-3 8-3 8 1 8 3Zm0 0v12c0 2-4 3-8 3s-8-1-8-3V6m0 6c0 2 4 3 8 3s8-1 8-3',
-    grid: 'M3 3h7v7H3V3Zm11 0h7v7h-7V3ZM3 14h7v7H3v-7Zm11 0h7v7h-7v-7Z',
-    activity: 'M2 12h4l4-9 4 18 4-9h4',
-    settings: 'M4 6h16M4 18h16M8 3v6m8 6v6',
-    terminal: 'm4 5 6 7-6 7m10 0h6',
-    code: 'm7 5-6 7 6 7M17 5l6 7-6 7M14 3l-4 18',
-    github: 'M9 19c-4 1-4-2-6-2m12 5v-4a3 3 0 0 0-1-2c4 0 7-2 7-6a5 5 0 0 0-2-4 5 5 0 0 0 0-4s-2-1-5 2a15 15 0 0 0-5 0C6 1 4 2 4 2a5 5 0 0 0 0 4 5 5 0 0 0-2 4c0 4 3 6 7 6a3 3 0 0 0-1 2v4',
-    chevron: 'm9 5 7 7-7 7',
-  };
-  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>;
+interface FeatureItem {
+  icon: IconName;
+  eyebrow: string;
+  title: string;
+  description: string;
+  tags: string[];
 }
 
-function Brand({ light = false }: { light?: boolean }) {
-  return <span className={`brand${light ? ' brand-light' : ''}`}><img src="/brand/servus.svg" width="30" height="30" alt="" /><span>Servus</span></span>;
-}
-
-function CopyCommand({ compact = false }: { compact?: boolean }) {
-  const [state, setState] = useState<'idle' | 'copied' | 'select'>('idle');
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const input = useRef<HTMLInputElement>(null);
-
-  async function copy() {
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
-      await navigator.clipboard.writeText(installCommand);
-      setState('copied');
-    } catch {
-      input.current?.focus();
-      input.current?.select();
-      setState('select');
-    }
-    if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => setState('idle'), 3500);
-  }
-
-  return <div className={`command-box${compact ? ' command-compact' : ''}`}>
-    <div className="command-line"><span className="prompt" aria-hidden="true">$</span><input ref={input} aria-label="Servus installation command" value={installCommand} readOnly spellCheck={false} /><button className="copy-button" onClick={() => void copy()} aria-label={state === 'copied' ? 'Command copied' : 'Copy installation command'}><Icon name={state === 'copied' ? 'check' : 'copy'} size={17} /><span>{state === 'copied' ? 'Copied' : 'Copy'}</span></button></div>
-    <span className="copy-status" role="status">{state === 'select' ? 'Command selected. Press Ctrl+C or Command+C to copy.' : state === 'copied' ? 'Installation command copied to clipboard.' : ''}</span>
-  </div>;
-}
-
-const examples = [
-  { name: 'web', icon: 'box' as const, kind: 'Application', source: 'Git / Dockerfile', detail: 'fieldnotes.example.com' },
-  { name: 'postgres', icon: 'database' as const, kind: 'PostgreSQL', source: 'Private network', detail: 'Persistent volume' },
-  { name: 'redis', icon: 'database' as const, kind: 'Redis', source: 'Private network', detail: 'Persistent volume' },
+const PIPELINE_STEPS = [
+  {
+    step: '01',
+    title: 'Connect your source',
+    description:
+      'Pull a Docker image, connect public or private Git via GitHub, SSH deploy key, or PAT, or paste Docker Compose YAML.',
+    detail: 'Image · Git · Compose · 5 templates',
+  },
+  {
+    step: '02',
+    title: 'Build with guardrails',
+    description:
+      'Cap build CPU and memory, stream live output, cancel queued or active builds, and keep saved config separate from deployed revisions.',
+    detail: 'Resource limits · Build cancel · .env',
+  },
+  {
+    step: '03',
+    title: 'Roll out safely',
+    description:
+      'Run custom container healthchecks, choose start-first or stop-first updates, and revert automatically when a release fails verification.',
+    detail: 'Healthcheck · Rollback · Stateful guard',
+  },
+  {
+    step: '04',
+    title: 'Route traffic with Traefik',
+    description:
+      'Issue automatic ACME HTTPS certificates, add path prefixes, IP allow-lists, Basic Auth, redirects, or publish admin-controlled TCP/UDP ports.',
+    detail: 'Auto TLS · Middlewares · DNSRR',
+  },
 ];
 
-function WorkspacePreview() {
-  const [tab, setTab] = useState('Services');
-  return <div className="workspace-preview" aria-label="Illustrative Servus workspace">
-    <div className="preview-browser"><div className="browser-dots" aria-hidden="true"><i /><i /><i /></div><span>your-server / workspace</span><span className="preview-caption">Example workspace</span></div>
-    <div className="preview-body">
-      <aside className="preview-sidebar" aria-hidden="true"><Brand /><div className="workspace-selector"><span>F</span><div>Fieldnotes<small>Personal workspace</small></div><Icon name="chevron" size={15} /></div><small className="preview-label">WORKSPACE</small><div className="preview-nav selected"><Icon name="grid" size={17} />Projects</div><div className="preview-nav"><Icon name="activity" size={17} />Activity</div><div className="preview-nav"><Icon name="settings" size={17} />Instance</div><div className="preview-sidebar-bottom"><span className="status-dot" /> Docker connected</div></aside>
-      <div className="preview-content"><div className="preview-breadcrumb">Projects <span>/</span> fieldnotes</div><div className="preview-project-heading"><div><span className="project-label">YOUR NEXT PROJECT</span><h3>Fieldnotes</h3><p>A little space for a big idea.</p></div><span className="preview-project-icon"><Icon name="box" size={26} /></span></div>
-        <div className="preview-tabs" role="tablist" aria-label="Workspace example views">{['Services', 'Deployments', 'Logs'].map(item => <button key={item} type="button" role="tab" id={`preview-tab-${item}`} aria-selected={tab === item} aria-controls="preview-panel" onClick={() => setTab(item)} onKeyDown={event => { if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') { event.preventDefault(); const items = ['Services', 'Deployments', 'Logs']; const next = items[(items.indexOf(item) + (event.key === 'ArrowRight' ? 1 : 2)) % 3]; setTab(next); document.getElementById(`preview-tab-${next}`)?.focus(); } }}>{item}</button>)}</div>
-        <div className="preview-panel" id="preview-panel" role="tabpanel" aria-labelledby={`preview-tab-${tab}`} tabIndex={0}>
-          {tab === 'Services' ? <div className="service-list">{examples.map(service => <div className="service-row" key={service.name}><span className="service-icon"><Icon name={service.icon} size={22} /></span><div className="service-title"><strong>{service.name}</strong><small>{service.kind}</small></div><div className="service-detail"><span>{service.source}</span><small>{service.detail}</small></div><span className="service-running"><span className="status-dot" />Running</span></div>)}</div> : tab === 'Deployments' ? <div className="preview-deployments"><div><span className="deploy-check"><Icon name="check" size={20} /></span><span><strong>Deploy web</strong><small>Dockerfile build · main</small></span><span className="service-running">Succeeded</span></div><ol><li>Fetch source</li><li>Build image</li><li>Start container</li><li>Check HTTP response</li></ol></div> : <div className="preview-logs"><span>Example application output</span><code><em>web</em> Listening on 0.0.0.0:3000<br /><em>web</em> Connected to PostgreSQL<br /><em>web</em> Redis connection ready<br /><em>web</em> GET /health 200<br /><em>web</em> Ready for the next request.</code></div>}
-        </div><div className="preview-bottom"><span><span className="status-dot" />All services on your infrastructure</span><span>Docker Engine<Icon name="check" size={14} /></span></div>
+const FEATURES: FeatureItem[] = [
+  {
+    icon: 'layers',
+    eyebrow: 'WORKLOADS',
+    title: 'Apps, Git repos & Compose',
+    description:
+      'Run Docker images, Dockerfile builds, or multi-container Compose stacks from inline YAML or Git. Start faster with verified templates for WordPress, n8n, Uptime Kuma, Grafana, and MinIO.',
+    tags: ['GitHub webhooks', 'SSH & PAT', 'Force rebuild', 'Compose templates'],
+  },
+  {
+    icon: 'database',
+    eyebrow: 'DATA',
+    title: 'Private managed databases',
+    description:
+      'Provision PostgreSQL 17, MariaDB 11.4, and Redis 7 on isolated project networks with persistent volumes, optional admin-only external TCP access, logical exports, and candidate-verified restore.',
+    tags: ['PostgreSQL 17', 'MariaDB 11.4', 'Redis 7', 'Verified restore'],
+  },
+  {
+    icon: 'globe',
+    eyebrow: 'NETWORKING',
+    title: 'Traefik routing & edge controls',
+    description:
+      'Configure HTTPS domains with ACME TLS alongside path-prefix matching, strip-prefix, IPv4/IPv6 CIDR allow-lists, htpasswd Basic Auth, redirect rules, and Swarm DNSRR.',
+    tags: ['Automatic HTTPS', 'IP allow-list', 'Basic Auth', 'TCP/UDP ports'],
+  },
+  {
+    icon: 'hard-drive',
+    eyebrow: 'RECOVERY',
+    title: 'Encrypted backups & snapshots',
+    description:
+      'Schedule database and volume backups to local storage, S3, or Cloudflare R2 with AES-256-GCM encryption and count, age, or GFS retention. Verify installation snapshots before recovery.',
+    tags: ['S3 & Cloudflare R2', 'AES-256-GCM', 'GFS retention', 'Integrity checks'],
+  },
+  {
+    icon: 'activity',
+    eyebrow: 'OBSERVABILITY',
+    title: 'Metrics, log archive & alerts',
+    description:
+      'Track 24-hour service CPU/RAM graphs, host disk usage, live browser container console, and a 7-day redacted log archive. Send threshold alerts to HMAC webhooks, SMTP, Telegram, Discord, or Slack.',
+    tags: ['24h history', '7d log search', 'Browser shell', '5 alert channels'],
+  },
+  {
+    icon: 'key',
+    eyebrow: 'ACCESS & AUTOMATION',
+    title: 'RBAC, CLI, API & MCP server',
+    description:
+      'Require TOTP MFA with recovery codes, assign project roles (admin, editor, viewer), mint project-scoped read or deploy tokens, and automate via OpenAPI 3.1, CLI, or stdio MCP.',
+    tags: ['TOTP MFA', 'Project RBAC', 'OpenAPI 3.1', 'CLI & MCP'],
+  },
+];
+
+const QUICKSTART_STEPS = [
+  {
+    step: '01 / INSTALL',
+    title: 'Bootstrap your Linux VPS',
+    description:
+      'Run install.sh as root on an Ubuntu or Debian amd64 host. It verifies GitHub release attestations, configures Docker Swarm, and prints your one-time setup token.',
+  },
+  {
+    step: '02 / SECURE',
+    title: 'Create admin & enable TOTP',
+    description:
+      'Open the panel URL printed by the installer, claim your administrator account with the setup token, attach your domain with ACME HTTPS, and turn on TOTP MFA.',
+  },
+  {
+    step: '03 / DEPLOY',
+    title: 'Launch an app or template',
+    description:
+      'Create a project, attach a Docker image, Git repo, or Compose template, connect a private database, and schedule your first encrypted S3 or R2 backup.',
+  },
+];
+
+function CopyCommand({ variant = 'hero' }: { variant?: 'hero' | 'terminal' }) {
+  const [status, setStatus] = useState<'idle' | 'copied' | 'select'>('idle');
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  async function handleCopy() {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
+      await navigator.clipboard.writeText(INSTALL_COMMAND);
+      setStatus('copied');
+    } catch {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+      setStatus('select');
+    }
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => setStatus('idle'), 3200);
+  }
+
+  return (
+    <div className={`command-box command-${variant}`}>
+      <div className="command-row">
+        <span className="command-prompt" aria-hidden="true">
+          $
+        </span>
+        <input
+          ref={inputRef}
+          className="command-input"
+          aria-label="Servus installation command"
+          value={INSTALL_COMMAND}
+          readOnly
+          spellCheck={false}
+          onFocus={(event) => event.currentTarget.select()}
+        />
+        <button
+          type="button"
+          className="copy-button"
+          onClick={() => void handleCopy()}
+          aria-label={status === 'copied' ? 'Command copied' : 'Copy installation command'}
+        >
+          <Icon name={status === 'copied' ? 'check' : 'copy'} size={15} />
+          <span>{status === 'copied' ? 'Copied' : 'Copy'}</span>
+        </button>
       </div>
+      <span className="command-feedback" role="status" aria-live="polite">
+        {status === 'copied'
+          ? 'Copied installation command to clipboard.'
+          : status === 'select'
+            ? 'Selected command. Press Ctrl+C or Command+C to copy.'
+            : ''}
+      </span>
     </div>
-  </div>;
+  );
 }
 
-function Header() {
-  const [open, setOpen] = useState(false);
-  return <header className="site-header"><div className="shell header-inner"><a className="brand-link" href="#top" aria-label="Servus home"><Brand /></a><button className="mobile-menu" type="button" aria-label={open ? 'Close navigation' : 'Open navigation'} aria-expanded={open} aria-controls="site-navigation" onClick={() => setOpen(!open)}><Icon name={open ? 'close' : 'menu'} /></button><nav id="site-navigation" className={open ? 'navigation is-open' : 'navigation'} aria-label="Main navigation" onClick={() => setOpen(false)} onKeyDown={event => { if (event.key === 'Escape') { setOpen(false); document.querySelector<HTMLButtonElement>('.mobile-menu')?.focus(); } }}><a href="#how-it-works">How it works</a><a href="#quickstart">Quickstart</a><a href={repository} target="_blank" rel="noreferrer">GitHub<Icon name="github" size={17} /></a><a className="button button-dark button-small" href="#install">Install Servus<Icon name="arrow" size={16} /></a></nav></div></header>;
+function SiteHeader() {
+  const headerRef = useRef<HTMLElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLUListElement>(null);
+  const [isWide, setIsWide] = useState(true);
+
+  useEffect(() => {
+    const header = headerRef.current;
+    const inner = innerRef.current;
+    const menu = menuRef.current;
+    if (!header || !inner || !menu) return;
+
+    let rafId = 0;
+
+    function syncLayout() {
+      if (!header || !inner || !menu) return;
+      const supportsPopover = Object.hasOwn(HTMLElement.prototype, 'popover');
+      const wasOpen = supportsPopover && menu.matches(':popover-open');
+
+      header.classList.add('is-measuring', 'is-wide');
+      menu.removeAttribute('popover');
+
+      const fits = inner.scrollWidth <= inner.clientWidth + 1;
+      setIsWide(fits);
+
+      if (fits) {
+        header.classList.add('is-wide');
+        menu.removeAttribute('popover');
+      } else {
+        header.classList.remove('is-wide');
+        if (supportsPopover) {
+          menu.setAttribute('popover', 'auto');
+          if (wasOpen) {
+            try {
+              menu.showPopover();
+            } catch {
+              // Ignore if popover cannot be re-opened during resize.
+            }
+          }
+        }
+      }
+
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        header.classList.remove('is-measuring');
+      });
+    }
+
+    syncLayout();
+
+    const observer = new ResizeObserver(() => syncLayout());
+    observer.observe(header);
+    observer.observe(menu);
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
+  }, []);
+
+  function closePopoverIfOpen() {
+    const menu = menuRef.current;
+    if (!menu) return;
+    if (Object.hasOwn(HTMLElement.prototype, 'popover') && menu.matches(':popover-open')) {
+      try {
+        menu.hidePopover();
+      } catch {
+        // Ignore if already closed.
+      }
+    }
+  }
+
+  return (
+    <header ref={headerRef} className={`site-header${isWide ? ' is-wide' : ''}`}>
+      <div ref={innerRef} className="shell header-inner">
+        <a className="brand-link" href="#top" aria-label="Servus home">
+          <ServusMark size={24} />
+          <span>Servus</span>
+        </a>
+
+        <nav className="site-nav" aria-label="Primary">
+          <button
+            className="menu-button"
+            type="button"
+            popoverTarget="site-menu"
+            popoverTargetAction="toggle"
+            aria-controls="site-menu"
+          >
+            <Icon name="menu" size={18} />
+            <span>Menu</span>
+          </button>
+
+          <ul
+            ref={menuRef}
+            id="site-menu"
+            className="site-menu"
+            onClick={(event) => {
+              if ((event.target as HTMLElement).closest('a')) {
+                closePopoverIfOpen();
+              }
+            }}
+          >
+            <li>
+              <a href="#workspace">Workspace</a>
+            </li>
+            <li>
+              <a href="#features">Features</a>
+            </li>
+            <li>
+              <a href="#architecture">Architecture</a>
+            </li>
+            <li>
+              <a href="#quickstart">Quickstart</a>
+            </li>
+            <li>
+              <a href={REPO_URL} target="_blank" rel="noreferrer" className="nav-external">
+                <Icon name="github" size={15} />
+                <span>GitHub</span>
+              </a>
+            </li>
+            <li className="nav-cta-item">
+              <a className="button button-primary button-sm" href="#install">
+                <span>Install Servus</span>
+                <Icon name="arrow" size={15} />
+              </a>
+            </li>
+          </ul>
+        </nav>
+      </div>
+    </header>
+  );
+}
+
+function ArchitectureDiagram() {
+  return (
+    <div className="arch-diagram" aria-label="Servus process isolation architecture">
+      <div className="arch-tier">
+        <span className="arch-tier-label">CONTROL SURFACES</span>
+        <div className="arch-row arch-row-3">
+          <div className="arch-node">
+            <strong>Web Panel</strong>
+            <small>React UI + Console</small>
+          </div>
+          <div className="arch-node">
+            <strong>CLI & OpenAPI</strong>
+            <small>Scoped deploy tokens</small>
+          </div>
+          <div className="arch-node">
+            <strong>MCP Server</strong>
+            <small>stdio automation</small>
+          </div>
+        </div>
+      </div>
+
+      <div className="arch-connector" aria-hidden="true">
+        <span />
+      </div>
+
+      <div className="arch-tier">
+        <span className="arch-tier-label">EDGE & API BOUNDARY</span>
+        <div className="arch-row arch-row-2">
+          <div className="arch-node arch-node-accent">
+            <strong>Traefik Ingress</strong>
+            <small>ACME HTTPS · IP Allow-list · Basic Auth · Redirects</small>
+          </div>
+          <div className="arch-node arch-node-accent">
+            <strong>Servus API</strong>
+            <small>TOTP MFA · Project RBAC · AES-256-GCM secrets</small>
+          </div>
+        </div>
+      </div>
+
+      <div className="arch-connector" aria-hidden="true">
+        <span />
+      </div>
+
+      <div className="arch-tier">
+        <span className="arch-tier-label">ISOLATED EXECUTION & HOST LIFECYCLE</span>
+        <div className="arch-row arch-row-3">
+          <div className="arch-node">
+            <strong>Worker</strong>
+            <small>Git builds · S3/R2 backups · Alerts</small>
+          </div>
+          <div className="arch-node">
+            <strong>Docker Agent</strong>
+            <small>Swarm services · Logs · Metrics</small>
+          </div>
+          <div className="arch-node">
+            <strong>systemd Supervisor</strong>
+            <small>Attested updates · Recovery</small>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function App() {
-  return <><a className="skip-link" href="#main">Skip to content</a><Header /><main id="main">
-    <section className="hero shell" id="top"><div className="hero-copy"><a className="release-pill" href="#status"><span className="status-dot" />A self-hosted panel, taking shape<Icon name="chevron" size={13} /></a><h1>A home for <br />what you <span>ship.</span></h1><p className="hero-description">Run your apps and private databases on a server you control, with deployments, environment settings, and the tools for inspecting a failing container gathered in the same workspace.</p><div className="hero-actions"><a className="button button-dark" href="#install">Start on your server<Icon name="arrow" size={18} /></a><a className="text-link" href="#workspace">Take a look<Icon name="chevron" size={15} /></a></div><div className="hero-footnote"><span className="tiny-server" aria-hidden="true"><i /><i /></span>Docker underneath. Your infrastructure throughout.</div></div><div className="hero-aside"><div className="hero-orbit" aria-hidden="true"><div className="orbit-center"><img src="/brand/servus.svg" alt="" /></div><div className="orbit-item orbit-web"><Icon name="box" size={23} /><span>Your app</span></div><div className="orbit-item orbit-db"><Icon name="database" size={22} /><span>Your data</span></div><div className="orbit-item orbit-code"><Icon name="code" size={22} /><span>Your source</span></div><svg className="orbit-lines" viewBox="0 0 440 400" fill="none"><path d="M90 98h86q44 0 44 44v64M352 194h-70q-62 0-62 12M168 337v-71q0-38 52-38" /></svg><span className="orbit-note">One place to keep things moving.</span></div></div></section>
-    <section className="workspace-section shell" id="workspace"><div className="section-eyebrow"><span>THE EVERYDAY VIEW</span><span className="example-label">An illustrative workspace, built to explore</span></div><WorkspacePreview /><div className="stack-strip"><span>Bring a Dockerfile.<br /><strong>Keep your favorite stack.</strong></span><div className="stack-names"><span>Node.js</span><span>Python</span><span>Go</span><span>PHP</span><span>PostgreSQL</span><span>Redis</span></div></div></section>
-    <section className="workflow-section" id="how-it-works"><div className="shell workflow-grid"><div className="workflow-intro"><span className="eyebrow">A SMALLER DISTANCE TO RUNNING</span><h2>From your source <br />to your server.</h2><p>Give an application a project, a source, and the configuration it needs. Servus handles the Docker work and records what happened along the way.</p><a className="text-link" href="#quickstart">Walk through your first deploy<Icon name="arrow" size={17} /></a></div><div className="workflow-steps"><article><span className="step-number">01</span><div><h3>Bring an image or a repository</h3><p>Use a public Docker image, or point to a public Git repository with a Dockerfile.</p><code>main <span>/</span> Dockerfile</code></div></article><article><span className="step-number">02</span><div><h3>Give it the right surroundings</h3><p>Add environment variables, HTTP domains, and persistent storage. Connect a private database in the same project.</p><div className="step-tags"><span>Environment</span><span>Domains</span><span>Volumes</span></div></div></article><article><span className="step-number">03</span><div><h3>Deploy, then see what happened</h3><p>Follow the operation, read the logs, or open a container shell. Saved changes reach the application when you deploy them.</p><span className="step-outcome"><Icon name="check" size={17} />Deployment history stays with the project</span></div></article></div></div></section>
-    <section className="tools-section shell"><div className="tools-heading"><span className="eyebrow">THE WORK AROUND THE DEPLOY</span><h2>Stay close to <br />your applications.</h2><p>Change an environment variable, connect a database, or inspect a failing request without leaving the project.</p></div><dl className="tools-list"><div><dt><Icon name="database" />Private databases</dt><dd>PostgreSQL, Redis, and MariaDB presets with project networking and persistent volumes.</dd></div><div><dt><Icon name="settings" />Configuration you can follow</dt><dd>Separate saved and deployed revisions, encrypted secret storage, and explicit deployment actions.</dd></div><div><dt><Icon name="terminal" />A view inside</dt><dd>Live application logs, a container terminal, and current CPU, memory, and network samples.</dd></div><div><dt><Icon name="activity" />Operations with a record</dt><dd>Start, stop, restart, and inspect failed deployments. An unsuccessful app update can restore its previous runtime configuration.</dd></div></dl></section>
-    <section className="install-section" id="install"><div className="shell"><div className="install-heading"><span className="eyebrow">MAKE ROOM FOR YOUR NEXT PROJECT</span><h2>Your server is a good place to start.</h2><p>Run the installer on a dedicated Linux VPS with root access. It prepares Docker and starts the Servus components.</p></div><div className="install-terminal"><div className="terminal-heading"><span><Icon name="terminal" size={17} />Server terminal</span><a href="/install.sh">Read the script<Icon name="arrow" size={15} /></a></div><CopyCommand /><div className="terminal-footer"><span>One command on your VPS</span><span>Keep the setup token private</span></div></div><p className="installer-publication-note">The command above is prepared for the servus.run release. Until the public installer is published, follow the <a href={`${repository}#run-locally`} target="_blank" rel="noreferrer">repository setup instructions</a>.</p><div className="install-detail" id="status"><span className="pilot-badge">CURRENT STATUS · LOCAL PILOT</span><p>Servus is under active development. Test it on a dedicated server before trusting it with important workloads. Application HTTPS, backups, and private Git credentials are still outside the current implementation.</p></div></div></section>
-    <section className="quickstart-section shell" id="quickstart"><div className="quickstart-heading"><span className="eyebrow">FIRST STEPS</span><h2>Get a small app running.</h2><a className="text-link" href={`${repository}#readme`} target="_blank" rel="noreferrer">Full documentation<Icon name="arrow" size={17} /></a></div><div className="quickstart-content"><article><span>01 / INSTALL & SIGN IN</span><h3>Set up your workspace</h3><p>Run the installer, then follow its connection instructions. Use the setup token to create the first administrator account.</p></article><article><span>02 / CREATE A SERVICE</span><h3>Start with a Docker image</h3><p>Create a project and add an application. For a first test, use <code>nginx:alpine</code> with container port <code>80</code>.</p></article><article><span>03 / CONFIGURE & DEPLOY</span><h3>Send a request to your app</h3><p>Add a hostname, point its DNS at your server, and deploy. Application routing currently uses HTTP on the ingress port shown by your installation.</p></article></div></section>
-    <section className="closing-section shell"><p>Something worth shipping?</p><h2>Give it a home.</h2><a className="button button-dark" href="#install">Install Servus<Icon name="arrow" size={18} /></a></section>
-  </main><footer className="site-footer shell"><div><a className="brand-link" href="#top" aria-label="Servus home"><Brand /></a><p>A workspace on your own server.</p></div><div className="footer-links"><a href={repository} target="_blank" rel="noreferrer">Source on GitHub</a><a href={`${repository}/blob/main/LICENSE`} target="_blank" rel="noreferrer">Noncommercial license</a><span>servus.run</span></div></footer></>;
+  return (
+    <>
+      <a className="skip-link" href="#main">
+        Skip to content
+      </a>
+
+      <SiteHeader />
+
+      <main id="main">
+        <section className="hero-section" id="top">
+          <div className="hero-grid-bg" aria-hidden="true" />
+          <div className="shell hero-inner">
+            <a className="release-pill" href={RELEASE_URL} target="_blank" rel="noreferrer">
+              <span className="pill-tag">Beta v0.1.55</span>
+              <span className="pill-copy">
+                Signed linux/amd64 releases
+                <Icon name="arrow-up-right" size={14} />
+              </span>
+            </a>
+
+            <h1>
+              Deploy apps and databases
+              <br />
+              <span>on your own Linux server.</span>
+            </h1>
+
+            <p className="hero-subtitle">
+              Servus is a self-hosted Docker control plane for a single VPS. Build from Git or Compose,
+              run private PostgreSQL, MariaDB, and Redis instances, schedule encrypted S3/R2 backups,
+              and monitor logs, metrics, and alerts from one workspace.
+            </p>
+
+            <div className="hero-actions">
+              <a className="button button-primary" href="#install">
+                <span>Install on your VPS</span>
+                <Icon name="arrow" size={16} />
+              </a>
+              <a className="button button-secondary" href={REPO_URL} target="_blank" rel="noreferrer">
+                <Icon name="github" size={16} />
+                <span>View source on GitHub</span>
+              </a>
+            </div>
+
+            <div className="hero-command">
+              <CopyCommand variant="hero" />
+              <div className="hero-command-meta">
+                <span>Ubuntu & Debian Linux (amd64) · Root access required</span>
+                <a href="/install.sh">
+                  <span>Inspect install.sh</span>
+                  <Icon name="arrow-up-right" size={14} />
+                </a>
+              </div>
+            </div>
+
+            <ul className="fact-strip" aria-label="Core capabilities">
+              <li>
+                <Icon name="server" size={15} />
+                <span>Docker Swarm</span>
+              </li>
+              <li>
+                <Icon name="globe" size={15} />
+                <span>Automatic Traefik HTTPS</span>
+              </li>
+              <li>
+                <Icon name="shield" size={15} />
+                <span>AES-256-GCM S3 & R2 Backups</span>
+              </li>
+              <li>
+                <Icon name="terminal" size={15} />
+                <span>OpenAPI, CLI & MCP</span>
+              </li>
+            </ul>
+          </div>
+        </section>
+
+        <section className="showcase-section shell" id="workspace">
+          <div className="section-intro section-intro-split">
+            <div>
+              <span className="eyebrow">THE CONTROL PLANE</span>
+              <h2>One interface for shipping, inspecting, and recovering.</h2>
+            </div>
+            <p>
+              Switch between services, 24-hour resource graphs, encrypted backup jobs, and redacted logs
+              without leaving the project.
+            </p>
+          </div>
+
+          <WorkspaceShowcase />
+
+          <div className="stack-strip">
+            <span className="stack-strip-label">Runs any container or Dockerfile</span>
+            <ul className="stack-pills">
+              <li>Node.js</li>
+              <li>Python</li>
+              <li>Go</li>
+              <li>PHP</li>
+              <li>PostgreSQL 17</li>
+              <li>MariaDB 11.4</li>
+              <li>Redis 7</li>
+              <li>Docker Compose</li>
+            </ul>
+          </div>
+        </section>
+
+        <section className="pipeline-section" id="workflow">
+          <div className="shell">
+            <div className="section-intro">
+              <span className="eyebrow">DEPLOYMENT PIPELINE</span>
+              <h2>From source to verified container.</h2>
+              <p>
+                Every deployment follows an explicit, recorded sequence so you know what changed, why a
+                build stopped, and what version is serving traffic.
+              </p>
+            </div>
+
+            <ol className="pipeline-grid">
+              {PIPELINE_STEPS.map((item) => (
+                <li className="pipeline-card" key={item.step}>
+                  <span className="pipeline-step">{item.step}</span>
+                  <h3>{item.title}</h3>
+                  <p>{item.description}</p>
+                  <code>{item.detail}</code>
+                </li>
+              ))}
+            </ol>
+          </div>
+        </section>
+
+        <section className="features-section shell" id="features">
+          <div className="section-intro">
+            <span className="eyebrow">CAPABILITIES</span>
+            <h2>Everything your server needs. Nothing rented.</h2>
+            <p>
+              No hosted management plane sitting between you and your VPS. Servus runs beside your
+              workloads on your own hardware.
+            </p>
+          </div>
+
+          <div className="features-grid">
+            {FEATURES.map((feature) => (
+              <article className="feature-card" key={feature.title}>
+                <div className="feature-head">
+                  <span className="feature-icon">
+                    <Icon name={feature.icon} size={19} />
+                  </span>
+                  <span className="feature-eyebrow">{feature.eyebrow}</span>
+                </div>
+                <h3>{feature.title}</h3>
+                <p>{feature.description}</p>
+                <ul className="feature-tags">
+                  {feature.tags.map((tag) => (
+                    <li key={tag}>{tag}</li>
+                  ))}
+                </ul>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section className="architecture-section" id="architecture">
+          <div className="shell architecture-grid">
+            <div className="architecture-copy">
+              <span className="eyebrow">SECURITY & ISOLATION</span>
+              <h2>Split privileges across the host.</h2>
+              <p>
+                Instead of handing full root and Docker socket control to a single web process, Servus
+                separates API requests, build/backup workers, container execution, and host updates into
+                dedicated components.
+              </p>
+
+              <dl className="architecture-points">
+                <div>
+                  <dt>
+                    <Icon name="shield" size={16} />
+                    <span>Signed releases verified before boot</span>
+                  </dt>
+                  <dd>
+                    The installer checks GitHub artifact attestations for published linux/amd64 images
+                    and records installed versions for controlled upgrades.
+                  </dd>
+                </div>
+                <div>
+                  <dt>
+                    <Icon name="key" size={16} />
+                    <span>Encrypted secrets & redacted archives</span>
+                  </dt>
+                  <dd>
+                    Environment variables, Git credentials, alert channels, and S3/R2 profiles are sealed
+                    with AES-256-GCM. Secrets are redacted before writing to the 7-day log archive.
+                  </dd>
+                </div>
+                <div>
+                  <dt>
+                    <Icon name="hard-drive" size={16} />
+                    <span>Candidate-verified database recovery</span>
+                  </dt>
+                  <dd>
+                    Database restores validate candidate dumps before switching data, and installation
+                    snapshots support integrity checks and last-snapshot deletion protection.
+                  </dd>
+                </div>
+              </dl>
+            </div>
+
+            <ArchitectureDiagram />
+          </div>
+        </section>
+
+        <section className="install-section shell" id="install">
+          <div className="install-card">
+            <div className="install-head">
+              <div>
+                <span className="eyebrow">SELF-HOSTED INSTALL</span>
+                <h2>Up and running in one command.</h2>
+                <p>
+                  Run the installer on a clean Linux VPS with root access. You can read every line of the
+                  script before executing it.
+                </p>
+              </div>
+              <a className="button button-secondary button-sm" href="/install.sh">
+                <Icon name="terminal" size={15} />
+                <span>Read install.sh</span>
+              </a>
+            </div>
+
+            <CopyCommand variant="terminal" />
+
+            <div className="install-specs">
+              <div>
+                <span>Target OS</span>
+                <strong>Ubuntu / Debian Linux</strong>
+              </div>
+              <div>
+                <span>Architecture</span>
+                <strong>linux/amd64</strong>
+              </div>
+              <div>
+                <span>Runtime</span>
+                <strong>Single-server Docker Swarm</strong>
+              </div>
+              <div>
+                <span>License</span>
+                <strong>PolyForm Noncommercial 1.0.0</strong>
+              </div>
+            </div>
+          </div>
+
+          <div className="quickstart-block" id="quickstart">
+            <div className="section-intro section-intro-split">
+              <div>
+                <span className="eyebrow">QUICKSTART</span>
+                <h2>Three steps to your first live service.</h2>
+              </div>
+              <a className="text-link" href={`${REPO_URL}#readme`} target="_blank" rel="noreferrer">
+                <span>Read repository docs</span>
+                <Icon name="arrow-up-right" size={15} />
+              </a>
+            </div>
+
+            <div className="quickstart-grid">
+              {QUICKSTART_STEPS.map((item) => (
+                <article className="quickstart-card" key={item.step}>
+                  <span className="quickstart-step">{item.step}</span>
+                  <h3>{item.title}</h3>
+                  <p>{item.description}</p>
+                </article>
+              ))}
+            </div>
+          </div>
+
+          <div className="status-banner" id="status">
+            <div className="status-banner-badge">
+              <Icon name="git" size={15} />
+              <span>CURRENT RELEASE · v0.1.55 (BETA)</span>
+            </div>
+            <p>
+              Servus is in active beta for single-server Linux (amd64) Docker Swarm hosts. Validate
+              backups, alerts, and upgrades on a dedicated VPS before running critical production
+              workloads. Source code and issue tracking live on{' '}
+              <a href={REPO_URL} target="_blank" rel="noreferrer">
+                GitHub
+              </a>
+              .
+            </p>
+          </div>
+        </section>
+
+        <section className="closing-section shell">
+          <div className="closing-card">
+            <span className="eyebrow">READY WHEN YOUR SERVER IS</span>
+            <h2>Own the server. Keep the workflow.</h2>
+            <p>Install Servus directly on your VPS or inspect the codebase on GitHub.</p>
+            <div className="hero-actions">
+              <a className="button button-primary" href="#install">
+                <span>Install Servus</span>
+                <Icon name="arrow" size={16} />
+              </a>
+              <a className="button button-secondary" href={REPO_URL} target="_blank" rel="noreferrer">
+                <Icon name="github" size={16} />
+                <span>Explore repository</span>
+              </a>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer className="site-footer">
+        <div className="shell footer-inner">
+          <div className="footer-brand">
+            <a className="brand-link" href="#top" aria-label="Servus home">
+              <ServusMark size={22} />
+              <span>Servus</span>
+            </a>
+            <p>Self-hosted Docker deployment panel for your own Linux server.</p>
+          </div>
+
+          <div className="footer-links">
+            <a href={REPO_URL} target="_blank" rel="noreferrer">
+              GitHub
+            </a>
+            <a href={RELEASE_URL} target="_blank" rel="noreferrer">
+              v0.1.55 Release
+            </a>
+            <a href="/install.sh">install.sh</a>
+            <a href={`${REPO_URL}/blob/main/LICENSE`} target="_blank" rel="noreferrer">
+              License
+            </a>
+          </div>
+        </div>
+      </footer>
+    </>
+  );
 }
 
-createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);
+createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);
