@@ -903,7 +903,7 @@ await h.close();s.close();if(count!==0)process.exit(2);'''
         self.panel.execute('INSERT INTO jobs(id,action_id,service_id,snapshot,status,attempts,created_at) VALUES(?,?,?,?,?,?,?)',
                            (destroy,destroy,UUID,snapshot,'succeeded',1,'2026-01-01T00:02:00.000Z'))
         self.agent.execute('INSERT INTO operations(id,request_hash,state,response,updated_at,service_id,operation_stage) VALUES(?,?,?,?,?,?,?)',
-                           (destroy,'b'*64,'succeeded',json.dumps({'state':'deleted'}),'2026-01-01T00:03:00.000Z',UUID,'applying'))
+                           (destroy,'b'*64,'succeeded',json.dumps({'state':'stopped','deployedRevision':1,'messages':['Runtime service and routes removed. Persistent volumes were preserved.']}),'2026-01-01T00:03:00.000Z',UUID,'applying'))
         self.panel.commit(); self.agent.commit(); self.fix_permissions()
         self.capture()
 

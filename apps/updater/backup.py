@@ -694,7 +694,7 @@ def _validate_operation_history(panel, agent):
             if candidate_type == 'deploy' and is_stateless and stateless_snapshot(snapshot, service) and isinstance(response, dict) and response.get('state') == 'running':
                 recovered = True
                 break
-            if candidate_type == 'destroy' and service_deleted and valid_snapshot(snapshot, service) and isinstance(response, dict) and response.get('state') == 'deleted':
+            if candidate_type == 'destroy' and service_deleted and valid_snapshot(snapshot, service) and isinstance(response, dict) and response.get('state') in ('deleted', 'stopped'):
                 recovered = True
                 break
         if not recovered: raise CaptureError('Unresolved failed operations require recovery')
