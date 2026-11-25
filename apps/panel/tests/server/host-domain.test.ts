@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { Store } from '../../src/server/store.js';
 import { createApp } from '../../src/server/app.js';
 import { HostDomainManager, generatedApplicationHostname } from '../../src/server/host-domain.js';
+import { hostDomainOptions } from '../../src/server/host-domain-config.js';
+import type { agentRequest } from '../../src/agent/client.js';
 import { hashPassword } from '../../src/server/auth.js';
 import { hostDomainPattern, hostConnectionSchema, isHostApplication, type HostCertificate, type HostConnection } from '../../src/shared/host-domain.js';
 
@@ -59,11 +61,13 @@ describe('host domain synchronization',()=>{
     manager.start(true);await manager.settled();expect(manager.status().lastError).toContain('reached securely');
     manager.start(true);await manager.settled();expect(requests).toHaveLength(2);expect(requests[0]).toEqual(requests[1]);
     expect(manager.status()).toMatchObject({hostname:host,ready:false,dnsStatus:'ready'});
+    expect(manager.status().lastError).toBeUndefined();expect(store.vault.hostConnection()?.lastError).toBeUndefined();
     const saved=store.vault.hostConnection()!;expect(store.vault.redact(`token=${saved.token}`)).toBe('token=[REDACTED]');
     expect(readFileSync(join(dir,'secrets','bd1e8899-6ba3-4e5e-bd51-b63bbb5010b9'),'utf8')).not.toContain(saved.token);
   });
   it('marks the panel ready only after certificate installation and an authenticated public proof',async()=>{
     const {store}=await fixture(),origins:string[]=[];let manager:HostDomainManager;
+    store.vault.setHttpsIngress('certificate-override@example.test',false);
     const transport=(async(input:any)=>{
       const url=String(input);
       if(url.endsWith('/register'))return Response.json({hostname:host,ip:'8.8.8.8',dnsStatus:'ready'});
@@ -77,6 +81,7 @@ describe('host domain synchronization',()=>{
     expect(manager.status()).toMatchObject({ready:true,hostname:host,certificateExpiresAt:certificate.expiresAt});
     expect(runtime).toHaveBeenCalledTimes(1);expect(runtime).toHaveBeenCalledWith('/host-domain/configure',certificate,{timeoutMs:400_000});
     expect(origins).toEqual([`https://${host}`]);
+    expect(store.vault.httpsIngress()).toEqual({email:'certificate-override@example.test',staging:false});
     const challenge='a'.repeat(64),saved=store.vault.hostConnection()!;
     expect(manager.proof(challenge)).toBe(createHmac('sha256',saved.token).update(`servus-host-proof:${challenge}`).digest('hex'));
   });
@@ -91,9 +96,50 @@ describe('host domain synchronization',()=>{
     const manager=new HostDomainManager(store,{apiOrigin:'https://other.example.test',fetch:transport as typeof fetch},async()=>({ok:true}),()=>{});
     expect(()=>manager.start(true)).toThrow('original host domain API');expect(transport).not.toHaveBeenCalled();
   });
+  it('omits the legacy certificate preparation notice while retaining real errors',async()=>{
+    const {store,connection}=await fixture(true);
+    const manager=new HostDomainManager(store,undefined,async()=>({ok:true}),()=>{});
+    store.vault.setHostConnection({...connection,lastError:'The wildcard certificate is being prepared. Synchronization will retry automatically.'});
+    expect(manager.status().lastError).toBeUndefined();
+    store.vault.setHostConnection({...connection,lastError:'The host registry is unavailable'});
+    expect(manager.status().lastError).toBe('The host registry is unavailable');
+  });
 });
 
 describe('panel host-domain API and generated application domains',()=>{
+  it('automatically provisions a managed installation after the first administrator registers',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'panel-host-setup-')),store=new Store(dir),requests:string[]=[];
+    cleanup.push(()=>{store.close();rmSync(dir,{recursive:true,force:true});});
+    const transport=vi.fn(async(input:Parameters<typeof fetch>[0])=>{
+      const url=String(input);requests.push(url);
+      if(url.endsWith('/register'))return Response.json({hostname:host,ip:'8.8.8.8',dnsStatus:'ready'});
+      if(url.endsWith('/certificate'))return Response.json({status:'ready',...certificate});
+      const connection=store.vault.hostConnection()!,challenge=url.split('/').at(-1)!;
+      return Response.json({proof:createHmac('sha256',connection.token).update(`servus-host-proof:${challenge}`).digest('hex')});
+    }) as unknown as typeof fetch;
+    const runtime=vi.fn<typeof agentRequest>(async<T>()=>({ok:true}) as T);
+    const app=await createApp({dataDir:dir,store,hostDomains:{...hostDomainOptions({NODE_ENV:'production'},true,()=>({}))!,fetch:transport},agentRequest:runtime});
+    cleanup.push(()=>app.close());
+    await app.ready();expect(transport).not.toHaveBeenCalled();
+    const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'first-admin@example.test',password}});
+    expect(setup.statusCode).toBe(200);
+    await vi.waitFor(()=>expect(store.vault.hostConnection()?.ready).toBe(true));
+    expect(requests.slice(0,2)).toEqual(['https://api.servus.run/api/hosts/register','https://api.servus.run/api/hosts/certificate']);
+    expect(runtime).toHaveBeenCalledExactlyOnceWith('/host-domain/configure',certificate,{timeoutMs:400_000});
+    expect(store.vault.httpsIngress()).toEqual({email:'first-admin@example.test',staging:false});
+    const again=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'second-admin@example.test',password}});
+    expect(again.statusCode).toBe(409);expect(requests).toHaveLength(3);
+  });
+  it('keeps local development and an explicit installation opt-out from contacting the registry on setup',async()=>{
+    for(const configuration of [hostDomainOptions({},false),hostDomainOptions({NODE_ENV:'production'},true,()=>({automatic:false}))]) {
+      const dir=mkdtempSync(join(tmpdir(),'panel-host-isolated-')),store=new Store(dir),transport=vi.fn();
+      cleanup.push(()=>{store.close();rmSync(dir,{recursive:true,force:true});});
+      const app=await createApp({dataDir:dir,store,hostDomains:{...configuration!,fetch:transport as typeof fetch}});
+      cleanup.push(()=>app.close());
+      const setup=await app.inject({method:'POST',url:'/api/v1/setup',payload:{email:'local-admin@example.test',password}});
+      expect(setup.statusCode).toBe(200);expect(transport).not.toHaveBeenCalled();expect(store.vault.hostConnection()).toBeNull();
+    }
+  });
   it('keeps credentials private, requires administrator and CSRF, and secures host cookies',async()=>{
     const {store,dir,connection,headers}=await fixture(true),app=await createApp({dataDir:dir,store});cleanup.push(()=>app.close());
     const status=await app.inject({url:'/api/v1/host-domain',headers});expect(status.statusCode).toBe(200);expect(status.body).not.toContain(connection.token);expect(status.body).not.toContain(connection.machineId);

@@ -85,6 +85,34 @@ class ProtectedJournalTest(unittest.TestCase):
         self.journal = backups.BackupJournal(self.maintenance, supervisor)
         self.addCleanup(self.journal.close)
 
+    def test_history_survives_reopen_is_newest_first_and_respects_frame_budget(self):
+        ids = []
+        for index in range(13):
+            record = self.journal.request(receipt(name='🚀' * 100), TOKEN, now_ms=NOW + index)
+            ids.append(record['operationId'])
+            self.journal.transition(record['operationId'], 'requested', 'failed', errorCode='capture_failed')
+            self.journal.clear_terminal(record['operationId'])
+        self.journal.close()
+        self.journal = backups.BackupJournal(self.maintenance, supervisor)
+        self.addCleanup(self.journal.close)
+        seen, cursor = [], None
+        while True:
+            page = self.journal.history(cursor)
+            self.assertLessEqual(len(json.dumps({'version': 1, 'status': 'history', 'history': page}).encode()), 4096)
+            for item in page['operations']:
+                self.assertEqual(set(item), {'operationId', 'actorId', 'name', 'state', 'createdAt', 'updatedAt', 'errorCode'})
+                self.assertEqual(item['state'], 'failed')
+                self.assertEqual(item['name'], '🚀' * 100)
+            seen.extend(item['operationId'] for item in page['operations'])
+            cursor = page['nextCursor']
+            if cursor is None:
+                break
+        self.assertEqual(seen, list(reversed(ids)))
+        with self.assertRaises(backups.BackupError):
+            self.journal.history('../escape')
+        with self.assertRaises(FileNotFoundError):
+            self.journal.history(str(uuid.uuid4()))
+
     def test_persists_approval_and_idempotency_across_reopen(self):
         approval = receipt()
         first = self.journal.request(approval, TOKEN, now_ms=NOW)

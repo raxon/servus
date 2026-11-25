@@ -52,6 +52,11 @@ export class SecretVault {
     return Buffer.from(hkdfSync('sha256', this.key, Buffer.from('servus-restore-archive-v1'), Buffer.from(operationId, 'ascii'), 32));
   }
 
+  databaseBackupKey(backupId: string): Buffer {
+    if (!referencePattern.test(backupId)) throw new Error('Invalid database backup identity.');
+    return Buffer.from(hkdfSync('sha256', this.key, Buffer.from('servus-database-backup-v1'), Buffer.from(backupId, 'ascii'), 32));
+  }
+
   open(value: string): string {
     if (!value.startsWith('enc:v1:')) throw new Error('An encrypted value is required.');
     const packed = Buffer.from(value.slice(7), 'base64');
@@ -129,7 +134,7 @@ export class SecretVault {
     if (!referencePattern.test(reference) || !referencePattern.test(serviceId)) throw new Error('Invalid secret identity.');
     const db = new Database(this.database, { readonly: true, fileMustExist: true });
     try {
-      if (![5,6,7,8].includes(Number(db.pragma('user_version', { simple: true })))) throw new Error('Secret purpose metadata is unavailable.');
+      if (![5,6,7,8,9].includes(Number(db.pragma('user_version', { simple: true })))) throw new Error('Secret purpose metadata is unavailable.');
       const row = db.prepare('SELECT purpose FROM service_secret_refs WHERE reference=? AND service_id=?').get(reference, serviceId) as { purpose: string } | undefined;
       if (!row || !(row.purpose === purpose || (row.purpose === 'legacy_shared' && (purpose === 'environment' || purpose === 'database')))) throw new Error('Secret reference is not valid for this purpose.');
       return this.get(reference);
@@ -141,7 +146,8 @@ export class SecretVault {
     if (!referencePattern.test(reference)) throw new Error('Invalid secret identity.');
     const db = new Database(this.database, { readonly: true, fileMustExist: true });
     try {
-      if (![5,6,7,8].includes(Number(db.pragma('user_version', { simple: true }))) || db.prepare('SELECT 1 FROM service_secret_refs WHERE reference=?').get(reference)) throw new Error('Database root secret is invalid.');
+      const version = Number(db.pragma('user_version', { simple: true }));
+      if (![5,6,7,8,9].includes(version) || db.prepare('SELECT 1 FROM service_secret_refs WHERE reference=?').get(reference) || (version >= 9 && db.prepare('SELECT 1 FROM backup_storage_profiles WHERE destination_ref=?').get(reference))) throw new Error('Database root secret is invalid.');
       return this.get(reference);
     } finally { db.close(); }
   }
@@ -154,7 +160,7 @@ export class SecretVault {
         try {
           const record: unknown = JSON.parse(value);
           if(record && typeof record==='object' && 'kind' in record && record.kind==='servus-host-v1' && 'token' in record && typeof record.token==='string')return [value,record.token,Buffer.from(record.token).toString('base64')];
-          if(record && typeof record==='object' && 'kind' in record && record.kind==='backup-storage-v1' && 'destination' in record && record.destination && typeof record.destination==='object') {
+          if(record && typeof record==='object' && 'kind' in record && (record.kind==='backup-storage-v1'||record.kind==='backup-global-v1') && 'destination' in record && record.destination && typeof record.destination==='object') {
             const destination=record.destination as {accessKeyId?:unknown;secretAccessKey?:unknown};
             return [value,...[destination.accessKeyId,destination.secretAccessKey].filter((item):item is string=>typeof item==='string'&&item.length>0)];
           }

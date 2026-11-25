@@ -5,16 +5,16 @@ import { agentRequest as defaultAgentRequest, AgentRequestError, type AgentReque
 import { LocalDatabaseBackupStorage } from '../agent/backups.js';
 import { readS3Backup, removeS3Backup, uploadS3Backup, validateBackupEndpoint, type S3BackupIdentity } from '../agent/s3-storage.js';
 import { backupCronMatches, describeBackupCron, parseBackupCron } from '../shared/backups.js';
-import { VOLUME_BACKUP_SCHEMA_SQL, type VolumeBackup, type VolumeBackupSettings, type VolumeRestore } from '../shared/volume-backups.js';
-import { redactBackupDestination, s3DestinationSchema, type BackupDestination } from '../shared/storage-target.js';
-import { loadBackupDestination } from './backup-providers.js';
+import { type VolumeBackup, type VolumeBackupSettings, type VolumeRestore } from '../shared/volume-backups.js';
+import { redactBackupDestination, s3DestinationSchema, type BackupDestination, type BackupStorageSelection } from '../shared/storage-target.js';
+import { loadBackupDestination, profileDestination, type ProfileRow } from './backup-providers.js';
 import type { Service, SessionResponse, User } from '../shared/types.js';
 import type { Store } from './store.js';
 import type { MaintenanceGate } from './maintenance.js';
 import { AppError } from './errors.js';
 
 interface BackupRow {id:string;service_id:string;mount_target:string;actor_id:string;name:string;status:VolumeBackup['status'];trigger:VolumeBackup['trigger'];idempotency_key:string;request_hash:string;created_at:string;finished_at:string|null;size:number|null;sha256:string|null;error:string|null;owner_id:string|null;lease_until:string|null;destination_ref:string|null;object_key:string|null}
-interface SettingsRow {service_id:string;mount_target:string;actor_id:string;enabled:number;cron:string;retention:number;last_tick:string|null;updated_at:string;destination_ref:string|null}
+interface SettingsRow {service_id:string;mount_target:string;actor_id:string;enabled:number;cron:string;retention:number;last_tick:string|null;updated_at:string;destination_ref:string|null;profile_id:string|null}
 interface RestoreRow {id:string;backup_id:string;service_id:string;mount_target:string;actor_id:string;phase:VolumeRestore['phase'];candidate_volume:string|null;previous_volume:string|null;error:string|null;created_at:string;updated_at:string;idempotency_key:string;owner_id:string|null;lease_until:string|null}
 export interface VolumeBackupOptions {
   store:Store;
@@ -48,7 +48,7 @@ export class VolumeBackups {
   private closing=false;
   private timer:ReturnType<typeof setInterval>|undefined;
   constructor(private readonly options:VolumeBackupOptions) {
-    options.store.db.transaction(()=>options.store.db.exec(VOLUME_BACKUP_SCHEMA_SQL)).immediate();this.storage=new LocalDatabaseBackupStorage(options.store.dataDir,'volume-backups');
+    this.storage=new LocalDatabaseBackupStorage(options.store.dataDir,'volume-backups');
   }
   private now() {return (this.options.now??(()=>new Date()))();}
   private row(id:string) {return this.options.store.db.prepare('SELECT * FROM volume_backups WHERE id=?').get(id) as BackupRow|undefined;}
@@ -68,11 +68,16 @@ export class VolumeBackups {
     }).immediate();return this.settingsFor(service.id,value.mountTarget);
   }
   destination(serviceId:string,mountTarget:string):BackupDestination {const reference=this.setting(serviceId,mountTarget)?.destination_ref;return reference?redactBackupDestination(loadBackupDestination(this.options.store,serviceId,reference)):{type:'local'};}
-  saveDestination(service:Service,actor:User,mountTarget:string,destination:z.infer<typeof s3DestinationSchema>|{type:'local'}) {
+  selection(serviceId:string,mountTarget:string):BackupStorageSelection {
+    const setting=this.setting(serviceId,mountTarget),profile=setting?.profile_id?this.options.store.db.prepare('SELECT name FROM backup_storage_profiles WHERE id=?').get(setting.profile_id) as {name:string}|undefined:undefined;
+    return {destination:this.destination(serviceId,mountTarget),profileId:setting?.profile_id??null,profileName:profile?.name??null,legacy:!!setting?.destination_ref&&!setting.profile_id};
+  }
+  saveDestination(service:Service,actor:User,mountTarget:string,destination:z.infer<typeof s3DestinationSchema>|{type:'local'},profileId:string|null=null) {
     requireMount(service,mountTarget);const now=this.now().toISOString();
     this.options.store.db.transaction(()=>{
       const reference=destination.type==='local'?null:this.options.store.putBackupDestinationSecret(service.id,JSON.stringify({kind:'backup-storage-v1',serviceId:service.id,destination}));
       this.options.store.db.prepare(`INSERT INTO volume_backup_settings (service_id,mount_target,actor_id,enabled,cron,retention,last_tick,updated_at,destination_ref) VALUES(?,?,?,0,'0 3 * * *',7,?,?,?) ON CONFLICT(service_id,mount_target) DO UPDATE SET destination_ref=excluded.destination_ref,updated_at=excluded.updated_at`).run(service.id,mountTarget,actor.id,now.slice(0,16),now,reference);
+      this.options.store.db.prepare('UPDATE volume_backup_settings SET profile_id=? WHERE service_id=? AND mount_target=?').run(profileId,service.id,mountTarget);
       this.options.store.recordAudit(actor.id,'volume.backup.destination',service.id);
     }).immediate();return this.destination(service.id,mountTarget);
   }
@@ -267,9 +272,17 @@ export function registerVolumeBackups(app:FastifyInstance,options:VolumeBackupOp
   app.post<{Params:{id:string}}>(`${prefix}/volume-backups`,async(request,reply)=>{const {service,auth}=options.serviceAccess(request,request.params.id,true);return reply.code(202).send({backup:manager.create(service,auth.user,request.body,request.headers['idempotency-key'])});});
   app.get<{Params:{id:string}}>(`${prefix}/volume-backup-settings`,async request=>{const {service}=options.serviceAccess(request,request.params.id);return {settings:manager.settings(service)};});
   app.put<{Params:{id:string}}>(`${prefix}/volume-backup-settings`,async request=>{const {service,auth}=options.serviceAccess(request,request.params.id,true);return {settings:manager.saveSettings(service,auth.user,request.body)};});
-  app.get<{Params:{id:string};Querystring:{mountTarget?:string}}>(`${prefix}/volume-backup-destination`,async request=>{const {service}=options.serviceAccess(request,request.params.id),mountTarget=mountSchema.parse(request.query.mountTarget);requireMount(service,mountTarget);return {destination:manager.destination(service.id,mountTarget)};});
+  app.get<{Params:{id:string};Querystring:{mountTarget?:string}}>(`${prefix}/volume-backup-destination`,async request=>{const {service}=options.serviceAccess(request,request.params.id),mountTarget=mountSchema.parse(request.query.mountTarget);requireMount(service,mountTarget);return manager.selection(service.id,mountTarget);});
   app.put<{Params:{id:string}}>(`${prefix}/volume-backup-destination`,async request=>{
     let access=options.serviceAccess(request,request.params.id,true);
+    if(request.body&&typeof request.body==='object'&&'profileId' in request.body){
+      const input=z.object({mountTarget:mountSchema,profileId:z.string().uuid().nullable()}).strict().parse(request.body);requireMount(access.service,input.mountTarget);
+      const profile=input.profileId?options.store.db.prepare('SELECT * FROM backup_storage_profiles WHERE id=? AND active=1').get(input.profileId) as ProfileRow|undefined:undefined;
+      if(input.profileId&&!profile)throw new AppError('BACKUP_PROFILE_NOT_FOUND','Choose an available backup storage profile.',400);
+      const destination=profile?profileDestination(options.store,profile):null;
+      manager.saveDestination(access.service,access.auth.user,input.mountTarget,destination??{type:'local'},input.profileId);
+      return manager.selection(access.service.id,input.mountTarget);
+    }
     const input=z.object({mountTarget:mountSchema,destination:z.discriminatedUnion('type',[z.object({type:z.literal('local')}).strict(),s3DestinationSchema])}).strict().parse(request.body);requireMount(access.service,input.mountTarget);
     if(input.destination.type==='s3')try{await validateBackupEndpoint(input.destination);}catch(error){throw new AppError('VOLUME_BACKUP_ENDPOINT',error instanceof Error?error.message:'Invalid backup endpoint.',400);}
     access=options.serviceAccess(request,request.params.id,true);return {destination:manager.saveDestination(access.service,access.auth.user,input.mountTarget,input.destination)};

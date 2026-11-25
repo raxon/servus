@@ -176,6 +176,39 @@ class BackupJournal:
             raise BackupError('Unverified backup contains unexpected snapshot evidence')
         return value
 
+    def history(self, cursor=None):
+        """Read summaries in stable newest-first order within the wire frame limit."""
+        self._locked()
+        if cursor is not None and not _uuid(cursor):
+            raise BackupError('Invalid backup history cursor')
+        anchor = self.get(cursor) if cursor is not None else None
+        names = os.listdir(self.directory)
+        if len(names) > 10000:
+            raise BackupError('Installation backup history exceeds its limit')
+        records = []
+        for name in names:
+            if name == 'active.json' or re.fullmatch(r'\.servus-[a-f0-9]{32}', name):
+                continue
+            if not name.endswith('.json') or not _uuid(name[:-5]):
+                raise BackupError('Unexpected installation backup journal entry')
+            record = self.get(name[:-5])
+            if anchor is None or (record['createdAt'], record['operationId']) < (anchor['createdAt'], anchor['operationId']):
+                records.append(record)
+        records.sort(key=lambda item: (item['createdAt'], item['operationId']), reverse=True)
+        page = []
+        fields = ('operationId', 'actorId', 'name', 'state', 'createdAt', 'updatedAt', 'errorCode')
+        for record in records[:10]:
+            summary = {key: record[key] for key in fields}
+            # The private and public protocols both have a 4096-byte frame.
+            # Reserve room for envelopes and the pagination cursor, including
+            # worst-case escaped Unicode names rather than truncating names.
+            if len(json.dumps(page + [summary], ensure_ascii=True).encode('ascii')) > 3500:
+                if not page:
+                    raise BackupError('Installation backup history entry exceeds its limit')
+                break
+            page.append(summary)
+        return {'operations': page, 'nextCursor': page[-1]['operationId'] if len(records) > len(page) else None}
+
     def active(self):
         try:
             marker = self._read('active.json')

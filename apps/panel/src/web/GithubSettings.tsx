@@ -23,7 +23,7 @@ export function GithubSettings() {
     onSuccess: (result) => { client.setQueryData(["github-connection"], result); setDisconnect(false); },
   });
   return <section id="github-connection" className="surface details-card central-settings">
-    <div className="card-heading"><GitBranch size={19} aria-hidden="true" /><h2>GitHub connection</h2></div>
+    <div className="card-heading"><GitBranch size={19} aria-hidden="true" /><h3>GitHub connection</h3></div>
     <p>Save one token for GitHub repositories used across projects. Only administrators can manage or assign it.</p>
     {connection.isPending ? <p>Loading connection...</p> : connection.error ? <FeatureError error={connection.error} /> : <>
       <p role="status">{connection.data?.connected ? "GitHub token saved. Access is checked during deployment." : "No GitHub token saved."}</p>

@@ -13,7 +13,7 @@ export function loadRestoreSource(options:{dataDir:string;serviceId:string;kind:
   const db = new Database(join(options.dataDir,'panel.sqlite'),{readonly:true,fileMustExist:true});
   let snapshot: z.infer<typeof snapshotSchema>;
   try {
-    if (![5,6,7,8].includes(Number(db.pragma('user_version',{simple:true})))) throw new Error('Unsupported panel database schema.');
+    if (![5,6,7,8,9].includes(Number(db.pragma('user_version',{simple:true})))) throw new Error('Unsupported panel database schema.');
     const service = db.prepare('SELECT project_id,deployed_revision,state,deleted_at FROM services WHERE id=?').get(options.serviceId) as {project_id:string;deployed_revision:number|null;state:string;deleted_at:string|null}|undefined;
     if (!service || service.deleted_at || service.deployed_revision === null || service.state !== 'running' || db.prepare("SELECT 1 FROM jobs WHERE service_id=? AND status IN ('queued','running') LIMIT 1").get(options.serviceId)) throw new Error('Database service is not ready for restoration.');
     const deployed = db.prepare("SELECT j.snapshot FROM jobs j JOIN actions a ON a.id=j.action_id WHERE j.service_id=? AND a.type='deploy' AND a.status='succeeded' ORDER BY a.finished_at DESC,a.rowid DESC LIMIT 1").get(options.serviceId) as {snapshot:string}|undefined;

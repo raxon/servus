@@ -11,12 +11,14 @@ import { SecretVault } from '../shared/secrets.js';
 import { configurationOf, validateConfiguration } from './configuration.js';
 import { assertHostDomainOwnership } from './host-domain.js';
 import { API_TOKEN_SCHEMA_SQL } from './api-tokens.js';
-import { BACKUP_SCHEMA_SQL } from '../shared/backups.js';
+import { BACKUP_PROFILES_SCHEMA_SQL, BACKUP_SCHEMA_SQL } from '../shared/backups.js';
 import { COMPOSE_SCHEMA_SQL } from '../shared/compose.js';
 import { TWO_FACTOR_SCHEMA_SQL } from './two-factor.js';
 import { WEBHOOK_SCHEMA_SQL } from './deploy-webhooks.js';
 import { VOLUME_BACKUP_SCHEMA_SQL } from '../shared/volume-backups.js';
 import { protectGitSshCredential, protectRegistryCredential } from './source-credentials.js';
+import { assertDatabasePortAvailable } from './database-access.js';
+import { normalizedDatabaseAccess, databaseTargetPort } from '../shared/database-access.js';
 
 const now = () => new Date().toISOString();
 const startupPause = new Int32Array(new SharedArrayBuffer(4));
@@ -51,7 +53,7 @@ export class Store {
     retryStartupLock(()=>this.db.pragma('journal_mode = WAL'));
     this.db.pragma('foreign_keys = ON');
     const version = this.db.pragma('user_version', { simple: true }) as number;
-    if (version > 8) throw new Error('This database requires a newer panel release');
+    if (version > 9) throw new Error('This database requires a newer panel release');
     if (version === 0) this.db.transaction(() => {
       const currentVersion = this.db.pragma('user_version', { simple: true }) as number;
       if(currentVersion>=1)return;
@@ -170,6 +172,22 @@ export class Store {
       // Older agents do not understand committed Redis volume bindings. Keep
       // the control plane from reopening those configurations with old code.
       this.db.pragma('user_version = 8');
+    }).immediate();
+    this.db.transaction(()=>{
+      if(Number(this.db.pragma('user_version',{simple:true}))>=9)return;
+      // Schema 9 adds reusable backup storage profiles, encrypted database
+      // backup metadata and retention policies. Older releases do not decrypt
+      // encrypted backups or honor non-count retention policies.
+      this.db.exec(BACKUP_PROFILES_SCHEMA_SQL);
+      for(const [table,columns] of [
+        ['database_backup_settings',{'profile_id':'TEXT REFERENCES backup_storage_profiles(id)','encrypted':'INTEGER NOT NULL DEFAULT 0 CHECK(encrypted IN (0,1))','retention_policy':'TEXT'}],
+        ['database_backups',{'encrypted':'INTEGER NOT NULL DEFAULT 0 CHECK(encrypted IN (0,1))','plaintext_size':'INTEGER'}],
+        ['volume_backup_settings',{'profile_id':'TEXT REFERENCES backup_storage_profiles(id)'}],
+      ] as const){
+        const known=new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as {name:string}[]).map(row=>row.name));
+        for(const [name,type] of Object.entries(columns))if(!known.has(name))this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+      }
+      this.db.pragma('user_version = 9');
     }).immediate();
     this.orm = drizzle(this.db, { schema });
     this.vault = new SecretVault(dataDir);
@@ -300,6 +318,7 @@ export class Store {
       }
       const service: Service = { id: randomUUID(), projectId, ...input, replicas: input.replicas ?? 1, revision: 1, deployedRevision: null, state: 'pending', lastError: null, createdAt: now(), updatedAt: now() };
       validateConfiguration(service);
+      assertDatabasePortAvailable(this,service);
       assertHostDomainOwnership(this,service);
       if(service.kind&&service.kind!=='app')service.hostname=`${service.id}.internal`;
       if(service.domains?.length===0)service.hostname=`${service.id}.internal`;
@@ -330,6 +349,7 @@ export class Store {
         if(patch.database.password!==undefined||patch.database.database!==current?.database||patch.database.user!==current?.user||patch.database.passwordSecretRef!==current?.passwordSecretRef)throw new AppError('DATABASE_CREDENTIALS_IMMUTABLE','Managed database names and credentials cannot be changed through configuration. Use a dedicated migration or credential-rotation operation.',409);
       }
       validateConfiguration(next);
+      assertDatabasePortAvailable(this,next);
       assertHostDomainOwnership(this,next);
       if(next.domains?.length) {const primary=next.domains.find(domain=>domain.primary)??next.domains[0]!;next.hostname=primary.hostname;next.port=primary.port;}
       else if(next.domains?.length===0)next.hostname=`${id}.internal`;
@@ -353,6 +373,7 @@ export class Store {
         return this.getAction(previous.action_id)!;
       }
       if(service.deletedAt)throw new AppError('SERVICE_DELETED','This service has been destroyed',410);
+      if(type==='deploy')assertDatabasePortAvailable(this,service);
       if (this.db.prepare("SELECT id FROM jobs WHERE service_id=? AND status IN ('queued','running')").get(serviceId)) throw new AppError('SERVICE_BUSY', 'Another operation is already queued or running for this service', 409);
       const action: Action = { id: randomUUID(), projectId: service.projectId, serviceId, type, status: 'queued', phase: 'queued', error: null, createdAt: now(), updatedAt: now(), finishedAt: null };
       this.db.prepare('INSERT INTO actions VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(action.id,action.projectId,serviceId,actorId,type,action.status,action.phase,null,action.createdAt,action.updatedAt,null);
@@ -439,6 +460,7 @@ export class Store {
       ['Domains',value=>({hostname:value.hostname,port:value.port,domains:value.domains})],
       ['Environment',value=>value.environment??[]],['Storage',value=>value.mounts??[]],
       ['Resources',value=>({resources:value.resources,replicas:value.replicas})],['Database',value=>value.database],
+      ['External database access',value=>normalizedDatabaseAccess(value.databaseAccess)],
     ];
     const domains=deployed.domains??[{hostname:deployed.hostname,port:deployed.port,primary:true}];
     const deployedPrimaryDomain=domains.find(domain=>domain.primary)??domains[0]??null;
@@ -601,8 +623,10 @@ export class Store {
     if(!service||!service.kind||service.kind==='app')throw new AppError('NOT_FOUND','Managed database not found',404);
     const deployed=this.db.prepare("SELECT j.snapshot FROM jobs j JOIN actions a ON a.id=j.action_id WHERE j.service_id=? AND a.type='deploy' AND a.status='succeeded' ORDER BY a.finished_at DESC,a.rowid DESC LIMIT 1").get(serviceId) as {snapshot:string}|undefined;
     if(!deployed||service.deployedRevision===null)throw new AppError('DATABASE_NOT_DEPLOYED','Database connection is available after its first confirmed deployment',409);
-    const database=(JSON.parse(deployed.snapshot) as Service).database??{database:'app',user:'app'};
-    const result:import('../shared/types.js').ConnectionInfo={host:`panel-app-${service.id}`,port:service.kind==='postgres'?5432:service.kind==='mariadb'?3306:6379,database:service.kind==='redis'?'0':database.database,user:service.kind==='redis'?'default':database.user};
+    const snapshot=JSON.parse(deployed.snapshot) as Service,database=snapshot.database??{database:'app',user:'app'};
+    const saved=normalizedDatabaseAccess(service.databaseAccess),confirmed=normalizedDatabaseAccess(snapshot.databaseAccess);
+    const result:import('../shared/types.js').ConnectionInfo={host:`panel-app-${service.id}`,legacyHost:`panel-app-${service.id}`,port:databaseTargetPort(service.kind),database:service.kind==='redis'?'0':database.database,user:service.kind==='redis'?'default':database.user,
+      deployedRevision:snapshot.revision,runtimeVerified:false,externalAccess:{saved,deployed:confirmed,pendingChanges:!isDeepStrictEqual(saved,confirmed),host:this.vault.hostConnection()?.ip??this.vault.hostConnection()?.hostname??null}};
     if(reveal&&database.passwordSecretRef){this.requireOwnedSecret(serviceId,database.passwordSecretRef,'database');result.password=this.vault.get(database.passwordSecretRef);}
     return result;
   }

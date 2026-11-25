@@ -1,11 +1,12 @@
 import { Skeleton } from "./Skeleton.js";
-import { deploymentProgress } from "./deployment-progress.js";
+import { deploymentFailure, deploymentProgress } from "./deployment-progress.js";
 import { applicationUrl } from "./application-url.js";
 import { DashboardOverview } from "./DashboardOverview.js";
 import React, {
   createContext,
   useContext,
   useEffect,
+  useId,
   useRef,
   useState,
 } from "react";
@@ -30,11 +31,11 @@ import {
 } from "@tanstack/react-router";
 import {
   Activity,
-  ArrowDownLeft,
   ArrowRight,
   ArrowUpRight,
   Box,
   Check,
+  ChevronDown,
   ChevronRight,
   Circle,
   CircleAlert,
@@ -72,7 +73,6 @@ import type {
 import { api, errorMessage, RequestError, setCsrfToken } from "./api.js";
 import { CreateService } from "./ServiceCreate.js";
 import { FeatureModal } from "./feature-ui.js";
-import { AccountLinkSettings, CentralAccessSettings, CentralSignIn } from "./CentralAccess.js";
 import { LocalPasswordSettings } from "./LocalPassword.js";
 import { ApiTokenSettings } from "./ApiTokenSettings.js";
 import { TwoFactorSettings } from "./TwoFactorSettings.js";
@@ -84,6 +84,7 @@ import { HttpsSettings } from "./HttpsSettings.js";
 import { HostDomainSettings } from "./HostDomainSettings.js";
 import { UpdateSettings, useUpdateDiscovery } from "./UpdateSettings.js";
 import { InstallationBackupSettings } from "./InstallationBackupSettings.js";
+import { BackupStorageSettings } from "./BackupStorageSettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
 import { PanelNotifications, notifyProjectCreated } from "./notifications.js";
 import {
@@ -96,6 +97,8 @@ import {
 } from "./ServiceFeatures.js";
 import type { ServiceTab } from "./ServiceFeatures.js";
 import "./styles.css";
+import "./Settings.css";
+import "./ServiceOperations.css";
 
 const createQueryClient = () => new QueryClient({
   defaultOptions: {
@@ -231,11 +234,34 @@ function AuthenticatedApp({ auth, sessionClient }: { auth: SessionResponse; sess
   </SessionClientContext.Provider>;
 }
 
+function SetupIllustration() {
+  return (
+    <svg className="setup-stack" width="248" height="104" viewBox="0 0 248 104" fill="none" aria-hidden="true">
+      <path d="M4 52h23l14-14h32m94 14h30l14 14h33" stroke="currentColor" strokeOpacity=".5" strokeDasharray="3 4" />
+      <path d="M67 80 120 53 173 80 120 101Z" fill="#e9eae9" />
+      <g stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round">
+        <path d="m73 66 47 23 47-23" strokeOpacity=".55" />
+        <path d="m73 52 47 23 47-23" strokeOpacity=".75" />
+        <path d="m73 38 47-23 47 23-47 23z" fill="#fafafa" />
+        <path d="m102 38 18-9 18 9-18 9z" fill="#e9eae9" />
+      </g>
+      <circle cx="4" cy="52" r="2.5" fill="currentColor" />
+      <circle cx="244" cy="66" r="2.5" fill="currentColor" />
+      <circle className="setup-stack-signal setup-stack-signal-in" cx="4" cy="52" r="3.5" fill="currentColor" />
+      <circle className="setup-stack-signal setup-stack-signal-out" cx="167" cy="52" r="3.5" fill="currentColor" />
+    </svg>
+  );
+}
+
 function AuthForm({ setup }: { setup: boolean }) {
   const client = useQueryClient();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPasswords, setShowPasswords] = useState(false);
+  const [passwordMismatch, setPasswordMismatch] = useState(false);
+  const confirmation = useRef<HTMLInputElement>(null);
   const [totpCode, setTotpCode] = useState("");
+  const passwordInputType = setup && showPasswords ? "text" : "password";
   const mutation = useMutation({
     mutationFn: () =>
       api<SessionResponse>(setup ? "/setup" : "/auth/login", {
@@ -249,41 +275,68 @@ function AuthForm({ setup }: { setup: boolean }) {
     },
   });
   return (
-    <main className="setup-screen">
+    <main className={`setup-screen${setup ? " setup-first-run" : ""}`}>
       <header className="setup-topbar"><Brand /></header>
-      <div className="setup-shell">
-        <div className="setup-intro">
-          <div className="setup-intro-copy">
-            <p className="setup-kicker">YOUR SERVER, YOUR SPACE</p>
-            <h1>{setup ? "Welcome to" : "Welcome back to"}<br /><em>your server.</em></h1>
-            <p className="setup-intro-description">{setup ? "A home for the applications you run. Set up your administrator account to get started." : "Sign in to manage your applications and check their status."}</p>
+      <div className={setup ? "setup-layout" : "setup-shell"}>
+        {setup ? (
+          <div className="setup-heading">
+            <SetupIllustration />
+            <h1 id="setup-form-heading" className="setup-title">
+              Create your <span>administrator account</span>
+            </h1>
           </div>
-          <div className="setup-diagram" aria-hidden="true">
-            <div className="setup-diagram-grid" />
-            <div className="setup-diagram-line" />
-            <div className="setup-diagram-orbit">
-              <div className="setup-diagram-node"><Server size={27} strokeWidth={1.4} /></div>
+        ) : (
+          <div className="setup-intro">
+            <div className="setup-intro-copy">
+              <p className="setup-kicker">YOUR SERVER, YOUR SPACE</p>
+              <h1>Welcome back to<br /><em>your server.</em></h1>
+              <p className="setup-intro-description">Sign in to manage your applications and check their status.</p>
             </div>
-            <div className="setup-diagram-caption"><span />YOUR LOCAL SERVER</div>
+            <div className="setup-diagram" aria-hidden="true">
+              <div className="setup-diagram-grid" />
+              <div className="setup-diagram-line" />
+              <div className="setup-diagram-orbit">
+                <div className="setup-diagram-node"><Server size={27} strokeWidth={1.4} /></div>
+              </div>
+              <div className="setup-diagram-caption"><span />YOUR LOCAL SERVER</div>
+            </div>
           </div>
-        </div>
-        <section className="setup-form-side" aria-labelledby="setup-form-heading">
+        )}
+        <section className={setup ? "setup-form-side setup-form-card" : "setup-form-side"} aria-labelledby="setup-form-heading">
           <div className="setup-form-inner">
-            <h2 id="setup-form-heading">{setup ? <>Create your<br />administrator account</> : "Sign in to your account"}</h2>
-            <form className="setup-form" onSubmit={(event) => { event.preventDefault(); mutation.mutate(); }}>
+            {!setup && <h2 id="setup-form-heading">Sign in to your account</h2>}
+            <form className="setup-form" onSubmit={(event) => {
+              event.preventDefault();
+              if (setup && confirmation.current?.value !== password) {
+                setPasswordMismatch(true);
+                confirmation.current?.focus();
+                return;
+              }
+              mutation.mutate();
+            }}>
               <label htmlFor="setup-email">Email address</label>
               <input id="setup-email" name="email" type="email" autoComplete="username" placeholder="you@example.com" maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} required />
-              <label htmlFor="setup-password">Password</label>
-              <input id="setup-password" name="password" type="password" autoComplete={setup ? "new-password" : "current-password"} placeholder={setup ? "At least 8 characters" : "Enter your password"} minLength={setup ? 8 : undefined} maxLength={128} value={password} onChange={(event) => setPassword(event.target.value)} required aria-describedby={setup ? "setup-password-hint" : undefined} />
-              {setup ? <p id="setup-password-hint" className="setup-password-hint">Use at least 8 characters.</p> : null}
+              {setup ? (
+                <div className="setup-password-row">
+                  <label htmlFor="setup-password">Password</label>
+                  <button type="button" className="setup-password-toggle" aria-controls="setup-password setup-password-confirmation" onClick={() => setShowPasswords((visible) => !visible)}>
+                    {showPasswords ? "Hide passwords" : "Show passwords"}
+                  </button>
+                </div>
+              ) : <label htmlFor="setup-password">Password</label>}
+              <input id="setup-password" name="password" type={passwordInputType} autoComplete={setup ? "new-password" : "current-password"} placeholder={setup ? undefined : "Enter your password"} minLength={setup ? 8 : undefined} maxLength={128} spellCheck={false} autoCapitalize="none" value={password} onChange={(event) => { setPassword(event.target.value); setPasswordMismatch(false); }} required aria-describedby={setup ? "setup-password-hint" : undefined} />
+              {setup && <>
+                <p id="setup-password-hint" className="setup-password-hint">Use at least 8 characters.</p>
+                <label htmlFor="setup-password-confirmation">Confirm password</label>
+                <input id="setup-password-confirmation" name="passwordConfirmation" ref={confirmation} type={passwordInputType} autoComplete="new-password" maxLength={128} spellCheck={false} autoCapitalize="none" required onChange={() => setPasswordMismatch(false)} aria-invalid={passwordMismatch} aria-describedby={passwordMismatch ? "setup-password-error" : undefined} />
+                <p id="setup-password-error" className="setup-password-error" aria-live="polite">{passwordMismatch && "Passwords do not match."}</p>
+              </>}
               {!setup&&(totpCode||mutation.error instanceof RequestError&&['TWO_FACTOR_REQUIRED','TWO_FACTOR_CODE_INVALID'].includes(mutation.error.code))?<><label htmlFor="signin-totp">Authenticator or recovery code</label><input id="signin-totp" name="totpCode" type="text" autoComplete="one-time-code" spellCheck={false} autoCapitalize="none" value={totpCode} maxLength={64} onChange={event=>setTotpCode(event.target.value)} required/></>:null}
               <ErrorNotice error={mutation.error} />
               <button className="setup-submit" type="submit" disabled={mutation.isPending}>
                 {mutation.isPending ? <Spinner label={setup ? "Creating administrator" : "Signing in"} /> : <>{setup ? "Create administrator" : "Sign in"} <ArrowRight size={18} aria-hidden="true" /></>}
               </button>
             </form>
-            {!setup ? <CentralSignIn /> : null}
-            <p className="setup-security-note"><ShieldCheck size={16} aria-hidden="true" /> {setup ? "This account is local to your installation." : "Local sign-in uses an account on this installation."}</p>
           </div>
         </section>
       </div>
@@ -561,12 +614,11 @@ function CreateProject({ onClose }: { onClose: () => void }) {
   const client = useQueryClient();
   const navigate = useNavigate();
   const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
   const mutation = useMutation({
     mutationFn: () =>
       api<Project>("/projects", {
         method: "POST",
-        body: { name, description },
+        body: { name },
       }),
     onSuccess: (project) => {
       notifyProjectCreated();
@@ -603,17 +655,6 @@ function CreateProject({ onClose }: { onClose: () => void }) {
             maxLength={63}
           />
           <small>Use lowercase letters, numbers, and hyphens.</small>
-        </label>
-        <label>
-          Description <span className="optional">Optional</span>
-          <textarea
-            name="description"
-            value={description}
-            onChange={(event) => setDescription(event.target.value)}
-            placeholder="What will you deploy here?"
-            rows={3}
-            maxLength={500}
-          />
         </label>
         <ErrorNotice error={mutation.error} />
         <div className="modal-footer">
@@ -668,10 +709,6 @@ function ProjectPage() {
   });
   return (
     <>
-      <Link to="/" className="back-link">
-        <ArrowDownLeft size={15} />
-        All projects
-      </Link>
       <div className="page-heading">
         <div>
           <div className="eyebrow">PROJECT</div>
@@ -679,10 +716,18 @@ function ProjectPage() {
             <Folder size={29} />
             {project?.name ?? "Project"}
           </h1>
-          <p>
-            {project?.description ||
-              "One place for your applications and deployment history."}
-          </p>
+          <div className="project-meta">
+            <span>
+              <Box size={15} aria-hidden="true" />
+              {services.isPending ? "Loading services" : services.error ? "Services unavailable" : `${services.data?.length ?? 0} ${services.data?.length === 1 ? "service" : "services"}`}
+            </span>
+            {project ? (
+              <span>
+                <Clock3 size={15} aria-hidden="true" />
+                Created {formatDate(project.createdAt)}
+              </span>
+            ) : null}
+          </div>
         </div>
         <div className="heading-actions">
           {project?.canWrite ? (
@@ -699,22 +744,6 @@ function ProjectPage() {
             New service
           </button> : null}
         </div>
-      </div>
-      <div className="project-meta">
-        <span>
-          <Box size={15} />
-          {services.isPending ? "Loading services" : services.error ? "Services unavailable" : `${services.data?.length ?? 0} services`}
-        </span>
-        <span>
-          <ShieldCheck size={15} />
-          Private project network
-        </span>
-        {project ? (
-          <span>
-            <Clock3 size={15} />
-            Created {formatDate(project.createdAt)}
-          </span>
-        ) : null}
       </div>
       <div className="section-heading">
         <div>
@@ -813,7 +842,7 @@ function ProjectPage() {
       <ErrorNotice error={actions.error} />
       {!actions.error ? <ActionsTable actions={actions.data ?? []} loading={actions.isPending} /> : null}
       {create && projectId ? (
-        <CreateService projectId={projectId} admin={user.role === "admin"} onClose={() => setCreate(false)} />
+        <CreateService projectId={projectId} admin={user.role === "admin"} serviceNames={services.data?.map(service => service.name) ?? []} onClose={() => setCreate(false)} />
       ) : null}
     </>
   );
@@ -823,10 +852,14 @@ function ActionsTable({
   actions,
   loading,
   onSelect,
+  selectedId,
+  emptyMessage,
 }: {
   actions: Action[];
   loading?: boolean;
   onSelect?: (action: Action) => void;
+  selectedId?: string;
+  emptyMessage?: string;
 }) {
   if (loading)
     return (
@@ -839,8 +872,8 @@ function ActionsTable({
           <Activity size={22} />
         </span>
         <div>
-          <strong>No operations yet</strong>
-          <p>Deployments and service actions will appear here.</p>
+          <strong>{emptyMessage ? "No matching operations" : "No operations yet"}</strong>
+          <p>{emptyMessage ?? "Deployments and service actions will appear here."}</p>
         </div>
       </div>
     );
@@ -855,7 +888,9 @@ function ActionsTable({
       {actions.map((action) => (
         <button
           key={action.id}
+          type="button"
           className="action-row"
+          aria-pressed={selectedId !== undefined ? selectedId === action.id : undefined}
           onClick={() =>
             onSelect
               ? onSelect(action)
@@ -885,7 +920,10 @@ function ActionsTable({
                 {action.type[0]?.toUpperCase()}
                 {action.type.slice(1)} service
               </strong>
-              <small className="mono">{shortId(action.id)}</small>
+              <small>
+                <span className="mono" title={action.id}>{shortId(action.id)}</span>
+                <span className="deployment-run-time"> · <time dateTime={action.createdAt} title={formatDate(action.createdAt)}>{relative(action.createdAt)}</time></span>
+              </small>
             </span>
           </div>
           <Badge status={action.status} />
@@ -902,6 +940,78 @@ function ActionsTable({
   );
 }
 
+const compactServiceLayout = "(max-width: 980px)";
+const serviceTabGroups: { title: string; sections: ServiceTab[] }[] = [
+  { title: "Observe", sections: ["overview", "deployments", "logs", "console"] },
+  { title: "Configure", sections: ["source", "environment", "domains", "resources"] },
+  { title: "Data", sections: ["storage", "backups"] },
+];
+
+function ServiceSections({
+  serviceId, tab, selectedAction, actionCount, compact,
+}: {
+  serviceId: string;
+  tab: ServiceTab;
+  selectedAction?: string;
+  actionCount: number;
+  compact: boolean;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const label = useId();
+  function sectionLink(item: (typeof serviceTabs)[number]) {
+    return (
+      <Link
+        key={item.id}
+        to="/services/$serviceId"
+        params={{ serviceId }}
+        search={{ tab: item.id, action: item.id === "deployments" ? selectedAction : undefined }}
+        viewTransition={false}
+        resetScroll={false}
+        aria-current={tab === item.id ? "page" : undefined}
+        className={tab === item.id ? "selected" : ""}
+        onClick={() => dialog.current?.close()}
+      >
+        <span>{item.label}</span>
+        {item.id === "deployments" && actionCount > 0 ? <span className="tab-count">{actionCount}</span> : null}
+      </Link>
+    );
+  }
+  if (!compact) {
+    return <nav className="service-tabs feature-tabs" aria-label="Service sections">{serviceTabs.map(sectionLink)}</nav>;
+  }
+  const current = serviceTabs.find(item => item.id === tab)!;
+  return (
+    <>
+      <button
+        className="button service-section-trigger"
+        type="button"
+        aria-haspopup="dialog"
+        onClick={() => dialog.current?.showModal()}
+      >
+        Section: {current.label} <ChevronDown size={16} aria-hidden="true" />
+      </button>
+      <dialog ref={dialog} className="service-section-sheet" aria-labelledby={label}>
+        <div className="service-section-sheet-header">
+          <h2 id={label}>Service sections</h2>
+          <form method="dialog">
+            <button className="icon-button" type="submit" aria-label="Close service sections">
+              <X size={19} aria-hidden="true" />
+            </button>
+          </form>
+        </div>
+        <nav aria-label="Service sections">
+          {serviceTabGroups.map(({ title, sections }) => (
+            <div key={title} className="service-section-group">
+              <h3>{title}</h3>
+              <div>{sections.map(id => sectionLink(serviceTabs.find(item => item.id === id)!))}</div>
+            </div>
+          ))}
+        </nav>
+      </dialog>
+    </>
+  );
+}
+
 function ServicePage() {
   const { serviceId } = useParams({ strict: false });
   const client = useQueryClient();
@@ -910,9 +1020,24 @@ function ServicePage() {
   const runtime = useRuntime();
   const projects = useProjects();
   const { tab = "overview", action: selectedAction } = serviceRoute.useSearch();
+  const [compact, setCompact] = useState(() => window.matchMedia(compactServiceLayout).matches);
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const secondaryDisclosure = useRef<HTMLDetailsElement>(null);
+  const [deploymentStatus, setDeploymentStatus] = useState("");
+  useEffect(() => {
+    const media = window.matchMedia(compactServiceLayout);
+    const update = () => {
+      if (media.matches && secondaryDisclosure.current?.querySelector("dialog[open]")) setActionsOpen(true);
+      setCompact(media.matches);
+    };
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
   const selectAction = (action: string) => void navigate({
     to: "/services/$serviceId", params: { serviceId: serviceId! },
     search: { tab: "deployments", action },
+    viewTransition: false,
+    resetScroll: false,
   });
   const [destroying, setDestroying] = useState(false);
   const serviceQuery = useQuery({
@@ -960,14 +1085,16 @@ function ServicePage() {
     );
   const service = serviceQuery.data;
   const database = !!service.kind && service.kind !== "app";
+  const canWrite = projects.data?.find(project => project.id === service.projectId)?.canWrite === true;
   const busy = !!(
     destroying ||
     execute.isPending ||
     actionsQuery.data?.some(pendingAction)
   );
   const changed = service.revision !== service.deployedRevision;
-  const latest = actionsQuery.data?.[0];
-  const actionId = selectedAction ?? latest?.id;
+  const actions = actionsQuery.data ?? [];
+  const filteredActions = deploymentStatus ? actions.filter(action => action.status === deploymentStatus) : actions;
+  const actionId = selectedAction ?? filteredActions[0]?.id;
   const domains = service.domains ?? [
     { hostname: service.hostname, port: service.port, primary: true },
   ];
@@ -980,6 +1107,32 @@ function ServicePage() {
     service.source?.type === "git"
       ? `${service.source.repository} · ${service.source.branch}`
       : service.image;
+  const secondaryActions = canWrite ? (
+    <>
+      {service.deployedRevision !== null && <>
+        <button type="button" className="button" onClick={() => execute.mutate("restart")} disabled={busy}>
+          <RefreshCw size={14} aria-hidden="true" /> Restart
+        </button>
+        <button type="button" className="button" onClick={() => execute.mutate(service.state === "stopped" ? "start" : "stop")} disabled={busy}>
+          {service.state === "stopped" ? <Play size={14} aria-hidden="true" /> : <Square size={13} aria-hidden="true" />}
+          {service.state === "stopped" ? "Start" : "Stop"}
+        </button>
+      </>}
+      {service.source?.type === "git" ? <button className="button" type="button" disabled={busy} onClick={() => execute.mutate("force-rebuild")}>Force rebuild</button> : null}
+      <DestroyService
+        service={service}
+        busy={busy}
+        showLabel={compact}
+        onStarted={() => setDestroying(true)}
+        onFailure={() => setDestroying(false)}
+        onDestroyed={() => {
+          void client.invalidateQueries({ queryKey: ["projects"] });
+          void client.invalidateQueries({ queryKey: ["services", service.projectId] });
+          void navigate({ to: "/projects/$projectId", params: { projectId: service.projectId } });
+        }}
+      />
+    </>
+  ) : null;
   return (
     <>
       <div className="page-heading service-heading">
@@ -998,7 +1151,15 @@ function ServicePage() {
           </h1>
           <p className="mono service-image">{sourceLabel}</p>
         </div>
-        <div className="heading-actions">
+        <div className="heading-actions service-heading-actions">
+          {canWrite && <button
+            type="button"
+            className="button button-primary"
+            onClick={() => execute.mutate("deploy")}
+            disabled={busy}
+          >
+            {busy ? <Spinner label="In progress" /> : <><Play size={15} aria-hidden="true" /> Deploy</>}
+          </button>}
           {!database && appUrl ? (
             <a
               href={appUrl}
@@ -1010,68 +1171,36 @@ function ServicePage() {
               Open app
             </a>
           ) : null}
-          <DestroyService
-            service={service}
-            busy={busy}
-            onStarted={() => setDestroying(true)}
-            onFailure={() => setDestroying(false)}
-            onDestroyed={() => {
-              void client.invalidateQueries({ queryKey: ["projects"] });
-              void client.invalidateQueries({
-                queryKey: ["services", service.projectId],
-              });
-              void navigate({
-                to: "/projects/$projectId",
-                params: { projectId: service.projectId },
-              });
-            }}
-          />
-          {service.source?.type === "git" ? <button className="button" type="button" disabled={busy} onClick={()=>execute.mutate("force-rebuild")}>Force rebuild</button> : null}
-          <button
-            className="button button-primary"
-            onClick={() => execute.mutate("deploy")}
-            disabled={busy}
-          >
-            {busy ? (
-              <Spinner label="In progress" />
-            ) : (
-              <>
-                <Play size={15} />
-                Deploy
-              </>
-            )}
-          </button>
+          {canWrite ? (
+            <details
+              ref={secondaryDisclosure}
+              className="service-actions-disclosure"
+              open={!compact || actionsOpen}
+              onToggle={event => { if (compact) setActionsOpen(event.currentTarget.open); }}
+              onKeyDown={event => {
+                if (compact && event.key === "Escape" && event.currentTarget.open && !(event.target as Element).closest("dialog")) {
+                  event.preventDefault();
+                  event.currentTarget.open = false;
+                  event.currentTarget.querySelector("summary")?.focus();
+                }
+              }}
+            >
+              <summary className="button">Actions <ChevronDown size={15} aria-hidden="true" /></summary>
+              <div className="service-action-options">{secondaryActions}</div>
+            </details>
+          ) : null}
         </div>
       </div>
-      <nav
-        className="service-tabs feature-tabs"
-        aria-label="Service sections"
-      >
-        {serviceTabs.map((item) => (
-          <Link
-            key={item.id}
-            to="/services/$serviceId"
-            params={{ serviceId: service.id }}
-            search={{ tab: item.id, action: item.id === "deployments" ? selectedAction : undefined }}
-            aria-current={tab === item.id ? "page" : undefined}
-            className={tab === item.id ? "selected" : ""}
-          >
-            <span>{item.label}</span>
-            {item.id === "deployments" && actionsQuery.data?.length ? (
-              <span className="tab-count">{actionsQuery.data.length}</span>
-            ) : null}
-          </Link>
-        ))}
-      </nav>
+      <ServiceSections serviceId={service.id} tab={tab} selectedAction={selectedAction} actionCount={actions.length} compact={compact} />
       <ErrorNotice error={execute.error} />
-      {service.lastError ? (
+      {service.lastError && !(tab === "deployments" && actions[0]?.status === "failed" && actionId === actions[0].id) ? (
         <div className="error-notice">
           <CircleAlert size={17} />
           <span>{service.lastError}</span>
         </div>
       ) : null}
       {changed ? (
-        <div className="change-notice">
+        <div id="configuration-changes" className="change-notice">
           <GitBranch size={17} />
           <div>
             <strong>
@@ -1082,7 +1211,7 @@ function ServicePage() {
             <span>
               Saved revision {service.revision}
               {service.deployedRevision !== null
-                ? ` · Running revision ${service.deployedRevision}`
+                ? ` · Last deployed revision ${service.deployedRevision}`
                 : ""}
               . Deploy to apply the saved settings.
             </span>
@@ -1091,19 +1220,35 @@ function ServicePage() {
         </div>
       ) : null}
       {tab === "deployments" ? (
-        <div className="operations-grid">
-          <div>
-            <div className="section-heading">
+        <div className="operations-grid deployment-workspace">
+          <div className="deployment-history">
+            <div className="section-heading deployment-history-heading">
               <h2>Deployments and operations</h2>
+              <label>
+                <span className="sr-only">Filter deployment history by status</span>
+                <select value={deploymentStatus} onChange={event => setDeploymentStatus(event.target.value)}>
+                  <option value="">All statuses</option>
+                  <option value="failed">Failed</option>
+                  <option value="succeeded">Succeeded</option>
+                  <option value="queued">Queued</option>
+                  <option value="running">Running</option>
+                  <option value="cancelled">Cancelled</option>
+                </select>
+              </label>
             </div>
-            <ActionsTable
-              actions={actionsQuery.data ?? []}
+            <ErrorNotice error={actionsQuery.error} />
+            {!actionsQuery.isError ? <ActionsTable
+              actions={filteredActions}
               loading={actionsQuery.isPending}
               onSelect={(action) => selectAction(action.id)}
-            />
+              selectedId={actionId}
+              emptyMessage={deploymentStatus ? "No operations match this status." : undefined}
+            /> : null}
           </div>
-          <DeployWebhookSettings service={service} canWrite={projects.data?.find(project=>project.id===service.projectId)?.canWrite===true}/>
-          <ActionLog actionId={actionId} busy={busy} onRedeployed={action => {selectAction(action.id);void client.invalidateQueries({queryKey:["service-actions",serviceId]});void client.invalidateQueries({queryKey:["service",serviceId]});}} />
+          <ActionLog key={`${service.id}:${actionId ?? ""}`} actionId={actionId} service={service} busy={busy} onRedeployed={canWrite ? action => {selectAction(action.id);void client.invalidateQueries({queryKey:["service-actions",serviceId]});void client.invalidateQueries({queryKey:["service",serviceId]});} : undefined} />
+          {canWrite && service.source?.type === "git" ? <div className="deployment-webhook">
+            <DeployWebhookSettings service={service} canWrite={canWrite}/>
+          </div> : null}
         </div>
       ) : tab !== "overview" ? (
         <ServiceConfigurationPanel
@@ -1111,14 +1256,14 @@ function ServicePage() {
           service={service}
           tab={tab}
           admin={user.role === "admin"}
-          canWrite={projects.data?.find(project=>project.id===service.projectId)?.canWrite === true}
+          canWrite={canWrite}
         />
       ) : (
         <>
           <ServiceMetricsPanel service={service} />
           <div className="service-overview-grid">
             {database ? (
-              <DatabaseConnection service={service} admin={user.role === "admin"} canWrite={projects.data?.find(project=>project.id===service.projectId)?.canWrite===true} />
+              <DatabaseConnection service={service} admin={user.role === "admin"} canWrite={canWrite} />
             ) : (
               <section className="surface details-card">
                 <div className="card-heading">
@@ -1204,44 +1349,18 @@ function ServicePage() {
               ) : null}
             </section>
           </div>
-          <div className="section-heading activity-heading">
-            <div>
-              <h2>Latest operation</h2>
-              <p>Worker progress and deployment output.</p>
-            </div>
-            <div className="lifecycle-actions">
-              <button
-                className="button button-small"
-                onClick={() => execute.mutate("restart")}
-                disabled={busy || service.deployedRevision === null}
-              >
-                <RefreshCw size={14} />
-                Restart
-              </button>
-              <button
-                className="button button-small"
-                onClick={() =>
-                  execute.mutate(service.state === "stopped" ? "start" : "stop")
-                }
-                disabled={busy}
-              >
-                {service.state === "stopped" ? (
-                  <Play size={14} />
-                ) : (
-                  <Square size={13} />
-                )}
-                {service.state === "stopped" ? "Start" : "Stop"}
-              </button>
-            </div>
-          </div>
-          <ActionLog actionId={latest?.id} />
         </>
       )}
     </>
   );
 }
 
-function ActionLog({ actionId, busy = false, onRedeployed }: { actionId?: string; busy?: boolean; onRedeployed?: (action:Action)=>void }) {
+function ActionLog({ actionId, service, busy = false, onRedeployed }: {
+  actionId?: string;
+  service?: Service;
+  busy?: boolean;
+  onRedeployed?: (action: Action) => void;
+}) {
   const [confirmRedeploy, setConfirmRedeploy] = useState(false);
   const [logSearch, setLogSearch] = useState("");
   const [copyState, setCopyState] = useState("");
@@ -1257,14 +1376,15 @@ function ActionLog({ actionId, busy = false, onRedeployed }: { actionId?: string
         ? false
         : 1_000,
   });
+  const wrongService = !!(service && detail.data && service.id !== detail.data.action.serviceId);
   const buildLog = useQuery({
     queryKey:["build-log",actionId],
     queryFn:()=>api<{available:boolean;text:string;truncated:boolean}>(`/actions/${actionId}/build-log`),
-    enabled:!!actionId && detail.data?.action.type === "deploy",
+    enabled:!wrongService && !!actionId && detail.data?.action.type === "deploy",
     refetchInterval: detail.data && pendingAction(detail.data.action) ? 2_000 : false,
     retry:false,
   });
-  const project = useQuery({queryKey:["project-access",detail.data?.action.projectId],queryFn:()=>api<Project>(`/projects/${detail.data!.action.projectId}`),enabled:!!onRedeployed && !!detail.data?.action.projectId});
+  const project = useQuery({queryKey:["project-access",detail.data?.action.projectId],queryFn:()=>api<Project>(`/projects/${detail.data!.action.projectId}`),enabled:!wrongService && !!onRedeployed && !!detail.data?.action.projectId});
   const redeploy = useMutation({
     mutationFn:()=>api<Action>(`/services/${detail.data!.action.serviceId}/deployments/${detail.data!.action.id}/redeploy`,{method:"POST",body:{confirm:true},idempotent:true}),
     onSuccess:action=>{setConfirmRedeploy(false);onRedeployed?.(action);},
@@ -1276,13 +1396,16 @@ function ActionLog({ actionId, busy = false, onRedeployed }: { actionId?: string
   const endTime = detail.data?.action.finishedAt ? Date.parse(detail.data.action.finishedAt) : Date.now();
   const duration = Number.isFinite(startTime) && Number.isFinite(endTime) && endTime >= startTime ? Math.floor((endTime-startTime)/1000) : undefined;
   const buildLines = buildLog.data?.text.split('\n').filter(line => line.toLowerCase().includes(logSearch.toLowerCase())).join('\n') ?? '';
-  useEffect(()=>{setFollowOutput(true);setLogSearch('');setCopyState('');},[actionId]);
+  const failure = detail.data ? deploymentFailure(detail.data.action, buildLog.data) : undefined;
   useEffect(()=>{
     if(!followOutput)return;
     for(const node of [operationOutputRef.current,buildOutputRef.current])if(node)node.scrollTop=node.scrollHeight;
   },[followOutput,detail.data?.events,buildLog.data?.text,logSearch]);
   const pauseIfScrolledUp = (node:HTMLElement) => {if(node.scrollHeight-node.scrollTop-node.clientHeight>32)setFollowOutput(false);};
   const canRedeploy = !!onRedeployed && !!project.data?.canWrite && detail.data?.action.type === "deploy" && detail.data.action.status === "succeeded" && !!deployedImage && /^(?:sha256:[a-f0-9]{64}|[a-zA-Z0-9][a-zA-Z0-9._/:@-]*@sha256:[a-f0-9]{64})$/.test(deployedImage);
+  if (wrongService) {
+    return <section className="log-card"><ErrorNotice error={new Error("This operation belongs to another service.")} /></section>;
+  }
   return (
     <section className="log-card">
       <div className="log-heading">
@@ -1300,6 +1423,38 @@ function ActionLog({ actionId, busy = false, onRedeployed }: { actionId?: string
           )}
         </span>
       </div>
+      {failure || (service && detail.data?.action.type === "deploy") ? (
+        <div className="deploy-diagnosis">
+          {failure ? (
+            <>
+              <div className="deploy-failure">
+                <h3>{failure.title}</h3>
+                <p>{failure.cause}</p>
+                {failure.nextStep ? <p>{failure.nextStep}</p> : null}
+              </div>
+              {failure.stage ? (
+                <ol className="deploy-phases" aria-label="Deployment stages">
+                  <li>Queued</li>
+                  <li className="failed">{failure.stage === "source" ? "Source preparation failed" : "Build failed"}</li>
+                  <li>Apply {failure.laterStagesUnreached ? "skipped" : "unconfirmed"}</li>
+                  <li>Health check {failure.laterStagesUnreached ? "skipped" : "unconfirmed"}</li>
+                </ol>
+              ) : null}
+            </>
+          ) : null}
+          {service ? (
+            <div className="deploy-revision">
+              <div>
+                <strong>Last deployed revision {service.deployedRevision ?? "—"}</strong>
+                <small>{service.deployedRevision === null ? "No revision deployed yet" : "Live service health is unverified in this view"}</small>
+              </div>
+              <Link className="button button-small" to="/services/$serviceId" params={{ serviceId: service.id }} search={{ tab: "logs" }} viewTransition={false}>
+                Open service logs <ChevronRight size={14} aria-hidden="true" />
+              </Link>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       {detail.data ? <div className="operation-tools">
         <div className="operation-meta"><span>Progress: {deploymentProgress(detail.data.action,buildLog.data)}</span><span>Queued: {new Date(detail.data.action.createdAt).toLocaleString()}</span>{started ? <span>Started: {new Date(started).toLocaleString()}</span> : null}{duration!==undefined ? <span>Duration: {Math.floor(duration/60)}m {duration%60}s</span> : null}{detail.data.action.finishedAt ? <span>Finished: {new Date(detail.data.action.finishedAt).toLocaleString()}</span> : null}{sourceCommit ? <span>Commit: <code>{sourceCommit}</code></span> : null}{deployedImage ? <span>Image: <code>{deployedImage}</code></span> : null}</div>
         <label>Search output <input type="search" value={logSearch} onChange={event => setLogSearch(event.target.value)} /></label>
@@ -1340,7 +1495,7 @@ function ActionLog({ actionId, busy = false, onRedeployed }: { actionId?: string
             {detail.data && detail.data.events.length > 0 && logSearch && !detail.data.events.some(event => event.message.toLowerCase().includes(logSearch.toLowerCase())) ? <p className="log-placeholder">No output matches your search.</p> : null}
             {detail.data && !detail.data.events.length ? (
               <p className="log-placeholder">
-                Waiting for the worker to pick up this operation...
+                {pendingAction(detail.data.action) ? "Waiting for operation events…" : "No operation events were recorded."}
               </p>
             ) : null}
             {detail.data?.action.error ? (
@@ -1398,7 +1553,7 @@ function ActivityPage() {
       />
       {selected ? (
         <div className="activity-log">
-          <ActionLog actionId={selected} />
+          <ActionLog key={selected} actionId={selected} />
         </div>
       ) : null}
     </>
@@ -1408,103 +1563,116 @@ function ActivityPage() {
 function SettingsPage() {
   const runtime = useRuntime();
   const { user } = useAuth();
+  const admin = user.role === "admin";
   return (
-    <>
-      <div className="page-heading">
-        <div>
-          <div className="eyebrow">SELF-HOSTED INSTALLATION</div>
-          <h1>Your instance</h1>
-          <p>The connection between your workspace and its Docker engine.</p>
-        </div>
-        <Badge status={runtime.data?.online ? "running" : "unknown"} />
-      </div>
-      <ErrorNotice error={runtime.error} />
-      <div className="instance-grid">
-        <section className="surface details-card">
-          <div className="card-heading">
-            <Server size={19} />
-            <h2>Docker runtime</h2>
-          </div>
-          <div className="detail-row">
-            <span>Connection</span>
-            <strong>
-              {runtime.isPending
-                ? "Checking"
-                : runtime.data?.online
-                  ? "Connected"
-                  : "Offline"}
-            </strong>
-          </div>
-          <div className="detail-row">
-            <span>Engine version</span>
-            <strong className="mono">
-              {runtime.data?.engineVersion ?? "Unavailable"}
-            </strong>
-          </div>
-          <div className="detail-row">
-            <span>CPUs</span>
-            <strong>{runtime.data?.cpus ?? "Unavailable"}</strong>
-          </div>
-          <div className="detail-row">
-            <span>Memory capacity</span>
-            <strong>
-              {runtime.data?.memoryBytes
-                ? `${(runtime.data.memoryBytes / 1024 ** 3).toFixed(1)} GiB`
-                : "Unavailable"}
-            </strong>
-          </div>
-          <div className="detail-row">
-            <span>Swarm state</span>
-            <strong>{runtime.data?.swarmState ?? "Unavailable"}</strong>
-          </div>
-          <div className="detail-row">
-            <span>HTTP ingress port</span>
-            <strong className="mono">
-              {runtime.data?.ingressPort ?? 18080}
-            </strong>
-          </div>
-          {runtime.data?.error ? (
-            <div className="error-notice">
-              <CircleAlert size={16} />
-              {runtime.data.error}
+    <div className="settings-page">
+      <header className="page-heading settings-heading">
+        <h1>Settings</h1>
+      </header>
+      <nav className="settings-jump" aria-label="Settings sections">
+        <a href="#instance"><Server size={16} aria-hidden="true" />Instance</a>
+        {admin ? <a href="#connectivity"><Globe2 size={16} aria-hidden="true" />Connectivity</a> : null}
+        {admin ? <a href="#settings-backups"><Database size={16} aria-hidden="true" />Backups</a> : null}
+        <a href="#account-access"><ShieldCheck size={16} aria-hidden="true" />Account &amp; access</a>
+      </nav>
+
+      <section className="settings-group" id="instance" aria-labelledby="settings-instance-heading">
+        <h2 id="settings-instance-heading">Instance</h2>
+        <ErrorNotice error={runtime.error} />
+        <div className="instance-grid">
+          <section className="surface details-card">
+            <div className="card-heading">
+              <Server size={19} />
+              <h3>Docker runtime</h3>
             </div>
-          ) : null}
+            <div className="detail-row">
+              <span>Connection</span>
+              <strong>
+                {runtime.isPending
+                  ? "Checking"
+                  : runtime.data?.online
+                    ? "Connected"
+                    : "Offline"}
+              </strong>
+            </div>
+            <div className="detail-row">
+              <span>Engine version</span>
+              <strong className="mono">
+                {runtime.data?.engineVersion ?? "Unavailable"}
+              </strong>
+            </div>
+            <div className="detail-row">
+              <span>CPUs</span>
+              <strong>{runtime.data?.cpus ?? "Unavailable"}</strong>
+            </div>
+            <div className="detail-row">
+              <span>Memory capacity</span>
+              <strong>
+                {runtime.data?.memoryBytes
+                  ? `${(runtime.data.memoryBytes / 1024 ** 3).toFixed(1)} GiB`
+                  : "Unavailable"}
+              </strong>
+            </div>
+            <div className="detail-row">
+              <span>Swarm state</span>
+              <strong>{runtime.data?.swarmState ?? "Unavailable"}</strong>
+            </div>
+            <div className="detail-row">
+              <span>HTTP ingress port</span>
+              <strong className="mono">
+                {runtime.data?.ingressPort ?? 18080}
+              </strong>
+            </div>
+            {runtime.data?.error ? (
+              <div className="error-notice">
+                <CircleAlert size={16} />
+                {runtime.data.error}
+              </div>
+            ) : null}
+          </section>
+          <div className="settings-instance-side">
+            <section className="surface details-card">
+              <div className="card-heading">
+                <ShieldCheck size={19} />
+                <h3>Workspace access</h3>
+              </div>
+              <div className="detail-row">
+                <span>Signed in as</span>
+                <strong>{user.email}</strong>
+              </div>
+              <div className="detail-row">
+                <span>Role</span>
+                <strong className="capitalize">{user.role}</strong>
+              </div>
+            </section>
+            {admin ? <UpdateSettings /> : null}
+          </div>
+        </div>
+      </section>
+
+      {admin ? <>
+        <section className="settings-group" id="connectivity" aria-labelledby="settings-connectivity-heading">
+          <h2 id="settings-connectivity-heading">Connectivity</h2>
+          <HostDomainSettings />
+          <HttpsSettings configured={runtime.data?.httpsConfigured === true} access={runtime.data?.httpsAccess} recoveryRequired={runtime.data?.ingressRecoveryRequired === true} busy={runtime.data?.ingressBusy === true} />
+          <GithubSettings />
         </section>
-        <section className="surface details-card">
-          <div className="card-heading">
-            <ShieldCheck size={19} />
-            <h2>Workspace access</h2>
-          </div>
-          <div className="detail-row">
-            <span>Signed in as</span>
-            <strong>{user.email}</strong>
-          </div>
-          <div className="detail-row">
-            <span>Role</span>
-            <strong className="capitalize">{user.role}</strong>
-          </div>
-          <div className="instance-note">
-            <ShieldCheck size={25} />
-            <h3>Local installation</h3>
-            <p>
-              This workspace runs on your own infrastructure. The browser talks
-              to your local panel API.
-            </p>
-          </div>
+
+        <section className="settings-group" id="settings-backups" aria-labelledby="settings-backups-heading">
+          <h2 id="settings-backups-heading">Backups</h2>
+          <BackupStorageSettings />
+          <InstallationBackupSettings userId={user.id} />
         </section>
-      </div>
-      {user.role === "admin" ? <UpdateSettings /> : null}
-      {user.role === "admin" ? <InstallationBackupSettings userId={user.id} /> : null}
-      {user.role === "admin" ? <GithubSettings /> : null}
-      {user.role === "admin" ? <HostDomainSettings /> : null}
-      {user.role === "admin" ? <HttpsSettings configured={runtime.data?.httpsConfigured === true} access={runtime.data?.httpsAccess} recoveryRequired={runtime.data?.ingressRecoveryRequired === true} busy={runtime.data?.ingressBusy === true} /> : null}
-      <LocalPasswordSettings />
-      <TwoFactorSettings />
-      <ApiTokenSettings />
-      {user.role === "admin" ? <CentralAccessSettings /> : null}
-      <AccountLinkSettings />
-      {user.role === "admin" ? <ProjectAccess /> : null}
-    </>
+      </> : null}
+
+      <section className="settings-group" id="account-access" aria-labelledby="settings-account-heading">
+        <h2 id="settings-account-heading">Account &amp; access</h2>
+        <LocalPasswordSettings />
+        <TwoFactorSettings />
+        <ApiTokenSettings canCreateProject={admin} />
+        {admin ? <ProjectAccess /> : null}
+      </section>
+    </div>
   );
 }
 
@@ -1561,7 +1729,9 @@ const router = createRouter({
     settingsRoute,
   ]),
   defaultPreload: "intent",
-  defaultViewTransition: true,
+  defaultViewTransition: typeof CSS !== "undefined" && CSS.supports("selector(:active-view-transition-type(a))")
+    ? { types: ({ fromLocation, pathChanged }) => fromLocation && pathChanged ? [] : false }
+    : false,
 });
 declare module "@tanstack/react-router" {
   interface Register {

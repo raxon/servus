@@ -21,7 +21,7 @@ await new Promise(resolve => probe.listen(0,'127.0.0.1',resolve));
 const port = probe.address().port;
 await new Promise(resolve => probe.close(resolve));
 const origin = `http://127.0.0.1:${port}`;
-const server = spawn(process.execPath,['apps/panel/dist/server/index.js'],{env:{...process.env,PANEL_DATA_DIR:directory,PANEL_HOST:'127.0.0.1',PANEL_PORT:String(port),PANEL_ALLOWED_ORIGINS:origin},stdio:'ignore'});
+const server = spawn(process.execPath,['apps/panel/dist/server/index.js'],{env:{...process.env,PANEL_DATA_DIR:directory,PANEL_AGENT_SOCKET:join(directory,'agent.sock'),PANEL_SUPERVISOR_SOCKET:undefined,PANEL_SUPERVISOR_SECRET_FILE:undefined,PANEL_HOST_DOMAINS_API_URL:'',PANEL_HOST_DOMAINS_AUTOMATIC:'false',PANEL_HOST:'127.0.0.1',PANEL_PORT:String(port),PANEL_ALLOWED_ORIGINS:origin},stdio:'ignore'});
 const exited = new Promise(resolve => server.once('exit',resolve));
 let browser;
 try {
@@ -43,15 +43,19 @@ try {
   assert.equal(await initialDialog.getByRole('link',{name:'Settings under GitHub connection'}).getAttribute('href'),'/settings#github-connection');
   await page.goto(`${origin}/settings`);
   const https=page.locator('#https-settings');
+  assert.equal(await https.getByLabel('Certificate contact email').inputValue(),'admin@example.test');
+  assert.equal(await https.getByRole('radio').count(),0);
+  assert.equal(await page.locator('#host-domain').getByRole('button').count(),0);
   await https.getByLabel('Certificate contact email').fill('ops@example.test');
-  await https.getByLabel('Staging certificates for testing').check();
   const savedHttps=page.waitForResponse(response=>response.url().endsWith('/settings/https') && response.request().method()==='PUT');
   await https.getByRole('button',{name:'Save HTTPS settings'}).click();
-  assert.equal((await savedHttps).status(),200);
+  const savedCertificateSettings=await savedHttps;
+  assert.equal(savedCertificateSettings.status(),200);
+  assert.deepEqual((await savedCertificateSettings.json()).settings,{email:'ops@example.test',staging:false});
   await https.getByText('HTTPS settings saved.').waitFor();
   await page.reload();
   assert.equal(await https.getByLabel('Certificate contact email').inputValue(),'ops@example.test');
-  assert.equal(await https.getByLabel('Staging certificates for testing').isChecked(),true);
+  assert.equal(await https.getByRole('radio').count(),0);
   await page.route('**/api/v1/settings/https/migrate',route=>route.fulfill({status:422,contentType:'application/json',body:JSON.stringify({error:{code:'INGRESS_MIGRATION_FAILED',message:'Port 443 is already in use.'}})}));
   await https.getByRole('button',{name:'Enable HTTPS ingress'}).click();
   const ingressDialog=page.getByRole('dialog',{name:'Enable HTTPS ingress?'});
@@ -97,7 +101,11 @@ try {
     if(project.id===first.id)firstService=value.service;
     assert.equal(value.service.source.sharedGithub,true);
     assert.equal(value.service.source.credential.token,undefined);
-    await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Source',exact:true}).click();
+    const openSection = async (label, exact = true) => {
+      await page.getByRole('button',{name:/^Section:/}).click();
+      await page.getByRole('dialog',{name:'Service sections'}).getByRole('link',{name:label,exact}).click();
+    };
+    await openSection('Source');
     await page.getByText('The shared token will be used for this repository.',{exact:false}).waitFor();
     assert.equal(await page.getByLabel('Private repository').count(),0);
     await page.getByLabel('Branch or ref').fill('fixture-ref');
@@ -139,7 +147,9 @@ try {
     await page.unroute(`**/api/v1/services/${value.service.id}`);
     await page.unroute(`**/api/v1/services/${value.service.id}/configuration-changes`);
     await page.reload();
-    await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Domains',exact:true}).click();
+    await openSection('Domains');
+    await page.getByText('Edit hostname and port', {exact:true}).click();
+    await page.getByText('HTTPS settings', {exact:true}).click();
     assert.equal(await page.getByLabel('Automatic HTTPS').isDisabled(),true);
     await page.getByLabel('Hostname').fill('app.example.com');
     await page.route(`**/api/v1/services/${value.service.id}/check-domain-dns`, route => route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({hostname:'app.example.com',checkedAt:'2026-01-01T00:00:00.000Z',ipv4:['8.8.8.8'],ipv6:[],status:'resolved'})}));
@@ -153,7 +163,9 @@ try {
     assert.equal(await page.getByText('A: 8.8.8.8; AAAA: none.',{exact:false}).count(),0);
     await page.route('**/api/v1/runtime',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({online:true,httpsConfigured:true,httpsAccess:'direct'})}));
     await page.reload();
-    await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Domains',exact:true}).click();
+    await openSection('Domains');
+    await page.getByText('Edit hostname and port', {exact:true}).click();
+    await page.getByText('HTTPS settings', {exact:true}).click();
     await page.getByLabel('Hostname').fill(`${name}.example.com`);
     await page.getByLabel('Automatic HTTPS').check();
     const domainSaved=page.waitForResponse(response=>response.url().endsWith(`/services/${value.service.id}`) && response.request().method()==='PATCH');
@@ -199,7 +211,7 @@ try {
     await page.route(`**/api/v1/actions/${historicalId}/build-log`, route => route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({available:true,text:'fetch source\ncompile app\n'+Array.from({length:80},(_,i)=>`build step ${i}`).join('\n'),truncated:false})}));
     await page.route(`**/api/v1/services/${value.service.id}/deployments/${historicalId}/redeploy`, route => route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({...oldAction,id:'22222222-2222-4222-8222-222222222222',status:'queued'})}));
     await page.reload();
-    await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Deployments',exact:false}).click();
+    await openSection('Deployments', false);
     await page.getByText('Duration: 0m 0s').waitFor();
     await page.locator('.build-log-details summary').getByText('Build output',{exact:true}).click();
     const buildOutput=page.locator('.build-log-details pre');
@@ -227,26 +239,27 @@ try {
   }
   await page.goto(origin);
   const search=page.getByLabel('Search projects and services');
-  await page.getByRole('link',{name:/web-one/}).waitFor();
+  const serviceCard=name=>page.locator('.dashboard-project-list').getByRole('link',{name:new RegExp(name)});
+  await serviceCard('web-one').waitFor();
   await search.fill('web-one');
-  await page.getByRole('link',{name:/web-one/}).waitFor();
-  assert.equal(await page.getByRole('link',{name:/web-two/}).count(),0);
+  await serviceCard('web-one').waitFor();
+  assert.equal(await serviceCard('web-two').count(),0);
   await search.fill('does-not-exist');
   await page.getByText('No projects or services match the current filters.').waitFor();
   await search.fill('');
   for(const name of ['First','Second'])await page.getByRole('button',{name:`Collapse ${name}`,exact:true}).click();
-  assert.equal(await page.getByRole('link',{name:/web-one/}).count(),0);
+  assert.equal(await serviceCard('web-one').count(),0);
   await page.reload();
   for(const name of ['First','Second']){
     await page.getByRole('button',{name:`Expand ${name}`,exact:true}).waitFor();
     await page.getByRole('button',{name:`Expand ${name}`,exact:true}).click();
   }
-  await page.getByRole('link',{name:/web-one/}).waitFor();
+  await serviceCard('web-one').waitFor();
   // The current dashboard exposes text filtering rather than a status select.
   await search.fill('no-matching-service');
   await page.getByText('No projects or services match the current filters.').waitFor();
   await search.fill('');
-  await page.getByRole('link',{name:/web-one/}).waitFor();
+  await serviceCard('web-one').waitFor();
   const activeService={...firstService,state:'running',revision:1,deployedRevision:1,domains:[{hostname:'app.example.com',port:3000,https:true,primary:true}]};
   let queued=false,finished=false;
   await page.route(`**/api/v1/projects/${first.id}/services`,route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify([activeService])}));
@@ -279,7 +292,7 @@ try {
   finished=true;
   await page.waitForFunction(id=>{const root=document.getElementById(`service-actions-${id}`);const button=Array.from(root?.querySelectorAll('button')??[]).find(item=>item.textContent==='Restart');return button && !button.disabled;},activeService.id);
   await page.getByRole('menu',{name:'Actions for web-one'}).getByRole('menuitem',{name:'Logs'}).click();
-  await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Logs',exact:true}).and(page.locator('[aria-current="page"]')).waitFor();
+  await page.getByRole('button',{name:'Section: Logs'}).waitFor();
   await page.unroute(`**/api/v1/projects/${first.id}/services`);
   await page.unroute(`**/api/v1/services/${activeService.id}/actions`);
   await page.unroute(`**/api/v1/services/${activeService.id}/restart`);

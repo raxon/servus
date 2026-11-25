@@ -1,0 +1,300 @@
+.settings-page {
+  display: grid;
+  gap: 28px;
+  max-width: 1120px;
+}
+.settings-heading {
+  margin-block-end: 0;
+}
+.settings-jump {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  padding-block-end: 10px;
+  border-block-end: 1px solid var(--border);
+}
+.settings-jump a {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 44px;
+  padding-inline: 8px;
+  border-radius: 8px;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 13px;
+}
+.settings-jump a:hover {
+  background: var(--surface);
+  color: var(--ink);
+}
+.settings-group {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.settings-group, .settings-group > section[id] {
+  scroll-margin-top: 24px;
+}
+.settings-group > h2 {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -.3px;
+  margin: 0 0 2px;
+}
+.settings-group > .details-card, .settings-instance-side > .details-card {
+  min-width: 0;
+  max-width: none;
+  margin: 0;
+}
+.settings-page .instance-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 14px;
+}
+.settings-instance-side {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.settings-page .card-heading :is(h2, h3) {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+}
+.settings-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 14px 24px;
+  margin-block-end: 18px;
+}
+.settings-card-intro {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+.settings-card-intro .card-heading {
+  margin-block-end: 8px;
+}
+.settings-card-intro p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.settings-card-header > .button {
+  flex-shrink: 0;
+  min-height: 44px;
+}
+.settings-empty {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  background: var(--canvas);
+  color: var(--muted);
+}
+.settings-empty > svg {
+  flex-shrink: 0;
+}
+.settings-empty strong {
+  font-size: 13px;
+  color: var(--ink);
+  font-weight: 600;
+}
+.settings-empty p {
+  margin: 4px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.settings-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.settings-list-item {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-block: 14px;
+  border-block-start: 1px solid var(--border);
+}
+.settings-list-item:last-child {
+  padding-block-end: 0;
+}
+.settings-list-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 36px;
+  height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--muted);
+}
+.settings-list-copy {
+  display: grid;
+  flex: 1 1 120px;
+  min-width: 0;
+  gap: 4px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.settings-list-copy strong {
+  font-weight: 600;
+}
+.settings-list-copy > span, .settings-feedback {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.settings-feedback {
+  margin-block: 12px 0;
+}
+.settings-list-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.settings-inline-confirm {
+  flex-basis: 100%;
+  padding-block-start: 10px;
+}
+.settings-inline-confirm p {
+  margin-block: 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.settings-inline-confirm .button {
+  margin-inline-end: 8px;
+}
+.settings-project-picker {
+  display: block;
+  max-width: 320px;
+  margin-block-end: 16px;
+}
+.settings-page .modal-heading p {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.modal .settings-modal-form {
+  --settings-modal-padding: 24px;
+  display: grid;
+  gap: 14px;
+  padding: 20px var(--settings-modal-padding) 0;
+  margin: 0;
+}
+.settings-form-fields, .settings-form-pair {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.settings-form-pair {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.settings-modal-form label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  font-size: 13px;
+}
+.settings-modal-form label :is(input, select) {
+  margin: 0;
+}
+.settings-modal-form .settings-form-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.storage-credentials {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.storage-credentials legend {
+  padding-inline: 5px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.settings-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.settings-modal-actions .button {
+  min-height: 44px;
+}
+.settings-modal-form > .settings-modal-actions {
+  margin-inline: calc(-1 * var(--settings-modal-padding));
+  padding: 14px var(--settings-modal-padding);
+  border-block-start: 1px dashed var(--border);
+  background: var(--canvas);
+}
+.modal[open]:has(> .storage-profile-form) {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 32px);
+  overflow: hidden;
+}
+.modal:has(> .storage-profile-form) > .modal-heading {
+  flex-shrink: 0;
+}
+.modal > .storage-profile-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  min-height: 0;
+}
+.storage-profile-fields {
+  padding: 20px var(--settings-modal-padding);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.storage-profile-form > .settings-modal-actions {
+  flex-shrink: 0;
+  margin-inline: 0;
+}
+@media (max-width: 950px) {
+  .settings-page .instance-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 600px) {
+  .settings-page {
+    gap: 22px;
+  }
+  .settings-jump {
+    gap: 3px 10px;
+  }
+  .settings-list-actions {
+    margin-inline-start: auto;
+  }
+  .settings-list-actions .button {
+    min-height: 44px;
+  }
+  .modal .settings-modal-form {
+    --settings-modal-padding: 16px;
+  }
+  .settings-modal-form :is(input:not([type="radio"]), select) {
+    font-size: 16px;
+  }
+}
+@media (max-width: 420px) {
+  .settings-form-pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-modal-actions .button {
+    white-space: normal;
+  }
+}

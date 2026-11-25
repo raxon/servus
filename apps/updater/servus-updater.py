@@ -31,7 +31,7 @@ EXECUTOR = pathlib.Path('/usr/local/libexec/servus/verification-executor.py')
 PREPARATION_FENCE = pathlib.Path('/usr/local/libexec/servus/preparation-fence.py')
 DISCOVERY_EXECUTOR = pathlib.Path('/usr/local/libexec/servus/discover-release.py')
 DNS_JOURNAL_BACKUP = pathlib.Path('/usr/local/libexec/servus/backup.py')
-DNS_JOURNAL_BACKUP_SHA256 = 'c3a687e806a3005f2cbea738f0811435f3d38e24bd2cec344e8555936a39235b'
+DNS_JOURNAL_BACKUP_SHA256 = 'd7873426f7bf0f93edd87562ac07b08dd658785e379f7790551ee7d4f35cd145'
 FENCE_MODULE = pathlib.Path('/usr/local/libexec/servus/verification-fence.py')
 FENCE_ROOT = pathlib.Path('/run/servus-updater/fences')
 NSS_CONFIG = pathlib.Path('/etc/nsswitch.conf')
@@ -1124,6 +1124,36 @@ class InstallationBackupProxy:
             raise ProtocolError('invalid_request')
         return self._operation(self._request({'version': 1, 'type': 'installation_backup_status', 'operationId': operation_id}), operation_id)
 
+    def history(self, cursor):
+        if cursor is not None and not valid_uuid(cursor):
+            raise ProtocolError('invalid_request')
+        result = self._request({'version': 1, 'type': 'installation_backup_history', 'cursor': cursor})
+        if result == {'version': 1, 'status': 'not_found'} and type(result.get('version')) is int:
+            raise ProtocolError('not_found')
+        if result == {'version': 1, 'status': 'failed'} and type(result.get('version')) is int:
+            # Older supervisors reject unknown commands using this exact frame.
+            raise ProtocolError('invalid_request')
+        if (not isinstance(result, dict) or set(result) != {'version', 'status', 'history'} or
+                type(result['version']) is not int or result['version'] != 1 or result['status'] != 'history'):
+            raise ProtocolError('unavailable')
+        page = result['history']
+        if (not isinstance(page, dict) or set(page) != {'operations', 'nextCursor'} or
+                not isinstance(page['operations'], list) or len(page['operations']) > 10 or
+                page['nextCursor'] is not None and not valid_uuid(page['nextCursor'])):
+            raise ProtocolError('unavailable')
+        previous = None
+        for item in page['operations']:
+            if not isinstance(item, dict):
+                raise ProtocolError('unavailable')
+            item = self._operation({'version': 1, 'status': item.get('state'), 'backup': item}, item.get('operationId'))
+            identity = (item['createdAt'], item['operationId'])
+            if previous is not None and identity >= previous or item['operationId'] == cursor:
+                raise ProtocolError('unavailable')
+            previous = identity
+        if page['nextCursor'] is not None and (not page['operations'] or page['nextCursor'] != page['operations'][-1]['operationId']):
+            raise ProtocolError('unavailable')
+        return page
+
 
 def wait_supervisor_ready(socket_path):
 
@@ -1462,6 +1492,9 @@ def process(journal, request, *, allow_apply=False, discovery=None, recovery=Non
     if action == 'installation_backup_status' and set(request) == {'version', 'action', 'operationId'}:
         if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
         return installation_backups.status(request['operationId'])
+    if action == 'installation_backup_history' and set(request) == {'version', 'action', 'cursor'}:
+        if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
+        return installation_backups.history(request['cursor'])
     if action == 'installation_backup_cancel' and set(request) == {'version', 'action', 'approval'}:
         if not allow_apply or installation_backups is None: raise ProtocolError('unavailable')
         return installation_backups.cancel(request['approval'])

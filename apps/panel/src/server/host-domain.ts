@@ -11,6 +11,7 @@ import type { ServiceInput, User } from '../shared/types.js';
 export interface HostDomainOptions {apiOrigin:string;automatic?:boolean;fetch?:typeof fetch}
 type RuntimeRequest=(path:string,input:unknown,options?:{timeoutMs?:number})=>Promise<unknown>;
 const registrySchema=z.object({hostname:z.string().regex(hostDomainPattern),ip:z.string().min(1).max(64),dnsStatus:z.literal('ready')}).strict();
+const legacyCertificatePendingMessage='The wildcard certificate is being prepared. Synchronization will retry automatically.';
 
 export function validateHostApiOrigin(input:string):string {
   const url=new URL(input);
@@ -39,7 +40,7 @@ export class HostDomainManager {
   status():HostDomainStatus {
     const saved=this.store.vault.hostConnection();
     const ready=!!saved?.ready && !!saved.certificateExpiresAt && Date.parse(saved.certificateExpiresAt)>Date.now();
-    return {available:!!this.origin,enabled:saved?.enabled??false,ready,busy:!!this.task,...(saved?{hostname:saved.hostname,ip:saved.ip,dnsStatus:saved.dnsStatus,certificateExpiresAt:saved.certificateExpiresAt,staging:saved.staging,lastSyncAt:saved.lastSyncAt,lastError:saved.lastError}:{})};
+    return {available:!!this.origin,enabled:saved?.enabled??false,ready,busy:!!this.task,...(saved?{hostname:saved.hostname,ip:saved.ip,dnsStatus:saved.dnsStatus,certificateExpiresAt:saved.certificateExpiresAt,staging:saved.staging,lastSyncAt:saved.lastSyncAt,lastError:saved.lastError===legacyCertificatePendingMessage?undefined:saved.lastError}:{})};
   }
   proof(challenge:string):string|undefined {
     const saved=this.store.vault.hostConnection();
@@ -95,7 +96,7 @@ export class HostDomainManager {
       connection=this.save({...registry,lastError:undefined});
       const response=await this.request('certificate',connection);
       if(z.object({status:z.literal('pending'),retryAfter:z.number(),error:z.string().optional()}).safeParse(response).success) {
-        this.save({lastSyncAt:new Date().toISOString(),lastError:'The wildcard certificate is being prepared. Synchronization will retry automatically.'});return;
+        this.save({lastSyncAt:new Date().toISOString(),lastError:undefined});return;
       }
       const {status,...value}=z.object({status:z.literal('ready'),...hostCertificateSchema.shape}).strict().parse(response);
       if(value.hostname!==connection.hostname)throw new Error('The certificate belongs to another host.');

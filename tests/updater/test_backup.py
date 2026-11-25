@@ -288,24 +288,45 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
 
     def capture(self,reader_gid=65534): return backup._capture_quiescent(self.source_fd,self.destination_fd,self.node_fd,source_uid=1000,reader_gid=reader_gid)
 
-    def test_standalone_v8_capture_has_no_sidecars_and_restores(self):
+    def test_standalone_v9_capture_has_no_sidecars_and_restores(self):
+        profile_id='11111111-1111-4111-8111-111111111111'
+        script=r'''import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);const ref=s.vault.put(JSON.stringify({kind:'backup-global-v1',destination:{type:'s3',provider:'s3',endpoint:'https://s3.example.test',region:'us-east-1',bucket:'backups',prefix:'',storageClass:'STANDARD',accessKeyId:'fixture',secretAccessKey:'fixture'}}));s.db.prepare('INSERT INTO backup_storage_profiles(id,name,destination_ref,updated_at,active) VALUES(?,?,?,?,1)').run(process.argv[2],'Offsite',ref,'2026-11-18T00:00:00.000Z');s.close();'''
         self.panel.close(); self.agent.close()
+        subprocess.run([NODE,'--input-type=module','-e',script,str(self.src),profile_id],check=True,timeout=20)
+        self.fix_permissions()
         self.capture()
         self.assertFalse(any(p.name.endswith(('-wal', '-shm', '-journal')) for p in self.dst.iterdir()))
         backup._validate_staging(self.destination_fd, self.node_fd)
         with closing(sqlite3.connect(f'file:{self.dst}/panel.sqlite?mode=ro&immutable=1',uri=True)) as db:
-            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],8)
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],9)
             self.assertEqual(db.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
             self.assertEqual(db.execute('SELECT description FROM projects WHERE id=?',(UUID,)).fetchone(),('committed-wal',))
-        restored=self.root/'restored-v5'; shutil.copytree(self.dst,restored)
-        script="import {Store} from '/app/dist/server/store.js';import {createAgent} from '/app/dist/agent/app.js';const d=process.argv[1],s=new Store(d);if(s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close();const a=await createAgent({dataDir:d,token:'42'.repeat(32),socketPath:d+'/agent.sock',dockerSocket:'/none',ingressPort:18080,ingressImage:'unused'},{});await a.ready();await a.close();"
+            self.assertEqual(db.execute('SELECT name FROM backup_storage_profiles WHERE id=?',(profile_id,)).fetchone(),('Offsite',))
+        restored=self.root/'restored-v9'; shutil.copytree(self.dst,restored)
+        script="import {Store} from '/app/dist/server/store.js';import {createAgent} from '/app/dist/agent/app.js';const d=process.argv[1],s=new Store(d);if(s.db.pragma('user_version',{simple:true})!==9||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close();const a=await createAgent({dataDir:d,token:'42'.repeat(32),socketPath:d+'/agent.sock',dockerSocket:'/none',ingressPort:18080,ingressImage:'unused'},{});await a.ready();await a.close();"
         subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
         (self.dst/'panel.sqlite-wal').touch(mode=0o600)
         with self.assertRaisesRegex(backup.CaptureError,'sidecar'):
             backup._validate_staging(self.destination_fd,self.node_fd)
 
+    def _downgrade_v9_to_v8(self):
+        for table, column in (('database_backup_settings','profile_id'),('database_backup_settings','encrypted'),('database_backup_settings','retention_policy'),('database_backups','encrypted'),('database_backups','plaintext_size'),('volume_backup_settings','profile_id')):
+            self.panel.execute(f'ALTER TABLE {table} DROP COLUMN {column}')
+        self.panel.execute('DROP TABLE backup_storage_profiles')
+
+    def test_standalone_v8_snapshot_remains_readable_and_migrates_only_its_copy(self):
+        self._downgrade_v9_to_v8()
+        self.panel.execute('PRAGMA user_version=8');self.panel.commit();self.panel.close();self.agent.close();self.fix_permissions()
+        self.capture();backup._validate_staging(self.destination_fd,self.node_fd)
+        restored=self.root/'restored-v8';shutil.copytree(self.dst,restored)
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==9||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+        subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
+        for path in (self.src,self.dst):
+            with closing(sqlite3.connect(path/'panel.sqlite')) as original:
+                self.assertEqual(original.execute('PRAGMA user_version').fetchone()[0],8)
+
     def test_standalone_v4_capture_has_no_sidecars_and_restores(self):
-        for table in ('volume_restores','volume_backups','volume_backup_settings','api_tokens','database_backups','database_backup_settings','compose_domains','compose_actions','compose_workloads','two_factor_auth','deployment_webhooks'):
+        for table in ('volume_restores','volume_backups','volume_backup_settings','api_tokens','database_backups','database_backup_settings','backup_storage_profiles','compose_domains','compose_actions','compose_workloads','two_factor_auth','deployment_webhooks'):
             self.panel.execute('DROP TABLE '+table)
         self.panel.execute('ALTER TABLE service_secret_refs DROP COLUMN purpose')
         self.panel.execute('PRAGMA user_version=4'); self.panel.commit()
@@ -319,26 +340,28 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
             self.assertEqual(db.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
             self.assertEqual(db.execute('SELECT description FROM projects WHERE id=?',(UUID,)).fetchone(),('committed-wal',))
         restored=self.root/'restored-v4-standalone'; shutil.copytree(self.dst,restored)
-        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==9||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
         subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
 
     def test_standalone_v6_snapshot_remains_readable_and_migrates_only_its_copy(self):
+        self._downgrade_v9_to_v8()
         for table in ('volume_restores','volume_backups','volume_backup_settings'):
             self.panel.execute('DROP TABLE '+table)
         self.panel.execute('PRAGMA user_version=6');self.panel.commit();self.panel.close();self.agent.close();self.fix_permissions()
         self.capture();backup._validate_staging(self.destination_fd,self.node_fd)
         restored=self.root/'restored-v6';shutil.copytree(self.dst,restored)
-        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==9||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
         subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
         with closing(sqlite3.connect(self.dst/'panel.sqlite')) as snapshot:
             self.assertEqual(snapshot.execute('PRAGMA user_version').fetchone()[0],6)
 
     def test_standalone_v7_snapshot_remains_readable_and_migrates_only_its_copy(self):
+        self._downgrade_v9_to_v8()
         self.panel.execute('PRAGMA user_version=7');self.panel.commit();self.panel.close()
         self.agent.execute('DROP TABLE redis_restore_plans');self.agent.commit();self.agent.close();self.fix_permissions()
         self.capture();backup._validate_staging(self.destination_fd,self.node_fd)
         restored=self.root/'restored-v7';shutil.copytree(self.dst,restored)
-        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==9||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
         subprocess.run([NODE,'--input-type=module','-e',script,str(restored),self.ref],check=True,timeout=20)
         for path in (self.src,self.dst):
             with closing(sqlite3.connect(path/'panel.sqlite')) as original:
@@ -461,18 +484,18 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
         with self.assertRaises(backup.CaptureError): self.capture()
 
     def test_v4_snapshot_restores_and_migrates_without_changing_source(self):
-        for table in ('volume_restores','volume_backups','volume_backup_settings','api_tokens','database_backups','database_backup_settings','compose_domains','compose_actions','compose_workloads','two_factor_auth','deployment_webhooks'):
+        for table in ('volume_restores','volume_backups','volume_backup_settings','api_tokens','database_backups','database_backup_settings','backup_storage_profiles','compose_domains','compose_actions','compose_workloads','two_factor_auth','deployment_webhooks'):
             self.panel.execute('DROP TABLE '+table)
         self.panel.execute('ALTER TABLE service_secret_refs DROP COLUMN purpose')
         self.panel.execute('PRAGMA user_version=4');self.panel.commit();self.fix_permissions()
         self.capture()
         restored_dir=self.root/'restored-v4';shutil.copytree(self.dst,restored_dir)
-        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8)process.exit(2);s.close()"
+        script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==9)process.exit(2);s.close()"
         subprocess.run([NODE,'--input-type=module','-e',script,str(restored_dir)],check=True,timeout=20)
         self.assertEqual(self.panel.execute('PRAGMA user_version').fetchone(),(4,))
 
     def test_v4_capture_stages_verified_restore_and_preserves_source(self):
-        for table in ('volume_restores','volume_backups','volume_backup_settings','api_tokens','database_backups','database_backup_settings','compose_domains','compose_actions','compose_workloads','two_factor_auth','deployment_webhooks'):
+        for table in ('volume_restores','volume_backups','volume_backup_settings','api_tokens','database_backups','database_backup_settings','backup_storage_profiles','compose_domains','compose_actions','compose_workloads','two_factor_auth','deployment_webhooks'):
             self.panel.execute('DROP TABLE '+table)
         self.panel.execute('ALTER TABLE service_secret_refs DROP COLUMN purpose')
         self.panel.execute('PRAGMA user_version=4');self.panel.commit();self.fix_permissions()
@@ -514,7 +537,7 @@ const a=await createAgent(cfg,{});await a.ready();await a.close();process.stdout
                     self.assertEqual(journal.db.execute('SELECT state FROM initial_adoptions').fetchone(),('consumed',))
                     self.assertEqual(journal.db.execute('SELECT phase FROM initial_generations').fetchone(),('starting',))
             finally:os.close(lock);journal.close()
-            script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==8||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
+            script="import {Store} from '/app/dist/server/store.js';const s=new Store(process.argv[1]);if(s.db.pragma('user_version',{simple:true})!==9||s.vault.get(process.argv[2])!=='synthetic-secret')process.exit(2);s.close()"
             subprocess.run([NODE,'--input-type=module','-e',script,destination,self.ref],check=True,timeout=20)
             self.assertEqual(self.panel.execute('PRAGMA user_version').fetchone(),(4,))
             self.assertEqual((pathlib.Path(destination)/'panel.sqlite').stat().st_uid,1000)

@@ -54,8 +54,9 @@ class BackupSchemaV6Test(unittest.TestCase):
 
     @staticmethod
     def create_schema(db, schema):
+        integer_columns = {'active', 'encrypted', 'plaintext_size'}
         for name, columns in schema.items():
-            db.execute('CREATE TABLE ' + name + ' (' + ','.join(column + ' TEXT' for column in sorted(columns)) + ')')
+            db.execute('CREATE TABLE ' + name + ' (' + ','.join(column + (' INTEGER' if column in integer_columns else ' TEXT') for column in sorted(columns)) + ')')
 
     def panel(self, version):
         schema = {**backup.PANEL_SCHEMA}
@@ -65,6 +66,10 @@ class BackupSchemaV6Test(unittest.TestCase):
             schema.update(V6_TABLES)
         if version >= 7:
             schema.update(backup.PANEL_V7_ADDITIONS)
+        if version >= 9:
+            schema.update(backup.PANEL_V9_ADDITIONS)
+            for table, columns in backup.PANEL_V9_COLUMN_ADDITIONS.items():
+                schema[table] = schema[table] | columns
         with self.database('panel.sqlite') as db:
             self.create_schema(db, schema)
             db.execute('PRAGMA user_version=' + str(version))
@@ -143,8 +148,8 @@ class BackupSchemaV6Test(unittest.TestCase):
                 (self.path / 'panel.sqlite').unlink()
 
     def test_rejects_future_schema_versions(self):
-        self.panel(6)
-        self.execute('PRAGMA user_version=9')
+        self.panel(9)
+        self.execute('PRAGMA user_version=10')
         with self.assertRaisesRegex(backup.CaptureError, 'Unsupported database schema'):
             self.validate()
 
@@ -321,6 +326,56 @@ class BackupSchemaV6Test(unittest.TestCase):
         with self.database('agent.sqlite') as db:
             db.execute("UPDATE volume_restore_bindings SET mount_target='/another'")
         with self.assertRaisesRegex(backup.CaptureError,'volume binding'):
+            self.validate()
+
+    def test_v9_validates_backup_storage_profiles_and_encrypted_backup_metadata(self):
+        self.panel(9)
+        profile_id = '12345678-1234-4123-8123-123456789abc'
+        profile_ref = '22345678-1234-4123-8123-123456789abc'
+        secret_file = self.path / 'secrets' / profile_ref
+        secret_file.write_text(SEALED)
+        secret_file.chmod(0o600)
+        with self.database('panel.sqlite') as db:
+            db.execute('INSERT INTO backup_storage_profiles(id,name,destination_ref,updated_at,active) VALUES(?,?,?,?,?)',
+                       (profile_id, 'R2', profile_ref, '2026-11-18T00:00:00.000Z', 1))
+            db.execute('INSERT INTO database_backup_settings(service_id,actor_id,enabled,cron,retention,updated_at,profile_id,encrypted,retention_policy) VALUES(?,?,?,?,?,?,?,?,?)',
+                       (profile_id, profile_id, 1, '0 2 * * *', 7, '2026-11-18T00:00:00.000Z', profile_id, 1, '{"mode":"gfs","daily":7,"weekly":4,"monthly":12}'))
+            db.execute('INSERT INTO database_backups(id,service_id,actor_id,name,status,trigger,idempotency_key,request_hash,created_at,encrypted,plaintext_size) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                       (profile_id, profile_id, profile_id, 'nightly', 'succeeded', 'manual', 'manual:1', 'hash', '2026-11-18T00:00:00.000Z', 1, 2048))
+            db.execute('INSERT INTO volume_backup_settings(service_id,mount_target,actor_id,enabled,cron,retention,updated_at,profile_id) VALUES(?,?,?,?,?,?,?,?)',
+                       (profile_id, '/data', profile_id, 1, '0 3 * * *', 7, '2026-11-18T00:00:00.000Z', profile_id))
+        self.validate([{'value': SEALED_BYTES, 'json': True, 'backupProfile': True}])
+        secret_file.unlink()
+        with self.assertRaisesRegex(backup.CaptureError, 'referenced secret is missing'):
+            self.validate()
+        secret_file.write_text(SEALED)
+        secret_file.chmod(0o600)
+        for statement, pattern in (
+            ("INSERT INTO service_secret_refs(reference,service_id,purpose) VALUES('22345678-1234-4123-8123-123456789abc','12345678-1234-4123-8123-123456789abc','backup-storage')", 'invalid owner'),
+            ("UPDATE backup_storage_profiles SET active=2", 'profile metadata is invalid'),
+            ("UPDATE database_backup_settings SET retention_policy='{\"mode\":\"unknown\"}'", 'retention policy is invalid'),
+            ("UPDATE database_backup_settings SET profile_id='32345678-1234-4123-8123-123456789abc'", 'storage profile reference is invalid'),
+            ("UPDATE database_backups SET encrypted=2", 'encryption metadata is invalid'),
+            ("UPDATE database_backups SET plaintext_size=-1", 'plaintext size is invalid'),
+            ("UPDATE volume_backup_settings SET profile_id='32345678-1234-4123-8123-123456789abc'", 'Volume backup storage profile reference is invalid'),
+        ):
+            with self.subTest(statement=statement):
+                original = self.real_connect(':memory:')
+                with self.database('panel.sqlite') as db:
+                    db.backup(original)
+                try:
+                    self.execute(statement)
+                    with self.assertRaisesRegex(backup.CaptureError, pattern):
+                        self.validate()
+                finally:
+                    with self.database('panel.sqlite') as db:
+                        original.backup(db)
+                    original.close()
+
+    def test_v8_rejects_v9_schema_additions(self):
+        self.panel(8)
+        self.execute('CREATE TABLE backup_storage_profiles (id TEXT,name TEXT,destination_ref TEXT,updated_at TEXT,active INTEGER)')
+        with self.assertRaisesRegex(backup.CaptureError, 'Unsupported database schema'):
             self.validate()
 
 

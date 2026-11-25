@@ -85,6 +85,10 @@ COPYFILE_DISABLE=1 tar --no-xattrs --no-acls --no-fflags -C "$fixture_root" --ex
 colima ssh --profile "$fixture_profile" -- sudo tee /run/servus-installation-backup-fixture/guest.py < "$fixture_root/tests/installation-backups/guest.py" >/dev/null
 colima ssh --profile "$fixture_profile" -- sudo tee /run/servus-installation-backup-fixture/compose.yaml < "$fixture_root/deployment/compose.yaml" >/dev/null
 colima ssh --profile "$fixture_profile" -- sudo python3 -I -B /run/servus-installation-backup-fixture/guest.py prepare --image "$fixture_reference"
-colima ssh --profile "$fixture_profile" -- sudo python3 -I -B /run/servus-installation-backup-fixture/guest.py exercise
+fixture_phase=exercise
+if [ "${SERVUS_BACKUP_E2E_HISTORY_ONLY:-0}" = 1 ]; then
+  fixture_phase=history
+fi
+colima ssh --profile "$fixture_profile" -- sudo python3 -I -B /run/servus-installation-backup-fixture/guest.py "$fixture_phase"
 mkdir -p "$fixture_artifacts"
 colima ssh --profile "$fixture_profile" -- sudo cat /run/servus-installation-backup-fixture/result.json > "$fixture_report"

@@ -1,0 +1,78 @@
+# docker --context colima-panel-dev compose -f compose.dev.yaml up -d --build
+# UI with HMR: http://localhost:4181
+# Node inspectors: API 9229, worker 9230, agent 9231 (localhost only).
+name: servus-dev
+
+x-dev: &dev
+  image: servus:dev
+  build:
+    context: .
+    dockerfile: Dockerfile.dev
+  init: true
+  volumes:
+    - ./apps/panel/src:/app/apps/panel/src
+    - ./apps/panel/index.html:/app/apps/panel/index.html:ro
+    - ./apps/panel/vite.config.ts:/app/apps/panel/vite.config.ts:ro
+    - ./apps/panel/public:/app/apps/panel/public:ro
+    - dev-data:/var/lib/panel
+  environment: &environment
+    # Polling detects edits across the macOS/Colima filesystem mount.
+    CHOKIDAR_USEPOLLING: "true"
+    CHOKIDAR_INTERVAL: "500"
+    PANEL_DATA_DIR: /var/lib/panel
+    PANEL_HOST: 0.0.0.0
+    PANEL_INGRESS_PORT: 18080
+    PANEL_ALLOWED_ORIGINS: http://localhost:4180,http://127.0.0.1:4180,http://localhost:4181,http://127.0.0.1:4181
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *dev
+    ports:
+      - "127.0.0.1:4180:4180"
+      - "127.0.0.1:4181:4181"
+      - "127.0.0.1:9229:9229"
+    depends_on:
+      agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4180/api/v1/setup').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  web:
+    <<: *dev
+    # Share the API network so the existing Vite /api proxy works unchanged.
+    network_mode: service:api
+    command: ["npm", "run", "dev", "--workspace=@servus/panel", "--", "--host", "0.0.0.0"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+  worker:
+    <<: *dev
+    command: ["node_modules/.bin/tsx", "watch", "--clear-screen=false", "--inspect=0.0.0.0:9229", "apps/panel/src/worker/index.ts"]
+    ports:
+      - "127.0.0.1:9230:9229"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  agent:
+    <<: *dev
+    command: ["node_modules/.bin/tsx", "watch", "--clear-screen=false", "--inspect=0.0.0.0:9229", "apps/panel/src/agent/index.ts"]
+    ports:
+      - "127.0.0.1:9231:9229"
+    volumes:
+      - ./apps/panel/src:/app/apps/panel/src
+      - dev-data:/var/lib/panel
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "node", "-e", "const c=require('node:net').connect('/var/lib/panel/agent.sock');c.on('connect',()=>{c.end();process.exit(0)});c.on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  dev-data:

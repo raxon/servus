@@ -12,6 +12,7 @@ export interface DatabaseBackup {
   extension: 'dump' | 'sql' | 'rdb' | null;
   error: string | null;
   destination: 'local' | 's3';
+  encrypted?: boolean;
 }
 export interface DatabaseBackupSettings {
   enabled: boolean;
@@ -19,6 +20,30 @@ export interface DatabaseBackupSettings {
   retention: number;
   timeZone: 'UTC';
   description: string;
+  encrypted?: boolean;
+  retentionPolicy?: BackupRetentionPolicy;
+}
+
+export type BackupRetentionPolicy = {mode:'count'} | {mode:'age';days:number} | {mode:'gfs';hourly?:number;daily:number;weekly:number;monthly:number;yearly?:number};
+
+/** Select removals only after a new successful backup exists. Always preserve the newest. */
+export function expiredDatabaseBackups<T extends {id:string;createdAt:string}>(rows:T[], count:number, policy:BackupRetentionPolicy, now:Date):T[] {
+  if(policy.mode==='count')return rows.slice(count);
+  const keep=new Set(rows.slice(0,1).map(row=>row.id));
+  if(policy.mode==='age') {
+    const since=now.getTime()-policy.days*86400000;
+    rows.filter(row=>new Date(row.createdAt).getTime()>=since).forEach(row=>keep.add(row.id));
+  } else {
+    for(const [period,limit] of [['hourly',policy.hourly??0],['daily',policy.daily],['weekly',policy.weekly],['monthly',policy.monthly],['yearly',policy.yearly??0]] as const) {
+      const buckets=new Set<string>();
+      for(const row of rows) {
+        const date=new Date(row.createdAt);
+        const bucket=period==='hourly'?date.toISOString().slice(0,13):period==='yearly'?date.toISOString().slice(0,4):period==='daily'?date.toISOString().slice(0,10):period==='monthly'?date.toISOString().slice(0,7):String(Math.floor((date.getTime()+3*86400000)/(7*86400000)));
+        if(!buckets.has(bucket)&&buckets.size<limit){buckets.add(bucket);keep.add(row.id);}
+      }
+    }
+  }
+  return rows.filter(row=>!keep.has(row.id));
 }
 
 export const BACKUP_SCHEMA_SQL = `
@@ -56,6 +81,16 @@ export const BACKUP_SCHEMA_SQL = `
   CREATE UNIQUE INDEX IF NOT EXISTS database_backup_active_service
     ON database_backups(service_id) WHERE status IN ('queued','running');
   CREATE INDEX IF NOT EXISTS database_backup_service_created ON database_backups(service_id,created_at);
+`;
+
+export const BACKUP_PROFILES_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS backup_storage_profiles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    destination_ref TEXT,
+    updated_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
+  );
 `;
 
 const ranges = [[0,59],[0,23],[1,31],[1,12],[0,7]] as const;

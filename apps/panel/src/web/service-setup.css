@@ -1,0 +1,40 @@
+/* Keep actions outside the scrolling fields so keyboard focus remains visible. */
+.modal:has(.service-create-form) {
+  width: min(880px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  overflow: hidden;
+}
+.modal:has(.service-create-form)[open] { display: flex; flex-direction: column; }
+.modal:has(.service-create-form) > .modal-heading { flex: 0 0 auto; padding: 20px 24px; }
+.modal form.service-create-form { display: flex; flex-direction: column; min-height: 0; overflow: hidden; padding: 0; }
+.service-create-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .65fr); gap: 24px; overflow-y: auto; overscroll-behavior: contain; padding: 24px; scroll-padding-block: 16px; }
+.service-create-body > .service-create-fields { min-width: 0; }
+.service-create-body :is(input, textarea, button, summary) { scroll-margin-block: 16px; }
+.service-create-preview { position: sticky; top: 0; align-self: start; background: #f7f9f7; border: 1px solid #e1e7e2; border-radius: 14px; padding: 18px; min-width: 0; }
+.service-create-preview h3 { font-size: 15px; margin: 0 0 16px; }
+.service-create-preview dl { margin: 0; display: grid; gap: 15px; }
+.service-create-preview dt { color: #666; font-size: 12px; }
+.service-create-preview dd { margin: 4px 0 0; overflow-wrap: anywhere; font-size: 13px; }
+.service-create-preview p { font-size: 12px; color: #666; line-height: 1.7; margin: 18px 0 0; }
+.modal .service-create-form .service-create-footer { flex: 0 0 auto; margin: 0; padding: 16px 24px; flex-wrap: wrap; }
+.service-create-footer > small { margin-inline-end: auto; color: #666; max-width: 250px; line-height: 1.5; }
+.service-registry-settings { margin-block: 12px 20px; }
+:is(.service-registry-settings, .domain-settings) > summary { cursor: pointer; font-size: 13px; padding-block: 12px; color: #3f5e49; }
+.domain-route-title { font-size: 15px; overflow-wrap: anywhere; margin-block: 18px 4px; }
+.domain-diagnostics-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.domain-diagnostics-heading h4 { font-size: 14px; }
+.domain-health-summary.domain-diagnostics-results { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding-block: 14px; }
+.domain-diagnostics-results > div { display: grid; align-content: start; gap: 7px; padding: 14px; background: #f7f9f7; border: 1px solid #e1e7e2; border-radius: 10px; overflow-wrap: anywhere; }
+.domain-diagnostics-results strong { font-size: 12px; }
+.domain-diagnostics-results span { font-size: 13px; }
+.domain-diagnostics-results small { font-size: 11px; color: #666; line-height: 1.6; }
+.domain-dns-check > .info-notice { color: #425c4d; }
+@media (max-width: 680px) {
+  .service-create-preview { position: static; }
+  .service-create-body { grid-template-columns: minmax(0, 1fr); padding: 18px; gap: 16px; }
+  .modal:has(.service-create-form) > .modal-heading { padding: 16px 18px; }
+  .modal .service-create-form .service-create-footer { padding: 12px 18px; gap: 10px; }
+  .service-create-footer > small { flex-basis: 100%; max-width: none; }
+  .service-create-footer > button { flex: 1; min-height: 44px; }
+  .domain-health-summary.domain-diagnostics-results { grid-template-columns: minmax(0, 1fr); }
+}

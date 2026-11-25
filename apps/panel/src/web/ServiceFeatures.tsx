@@ -1,3 +1,4 @@
+import "./service-setup.css";
 import { randomUuid } from "./random-uuid.js";
 import { Skeleton } from "./Skeleton.js";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
@@ -40,6 +41,7 @@ import type {
 import { api, errorMessage } from "./api.js";
 import { SourcePanel } from "./SourcePanel.js";
 import { DatabaseRestore } from "./DatabaseRestore.js";
+import { DatabaseConnectionString, DatabaseExternalAccess } from "./DatabaseExternalAccess.js";
 import { BackupSettings } from "./BackupSettings.js";
 import { VolumeBackupSettings } from "./VolumeBackupSettings.js";
 import { combineEnvironment, formatEnvironment } from "./environment.js";
@@ -89,9 +91,14 @@ export function ServiceConfigurationPanel({
   canWrite?: boolean;
 }) {
   if (tab === "source") return <SourcePanel service={service} admin={admin} />;
-  if (tab === "backups") return (service.kind??'app')==='app'?<VolumeBackupSettings service={service} canWrite={canWrite}/>:<BackupSettings service={service} canWrite={canWrite} />;
+  if (tab === "backups") return (service.kind ?? "app") === "app"
+    ? <VolumeBackupSettings service={service} canWrite={canWrite} admin={admin} />
+    : <>
+      {canWrite && <DatabaseTransfer service={service} admin={admin} />}
+      <BackupSettings service={service} canWrite={canWrite} admin={admin} />
+    </>;
   if (tab === "environment") return <EnvironmentPanel service={service} />;
-  if (tab === "domains") return <DomainsPanel service={service} />;
+  if (tab === "domains") return <DomainsPanel service={service} canWrite={canWrite} />;
   if (tab === "storage")
     return <StoragePanel service={service} admin={admin} />;
   if (tab === "resources") return <ResourcesPanel service={service} />;
@@ -314,7 +321,7 @@ function EnvironmentPanel({ service }: { service: Service }) {
   );
 }
 
-function DomainsPanel({ service }: { service: Service }) {
+function DomainsPanel({ service, canWrite }: { service: Service; canWrite: boolean }) {
   const [domains, setDomains] = useState<(DomainConfig & { rowId: string })[]>(
     () =>
       (
@@ -323,6 +330,7 @@ function DomainsPanel({ service }: { service: Service }) {
         ]
       ).map((domain) => ({ ...domain, rowId: randomUuid() })),
   );
+  const [editingDomains, setEditingDomains] = useState<Record<string, boolean>>(() => Object.fromEntries(domains.map(row => [row.rowId, !row.hostname])));
   const save = useServiceSave(service);
   const runtime = useQuery({queryKey:["runtime"],queryFn:()=>api<{online:boolean;httpsConfigured?:boolean;httpsAccess?:'direct'|'external'}>("/runtime"),refetchInterval:15_000});
   const update = (id: string, patch: Partial<DomainConfig>) =>
@@ -335,6 +343,7 @@ function DomainsPanel({ service }: { service: Service }) {
       onChange={() => save.reset()}
       onSubmit={(event) => {
         event.preventDefault();
+        if (!canWrite) return;
         const clean = domains.map(({ rowId, ...domain }) => domain);
         const primary = clean.find((domain) => domain.primary) ?? clean[0];
         save.mutate({
@@ -357,10 +366,10 @@ function DomainsPanel({ service }: { service: Service }) {
       </div>
       <fieldset
         className="configuration-fields feature-full-width"
-        disabled={save.isPending}
+        disabled={save.isPending || !canWrite}
       >
         {domains.map((row) => (
-          <div className="domain-editor-group" key={row.rowId}><div className="domain-editor-row">
+          <div className="domain-editor-group" key={row.rowId}><h3 className="domain-route-title">{row.hostname || "New domain"}{row.primary ? " · Primary" : ""}</h3><details className="domain-settings" open={editingDomains[row.rowId] ?? false} onToggle={event => { const open = event.currentTarget.open; setEditingDomains(value => value[row.rowId] === open ? value : { ...value, [row.rowId]: open }); }}><summary>Edit hostname and port</summary><div className="domain-editor-row">
             <label className="domain-primary">
               <input
                 type="radio"
@@ -417,24 +426,26 @@ function DomainsPanel({ service }: { service: Service }) {
             >
               <Trash2 size={17} />
             </button>
-          </div>
+          </div></details>
           <DomainChecks row={row} service={service} runtime={runtime} update={update} /></div>
         ))}
         <button
           type="button"
           className="button button-small"
           disabled={!!service.kind && service.kind !== "app"}
-          onClick={() =>
+          onClick={() => {
+            const rowId = randomUuid();
+            setEditingDomains(value => ({ ...value, [rowId]: true }));
             setDomains((rows) => [
               ...rows,
               {
-                rowId: randomUuid(),
+                rowId,
                 hostname: "",
                 port: service.port,
                 primary: rows.length === 0,
               },
-            ])
-          }
+            ]);
+          }}
         >
           <Plus size={15} />
           Add domain
@@ -451,7 +462,8 @@ function DomainsPanel({ service }: { service: Service }) {
         ) : null}
         <FeatureError error={save.error} />
       </fieldset>
-      <SaveFooter pending={save.isPending} saved={save.isSuccess} />
+      {!canWrite ? <p className="feature-helper">Project write access is required to edit domains or run diagnostics.</p> : null}
+      <SaveFooter pending={save.isPending} saved={save.isSuccess} disabled={!canWrite} />
     </form>
   );
 }
@@ -472,29 +484,40 @@ function DomainChecks({row,service,runtime,update}:{row:DomainConfig & {rowId:st
   const tlsObserved=tls.variables?.hostname===row.hostname;
   const managedObserved=managed.variables?.hostname===row.hostname;
   const dnsState=!dnsObserved?'Not checked':dns.isPending?'Checking':dns.isError?'Check failed':dns.data?.status==='resolved'?'Records found':dns.data?.status==='not_found'?'No records found':dns.data?.status==='partial'?'Partial result':'Unavailable';
-  const httpsState=tlsObserved && tls.isPending || managedObserved && managed.isPending?'Checking'
-    :tlsObserved && tls.data?.status==='valid'?'Public certificate trusted'
-    :tlsObserved && tls.isError?'Check failed'
-    :tlsObserved && tls.data?'Public HTTPS unavailable or untrusted'
-    :managedObserved && managed.isError?'Managed certificate check failed'
-    :managedObserved && managed.data?.status==='active'?'Stored certificate valid; public HTTPS not checked'
-    :managedObserved && managed.data?.status==='expired'?'Stored certificate expired'
-    :managedObserved && managed.data?.status==='not_yet_valid'?'Stored certificate not yet valid'
-    :managedObserved && managed.data?.status==='not_found'?'No stored certificate; issuance may be pending'
-    :row.https?'Not checked':'Automatic HTTPS off';
+  const canCheckManaged = !!row.https && !!service.domains?.some(domain => domain.hostname === row.hostname && domain.https);
+  const checking = dns.isPending || tls.isPending || managed.isPending;
+  const runDiagnostics = () => {
+    const variables = { hostname: row.hostname, rowId: row.rowId };
+    dns.mutate(variables);
+    tls.mutate(variables);
+    if (canCheckManaged) managed.mutate(variables);
+  };
+  const httpsState = !tlsObserved ? 'Not checked' : tls.isPending ? 'Checking' : tls.isError ? 'Check failed'
+    : tls.data?.status === 'valid' ? 'Public certificate trusted'
+    : tls.data?.status === 'untrusted' ? 'Public certificate untrusted'
+    : tls.data?.status === 'dns_unavailable' ? 'DNS unavailable'
+    : tls.data?.status === 'unsafe_address' ? 'Private or reserved address' : 'Public HTTPS unavailable';
   return (
           <div className="domain-dns-check">
-            <div className="domain-health-summary"><span>DNS: {dnsState}</span><span>HTTPS: {httpsState}</span></div>
+            <div className="domain-diagnostics-heading"><h4>Domain diagnostics</h4><button type="button" className="button button-primary button-small" disabled={!row.hostname || checking} onClick={runDiagnostics}>{checking ? "Running diagnostics..." : "Run diagnostics"}</button></div>
+            <div className="domain-health-summary domain-diagnostics-results" aria-live="polite">
+              <div><strong>Public DNS</strong><span>{dnsState}</span><small>{dnsObserved && dns.data && !dns.isPending ? `Checked ${new Date(dns.data.checkedAt).toLocaleString()}` : "Checks public A and AAAA records"}</small></div>
+              <div><strong>Public HTTPS</strong><span>{httpsState}</span><small>{tlsObserved && tls.data && !tls.isPending ? `Checked ${new Date(tls.data.checkedAt).toLocaleString()}` : "Checks the certificate served publicly"}</small></div>
+              <div><strong>Managed certificate</strong><span>{!canCheckManaged ? "Save automatic HTTPS to enable this check" : !managedObserved ? "Not checked" : managed.isPending ? "Checking" : managed.isError ? "Check failed" : managed.data?.status === "active" ? "Stored certificate valid" : managed.data?.status === "not_found" ? "No stored certificate" : managed.data?.status === "expired" ? "Stored certificate expired" : "Stored certificate not yet valid"}</span><small>{managedObserved && managed.data && !managed.isPending ? `Checked ${new Date(managed.data.checkedAt).toLocaleString()}` : "Checks certificate storage on this installation"}</small></div>
+            </div>
+            {dnsObserved && !dns.isPending && dns.data?.status === "not_found" ? <p className="info-notice">Next step: add an A or AAAA record at your DNS provider using the instructions below, then run diagnostics again. A stored certificate does not establish DNS routing.</p> : null}
+            {tlsObserved && !tls.isPending && tls.data?.status === "untrusted" ? <p className="info-notice">Next step: check the certificate and hostname at your public proxy or HTTPS ingress. A valid stored certificate does not prove that the public endpoint serves it. Run diagnostics after correcting TLS forwarding.</p> : null}
             <div className="domain-guidance">
               <small>Create an A record for this hostname pointing to your server's public IPv4 address. Add an AAAA record only if the server is reachable over IPv6. With Cloudflare or another proxy, ensure HTTP validation and TLS forwarding reach this installation.</small>
               {row.hostname ? <div><button type="button" className="button button-small" onClick={()=>{if(!navigator.clipboard){setCopiedDomain('Copy unavailable');return;} void navigator.clipboard.writeText(row.hostname).then(()=>setCopiedDomain(`Copied ${row.hostname}`),()=>setCopiedDomain('Copy unavailable'));}}><Copy size={14} /> Copy hostname</button><span role="status">{copiedDomain === `Copied ${row.hostname}` || copiedDomain === 'Copy unavailable' ? copiedDomain : ''}</span></div> : null}
             </div>
-            <div className="domain-https-options">
+            <details className="domain-settings"><summary>HTTPS settings</summary><div className="domain-https-options">
               <label className="checkbox-label"><input type="checkbox" checked={!!row.https} disabled={!runtime.data?.httpsConfigured && !row.https} onChange={event => update(row.rowId,{https:event.target.checked, ...(!event.target.checked ? {redirectHttps:false} : {})})} /> Automatic HTTPS</label>
               {!runtime.data?.httpsConfigured ? <small>Automatic HTTPS ingress is not configured on this installation.</small> : <small>Certificate issuance starts after deployment and requires public DNS and port 80.</small>}
               {row.https ? <><label className="checkbox-label"><input type="checkbox" checked={!!row.redirectHttps} onChange={event=>update(row.rowId,{redirectHttps:event.target.checked})} /> Redirect HTTP to HTTPS</label><small>First deploy HTTPS and check its certificate. When deploying this change, every public DNS address must serve the managed certificate; otherwise the existing route is preserved.</small></> : null}
               {runtime.data?.httpsAccess==='external' ? <small>The external proxy must forward this domain's TLS traffic to the local HTTPS ingress.</small> : null}
             </div>
+            </details>
             <div className="domain-check-actions">
             <button type="button" className="button button-small" aria-label={`Check DNS for ${row.hostname || 'domain'}`} disabled={!row.hostname || dns.isPending} onClick={() => dns.mutate({hostname:row.hostname,rowId:row.rowId})}>Check DNS</button>
             <button type="button" className="button button-small" aria-label={`Check HTTPS for ${row.hostname || 'domain'}`} disabled={!row.hostname || tls.isPending} onClick={() => tls.mutate({hostname:row.hostname,rowId:row.rowId})}>Check HTTPS</button>
@@ -866,7 +889,7 @@ export function ServiceMetricsPanel({ service }: { service: Service }) {
   );
 }
 
-export function DatabaseConnection({ service, admin, canWrite=admin }: { service: Service; admin: boolean; canWrite?:boolean }) {
+export function DatabaseConnection({ service, admin, canWrite }: { service: Service; admin: boolean; canWrite: boolean }) {
   const [visible, setVisible] = useState(false);
   const [revealed, setRevealed] = useState<ConnectionInfo | null>(null);
   const connection = useQuery({
@@ -884,23 +907,6 @@ export function DatabaseConnection({ service, admin, canWrite=admin }: { service
       setVisible(true);
     },
   });
-  const exportMutation = useMutation({
-    mutationFn: async () => {
-      const result = await api<{ downloadUrl: string }>(`/services/${service.id}/database-export`, { method: "POST", body: {} });
-      const expected = `/api/v1/services/${service.id}/database-export/download`;
-      if (result.downloadUrl !== expected) throw new Error("The export could not be downloaded.");
-      return expected;
-    },
-    onSuccess: (url) => {
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = "";
-      link.hidden = true;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-    },
-  });
   useEffect(() => {
     setVisible(false);
     setRevealed(null);
@@ -913,13 +919,14 @@ export function DatabaseConnection({ service, admin, canWrite=admin }: { service
     }, 60_000);
     return () => clearTimeout(timeout);
   }, [visible]);
+  const password = visible && canWrite && (revealed?.deployedRevision === undefined || revealed.deployedRevision === service.deployedRevision) ? revealed?.password : undefined;
   return (
     <section className="surface details-card">
       <div className="card-heading">
         <Database size={18} />
         <h2>Database connection</h2>
       </div>
-      <FeatureError error={connection.error ?? reveal.error ?? exportMutation.error} />
+      <FeatureError error={connection.error ?? reveal.error} />
       {connection.isPending ? (
         <FeatureLoading label="Loading connection details" />
       ) : connection.data ? (
@@ -948,14 +955,14 @@ export function DatabaseConnection({ service, admin, canWrite=admin }: { service
             <label>
               Password
               <input
-                type={visible ? "text" : "password"}
-                value={visible ? (revealed?.password ?? "") : "************"}
+                type={password === undefined ? "password" : "text"}
+                value={password ?? "************"}
                 readOnly
                 autoComplete="off"
                 aria-label="Database password"
               />
             </label>
-            <button
+            {canWrite && <button
               className="button button-small"
               type="button"
               disabled={reveal.isPending}
@@ -979,22 +986,55 @@ export function DatabaseConnection({ service, admin, canWrite=admin }: { service
                   Reveal
                 </>
               )}
-            </button>
+            </button>}
           </div>
+          {canWrite && <DatabaseConnectionString label="Internal connection URL" kind={service.kind} connection={connection.data} host={connection.data.host} port={connection.data.port} password={password} />}
           <p className="feature-helper">
-            This address is reachable by services in the project network.
-            Revealed credentials are hidden after one minute.
+            Use this address inside the project network.{canWrite ? " Revealed credentials are hidden after one minute." : ""}
           </p>
-          <div className="detail-row">
-            <span>Database export</span>
-            <button className="button button-small" type="button" disabled={exportMutation.isPending} onClick={() => exportMutation.mutate()}>
-              {exportMutation.isPending ? <FeatureLoading label="Preparing export" /> : <><Download size={15} /> Download</>}
-            </button>
-          </div>
-          <p className="feature-helper">Exports up to 2 GiB of database data. Application files are not included.</p>
-          {canWrite && (service.kind === "postgres" || service.kind === "mariadb" || service.kind === "redis") && <DatabaseRestore service={service} admin={admin} />}
         </>
       ) : null}
+      <DatabaseExternalAccess service={service} connection={connection.data} canManage={admin} canReveal={canWrite} password={password} />
+    </section>
+  );
+}
+
+function DatabaseTransfer({ service, admin }: { service: Service; admin: boolean }) {
+  const exportMutation = useMutation({
+    mutationFn: async () => {
+      const result = await api<{ downloadUrl: string }>(`/services/${service.id}/database-export`, { method: "POST", body: {} });
+      const expected = `/api/v1/services/${service.id}/database-export/download`;
+      if (result.downloadUrl !== expected) throw new Error("The export could not be downloaded.");
+      return expected;
+    },
+    onSuccess: (url) => {
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "";
+      link.hidden = true;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    },
+  });
+  return (
+    <section className="database-backups database-transfer" aria-labelledby="database-transfer-heading">
+      <div className="backup-section">
+        <div className="backup-heading"><Database size={19} aria-hidden="true" /><h2 id="database-transfer-heading">Export and restore</h2></div>
+        {service.deployedRevision === null ? <p>Deploy this database to export or restore its data.</p> : <>
+          <div className="database-transfer-actions">
+            <div className="detail-row">
+              <span>Database export</span>
+              <button className="button button-small" type="button" disabled={exportMutation.isPending} onClick={() => exportMutation.mutate()}>
+                {exportMutation.isPending ? <FeatureLoading label="Preparing export" /> : <><Download size={15} aria-hidden="true" /> Download</>}
+              </button>
+            </div>
+            <DatabaseRestore service={service} admin={admin} />
+          </div>
+          <p className="feature-helper">Exports up to 2 GiB of database data.</p>
+        </>}
+        <FeatureError error={exportMutation.error} />
+      </div>
     </section>
   );
 }
@@ -1121,12 +1161,14 @@ function RuntimeLogs({ service }: { service: Service }) {
 export function DestroyService({
   service,
   busy,
+  showLabel = false,
   onStarted,
   onFailure,
   onDestroyed,
 }: {
   service: Service;
   busy: boolean;
+  showLabel?: boolean;
   onStarted: () => void;
   onFailure: () => void;
   onDestroyed: () => void;
@@ -1177,7 +1219,7 @@ export function DestroyService({
   return (
     <>
       <button
-          className="icon-button"
+          className={showLabel ? "button service-action-delete" : "icon-button"}
           type="button"
           aria-label="Delete service"
           title="Delete service"
@@ -1185,6 +1227,7 @@ export function DestroyService({
           onClick={() => setShow(true)}
         >
           <Trash2 size={16} />
+          {showLabel ? "Delete service" : null}
       </button>
       {show ? (
         <FeatureModal

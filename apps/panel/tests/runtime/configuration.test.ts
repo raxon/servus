@@ -14,6 +14,7 @@ import { validateRepository } from '../../src/agent/build.js';
 import { ingressStatus } from '../../src/agent/observability.js';
 import { RestoreJournal } from '../../src/agent/restore-journal.js';
 import type { Service } from '../../src/shared/types.js';
+import * as databaseAccess from '../../src/agent/database-access.js';
 
 const cleanup: (() => unknown | Promise<unknown>)[]=[];
 afterEach(async()=>{for(const fn of cleanup.splice(0).reverse())await fn();vi.unstubAllEnvs();});
@@ -42,6 +43,41 @@ function fixture() {
 }
 
 describe('service configuration and protected storage',()=>{
+  it.each(['mariadb','redis'] as const)('retains the confirmed %s digest when deploying database TCP access',async kind=>{
+    const f=fixture();Object.assign(f.service,{kind,image:kind==='mariadb'?'mariadb:11.4':'redis:7-alpine',database:{database:'app',user:'app',passwordSecretRef:f.putSecret('synthetic-password','database')},domains:[]});
+    const check=vi.spyOn(databaseAccess,'assertDatabasePortFree').mockResolvedValue();cleanup.push(()=>check.mockRestore());
+    await f.runtime.apply(f.service,'deploy',randomUUID());
+    const image=f.current().TaskTemplate.ContainerSpec.Image;Object.assign(f.service,{revision:2,deployedRevision:1,imageDigest:image,databaseAccess:{enabled:true,publishedPort:15432}});
+    vi.mocked(f.runtime.pull).mockClear();
+    await f.runtime.apply(f.service,'deploy',randomUUID());
+    expect(f.runtime.pull).not.toHaveBeenCalled();expect(f.current().TaskTemplate.ContainerSpec.Image).toBe(image);
+  });
+  it('deploys opt-in database ports and removes them without changing volume or internal DNS ownership',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',name:'database',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.putSecret('synthetic-password','database')},domains:[]});
+    const check=vi.spyOn(databaseAccess,'assertDatabasePortFree').mockResolvedValue();cleanup.push(()=>check.mockRestore());
+    await f.runtime.apply(f.service,'deploy',randomUUID());
+    const mounts=structuredClone(f.current().TaskTemplate.ContainerSpec.Mounts),name=f.current().Name;
+    Object.assign(f.service,{revision:2,deployedRevision:1,databaseAccess:{enabled:true,publishedPort:15432}});
+    await f.runtime.apply(f.service,'restart',randomUUID());
+    expect(f.current().EndpointSpec.Ports).toEqual([]);
+    await f.runtime.apply(f.service,'deploy',randomUUID());
+    expect(f.current().EndpointSpec.Ports).toEqual([{Protocol:'tcp',PublishedPort:15432,TargetPort:5432,PublishMode:'host'}]);
+    expect(f.current().Name).toBe(name);expect(f.current().TaskTemplate.Networks[0].Aliases).toEqual(['database']);
+    expect(f.current().TaskTemplate.ContainerSpec.Mounts).toEqual(mounts);
+    Object.assign(f.service,{revision:3,deployedRevision:2,databaseAccess:{enabled:false}});
+    await f.runtime.apply(f.service,'deploy',randomUUID());
+    expect(f.current().EndpointSpec.Ports).toEqual([]);expect(f.current().TaskTemplate.ContainerSpec.Mounts).toEqual(mounts);
+    expect(check).toHaveBeenCalledTimes(3);
+  });
+  it('rolls a failed database port deployment back to its private runtime and retained volume',async()=>{
+    const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.putSecret('synthetic-password','database')},domains:[]});
+    const check=vi.spyOn(databaseAccess,'assertDatabasePortFree').mockResolvedValue();cleanup.push(()=>check.mockRestore());
+    await f.runtime.apply(f.service,'deploy',randomUUID());const mounts=structuredClone(f.current().TaskTemplate.ContainerSpec.Mounts);
+    Object.assign(f.service,{revision:2,deployedRevision:1,databaseAccess:{enabled:true,publishedPort:15432}});
+    vi.mocked((f.runtime as any).verifyService).mockRejectedValueOnce(new Error('readiness failed'));
+    await expect(f.runtime.apply(f.service,'deploy',randomUUID())).rejects.toThrow('restored the previous runtime configuration');
+    expect(f.current().EndpointSpec.Ports).toEqual([]);expect(f.current().TaskTemplate.ContainerSpec.Mounts).toEqual(mounts);
+  });
   it.each(['postgres','mariadb'] as const)('keeps the committed %s restore volume on restart and redeploy',async kind=>{
     const f=fixture(),ref=f.putSecret('synthetic-password','database');
     Object.assign(f.service,{kind,...(kind==='postgres'?{image:'postgres:17-alpine'}:{}),database:{database:'app',user:'app',passwordSecretRef:ref},domains:[]});
@@ -140,7 +176,7 @@ describe('service configuration and protected storage',()=>{
     const f=fixture();Object.assign(f.service,{kind:'postgres',image:'postgres:17-alpine',database:{database:'app',user:'app',passwordSecretRef:f.putSecret('synthetic-password','database')},domains:[]});
     await f.runtime.apply(f.service,'deploy',randomUUID());const target=structuredClone(f.current());
     const initial={previousRecorded:true,previousSpec:null,targetSpec:target,stage:'applying',previousError:null,recordPrevious:vi.fn(),recordTarget:vi.fn(),beginRollback:vi.fn()} as any;
-    f.client.getService=vi.fn(()=>({inspect:async()=>{throw {statusCode:404};}}));
+    f.client.getService=vi.fn(()=>({inspect:async()=>{if(f.client.createService.mock.calls.length<2)throw {statusCode:404};return {Spec:f.current(),Version:{Index:1}};}}));
     const created=f.client.createVolume.mock.calls.length;await f.runtime.apply(f.service,'deploy',randomUUID(),initial);
     expect(f.client.createVolume.mock.calls.length).toBe(created);expect(f.client.createService).toHaveBeenCalledTimes(2);
   });

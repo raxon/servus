@@ -323,9 +323,26 @@ def cancel_queued_backup(client):
     finally:
         docker('start', worker)
     wait('worker fresh authenticated channel', supervisor_ready, 60)
+    return operation
 
 
-def exercise():
+def read_history(credentials, operation, state):
+    client = Client()
+    client.request('/auth/login', 'POST', credentials)
+    history = client.request('/installation-backups/history')
+    operations = history.get('operations') or []
+    if history.get('available') is not True or not operations or (
+            operations[0]['operationId'], operations[0]['state']) != (operation, state):
+        raise RuntimeError('A fresh administrator session could not read the latest host backup operation')
+    if set(operations[0]) != {'operationId', 'actorId', 'name', 'state', 'createdAt', 'updatedAt', 'errorCode'}:
+        raise RuntimeError('History exposed data outside the public backup summary')
+    older = client.request('/installation-backups/history?cursor=' + operation).get('operations') or []
+    if operation in [item['operationId'] for item in older] or not any(item['state'] == 'cancelled' for item in older):
+        raise RuntimeError('The real host history cursor did not return the older cancellation')
+    CHECKS.append('real-host-backup-history-in-fresh-session-and-cursor')
+
+
+def exercise(history_only=False):
     client = Client()
     def ready():
         try: return client.request('/health').get('status') == 'ok'
@@ -334,6 +351,16 @@ def exercise():
     credentials = {'email': 'backup-fixture@example.test', 'password': secrets.token_urlsafe(24)}
     private(BASE / 'credentials.json', json.dumps(credentials))
     client.request('/setup', 'POST', credentials)
+    if history_only:
+        cancel_queued_backup(client)
+        operation = cancel_queued_backup(client)
+        read_history(credentials, operation, 'cancelled')
+        report = {'status': 'passed', 'checkedAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  'checks': list(dict.fromkeys(CHECKS)), 'operationId': operation,
+                  'limits': 'Real API, updater socket and supervisor journal in a disposable VM. History-only run using cancelled requests.'}
+        private(BASE / 'result.json', json.dumps(report, indent=2) + '\n')
+        print(json.dumps(report), flush=True)
+        return
     project = client.request('/projects', 'POST', {'name': 'installation-backup-proof'})
     create = client.request('/projects/' + project['id'] + '/services', 'POST', {
         'name': 'persistent-app', 'image': 'nginx:alpine', 'port': 80, 'domains': [],
@@ -379,6 +406,7 @@ def verify_backup(client, operation):
             raise RuntimeError('Real installation backup requires investigation: ' + record['state'])
         return record['state'] == 'completed'
     wait('capture and authenticated restart', completed, 240)
+    read_history(credentials, operation, 'completed')
     journal = json.loads((STATE / 'maintenance/installation-backups' / (operation + '.json')).read_text())
     if journal['state'] != 'completed' or (STATE / 'maintenance/maintenance.json').exists():
         raise RuntimeError('Protected completion receipt is inconsistent')
@@ -457,10 +485,10 @@ def retry_after_recovery():
 if __name__ == '__main__':
     guard()
     parser = argparse.ArgumentParser()
-    parser.add_argument('phase', choices=('prepare', 'exercise', 'retry-after-recovery', 'diagnostics'))
+    parser.add_argument('phase', choices=('prepare', 'exercise', 'history', 'retry-after-recovery', 'diagnostics'))
     parser.add_argument('--image')
     args = parser.parse_args()
     if args.phase == 'diagnostics': diagnostics()
     elif args.phase == 'prepare': prepare(args.image)
-    elif args.phase == 'exercise': exercise()
+    elif args.phase in ('exercise', 'history'): exercise(history_only=args.phase == 'history')
     else: retry_after_recovery()

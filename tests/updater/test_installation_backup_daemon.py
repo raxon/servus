@@ -136,6 +136,11 @@ class InstallationBackupDaemonTest(unittest.TestCase):
         self.assertEqual(self.command({'version': 1, 'type': 'installation_backup_active'}), {'version': 1, 'status': 'busy'})
         status = self.command({'version': 1, 'type': 'installation_backup_status', 'operationId': value['operationId']})
         self.assertEqual(status['backup'], response['backup'])
+        history = self.command({'version': 1, 'type': 'installation_backup_history', 'cursor': None})
+        self.assertEqual(history, {'version': 1, 'status': 'history', 'history': {'operations': [response['backup']], 'nextCursor': None}})
+        self.assertEqual(self.command({'version': 1, 'type': 'installation_backup_history', 'cursor': '../escape'})['status'], 'failed')
+        with mock.patch.object(self.runner, 'installation_backup_history', side_effect=supervisor.SupervisorError('journal unreadable')):
+            self.assertEqual(self.command({'version': 1, 'type': 'installation_backup_history', 'cursor': None})['status'], 'unavailable')
 
     def test_rejects_missing_wrong_or_changed_api_proof_and_nonroot_peer(self):
         for token in (None, '24' * 32):

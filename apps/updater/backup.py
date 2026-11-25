@@ -71,11 +71,12 @@ let text='';process.stdin.setEncoding('utf8');process.stdin.on('data',v=>text+=v
  const x=JSON.parse(text),k=Buffer.from(x.key,'hex');
  for(const s of x.sealed){
   const b=Buffer.from(s.value,'base64'),d=createDecipheriv('aes-256-gcm',k,b.subarray(0,12));d.setAAD(Buffer.from('panel-secret-v1'));d.setAuthTag(b.subarray(12,28));const p=Buffer.concat([d.update(b.subarray(28)),d.final()]);
-  if(!s.json&&!s.git&&!s.registry&&!s.ssh&&!s.redis)continue;const j=object(JSON.parse(p.toString('utf8')));
+  if(!s.json&&!s.git&&!s.registry&&!s.ssh&&!s.redis&&!s.backupProfile)continue;const j=object(JSON.parse(p.toString('utf8')));
   if(s.git){object(j,'kind,repository,serviceId,token,username');if(j.kind!=='git-credential-v1'||/[\x00-\x20\x7f]/.test(string(j.token))||!Array.isArray(s.git)||!s.git.length)throw Error();for(const e of s.git){const u=new URL(e.repository);if(u.protocol!=='https:'||u.username||u.password||u.search||u.hash||u.href!==e.repository||j.serviceId!==e.serviceId||j.repository!==e.repository||j.username!==e.username)throw Error();}}
   if(s.registry){object(j,'kind,password,server,serviceId,username');if(j.kind!=='registry-credential-v1'||j.serviceId!==s.registry.serviceId||registry(j.server)!==j.server||/[\x00-\x1f\x7f]/.test(string(j.username,256)))throw Error();string(j.password);for(const e of s.registry.requirements)if(e.server!==j.server||e.username!==j.username||imageRegistry(e.image)!==j.server)throw Error();}
   if(s.ssh){object(j,'kind,knownHosts,privateKey,publicKey,repository,serviceId');if(j.kind!=='git-ssh-v1'||j.serviceId!==s.ssh.serviceId)throw Error();const host=sshTarget(j.repository),lines=string(j.knownHosts).trim().split('\n');if(lines.length<1||lines.length>4||[...new Set(lines)].sort().join('\n')+'\n'!==j.knownHosts)throw Error();for(const line of lines){const parts=line.split(' ');if(parts.length!==3||parts[0]!==host||parts[1]!=='ssh-ed25519')throw Error();ed25519(parts[2]);}keyPair(j);for(const e of s.ssh.requirements)if(e.repository!==j.repository||e.knownHosts!==j.knownHosts||e.publicKey!==j.publicKey)throw Error();}
   if(s.redis)redisPlan(j,s.redis);
+  if(s.backupProfile){object(j,'destination,kind');if(j.kind!=='backup-global-v1')throw Error();object(j.destination);}
  }
  process.stdout.write('ok');
 }catch{process.exitCode=1;}});'''
@@ -118,6 +119,14 @@ PANEL_V7_ADDITIONS = {
  'volume_backup_settings': {'service_id','mount_target','actor_id','enabled','cron','retention','last_tick','updated_at','destination_ref'},
  'volume_backups': {'id','service_id','mount_target','actor_id','name','status','trigger','idempotency_key','request_hash','created_at','finished_at','size','sha256','error','owner_id','lease_until','destination_ref','object_key'},
  'volume_restores': {'id','backup_id','service_id','mount_target','actor_id','phase','candidate_volume','previous_volume','error','created_at','updated_at','idempotency_key','owner_id','lease_until'},
+}
+PANEL_V9_ADDITIONS = {
+ 'backup_storage_profiles': {'id','name','destination_ref','updated_at','active'},
+}
+PANEL_V9_COLUMN_ADDITIONS = {
+ 'database_backup_settings': {'profile_id','encrypted','retention_policy'},
+ 'database_backups': {'encrypted','plaintext_size'},
+ 'volume_backup_settings': {'profile_id'},
 }
 AGENT_VOLUME_SCHEMA = {
  'volume_backup_operations': {'id','service_id','mount_target','mount_name','source_volume','phase','sealed_plan','sealed_manifest','size','sha256','error','created_at','updated_at'},
@@ -676,18 +685,52 @@ def _validate_staging(dest_fd,node_fd):
         try: data[name]=_read(fd).decode('ascii')
         finally: os.close(fd)
         if not re.fullmatch(r'[a-f0-9]{64}',data[name]): raise CaptureError('Installation key or token is invalid')
-    encrypted=[]; refs=set(); mariadb=set(); git_requirements={}; registry_requirements={}; ssh_requirements={}; dev=os.fstat(dest_fd).st_dev
+    encrypted=[]; refs=set(); profile_refs=set(); mariadb=set(); git_requirements={}; registry_requirements={}; ssh_requirements={}; dev=os.fstat(dest_fd).st_dev
     with closing(sqlite3.connect(f'file:/proc/self/fd/{dest_fd}/panel.sqlite?mode=ro&immutable=1',uri=True)) as db:
         version=db.execute('PRAGMA user_version').fetchone()[0]
         if version==4: _schema(db,PANEL_SCHEMA,4)
-        elif version in (5,6,7,8):
+        elif version in (5,6,7,8,9):
             expected={**PANEL_SCHEMA,'service_secret_refs':PANEL_SCHEMA['service_secret_refs']|{'purpose'}}
             if version>=6: expected.update(PANEL_V6_ADDITIONS)
             if version>=7: expected.update(PANEL_V7_ADDITIONS)
+            if version>=9:
+                expected.update(PANEL_V9_ADDITIONS)
+                for table,cols in PANEL_V9_COLUMN_ADDITIONS.items(): expected[table]=expected[table]|cols
             _schema(db,expected,version)
         else: raise CaptureError('Unsupported database schema')
         owners=dict(db.execute('SELECT reference,service_id FROM service_secret_refs'))
         purposes=dict(db.execute('SELECT reference,purpose FROM service_secret_refs')) if version>=5 else None
+        if version>=9:
+            profile_ids=set()
+            for ident,reference,active in db.execute('SELECT id,destination_ref,active FROM backup_storage_profiles'):
+                if not isinstance(ident,str) or not UUID.fullmatch(ident) or type(active) is not int or active not in (0,1):
+                    raise CaptureError('Backup storage profile metadata is invalid')
+                profile_ids.add(ident)
+                if reference is not None:
+                    if not isinstance(reference,str) or not UUID.fullmatch(reference):
+                        raise CaptureError('Backup storage profile reference is invalid')
+                    if reference in owners:
+                        raise CaptureError('Backup storage profile reference has an invalid owner')
+                    profile_refs.add(reference)
+                    refs.add(reference)
+            for profile_id,is_encrypted,policy in db.execute('SELECT profile_id,encrypted,retention_policy FROM database_backup_settings'):
+                if type(is_encrypted) is not int or is_encrypted not in (0,1):
+                    raise CaptureError('Database backup settings metadata is invalid')
+                if profile_id is not None and profile_id not in profile_ids:
+                    raise CaptureError('Database backup storage profile reference is invalid')
+                if policy is not None:
+                    try: parsed_policy=json.loads(policy)
+                    except (TypeError,ValueError): raise CaptureError('Database backup retention policy is invalid') from None
+                    if not isinstance(parsed_policy,dict) or parsed_policy.get('mode') not in ('count','age','gfs'):
+                        raise CaptureError('Database backup retention policy is invalid')
+            for is_encrypted,plaintext_size in db.execute('SELECT encrypted,plaintext_size FROM database_backups'):
+                if type(is_encrypted) is not int or is_encrypted not in (0,1):
+                    raise CaptureError('Database backup encryption metadata is invalid')
+                if plaintext_size is not None and (type(plaintext_size) is not int or plaintext_size<0):
+                    raise CaptureError('Database backup plaintext size is invalid')
+            for (profile_id,) in db.execute('SELECT profile_id FROM volume_backup_settings WHERE profile_id IS NOT NULL'):
+                if profile_id not in profile_ids:
+                    raise CaptureError('Volume backup storage profile reference is invalid')
         if version>=7:
             if db.execute("SELECT 1 FROM volume_backups WHERE status='running' LIMIT 1").fetchone(): raise CaptureError('An application volume backup is still running')
             if db.execute("SELECT 1 FROM volume_restores WHERE phase NOT IN ('completed','cancelled','failed','rolled_back') OR phase IS NULL LIMIT 1").fetchone(): raise CaptureError('Unresolved application volume restore requires recovery')
@@ -768,7 +811,8 @@ def _validate_staging(dest_fd,node_fd):
                 try: text=_read(fd).decode('ascii')
                 finally: os.close(fd)
                 if directory==secret_dir:
-                    entry=_sealed(text,purposes is not None and purposes.get(name)=='backup-storage')
+                    entry=_sealed(text,(purposes is not None and purposes.get(name)=='backup-storage') or name in profile_refs)
+                    if name in profile_refs: entry['backupProfile']=True
                     if name in git_requirements: entry['git']=[{'serviceId':service_id,'repository':repository,'username':username} for service_id,repository,username in sorted(git_requirements[name])]
                     if purposes is not None and purposes.get(name)=='registry': entry['registry']={'serviceId':owners[name],'requirements':[{'server':server,'username':username,'image':image} for server,username,image in sorted(registry_requirements.get(name,()))]}
                     if purposes is not None and purposes.get(name)=='git-ssh': entry['ssh']={'serviceId':owners[name],'requirements':[{'repository':repository,'knownHosts':known_hosts,'publicKey':public_key} for repository,known_hosts,public_key in sorted(ssh_requirements.get(name,()))]}

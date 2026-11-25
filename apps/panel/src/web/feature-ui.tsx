@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import type { ReactNode, RefObject } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Check, CircleAlert, LoaderCircle, X } from "lucide-react";
 import type { Service, ServicePatch } from "../shared/types.js";
@@ -29,25 +29,29 @@ export function FeatureModal({
   children,
   onClose,
   dismissible = true,
+  initialFocus,
 }: {
   title: string;
   description: string;
   children: ReactNode;
   onClose: () => void;
   dismissible?: boolean;
+  initialFocus?: RefObject<HTMLElement | null>;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const id = useId();
   useEffect(() => {
     const dialog = ref.current;
     dialog?.showModal();
+    initialFocus?.current?.focus();
     return () => dialog?.close();
-  }, []);
+  }, [initialFocus]);
   return (
     <dialog
       ref={ref}
       className="modal"
-      aria-labelledby="feature-modal-title"
-      aria-describedby="feature-modal-description"
+      aria-labelledby={`${id}-title`}
+      aria-describedby={`${id}-description`}
       onCancel={(event) => {
         if (!dismissible) event.preventDefault();
       }}
@@ -58,8 +62,8 @@ export function FeatureModal({
     >
       <div className="modal-heading">
         <div>
-          <h2 id="feature-modal-title">{title}</h2>
-          <p id="feature-modal-description">{description}</p>
+          <h2 id={`${id}-title`}>{title}</h2>
+          <p id={`${id}-description`}>{description}</p>
         </div>
         <button
           className="icon-button"
@@ -76,14 +80,14 @@ export function FeatureModal({
   );
 }
 
-export function useServiceSave(service: Service) {
+export function useServiceSave(service: Service, expectedRevision?: number) {
   const client = useQueryClient();
   const [baseRevision, setBaseRevision] = useState(service.revision);
   return useMutation({
     mutationFn: (patch: Omit<ServicePatch, "expectedRevision">) =>
       api<Service>(`/services/${service.id}`, {
         method: "PATCH",
-        body: { ...patch, expectedRevision: baseRevision },
+        body: { ...patch, expectedRevision: expectedRevision ?? baseRevision },
       }),
     onSuccess: (value) => {
       setBaseRevision(value.revision);

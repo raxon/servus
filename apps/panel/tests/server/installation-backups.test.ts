@@ -62,6 +62,32 @@ async function fixture(options: Partial<InstallationBackupRoutesOptions> = {}, r
 const success = (socket: Socket) => socket.end(`${JSON.stringify({ok: true, operation})}\n`);
 
 describe('installation backup API authorization and protocol', () => {
+  it('reads paginated host history only for administrator sessions, including a fresh browser', async () => {
+    const page = {operations: [operation], nextCursor: id};
+    const {app, requests} = await fixture({}, (socket, request) => {
+      expect(request.action).toBe('installation_backup_history');
+      socket.end(`${JSON.stringify({ok: true, operation: request.cursor ? {operations: [], nextCursor: null} : page})}\n`);
+    });
+    const url = '/api/v1/installation-backups/history';
+    for (const denied of [{}, {cookie: 'session=member'}, {...headers, authorization: 'Bearer token'}])
+      expect((await app.inject({url, headers: denied})).statusCode).toBeGreaterThanOrEqual(401);
+    for (const suffix of ['?cursor=../escape', '?cursor=', '?limit=10000'])
+      expect((await app.inject({url: url + suffix, headers})).statusCode).toBe(400);
+    expect(requests).toEqual([]);
+    expect((await app.inject({url, headers})).json()).toEqual({available: true, ...page});
+    expect((await app.inject({url, headers: {...headers}})).json()).toEqual({available: true, ...page});
+    expect((await app.inject({url: url + `?cursor=${id}`, headers})).json()).toEqual({available: true, operations: [], nextCursor: null});
+    expect(requests[0]).toEqual({version: 1, action: 'installation_backup_history', cursor: null});
+  });
+  it('handles absent history support and rechecks session liveness after reading history', async () => {
+    const old = await fixture({}, socket => socket.end(`${JSON.stringify({ok: false, error: 'invalid_request'})}\n`));
+    expect((await old.app.inject({url: '/api/v1/installation-backups/history', headers})).json()).toEqual({available: false, reason: 'host_unsupported'});
+    const disabled = await fixture({applyEnabled: false}, success);
+    expect((await disabled.app.inject({url: '/api/v1/installation-backups/history', headers})).json()).toEqual({available: false, reason: 'not_configured'});
+    expect(disabled.requests).toEqual([]);
+    const f = await fixture({}, socket => {f.revoke(); socket.end(`${JSON.stringify({ok: true, operation: {operations: [], nextCursor: null}})}\n`);});
+    expect((await f.app.inject({url: '/api/v1/installation-backups/history', headers})).statusCode).toBe(401);
+  });
   it('requires administrator browser authentication and mutation CSRF/origin before any dispatch', async () => {
     const {app, requests} = await fixture({}, success);
     for (const selected of [{}, {...headers, cookie: 'session=member'}, {...headers, 'x-csrf-token': ''}, {...headers, origin: 'https://foreign.example'}, {...headers, authorization: 'Bearer valid-api-token'}]) {

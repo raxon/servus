@@ -13,7 +13,7 @@ import { hashPassword } from '/app/dist/server/auth.js';
 const dataDir=mkdtempSync(join(tmpdir(),'servus-package-parity-'));
 let store,app,agent;
 try{
-  store=new Store(dataDir);assert.equal(store.db.pragma('user_version',{simple:true}),8);
+  store=new Store(dataDir);assert.equal(store.db.pragma('user_version',{simple:true}),9);
   const actor=store.setup('fixture@example.test',await hashPassword('synthetic-package-password'));
   const session=store.createSession(actor.id),project=store.createProject('package-parity');
   app=await createApp({dataDir,store,allowedOrigins:['http://localhost:4180'],runtimeStatus:async()=>({online:false})});await app.ready();
@@ -31,7 +31,7 @@ try{
   const ssh=spawnSync('ssh',['-V'],{encoding:'utf8'});assert.equal(ssh.status,0);assert.match(ssh.stderr,/OpenSSH/);
   const compose=spawnSync('docker',['compose','version','--short'],{encoding:'utf8'});assert.equal(compose.status,0);assert.match(compose.stdout.trim(),/^v?\d+\./);
   const cli=spawnSync(process.execPath,['/app/scripts/servus.mjs','help'],{encoding:'utf8'});assert.equal(cli.status,0);
-  console.log(JSON.stringify({status:'passed',schema:8,checks:['native-sqlite','packaged-esm','registry-secret-ref','ssh-key-generation','volume-api','agent-schema','openssh-client','compose-plugin','cli']}));
+  console.log(JSON.stringify({status:'passed',schema:9,checks:['native-sqlite','packaged-esm','registry-secret-ref','ssh-key-generation','volume-api','agent-schema','openssh-client','compose-plugin','cli']}));
 }finally{
   if(agent)await agent.close();if(app)await app.close();if(store?.db.open)store.close();rmSync(dataDir,{recursive:true,force:true});
 }

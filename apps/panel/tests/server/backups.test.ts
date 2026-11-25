@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
-import { chmodSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
@@ -8,7 +9,7 @@ import { DatabaseBackups } from '../../src/server/backups.js';
 import { Store } from '../../src/server/store.js';
 import { normalizeServiceInput } from '../../src/server/configuration.js';
 import { MaintenanceGate } from '../../src/server/maintenance.js';
-import { backupCronMatches, describeBackupCron, parseBackupCron } from '../../src/shared/backups.js';
+import { backupCronMatches, describeBackupCron, parseBackupCron, expiredDatabaseBackups } from '../../src/shared/backups.js';
 
 const cleanups:(()=>Promise<void>)[]=[];
 afterEach(async()=>{for(const cleanup of cleanups.splice(0).reverse())await cleanup();});
@@ -116,4 +117,57 @@ it('parses standard numeric cron ranges, lists and steps with UTC day semantics'
   expect(backupCronMatches('0 2 17 * 0',new Date('2026-11-22T02:00:00Z'))).toBe(true);
   expect(backupCronMatches('0 2 * * *',new Date('2026-11-17T02:01:00Z'))).toBe(false);
   expect(()=>parseBackupCron('0 0 1 13 *')).toThrow('range');
+});
+
+
+it('encrypts database bytes at rest, authenticates downloads and preserves older unencrypted backups',async()=>{
+  const {backups,actor,service,dataDir,setTime}=fixture();
+  const plain=backups.create(service,actor,{},'unencrypted');await backups.drain();
+  backups.saveSettings(service,actor,{enabled:false,cron:'0 2 * * *',retention:7,encrypted:true});
+  setTime('2026-11-17T01:01:00.000Z');
+  const encrypted=backups.create(service,actor,{},'encrypted');await backups.drain();
+  const stored=readFileSync(join(dataDir,'database-backups',`${encrypted.id}.dump`));
+  expect(stored.toString()).not.toContain('database-content');expect(stored.subarray(0,16).toString()).toBe('SERVUS-BACKUP-1\n');
+  expect(backups.list(service.id).find(backup=>backup.id===encrypted.id)).toMatchObject({encrypted:true,status:'succeeded'});
+  for(const id of [plain.id,encrypted.id]){
+    const downloaded=await backups.read(service.id,id),chunks:Buffer[]=[];for await(const chunk of downloaded.stream)chunks.push(chunk);
+    expect(Buffer.concat(chunks).toString()).toBe('database-content');expect(downloaded.backup.size).toBe(16);
+    expect(downloaded.backup.sha256).toBe(createHash('sha256').update('database-content').digest('hex'));
+  }
+  expect(readdirSync(join(dataDir,'database-backups')).sort()).toEqual([`${plain.id}.dump`,`${encrypted.id}.dump`].sort());
+});
+
+it('rejects corrupted authenticated ciphertext before publishing plaintext and removes staging files',async()=>{
+  const {backups,actor,service,dataDir,store}=fixture();
+  backups.saveSettings(service,actor,{enabled:false,cron:'0 2 * * *',retention:7,encrypted:true});
+  const created=backups.create(service,actor,{},'tampered');await backups.drain();
+  const path=join(dataDir,'database-backups',`${created.id}.dump`),bytes=readFileSync(path);bytes[bytes.length-1]=bytes[bytes.length-1]!^1;writeFileSync(path,bytes);
+  // Update the outer hash to exercise GCM rather than the independent SHA check.
+  store.db.prepare('UPDATE database_backups SET sha256=? WHERE id=?').run(createHash('sha256').update(bytes).digest('hex'),created.id);
+  await expect(backups.read(service.id,created.id)).rejects.toThrow('unavailable or changed');
+  expect(readdirSync(join(dataDir,'database-backups'))).toEqual([`${created.id}.dump`]);
+});
+
+it('cancels encrypted download staging without leaving plaintext or partial files',async()=>{
+  const {backups,actor,service,dataDir}=fixture();
+  backups.saveSettings(service,actor,{enabled:false,cron:'0 2 * * *',retention:7,encrypted:true});
+  const created=backups.create(service,actor,{},'cancelled-download');await backups.drain();
+  const controller=new AbortController();controller.abort();
+  await expect(backups.read(service.id,created.id,controller.signal)).rejects.toThrow('unavailable or changed');
+  expect(readdirSync(join(dataDir,'database-backups'))).toEqual([`${created.id}.dump`]);
+});
+
+it('selects age and GFS retention buckets while preserving the newest recovery point',()=>{
+  const rows=[
+    {id:'latest',createdAt:'2026-11-17T12:50:00Z'},
+    {id:'same-hour',createdAt:'2026-11-17T12:20:00Z'},
+    {id:'hour',createdAt:'2026-11-17T11:00:00Z'},
+    {id:'day',createdAt:'2026-11-16T12:00:00Z'},
+    {id:'week',createdAt:'2026-11-09T12:00:00Z'},
+    {id:'month',createdAt:'2026-10-01T12:00:00Z'},
+    {id:'year',createdAt:'2025-11-01T12:00:00Z'},
+  ];
+  expect(expiredDatabaseBackups(rows,7,{mode:'gfs',hourly:2,daily:2,weekly:2,monthly:2,yearly:2},new Date('2026-11-17T13:00:00Z')).map(row=>row.id)).toEqual(['same-hour']);
+  expect(expiredDatabaseBackups(rows,7,{mode:'age',days:2},new Date('2026-11-17T13:00:00Z')).map(row=>row.id)).toEqual(['week','month','year']);
+  expect(expiredDatabaseBackups(rows,7,{mode:'age',days:1},new Date('2030-01-01T00:00:00Z')).map(row=>row.id)).not.toContain('latest');
 });

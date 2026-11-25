@@ -35,8 +35,10 @@ export class LocalDatabaseBackupStorage {
     try { fsyncSync(fd); } finally { closeSync(fd); }
   }
 
-  async capture<Extension extends BackupArtifactExtension>(id: string, extension: Extension, input: Readable, expectedSize: number|undefined, options: {signal?:AbortSignal; publish?:()=>void} = {}) {
-    if (expectedSize!==undefined&&(!Number.isSafeInteger(expectedSize) || expectedSize < 1 || expectedSize > maximumBytes)) throw new Error('Backups support exports between 1 byte and 2 GiB.');
+  async capture<Extension extends BackupArtifactExtension>(id: string, extension: Extension, input: Readable, expectedSize: number|undefined, options: {signal?:AbortSignal; publish?:()=>void; encryptionOverhead?:number} = {}) {
+    const overhead=options.encryptionOverhead??0;
+    if(!Number.isSafeInteger(overhead)||overhead<0||overhead>128)throw new Error('Invalid backup encryption overhead.');
+    if (expectedSize!==undefined&&(!Number.isSafeInteger(expectedSize) || expectedSize < 1 || expectedSize > maximumBytes+overhead)) throw new Error('Backups support exports between 1 byte and 2 GiB.');
     const space = statfsSync(this.root);
     if (Number(space.bavail)*Number(space.bsize) < (expectedSize??0) + reserveBytes) throw new Error('Not enough free space for the backup.');
     const partial = this.path(id,'partial'), destination = this.path(id,extension);

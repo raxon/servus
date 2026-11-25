@@ -2,7 +2,7 @@ import {mkdtempSync, rmSync} from 'node:fs';
 import {createServer, type Server, type Socket} from 'node:net';
 import {join} from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
-import {cancelInstallationBackup,installationBackupStatus, submitInstallationBackup} from '../../src/server/updater-client.js';
+import {installationBackupHistory,cancelInstallationBackup,installationBackupStatus, submitInstallationBackup} from '../../src/server/updater-client.js';
 
 const operationId = '12345678-1234-4123-8123-123456789abc';
 const actorId = '22345678-1234-4123-8123-123456789abc';
@@ -28,6 +28,26 @@ afterEach(async () => {
 });
 
 describe('installation backup updater transport', () => {
+  it('validates history envelopes, order, unique records, cursors and redaction', async () => {
+    const older = {...operation, operationId: actorId, createdAt: operation.createdAt - 1};
+    const page = {operations: [operation, older], nextCursor: actorId};
+    const valid = await fixture((socket, input) => {
+      expect(input).toEqual({version: 1, action: 'installation_backup_history', cursor: null});
+      socket.end(`${JSON.stringify({ok: true, operation: page})}\n`);
+    });
+    await expect(installationBackupHistory(null, valid)).resolves.toEqual(page);
+    for (const bad of [
+      {operations: [older, operation], nextCursor: null}, {operations: [operation, operation], nextCursor: null},
+      {operations: [], nextCursor: operationId}, {...page, nextCursor: operationId},
+      {operations: [{...operation, snapshotPath: '/root/private'}], nextCursor: null},
+      {operations: [{...operation, updatedAt: 1}], nextCursor: null},
+    ]) {
+      const endpoint = await fixture(socket => socket.end(`${JSON.stringify({ok: true, operation: bad})}\n`));
+      await expect(installationBackupHistory(null, endpoint)).rejects.toMatchObject({code: 'invalid_response'});
+    }
+    const repeated = await fixture(socket => socket.end(`${JSON.stringify({ok: true, operation: page})}\n`));
+    await expect(installationBackupHistory(operationId, repeated)).rejects.toMatchObject({code: 'invalid_response'});
+  });
   it('correlates cancellation with the operation and name while preserving its original creator',async()=>{
     const endpoint=await fixture((socket,input)=>{expect(input).toEqual({version:1,action:'installation_backup_cancel',approval});socket.end(`${JSON.stringify({ok:true,operation:{...operation,actorId:operationId,state:'cancelled'}})}\n`);});
     await expect(cancelInstallationBackup(approval,endpoint)).resolves.toMatchObject({state:'cancelled',actorId:operationId});

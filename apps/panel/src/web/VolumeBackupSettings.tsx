@@ -7,7 +7,7 @@ import { api } from './api.js';
 import { BackupDestinationForm, BackupScheduleForm } from './BackupSettings.js';
 import { FeatureError, FeatureLoading } from './feature-ui.js';
 
-export function VolumeBackupSettings({service,canWrite}:{service:Service;canWrite:boolean}) {
+export function VolumeBackupSettings({service,canWrite,admin=false}:{service:Service;canWrite:boolean;admin?:boolean}) {
   const id=useId(),mounts=(service.mounts??[]).filter(mount=>mount.type==='volume'&&!mount.readOnly);
   const [selection,setSelection]=useState('');
   const target=mounts.some(mount=>mount.target===selection)?selection:mounts[0]?.target;
@@ -18,11 +18,11 @@ export function VolumeBackupSettings({service,canWrite}:{service:Service;canWrit
       <p className="feature-helper">Database data and panel configuration have separate backup procedures. Keep a copy outside this server to protect against server or disk loss. Hard links, special files and symbolic links that leave their directory are unsupported.</p>
       {target?<><label htmlFor={`${id}-mount`}>Application volume</label><select id={`${id}-mount`} name="mountTarget" value={target} onChange={event=>setSelection(event.target.value)}>{mounts.map(mount=><option key={mount.target} value={mount.target}>{mount.name} - {mount.target}</option>)}</select></>:<p>Add a writable named volume in Storage before creating a volume backup. Bind mounts and configuration files are excluded.</p>}
     </section>
-    {target?<SelectedVolumeBackups key={`${service.id}:${target}`} service={service} mountTarget={target} canWrite={canWrite}/>:null}
+    {target?<SelectedVolumeBackups key={`${service.id}:${target}`} service={service} mountTarget={target} canWrite={canWrite} admin={admin}/>:null}
   </div>;
 }
 
-function SelectedVolumeBackups({service,mountTarget,canWrite}:{service:Service;mountTarget:string;canWrite:boolean}) {
+function SelectedVolumeBackups({service,mountTarget,canWrite,admin}:{service:Service;mountTarget:string;canWrite:boolean;admin:boolean}) {
   const id=useId(),client=useQueryClient(),[name,setName]=useState('');
   const [confirmation,setConfirmation]=useState<{restore:VolumeRestore;action:'commit'|'rollback'}|null>(null);
   const [deleting,setDeleting]=useState<string|null>(null);
@@ -50,7 +50,7 @@ function SelectedVolumeBackups({service,mountTarget,canWrite}:{service:Service;m
       <button className="button button-primary" type="submit" disabled={busy||activeBackup||activeRestore||service.deployedRevision===null}>{create.isPending?'Queuing backup':'Create volume backup'}</button>
       {create.isSuccess?<p role="status">Volume backup queued. Its result will appear below.</p>:null}<FeatureError error={create.error}/>
     </form></section>:null}
-    <BackupDestinationForm serviceId={service.id} mountTarget={mountTarget} canWrite={canWrite}/>
+    <BackupDestinationForm serviceId={service.id} mountTarget={mountTarget} canWrite={canWrite} admin={admin}/>
     {selectedSettings?<BackupScheduleForm serviceId={service.id} mountTarget={mountTarget} settings={selectedSettings} canWrite={canWrite}/>:settings.isPending?<FeatureLoading label="Loading volume backup settings"/>:null}
     <section className="backup-section" aria-labelledby={`${id}-history`}><h3 id={`${id}-history`}>Volume backup history</h3>
       {history.isPending?<FeatureLoading label="Loading volume backups"/>:selectedBackups.length?<ul className="backup-history">{selectedBackups.map(backup=><li key={backup.id}>

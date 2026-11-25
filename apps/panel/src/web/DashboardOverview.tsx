@@ -17,6 +17,7 @@ import { api, errorMessage } from "./api.js";
 import { DashboardActions } from "./DashboardActions.js";
 import { Skeleton } from "./Skeleton.js";
 import { FeatureModal } from "./feature-ui.js";
+import "./DashboardAttention.css";
 
 const hasChanges = (service: Service) =>
   service.deployedRevision !== null &&
@@ -31,6 +32,45 @@ const attention = (service: Service) =>
         : service.state === "deploying" || hasChanges(service)
           ? 1
           : 0;
+const attentionFilters = [
+  { value: "all", label: "All statuses" },
+  { value: "failed", label: "Failed" },
+  { value: "changes", label: "Pending deployment" },
+  { value: "other", label: "Other service states" },
+] as const;
+
+function AttentionItem({ project, service, reviewChanges }: { project: Project; service: Service; reviewChanges: boolean }) {
+  const failed = service.state === "failed" && !reviewChanges;
+  const changed = hasChanges(service);
+  const status = failed ? "Failed" : changed ? "Pending deployment"
+    : service.state === "pending" ? "Awaiting first deployment"
+    : service.state === "deploying" ? "Deploying" : "State unavailable";
+  return (
+    <li className="dashboard-attention-item">
+      <div className="dashboard-attention-service">
+        <Box size={17} aria-hidden="true" />
+        <div><strong>{service.name}</strong><small>{project.name}</small></div>
+      </div>
+      <div className="dashboard-attention-reason">
+        <span className={`badge ${failed ? "status-failed" : changed ? "dashboard-attention-change" : ""}`}>{status}</span>
+        {failed && service.lastError ? <small title={service.lastError}>{service.lastError}</small>
+          : changed ? <small>Saved revision {service.revision} · Last deployed revision {service.deployedRevision}</small> : null}
+      </div>
+      <Link
+        className="button button-small"
+        to="/services/$serviceId"
+        params={{ serviceId: service.id }}
+        search={{ tab: failed ? "logs" : changed ? "overview" : "deployments" }}
+        hash={changed && !failed ? "configuration-changes" : undefined}
+        aria-label={`${failed ? "Open logs" : changed ? "Review changes" : "View deployments"} for ${service.name}`}
+      >
+        {failed ? "Open logs" : changed ? "Review changes" : "View deployments"}
+        <ChevronRight size={15} aria-hidden="true" />
+      </Link>
+    </li>
+  );
+}
+
 /** Project counts remain unavailable until all filtered service queries resolve. */
 export function DashboardOverview({
   projects,
@@ -50,6 +90,7 @@ export function DashboardOverview({
   onCreate: () => void;
 }) {
   const [errorService, setErrorService] = useState<Service | null>(null);
+  const [attentionFilter, setAttentionFilter] = useState("all");
   const collapseKey = `servus-dashboard-collapsed:${userId}`;
   const [collapsed, setCollapsed] = useState<string[]>(() => {
     try {
@@ -101,6 +142,17 @@ export function DashboardOverview({
   );
   const complete =
     !loading && !error && queries.every((result) => result.isSuccess);
+  const monitored = visible.flatMap(({ project, result, services }) =>
+    result.isSuccess ? services.map(service => ({ project, service })) : []);
+  const failedCount = monitored.filter(({ service }) => service.state === "failed").length;
+  const changedCount = monitored.filter(({ service }) => hasChanges(service)).length;
+  const attentionRows = monitored.filter(({ service }) => {
+    if (attentionFilter === "failed") return service.state === "failed";
+    if (attentionFilter === "changes") return hasChanges(service);
+    if (attentionFilter === "other") return attention(service) > 0 && service.state !== "failed" && !hasChanges(service);
+    return attention(service) > 0;
+  }).sort((a, b) => attention(b.service) - attention(a.service));
+  const incomplete = !complete && (!!error || queries.some(result => result.isError));
   const filtered = query !== "";
   const updateCollapsed = (next: string[]) => {
     setCollapsed(next);
@@ -115,7 +167,54 @@ export function DashboardOverview({
             {query ? "Search results" : "All projects"}
           </span>
         </div>
+        <div className="dashboard-operator-actions">
+          <span className={`badge dashboard-runtime-badge ${!runtime.isError && runtime.data?.online ? "status-running" : ""}`}>
+            {runtime.isPending ? "Checking Docker"
+              : runtime.isError ? "Docker status unavailable"
+              : runtime.data?.online ? "Docker connected" : "Docker offline"}
+          </span>
+          {canCreate ? (
+            <button className="button button-primary" type="button" onClick={onCreate}>
+              <Plus size={16} aria-hidden="true" /> New project
+            </button>
+          ) : null}
+        </div>
       </div>
+      {projects?.length ? (
+        <>
+          <dl className="dashboard-service-summary" aria-label="Service totals">
+            <div><dt>Services</dt><dd>{complete ? monitored.length : "—"}</dd></div>
+            <div className={complete && failedCount > 0 ? "has-failure" : ""}>
+              <dt>Failed services</dt><dd>{complete ? failedCount : "—"}</dd>
+            </div>
+            <div><dt>Pending deployment</dt><dd>{complete ? changedCount : "—"}</dd></div>
+          </dl>
+          <section className="surface dashboard-attention" aria-labelledby="dashboard-attention-title">
+            <div className="dashboard-attention-header">
+              <h2 id="dashboard-attention-title">Needs attention</h2>
+              <label className="dashboard-status-filter">
+                <span className="sr-only">Filter attention by status</span>
+                <select value={attentionFilter} onChange={event => setAttentionFilter(event.target.value)}>
+                  {attentionFilters.map(({ value, label }) => <option key={value} value={value}>{label}</option>)}
+                </select>
+              </label>
+            </div>
+            {incomplete ? <p className="dashboard-attention-note" role="status">Some project data is unavailable. Showing confirmed results only.</p>
+              : !complete ? <p className="dashboard-attention-note" role="status">Checking service states…</p> : null}
+            {attentionRows.length ? (
+              <ul className="dashboard-attention-list">
+                {attentionRows.map(({ project, service }) => (
+                  <AttentionItem key={service.id} project={project} service={service} reviewChanges={attentionFilter === "changes"} />
+                ))}
+              </ul>
+            ) : complete ? (
+              <p className="dashboard-attention-note">
+                {attentionFilter === "all" ? "No services need attention." : "No services match this status."}
+              </p>
+            ) : null}
+          </section>
+        </>
+      ) : null}
       <section
         className="dashboard-project-region"
         aria-labelledby="dashboard-projects-title"
@@ -133,14 +232,6 @@ export function DashboardOverview({
                     : (projects?.length ?? 0)}
             </span>
           </h2>
-          <div className="dashboard-collection-actions">
-            {canCreate ? (
-              <button className="button" onClick={onCreate}>
-                <Plus size={16} aria-hidden="true" />
-                New project
-              </button>
-            ) : null}
-          </div>
         </div>
         {error ? (
           <div className="error-notice" role="alert">
@@ -153,6 +244,7 @@ export function DashboardOverview({
           <div className="dashboard-project-list">
             {visible.map(({ project, result, services }) => {
               const isCollapsed = collapsed.includes(project.id);
+              const failures = result.isSuccess ? services.filter(service => service.state === "failed").length : 0;
               return (
                 <section className="dashboard-project-group" key={project.id}>
                   <div className="dashboard-project-heading">
@@ -165,8 +257,9 @@ export function DashboardOverview({
                       <ChevronRight size={15} aria-hidden="true" />
                     </Link>
                     <div className="dashboard-project-meta">
+                      {failures > 0 ? <span className="badge status-failed">{failures} failed</span> : null}
                       <span>
-                        {result.data
+                        {result.isSuccess && result.data
                           ? `${filtered ? `${services.length}/` : ""}${result.data.length}`
                           : "—"}{" "}
                         {result.data?.length === 1 ? "service" : "services"}

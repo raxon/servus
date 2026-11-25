@@ -1,3 +1,4 @@
+import "./service-setup.css";
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -59,10 +60,12 @@ const kinds: {
 export function CreateService({
   projectId,
   admin,
+  serviceNames,
   onClose,
 }: {
   projectId: string;
   admin: boolean;
+  serviceNames: readonly string[];
   onClose: () => void;
 }) {
   const client = useQueryClient();
@@ -70,6 +73,11 @@ export function CreateService({
   const [kind, setKind] = useState<ServiceKind>("app");
   const [sourceType, setSourceType] = useState<SourceChoice>("image");
   const [name, setName] = useState("");
+  const nameBase = kind === "app" ? "web" : kind;
+  let defaultName: string = nameBase;
+  const existingNames = new Set(serviceNames);
+  for (let suffix = 2; existingNames.has(defaultName); suffix++) defaultName = `${nameBase}-${suffix}`;
+  const serviceName = name || defaultName;
   const [image, setImage] = useState("");
   const [hostname, setHostname] = useState("");
   const [port, setPort] = useState(80);
@@ -99,7 +107,7 @@ export function CreateService({
           ? { type: "git", repository: sourceType === "github" ? githubRepositoryUrl(githubRepository) : repository, branch, context, dockerfile, ...(generateEnv ? { envFile } : {}), ...(sshSource?{ssh:{knownHosts}}:sourceType === "github" && github.data?.connected ? {sharedGithub: true} : sourceType === "git" && privateGit ? { credential: { username: gitUsername, token: gitToken } } : {}) }
           : { type: "image" };
       const body: Omit<ServiceInput,'hostname'> & {hostname?:string} = {
-        name,
+        name: serviceName,
         kind,
         source,
         image:
@@ -107,7 +115,7 @@ export function CreateService({
           (source.type === "git"
             ? "panel-build:pending"
             : kinds.find((item) => item.kind === kind)!.image),
-        ...(kind==='app' && automaticDomain && !hostname?{}:{hostname:hostname || `${name}.localhost`}),
+        ...(kind==='app' && automaticDomain && !hostname?{}:{hostname:hostname || `${serviceName}.localhost`}),
         port,
         replicas: 1,
         ...(kind==='app'&&sourceType==='image'&&registry.registryEnabled?{registry:{server:registry.registryServer,username:registry.registryUsername,password:registry.registryPassword}}:{}),
@@ -143,6 +151,7 @@ export function CreateService({
       onClose={onClose}
     >
       <form
+        className="service-create-form"
         onSubmit={(event) => {
           event.preventDefault();
           if(sshSource&&!admin)return;
@@ -150,10 +159,12 @@ export function CreateService({
           mutation.mutate();
         }}
       >
+        <div className="service-create-body">
         <fieldset
           className="service-create-fields"
           disabled={mutation.isPending}
         >
+          <legend className="sr-only">Service configuration</legend>
           {sourceType === "github" && admin && github.isError ? <FeatureError error={github.error} /> : null}
           <div className="service-kind-grid">
             {kinds.map((item) => (
@@ -188,12 +199,11 @@ export function CreateService({
               onChange={(event) => {
                 setName(event.target.value);
               }}
-              pattern="[a-z0-9][a-z0-9-]*"
+              pattern={"[a-z0-9][a-z0-9\\-]*"}
               maxLength={63}
-              placeholder={kind === "app" ? "web" : kind}
-              required
+              placeholder={defaultName}
             />
-            <small>Use lowercase letters, numbers, and hyphens.</small>
+            <small>Leave blank to use {defaultName}. Custom names use lowercase letters, numbers, and hyphens.</small>
           </label>
           {kind === "app" ? <SourceChoiceFields value={sourceType} onChange={setSourceType} /> : null}
           {sourceType === "image" ? (<>
@@ -212,7 +222,7 @@ export function CreateService({
                   : "The selected engine requires a compatible database image."}
               </small>
             </label>
-            {kind==='app'?<RegistryFields value={registry} needsPassword onChange={patch=>setRegistry(value=>({...value,...patch}))}/>:null}
+            {kind==='app'?<details className="service-registry-settings"><summary>Private registry access{registry.registryEnabled ? ' (enabled)' : ''}</summary><RegistryFields value={registry} needsPassword onChange={patch=>setRegistry(value=>({...value,...patch}))}/></details>:null}
             </>
           ) : (
             <>
@@ -282,10 +292,10 @@ export function CreateService({
                 Hostname
                 <input
                   name="hostname"
-                  value={hostname || (!automaticDomain && name?`${name}.localhost`:'')}
+                  value={hostname || (automaticDomain ? "" : `${serviceName}.localhost`)}
                   onChange={(event) => setHostname(event.target.value)}
                   required={!automaticDomain}
-                  placeholder={automaticDomain?'Leave blank for an automatic HTTPS address':'web.localhost'}
+                  placeholder={automaticDomain ? "Leave blank for an automatic HTTPS address" : `${serviceName}.localhost`}
                   autoCapitalize="none"
                   autoCorrect="off"
                   spellCheck={false}
@@ -371,7 +381,19 @@ export function CreateService({
           </div>
           <FeatureError error={mutation.error} />
         </fieldset>
-        <div className="modal-footer">
+        <aside className="service-create-preview" aria-label="Service preview">
+          <h3>Service preview</h3>
+          <dl>
+            <div><dt>Name</dt><dd>{serviceName}</dd></div>
+            <div><dt>Source</dt><dd>{sourceType === "image" ? image || "Choose a Docker image" : `${sourceType === "github" ? githubRepository || "Choose a GitHub repository" : repository || "Enter a repository URL"} · ${branch || "Choose a ref"}`}</dd></div>
+            <div><dt>{kind === "app" ? "Address" : "Network"}</dt><dd>{kind !== "app" ? "Private project network" : hostname || (automaticDomain ? `Automatic HTTPS address under ${hostDomain.data?.hostname}, assigned on creation` : `${serviceName}.localhost (local use)`)}</dd></div>
+            <div><dt>Container port</dt><dd>{port || "Enter a port"}</dd></div>
+          </dl>
+          <p>{sshSource ? "Creation queues a deployment. Add the generated deploy public key to your repository before a Git build can succeed." : "Creation queues a deployment. The service becomes available after deployment succeeds."}</p>
+        </aside>
+        </div>
+        <div className="modal-footer service-create-footer">
+          <small>Creates the service and queues deployment.</small>
           <button className="button" type="button" onClick={onClose}>
             Cancel
           </button>

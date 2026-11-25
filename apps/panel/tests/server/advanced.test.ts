@@ -383,7 +383,7 @@ describe('v1 to v2 migration',()=>{
     db.prepare('INSERT INTO actions VALUES (?,?,?,?,?,?,?,?,?,?,?)').run('legacy-action','legacy','service','admin','deploy','queued','queued',null,'2026-01-01','2026-01-01',null);
     db.prepare('INSERT INTO jobs(id,action_id,service_id,snapshot,status,created_at) VALUES (?,?,?,?,?,?)').run('legacy-job','legacy-action','service',JSON.stringify(legacySnapshot),'queued','2026-01-01');
     db.close();const store=new Store(dir);cleanup.push(async()=>store.close());
-    expect(store.db.pragma('user_version',{simple:true})).toBe(8);expect(store.getProject('legacy')!.description).toBe('existing data');expect(store.getService('service')!.kind).toBe('app');
+    expect(store.db.pragma('user_version',{simple:true})).toBe(9);expect(store.getProject('legacy')!.description).toBe('existing data');expect(store.getService('service')!.kind).toBe('app');
     const recovered=store.claimNextJob('migration-worker',60000)!;expect(recovered.actionId).toBe('legacy-action');expect(recovered.snapshot).toEqual(legacySnapshot);
     expect(store.updateService('service',{expectedRevision:1,environment:[{name:'TOKEN',secret:true,value:'migration-secret-123'}]}).environment![0]!.secretRef).toBeTruthy();
   });
@@ -532,13 +532,24 @@ it('queues a historical deployment with the exact verified image and immutable o
 it('saves encrypted ACME settings only for administrators with CSRF protection',async()=>{
   const {app,headers,store}=await fixture();
   const url='/api/v1/settings/https';
-  expect((await app.inject({url,headers})).json()).toEqual({settings:null});
+  expect((await app.inject({url,headers})).json()).toEqual({settings:null,defaultEmail:'admin@example.test'});
   expect((await app.inject({method:'PUT',url,headers:{cookie:headers.cookie},payload:{email:'ops@example.com',staging:true}})).statusCode).toBe(403);
   const member=store.createUser('https-member@example.test',await hashPassword('member-testing-password'));const session=store.createSession(member.id);
   expect((await app.inject({method:'PUT',url,headers:{cookie:`panel_session=${session.token}`,'x-csrf-token':session.csrfToken},payload:{email:'ops@example.com',staging:true}})).statusCode).toBe(403);
-  expect((await app.inject({method:'PUT',url,headers,payload:{email:'invalid',staging:true}})).statusCode).toBe(400);
-  expect((await app.inject({method:'PUT',url,headers,payload:{email:'ops@example.com',staging:true}})).json()).toEqual({settings:{email:'ops@example.com',staging:true}});
-  expect(store.vault.httpsIngress()).toEqual({email:'ops@example.com',staging:true});
+  expect((await app.inject({method:'PUT',url,headers,payload:{email:'invalid',staging:false}})).statusCode).toBe(400);
+  expect((await app.inject({method:'PUT',url,headers,payload:{email:'ops@example.com',staging:true}})).statusCode).toBe(400);
+  expect(store.vault.httpsIngress()).toBeNull();
+  expect((await app.inject({method:'PUT',url,headers,payload:{email:'ops@example.com'}})).json()).toEqual({settings:{email:'ops@example.com',staging:false}});
+  expect(store.vault.httpsIngress()).toEqual({email:'ops@example.com',staging:false});
+  expect((await app.inject({url,headers})).json()).toEqual({settings:{email:'ops@example.com',staging:false},defaultEmail:'admin@example.test'});
+});
+
+it('preserves internal staging settings until an administrator explicitly saves production settings',async()=>{
+  const {app,headers,store}=await fixture(),url='/api/v1/settings/https';
+  store.vault.setHttpsIngress('internal@example.test',true);
+  expect((await app.inject({url,headers})).json()).toEqual({settings:{email:'internal@example.test',staging:true},defaultEmail:'admin@example.test'});
+  expect(store.vault.httpsIngress()).toEqual({email:'internal@example.test',staging:true});
+  expect((await app.inject({method:'PUT',url,headers,payload:{email:'production@example.test',staging:false}})).json()).toEqual({settings:{email:'production@example.test',staging:false}});
 });
 
 it('requires administrator confirmation before invoking an ingress migration or recovery',async()=>{

@@ -15,11 +15,13 @@ it('upgrades a v6 copy without changing sessions, existing secret ownership or q
   const created=source.createService(project.id,{name:'web',image:'nginx:alpine',hostname:'six.localhost',port:80,environment:[{name:'TOKEN',secret:true,value:'v6-fixture-secret'}]},user.id);
   const reference=created.service.environment![0]!.secretRef!;
   const prior=(source.db.prepare('SELECT snapshot FROM jobs WHERE action_id=?').get(created.action.id) as {snapshot:string}).snapshot;
-  source.db.exec(`DROP TABLE volume_restores; DROP TABLE volume_backups; DROP TABLE volume_backup_settings;
+  source.db.exec(`ALTER TABLE database_backup_settings DROP COLUMN profile_id; ALTER TABLE database_backup_settings DROP COLUMN encrypted; ALTER TABLE database_backup_settings DROP COLUMN retention_policy;
+    ALTER TABLE database_backups DROP COLUMN encrypted; ALTER TABLE database_backups DROP COLUMN plaintext_size;
+    DROP TABLE volume_restores; DROP TABLE volume_backups; DROP TABLE volume_backup_settings; DROP TABLE backup_storage_profiles;
     CREATE TABLE service_secret_refs_v6(reference TEXT PRIMARY KEY,service_id TEXT NOT NULL REFERENCES services(id),purpose TEXT NOT NULL CHECK(purpose IN ('unclassified','environment','database','git','legacy_shared','backup-storage')));
     INSERT INTO service_secret_refs_v6 SELECT * FROM service_secret_refs; DROP TABLE service_secret_refs; ALTER TABLE service_secret_refs_v6 RENAME TO service_secret_refs; PRAGMA user_version=6;`);source.close();
   cpSync(original,copy,{recursive:true});const migrated=new Store(copy);
-  expect(migrated.db.pragma('user_version',{simple:true})).toBe(8);
+  expect(migrated.db.pragma('user_version',{simple:true})).toBe(9);
   expect(migrated.getSession(session.token)?.user.id).toBe(user.id);
   expect(migrated.vault.getServiceSecret(reference,created.service.id,'environment')).toBe('v6-fixture-secret');
   expect((migrated.db.prepare('SELECT snapshot FROM jobs WHERE action_id=?').get(created.action.id) as {snapshot:string}).snapshot).toBe(prior);
@@ -37,7 +39,7 @@ it('migrates a copy of v4 with users, sessions, queued snapshots and legacy purp
   source.db.exec('ALTER TABLE service_secret_refs DROP COLUMN purpose; PRAGMA user_version=4');source.close();
   cpSync(original,copy,{recursive:true});
   const migrated=new Store(copy);
-  expect(migrated.db.pragma('user_version',{simple:true})).toBe(8);
+  expect(migrated.db.pragma('user_version',{simple:true})).toBe(9);
   expect(migrated.getSession(session.token)?.user.id).toBe(user.id);
   expect(migrated.getProject(project.id)?.name).toBe('before');
   expect(migrated.vault.getServiceSecret(envRef,env.service.id,'environment')).toBe('legacy-env-secret');
@@ -86,4 +88,28 @@ it('rejects a v4 reference used for both Git and environment without changing th
   store.db.exec('ALTER TABLE service_secret_refs DROP COLUMN purpose; PRAGMA user_version=4');store.close();
   expect(()=>new Store(root)).toThrow('Git credential has conflicting legacy purposes');
   const db=new Database(join(root,'panel.sqlite'),{readonly:true});expect(db.pragma('user_version',{simple:true})).toBe(4);db.close();
+});
+it('upgrades a v8 copy to v9 with backup profiles and encryption defaults while leaving the original untouched',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'schema-v8-to-v9-'));roots.push(root);
+  const original=join(root,'original'),copy=join(root,'copy');
+  const source=new Store(original),user=source.createUser('eight@example.test',await hashPassword('migration-password'),'admin'),session=source.createSession(user.id),project=source.createProject('before-nine');
+  const database=source.createService(project.id,{name:'db',image:'postgres:17',hostname:'db.internal',port:5432,kind:'postgres',domains:[],database:{database:'app',user:'app',password:'v8-db-secret'}},user.id);
+  const dbRef=database.service.database!.passwordSecretRef!;
+  source.db.prepare(`INSERT INTO database_backup_settings(service_id,actor_id,enabled,cron,retention,last_tick,updated_at,destination_ref) VALUES(?,?,1,'0 2 * * *',7,'2026-11-17T02:00','2026-11-17T02:00:00.000Z',NULL)`).run(database.service.id,user.id);
+  source.db.prepare(`INSERT INTO database_backups(id,service_id,actor_id,name,status,trigger,idempotency_key,request_hash,created_at,finished_at,size,sha256,extension,error,owner_id,lease_until,destination_ref,object_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run('11111111-1111-4111-8111-111111111111',database.service.id,user.id,'pre-v9','succeeded','manual','manual:v8','hash','2026-11-17T02:00:00.000Z','2026-11-17T02:00:05.000Z',128,'a'.repeat(64),'dump',null,null,null,null,null);
+  source.db.exec(`ALTER TABLE database_backup_settings DROP COLUMN profile_id; ALTER TABLE database_backup_settings DROP COLUMN encrypted; ALTER TABLE database_backup_settings DROP COLUMN retention_policy;
+    ALTER TABLE database_backups DROP COLUMN encrypted; ALTER TABLE database_backups DROP COLUMN plaintext_size;
+    ALTER TABLE volume_backup_settings DROP COLUMN profile_id; DROP TABLE backup_storage_profiles; PRAGMA user_version=8;`);source.close();
+  cpSync(original,copy,{recursive:true});
+  const migrated=new Store(copy);
+  expect(migrated.db.pragma('user_version',{simple:true})).toBe(9);
+  expect(migrated.getSession(session.token)?.user.id).toBe(user.id);
+  expect(migrated.vault.getServiceSecret(dbRef,database.service.id,'database')).toBe('v8-db-secret');
+  expect(migrated.db.prepare('SELECT profile_id,encrypted,retention_policy FROM database_backup_settings WHERE service_id=?').get(database.service.id)).toEqual({profile_id:null,encrypted:0,retention_policy:null});
+  expect(migrated.db.prepare('SELECT encrypted,plaintext_size FROM database_backups WHERE id=?').get('11111111-1111-4111-8111-111111111111')).toEqual({encrypted:0,plaintext_size:null});
+  expect((migrated.db.prepare('PRAGMA table_info(volume_backup_settings)').all() as {name:string}[]).map(row=>row.name)).toContain('profile_id');
+  expect(migrated.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='backup_storage_profiles'").get()).toEqual({name:'backup_storage_profiles'});
+  migrated.close();
+  const unchanged=new Database(join(original,'panel.sqlite'),{readonly:true});expect(unchanged.pragma('user_version',{simple:true})).toBe(8);unchanged.close();
 });

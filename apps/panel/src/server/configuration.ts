@@ -5,6 +5,7 @@ import type { ServiceConfiguration, ServiceInput, ServicePatch } from '../shared
 import { AppError } from './errors.js';
 import { canonicalDnsName } from '../agent/acme/dns01.js';
 import { validEnvFilePath } from '../shared/build-options.js';
+import { databaseAccessSchema, databasePortAllowed } from '../shared/database-access.js';
 import {registryCredentialSchema,gitSshCredentialSchema,canonicalRegistry,imageRegistry,normalizeKnownHosts,parseSshRepository} from '../shared/source-credentials.js';
 
 export const nameSchema = z.string().min(1).max(63).regex(/^[a-z0-9][a-z0-9-]*$/, 'Use lowercase letters, numbers and hyphens');
@@ -21,7 +22,7 @@ const domainSchema = z.object({hostname:hostnameSchema,port:z.number().int().min
 const mountSchema = z.object({type:z.enum(['volume','file','bind']),name:nameSchema,target:targetSchema,readOnly:z.boolean().optional(),content:z.string().max(32000).optional(),source:z.string().max(1000).optional()}).strict();
 const resourcesSchema = z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).strict();
 const databaseSchema = z.object({database:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),user:z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/).max(63),password:z.string().min(12).max(128).optional(),passwordSecretRef:z.string().uuid().optional()}).strict();
-const fields={kind:kindSchema.optional(),source:sourceSchema.optional(),environment:z.array(envSchema).max(100).optional(),domains:z.array(domainSchema).max(20).optional(),mounts:z.array(mountSchema).max(20).optional(),resources:resourcesSchema.optional(),database:databaseSchema.optional(),registry:registryCredentialSchema.nullable().optional()};
+const fields={kind:kindSchema.optional(),source:sourceSchema.optional(),environment:z.array(envSchema).max(100).optional(),domains:z.array(domainSchema).max(20).optional(),mounts:z.array(mountSchema).max(20).optional(),resources:resourcesSchema.optional(),database:databaseSchema.optional(),databaseAccess:databaseAccessSchema.optional(),registry:registryCredentialSchema.nullable().optional()};
 export const newServiceSchema=z.object({name:nameSchema,image:imageSchema.optional(),port:z.number().int().min(1).max(65535).optional(),hostname:hostnameSchema.optional(),replicas:z.number().int().min(1).max(5).default(1),...fields}).strict();
 export const servicePatchSchema=z.object({expectedRevision:z.number().int().positive(),image:imageSchema.optional(),port:z.number().int().min(1).max(65535).optional(),hostname:hostnameSchema.optional(),replicas:z.number().int().min(1).max(5).optional(),...fields}).strict();
 
@@ -41,6 +42,11 @@ export function normalizeServiceInput(value: unknown): ServiceInput {
 
 export function validateConfiguration(config: ServiceConfiguration & {replicas?:number}) {
   const kind=config.kind??'app';
+  if(config.databaseAccess!==undefined) {
+    if(kind==='app')throw new AppError('DATABASE_ACCESS','External database access belongs to managed databases');
+    databaseAccessSchema.parse(config.databaseAccess);
+    if(config.databaseAccess.enabled && !databasePortAllowed(config.databaseAccess.publishedPort,Number(process.env.PANEL_PORT??4180)))throw new AppError('DATABASE_PORT_RESERVED','This TCP port is reserved for the panel API');
+  }
   if(config.registry){if(kind!=='app'||config.source?.type==='git')throw new AppError('REGISTRY_SOURCE','Private registry credentials are available for application image sources');if('image'in config&&canonicalRegistry(config.registry.server)!==imageRegistry(String(config.image)))throw new AppError('REGISTRY_MISMATCH','Registry credentials must match the image registry');}
   const unique=(values:string[],name:string)=>{if(new Set(values).size!==values.length)throw new AppError('DUPLICATE_CONFIG',`${name} must be unique`);};
   unique((config.environment??[]).map(item=>item.name),'Environment names');
@@ -89,7 +95,7 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
 }
 
 export function configurationOf(input: ServiceConfiguration): ServiceConfiguration {
-  return {kind:input.kind??'app',source:input.source??{type:'image'},environment:input.environment??[],domains:input.domains,mounts:(input.mounts??[]).map(mount=>({...mount,readOnly:mount.readOnly??mount.type==='file'})),resources:input.resources,database:input.database,registry:input.registry};
+  return {kind:input.kind??'app',source:input.source??{type:'image'},environment:input.environment??[],domains:input.domains,mounts:(input.mounts??[]).map(mount=>({...mount,readOnly:mount.readOnly??mount.type==='file'})),resources:input.resources,database:input.database,databaseAccess:input.databaseAccess,registry:input.registry};
 }
 
 export function parseServicePatch(value:unknown): ServicePatch { return servicePatchSchema.parse(value); }

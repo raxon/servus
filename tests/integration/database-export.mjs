@@ -16,10 +16,12 @@ const user=store.createUser('fixture@example.test',await hashPassword('fixture-p
 const project=store.createProject('fixture');
 const {service}=store.createService(project.id,normalizeServiceInput({name:'database',kind:'postgres',database:{database:'app',user:'app'}}),user.id);
 const job=store.claimNextJob('worker',60000);assert(job);store.completeAction(job.actionId,'worker',{state:'running',deployedRevision:job.snapshot.revision});
-const agentRequest=async path=>{
+const agentRequest=async (path,payload)=>{
   if(path.includes('/metrics'))return {cpuPercent:0,memoryBytes:0,memoryLimitBytes:0,networkRxBytes:0,networkTxBytes:0,containers:1};
   if(path.includes('/containers'))return [];
   if(path.includes('/logs'))return {lines:[]};
+  if(path.endsWith('/database-network'))return {aliases:[service.name],publishedPort:null,revision:service.deployedRevision??1};
+  if(path.endsWith('/database-port-suggestion'))return {port:payload.candidates[0]};
   throw new Error('Unexpected agent request');
 };
 const databaseExport=async()=>Object.assign(Readable.from([Buffer.from('fixture-export')]),{headers:{'content-length':'14','x-export-extension':'dump'}});
@@ -70,7 +72,53 @@ try {
     await page.getByLabel('Email address').fill('fixture@example.test');
     await page.getByLabel('Password',{exact:true}).fill('fixture-password');
     await page.getByRole('button',{name:'Sign in',exact:true}).click();
-    const section=page.locator('section').filter({has:page.getByRole('heading',{name:'Database connection'})});
+    await page.getByRole('heading',{name:'Database connection'}).waitFor();
+    const connection=page.locator('section').filter({has:page.getByRole('heading',{name:'Database connection',exact:true})});
+    await connection.getByText('database',{exact:true}).waitFor();
+    const access=connection.getByRole('region',{name:'External access',exact:true});
+    await access.getByText('Private',{exact:true}).waitFor();
+    const toggle=access.getByRole('switch',{name:'Expose database over TCP',exact:true});
+    const portInput=access.getByRole('spinbutton',{name:'External port',exact:true});
+    if (viewport.width === 1440) {
+      assert.equal(await portInput.count(),0);
+      await toggle.focus();
+      await toggle.press('Space');
+      await portInput.waitFor();
+      assert.equal(store.getService(service.id).databaseAccess,undefined);
+      await portInput.fill('4180');
+      await access.getByRole('button',{name:'Save access'}).click();
+      assert.equal(await portInput.evaluate(input=>input.validity.customError),true);
+      assert.equal(store.getService(service.id).databaseAccess,undefined);
+      const suggestion=page.waitForResponse(response=>response.url().endsWith('/database-port-suggestion'));
+      await access.getByRole('button',{name:'Suggest free port'}).click();
+      const suggested=await suggestion;
+      assert.equal(suggested.status(),200);
+      const {port: available}=await suggested.json();
+      await access.getByText(`Port ${available} was free when checked.`,{exact:true}).waitFor();
+      assert.equal(await portInput.inputValue(),String(available));
+      assert.equal(store.getService(service.id).databaseAccess,undefined);
+      await access.getByRole('button',{name:'Save access'}).click();
+      await access.getByText(`TCP port ${available} saved. Deploy to apply the change.`).waitFor();
+      assert.equal(store.getService(service.id).databaseAccess.publishedPort,available);
+      assert.equal(store.getService(service.id).deployedRevision,1);
+    }
+    await portInput.waitFor();
+    const savedPort=await portInput.inputValue();
+    await toggle.press('Space');
+    await portInput.waitFor({state:'hidden'});
+    await access.getByRole('button',{name:'Discard',exact:true}).click();
+    await portInput.waitFor();
+    assert.equal(await portInput.inputValue(),savedPort);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    await access.screenshot({path:`/tmp/servus-external-access-${viewport.width}.png`});
+    assert.equal(await page.getByText('Database export',{exact:true}).count(),0);
+    if (viewport.width <= 768) {
+      await page.getByRole('button',{name:/^Section:/}).click();
+      await page.getByRole('dialog',{name:'Service sections'}).getByRole('link',{name:'Backups',exact:true}).click();
+    } else {
+      await page.getByRole('navigation',{name:'Service sections'}).getByRole('link',{name:'Backups',exact:true}).click();
+    }
+    const section=page.getByRole('region',{name:'Export and restore'});
     await section.getByText('Database export').waitFor();
     const downloadPromise=page.waitForEvent('download');
     await section.getByRole('button',{name:'Download',exact:true}).click();

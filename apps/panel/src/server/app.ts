@@ -5,13 +5,15 @@ import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomInt } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
 import type { ActionType, RuntimeStatus, User } from '../shared/types.js';
 import { hashPassword, verifyPassword } from './auth.js';
 import { AppError } from './errors.js';
+import { reservedDatabasePorts } from './database-access.js';
+import { databasePortAllowed } from '../shared/database-access.js';
 import { Store } from './store.js';
 import { inspectDomainDns } from './domain-dns.js';
 import { inspectDomainTls } from './domain-tls.js';
@@ -19,7 +21,6 @@ import { canonicalDnsName } from '../agent/acme/dns01.js';
 import { nameSchema, normalizeServiceInput, parseServicePatch, validateConfiguration } from './configuration.js';
 import { agentRequest as defaultAgentRequest, agentDatabaseExport, agentDatabaseUpload, AgentRequestError } from '../agent/client.js';
 import { registerConsole } from './console.js';
-import { registerCentralAuth } from './central-auth.js';
 import { HostDomainManager, registerHostDomainRoutes, withAutomaticHostDomain, type HostDomainOptions } from './host-domain.js';
 import { isHostApplication } from '../shared/host-domain.js';
 import { BUILD_INFO } from './generated-build-info.js';
@@ -207,12 +208,11 @@ export async function createApp(options: AppOptions) {
     return {success:true};
   });
   apiTokens.register(app,session);
-  registerBackups(app,{store,serviceAccess,agentConnection:options.agentConnection,databaseExport:options.databaseExport,maintenance});
+  registerBackups(app,{store,serviceAccess,session,agentConnection:options.agentConnection,databaseExport:options.databaseExport,maintenance});
   registerVolumeBackups(app,{store,serviceAccess,agentConnection:options.agentConnection,agentRequest:runtimeRequest,maintenance});
   const compose=registerCompose(app,{store,session:req=>session(req,!['GET','HEAD','OPTIONS'].includes(req.method)),projectAccess,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance});
   registerTemplates(app,{session,projectAccess,createWorkload:compose.createWorkload});
   await registerDeployWebhooks(app,{store,serviceAccess});
-  registerCentralAuth(app,{store,allowedOrigins,secureCookies:options.secureCookies??false,session,setSession});
   registerHostDomainRoutes(app,hostDomains,session);
 
   function administrator(req:FastifyRequest,mutation=false) {
@@ -246,12 +246,17 @@ export async function createApp(options: AppOptions) {
     if (configuration.source?.type === 'git' && configuration.source.sharedGithub && user.role !== 'admin') throw new AppError('FORBIDDEN','Only administrators can configure the shared GitHub connection',403);
     if(configuration.source?.type==='git'&&configuration.source.ssh&&user.role!=='admin')throw new AppError('FORBIDDEN','Only administrators can configure SSH deploy keys and trusted host keys',403);
   }
+  function approveDatabaseAccess(user:User, configuration:import('../shared/types.js').ServiceConfiguration) {
+    if(configuration.databaseAccess!==undefined && user.role!=='admin')throw new AppError('FORBIDDEN','Only administrators can configure external database access',403);
+  }
   app.get(`${prefix}/settings/https`,async req=>{
-    administrator(req);return {settings:store.vault.httpsIngress()};
+    administrator(req);
+    const administratorEmail=(store.db.prepare("SELECT email FROM users WHERE role='admin' ORDER BY created_at LIMIT 1").get() as {email:string}).email;
+    return {settings:store.vault.httpsIngress(),defaultEmail:administratorEmail};
   });
   app.put(`${prefix}/settings/https`,{config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async req=>{
     const actor=administrator(req,true);
-    const input=z.object({email:z.string().email().max(254),staging:z.boolean()}).strict().parse(req.body);
+    const input=z.object({email:z.string().email().max(254),staging:z.literal(false).default(false)}).strict().parse(req.body);
     try {store.vault.setHttpsIngress(input.email,input.staging);} catch {throw new AppError('INVALID_HTTPS_SETTINGS','Enter a valid ACME contact email',400);}
     store.recordAudit(actor.id,'settings.https.set','https');
     return {settings:store.vault.httpsIngress()};
@@ -315,6 +320,7 @@ export async function createApp(options: AppOptions) {
     const input=normalizeServiceInput(withAutomaticHostDomain(store,req.params.id,req.body));
     approveBindMounts(user,input);
     approveSharedGithub(user,input);
+    approveDatabaseAccess(user,input);
     const result=store.createService(req.params.id,input,user.id,key);
     return reply.code(202).send(result);
   });
@@ -399,6 +405,7 @@ export async function createApp(options: AppOptions) {
     const input=parseServicePatch(req.body);
     approveBindMounts(auth.user,input);
     approveSharedGithub(auth.user,input);
+    approveDatabaseAccess(auth.user,input);
     if (input.source && auth.user.role !== 'admin' && service.source?.type === 'git' && service.source.sharedGithub) throw new AppError('FORBIDDEN','Only administrators can change a source using the shared GitHub connection',403);
     if(input.source&&auth.user.role!=='admin'&&service.source?.type==='git'&&service.source.ssh)throw new AppError('FORBIDDEN','Only administrators can change a source using an SSH deploy key',403);
     if (input.source?.type === 'git' && input.source.credential?.secretRef) {
@@ -447,8 +454,47 @@ export async function createApp(options: AppOptions) {
     return {action,events:store.getEvents(action.id)};
   });
   app.get(`${prefix}/runtime`, async req => {session(req);return options.runtimeStatus ? options.runtimeStatus() : {online:false,error:'Runtime agent is not connected'};});
-  app.get<{Params:{id:string}}>(`${prefix}/services/:id/connection`,async req=>{serviceAccess(req,req.params.id);return store.connectionInfo(req.params.id);});
-  app.post<{Params:{id:string}}>(`${prefix}/services/:id/connection/reveal`,async req=>{const {auth}=serviceAccess(req,req.params.id,true);const result=store.connectionInfo(req.params.id,true);store.recordAudit(auth.user.id,'connection.reveal',req.params.id);return result;});
+  async function databaseConnection(service:import('../shared/types.js').Service) {
+    const result=store.connectionInfo(service.id);
+    try {
+      const status=z.object({aliases:z.array(z.string().max(253)).max(100),publishedPort:z.number().int().min(1).max(65535).nullable(),revision:z.number().int().positive()}).strict().parse(await runtimeRequest(`/services/${service.id}/database-network`,undefined,{...options.agentConnection,timeoutMs:5_000}));
+      const access=result.externalAccess!.deployed;
+      if(status.revision===result.deployedRevision && status.publishedPort===(access.enabled?access.publishedPort:null)) {
+        result.runtimeVerified=true;
+        if(status.aliases.includes(service.name))result.host=service.name;
+      }
+    } catch { /* Keep the stable Swarm service DNS name when live state is unavailable. */ }
+    return result;
+  }
+  app.get<{Params:{id:string}}>(`${prefix}/services/:id/database-port-suggestion`, {config:{rateLimit:{max:10,timeWindow:'1 minute'}}}, async req => {
+    const authorize=()=>{
+      if(req.headers.authorization!==undefined)throw new AppError('FORBIDDEN','Use an administrator session to suggest a database port',403);
+      administrator(req);
+      const result=serviceAccess(req,req.params.id);
+      projectAccess(result.auth.user,result.service.projectId,true);
+      if(!['postgres','mariadb','redis'].includes(result.service.kind??''))throw new AppError('DATABASE_REQUIRED','Port suggestions are available only for managed databases',400);
+      return result.service;
+    };
+    const service=authorize();
+    z.object({}).strict().parse(req.query);
+    const reserved=reservedDatabasePorts(store), candidates:number[]=[], start=randomInt(10000,65536);
+    for(let offset=0;offset<55536 && candidates.length<64;offset++) {
+      const port=10000+(start-10000+offset)%55536;
+      if(databasePortAllowed(port,Number(process.env.PANEL_PORT??4180))&&!reserved.has(port))candidates.push(port);
+    }
+    if(!candidates.length)throw new AppError('DATABASE_PORT_UNAVAILABLE','No unreserved database TCP port could be found. Free a port and try again.',409);
+    let response:unknown;
+    try {response=await runtimeRequest(`/services/${service.id}/database-port-suggestion`,{candidates},{...options.agentConnection,timeoutMs:20_000});}
+    catch {authorize();throw new AppError('DATABASE_PORT_CHECK_UNAVAILABLE','Could not verify free TCP ports on the panel server. Check the agent and Docker connection, then try again.',503);}
+    authorize();
+    const result=z.object({port:z.number().int().nullable()}).strict().safeParse(response);
+    if(!result.success || (result.data.port!==null&&!candidates.includes(result.data.port)))throw new AppError('DATABASE_PORT_CHECK_UNAVAILABLE','The agent returned an invalid TCP port check. Try again.',503);
+    const port=result.data.port;
+    if(port===null || reservedDatabasePorts(store).has(port))throw new AppError('DATABASE_PORT_UNAVAILABLE','No free TCP port was found in this check. Try again to check another range.',409);
+    return {port};
+  });
+  app.get<{Params:{id:string}}>(`${prefix}/services/:id/connection`,async req=>{const {service}=serviceAccess(req,req.params.id);const result=await databaseConnection(service);serviceAccess(req,req.params.id);return result;});
+  app.post<{Params:{id:string}}>(`${prefix}/services/:id/connection/reveal`,async req=>{const {service}=serviceAccess(req,req.params.id,true);const result=await databaseConnection(service);const {auth}=serviceAccess(req,req.params.id,true);result.password=store.connectionInfo(req.params.id,true).password;store.recordAudit(auth.user.id,'connection.reveal',req.params.id);return result;});
   app.post<{Params:{id:string}}>(`${prefix}/services/:id/database-export`,async(req,reply)=>{
     const {auth,service}=serviceAccess(req,req.params.id,true);
     z.object({}).strict().parse(req.body??{});

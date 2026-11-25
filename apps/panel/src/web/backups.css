@@ -24,3 +24,68 @@
 .backup-history .detail-row strong { font-size:14px; }
 .backup-history li > div > .button { margin:10px 6px 0 0; }
 @media (max-width:600px) { .backup-section { padding:18px; } .database-backups input:not([type="checkbox"]):not([type="radio"]), .database-backups select { font-size:16px; min-height:48px; } .database-backups .button { min-height:44px; } }
+
+/* Backup configuration follows Servus' quiet surfaces and green action color. */
+.database-backups { max-width:1040px; gap:18px; }
+.database-backups > .backup-section { padding:26px 28px; border-color:#dce3dc; border-radius:13px; box-shadow:0 2px 3px #203d2703; }
+.database-backups .backup-section form { max-width:none; gap:10px; }
+.backup-overview { display:flex; align-items:center; justify-content:space-between; gap:20px; min-width:0; }
+.backup-overview > div { min-width:0; }
+.database-backups .backup-overview h2 { font-size:21px; letter-spacing:-.55px; font-weight:600; }
+.backup-eyebrow { display:block; margin-bottom:7px; font-size:10px; font-weight:650; line-height:1.5; letter-spacing:1.25px; color:#68776b; }
+.backup-status { display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; gap:7px; padding:5px 10px; border:1px solid #dce3dc; border-radius:20px; font-size:11px; color:#526156; white-space:nowrap; background:#f8faf7; }
+.backup-status-dot { height:6px; width:6px; background:#8b968d; border-radius:50%; }
+.backup-status-dot.active { background:#25834c; }
+.backup-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); margin:0; padding:15px 0; border-top:1px solid #e7ece5; border-bottom:1px solid #e7ece5; gap:18px; }
+.backup-summary > div { display:flex; gap:10px; color:#6e7e71; align-items:flex-start; }
+.backup-summary span { font-size:12px; color:var(--ink); line-height:1.4; }
+.backup-summary small { display:block; color:var(--muted); font-size:11px; margin-top:4px; }
+.database-backups form > label,.backup-field-pair label { color:#47544b; font-size:12px; font-weight:550; }
+.database-backups input:not([type=checkbox]):not([type=radio]),.database-backups select { min-height:42px; font-size:14px; border-color:#aeb9af; border-radius:7px; padding:9px 12px; }
+.database-backups input[type=time],.database-backups input[type=number] { max-width:220px; }
+.database-backups :is(input,select,button,a):focus-visible { outline:2px solid #227a49; outline-offset:3px; }
+.backup-settings-link { display:inline-flex; align-items:center; gap:4px; color:#356544; font-size:12px; font-weight:550; white-space:nowrap; text-decoration:none; min-height:44px; }
+.backup-settings-link:hover { text-decoration:underline; }
+.backup-enable { margin:8px 0; padding:15px 16px; border:1px solid #e0e7df; background:#f8faf6; border-radius:9px; }
+.backup-enable label { flex:1; font-weight:550; }
+.backup-enable small { display:block; color:var(--muted); font-size:12px; font-weight:400; margin-top:2px; }
+.backup-enable input[role=switch] { appearance:none; width:32px; height:19px; border-radius:20px; border:1px solid #91a293; background:#b4beb4; position:relative; flex-shrink:0; cursor:pointer; }
+.backup-enable input[role=switch]::after { content:""; position:absolute; width:13px; height:13px; background:#fff; top:2px; left:2px; border-radius:50%; transition:transform .15s; }
+.backup-enable input[role=switch]:checked { background:#2c7846; border-color:#2c7846; }
+.backup-enable input[role=switch]:checked::after { transform:translateX(13px); }
+.backup-presets { display:flex; flex-wrap:wrap; padding:0; margin:6px 0; border:0; gap:8px; }
+.backup-presets legend { margin-bottom:9px; font-size:12px; font-weight:550; color:#47544b; }
+.backup-presets label { display:flex; align-items:center; gap:7px; min-height:40px; padding:6px 12px; border:1px solid #cbd5c9; border-radius:7px; font-size:12px; cursor:pointer; }
+.backup-presets label.selected { border-color:#518761; background:#eef5eb; color:#235b35; }
+.backup-presets input { accent-color:#227a49; margin:0; }
+.backup-encryption { margin:10px 0 4px; padding:13px 16px; border:1px solid #e0e7df; border-radius:9px; }
+.backup-encryption label { display:flex; align-items:center; gap:7px; font-weight:550; }
+.backup-encryption .feature-helper { margin-left:28px; }
+.backup-field-pair { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+.backup-field-pair > div { display:grid; align-content:start; gap:6px; }
+.backup-gfs { grid-template-columns:repeat(3,minmax(0,1fr)); margin-top:8px; }
+.backup-notice { border-left:3px solid #b7bf8e; padding:8px 12px; background:#f8f9ed; color:#657046; font-size:12px; }
+.backup-empty { display:grid; justify-items:center; text-align:center; padding:28px 18px; gap:10px; color:#718171; border:1px dashed #d2ddcf; border-radius:10px; background:#fafcf8; }
+.backup-empty h3 { color:#435347; }
+.backup-empty p { color:var(--muted); max-width:430px; font-size:13px; }
+.backup-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:10px; }
+@media (max-width:600px) {
+  .database-backups > .backup-section { padding:20px 17px; }
+  .backup-overview { align-items:flex-start; flex-wrap:wrap; gap:10px; }
+  .backup-summary { grid-template-columns:1fr; gap:14px; }
+  .backup-field-pair { grid-template-columns:1fr; }
+  .backup-gfs { grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+  .backup-gfs label { font-size:11px; }
+  .backup-enable { flex-wrap:wrap; padding:12px; }
+  .backup-enable .backup-status { margin-left:28px; }
+  .backup-encryption .feature-helper { margin-left:0; }
+  .database-backups input:not([type=checkbox]):not([type=radio]),.database-backups select { font-size:16px; min-height:48px; }
+  .backup-presets label { min-height:44px; }
+}
+@media (prefers-reduced-motion:reduce) { .backup-enable input[role=switch]::after { transition:none; } }
+.backup-gfs { grid-template-columns:repeat(5,minmax(0,1fr)); }
+@media (max-width:750px) { .backup-gfs { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+@media (max-width:420px) { .backup-gfs { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+.database-backups label { margin-bottom:0; }
+.backup-presets input[type=radio] { display:inline-block; width:14px; height:14px; min-width:14px; min-height:0; padding:0; border:0; flex:0 0 14px; }
+.backup-toggle input[type=checkbox] { min-height:0; padding:0; flex-shrink:0; }

@@ -131,3 +131,16 @@ it('rechecks access after asynchronous volume destination validation before seal
   const pending=app.inject({method:'PUT',url:`${base}/volume-backup-destination`,headers,payload:{mountTarget:'/data',destination:{type:'s3',provider:'s3',endpoint:'https://s3.example.test',region:'us-east-1',bucket:'backup-fixture',prefix:'',accessKeyId:'fixture-access',secretAccessKey:'fixture-secret'}}}).then(response=>response);
   await vi.waitFor(()=>expect(validation).toHaveBeenCalled());store.addMember(project.id,member.id,'viewer');release();expect((await pending).statusCode).toBe(404);expect(store.db.prepare("SELECT 1 FROM service_secret_refs WHERE service_id=? AND purpose='backup-storage'").get(service.id)).toBeUndefined();
 });
+
+
+it('selects shared local profiles without changing existing volume archives or restore behavior',async()=>{
+  const {app,base,headers,backup}=await fixture(),url='/api/v1/backup-storage';
+  const archive=await backup();
+  const created=await app.inject({method:'POST',url,headers,payload:{name:'Local recovery',destination:{type:'local'}}});expect(created.statusCode).toBe(201);const profileId=created.json().profile.id;
+  const selected=await app.inject({method:'PUT',url:`${base}/volume-backup-destination`,headers,payload:{mountTarget:'/data',profileId}});expect(selected.statusCode).toBe(200);expect(selected.json()).toMatchObject({profileId,profileName:'Local recovery',legacy:false,destination:{type:'local'}});
+  expect((await app.inject({method:'DELETE',url:`${url}/${profileId}`,headers})).statusCode).toBe(200);
+  expect((await app.inject({url:`${base}/volume-backup-destination?mountTarget=%2Fdata`,headers})).json()).toMatchObject({profileId,profileName:'Local recovery'});
+  expect((await app.inject({url:`${base}/volume-backups/${archive}/download`,headers})).rawPayload.toString()).toBe('archive-fixture');
+  const prepared=await app.inject({method:'POST',url:`${base}/volume-backups/${archive}/restore`,headers:{...headers,'idempotency-key':'profile-restore'},payload:{}});expect(prepared.statusCode).toBe(202);
+  await vi.waitFor(async()=>expect((await app.inject({url:`${base}/volume-restores`,headers})).json().restores[0].phase).toBe('prepared'));
+});

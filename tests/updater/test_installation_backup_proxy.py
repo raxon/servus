@@ -25,6 +25,31 @@ class InstallationProxyTest(unittest.TestCase):
             call()
         self.assertEqual(caught.exception.code, code)
 
+    def test_history_is_read_only_bounded_ordered_and_strictly_redacted(self):
+        page = {'operations': [OPERATION], 'nextCursor': ID}
+        frame = {'version': 1, 'status': 'history', 'history': page}
+        with mock.patch.object(updater, 'supervisor_request', return_value=frame) as request:
+            self.assertEqual(self.proxy.history(None), page)
+            request.assert_called_once_with('/run/servus-supervisor/command',
+                {'version': 1, 'type': 'installation_backup_history', 'cursor': None}, 2)
+        for bad in ({'operations': [OPERATION, OPERATION], 'nextCursor': None},
+                    {'operations': [{**OPERATION, 'snapshotPath': '/root/private'}], 'nextCursor': None},
+                    {'operations': [], 'nextCursor': ID}, {'operations': [OPERATION], 'nextCursor': ACTOR}):
+            with mock.patch.object(updater, 'supervisor_request', return_value={**frame, 'history': bad}):
+                self.assert_code('unavailable', lambda: self.proxy.history(None))
+        with mock.patch.object(updater, 'supervisor_request', return_value=frame):
+            self.assert_code('unavailable', lambda: self.proxy.history(ID))
+        with mock.patch.object(updater, 'supervisor_request', return_value={'version': 1, 'status': 'failed'}):
+            self.assert_code('invalid_request', lambda: self.proxy.history(None))
+        with mock.patch.object(updater, 'supervisor_request') as request:
+            self.assert_code('invalid_request', lambda: self.proxy.history('../escape'))
+            request.assert_not_called()
+        proxy = SimpleNamespace(history=mock.Mock(return_value=page))
+        message = {'version': 1, 'action': 'installation_backup_history', 'cursor': None}
+        self.assert_code('unavailable', lambda: updater.process(None, message, installation_backups=proxy))
+        self.assertEqual(updater.process(None, message, allow_apply=True, installation_backups=proxy), page)
+        self.assert_code('invalid_request', lambda: updater.process(None, {**message, 'path': '/etc'}, allow_apply=True, installation_backups=proxy))
+
     def test_forwards_only_receipt_and_returns_redacted_correlated_operation(self):
         with mock.patch.object(updater, 'supervisor_request', return_value={'version': 1, 'status': 'queued', 'backup': OPERATION}) as request:
             self.assertEqual(self.proxy.submit(APPROVAL), OPERATION)

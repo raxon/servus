@@ -1,1 +1,29 @@
 .installation-backups{margin-block:24px}.installation-backups>p{max-width:72ch}.installation-backups form{display:grid;gap:10px;max-width:500px;margin-block-start:18px}.installation-backups input{font-size:16px;min-height:48px}.installation-backups .button{min-height:44px;white-space:normal}.installation-backups form .button{justify-self:start}.installation-backups .installation-backup-progress{border-block-start:1px solid var(--border);margin-block:18px;padding-block-start:18px}.installation-backup-progress h3:focus-visible{outline:2px solid var(--green);outline-offset:4px}.installation-backup-progress dl{display:grid;gap:10px;margin-block:14px}.installation-backup-progress dl>div{display:grid;grid-template-columns:140px minmax(0,1fr);gap:12px}.installation-backup-progress dt{color:var(--muted)}.installation-backup-progress dd{margin:0;overflow-wrap:anywhere}.installation-backup-progress code{white-space:normal;overflow-wrap:anywhere}.installation-backup-progress .button+.button{margin-inline-start:8px}.installation-backups input[aria-invalid=true]{border-color:var(--orange)}@media(max-width:600px){.installation-backup-progress dl>div{grid-template-columns:1fr;gap:4px}.installation-backup-progress .button+.button{margin-inline-start:0;margin-block-start:8px}.installation-backups .button{width:100%}}
+
+.installation-backup-history{border-block-start:1px solid var(--border);margin-block-start:24px;padding-block-start:20px;min-width:0}
+.installation-backup-history-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.installation-backup-history-heading h3{margin:0}
+.installation-backup-history-table{overflow:auto;max-inline-size:100%;max-block-size:560px;margin-block:16px;container-type:inline-size}
+.installation-backup-history-table:focus-visible{outline:2px solid var(--green);outline-offset:2px}
+.installation-backup-history table{width:100%;border-collapse:separate;border-spacing:0;font-size:14px}
+.installation-backup-history th,.installation-backup-history td{padding:12px;text-align:start;vertical-align:top;border-block-end:1px solid var(--border);overflow-wrap:anywhere;min-width:120px}
+.installation-backup-history thead{position:sticky;inset-block-start:0;z-index:1;background:var(--surface)}
+.installation-backup-history th[scope=row]{max-width:220px}
+.installation-backup-history summary{cursor:pointer;min-height:44px;display:list-item;max-width:240px}
+.installation-backup-details{min-width:200px;max-width:480px}
+.installation-backup-details dl{display:grid;gap:10px}.installation-backup-details dt{color:var(--muted)}
+.installation-backup-details dd{margin:4px 0 0;overflow-wrap:anywhere}.installation-backup-details code{white-space:normal;overflow-wrap:anywhere}
+.installation-backup-lookup{margin-block-start:16px}
+@media(max-width:600px){.installation-backup-history-heading .button{width:auto}}
+@container (width < 680px){
+  .installation-backup-history table,.installation-backup-history tbody,.installation-backup-history tr,.installation-backup-history th,.installation-backup-history td{display:block}
+  .installation-backup-history thead{display:none}
+  .installation-backup-history tr{margin-block-end:16px;border:1px solid var(--border);border-radius:8px}
+  .installation-backup-history td,.installation-backup-history th{min-width:0;max-width:none;border:0;padding:10px 12px}
+  .installation-backup-history th[scope=row]{position:sticky;inset-block-start:0;background:var(--surface);z-index:1}
+  .installation-backup-history td:first-child::before{content:"Created: ";color:var(--muted)}
+  .installation-backup-history td:nth-child(3)::before{content:"Outcome: ";color:var(--muted)}
+  .installation-backup-history td:nth-child(4)::before{content:"Operation details";display:block;color:var(--muted);margin-block-end:8px}
+  .installation-backup-history summary{max-width:none}
+  .installation-backup-details{min-width:0}
+}

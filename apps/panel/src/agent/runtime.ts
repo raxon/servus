@@ -19,6 +19,8 @@ import type { RestoreVolumeBinding } from './restore-journal.js';
 import { serviceContainers, serviceMetrics, ownedContainer, outputBuffer, execOutput, ingressStatus } from './observability.js';
 import type { Service, RuntimeStatus, ServiceLogs, ContainerInfo, ServiceMetrics } from '../shared/types.js';
 import type { ApplyResult } from './client.js';
+import { assertDatabaseAccessNode, assertDatabasePortFree, databaseEndpoint, databaseEndpointsMatch, suggestDatabasePort } from './database-access.js';
+import { databaseTargetPort, type DatabaseNetworkStatus } from '../shared/database-access.js';
 
 export const OWNER = 'self-hosted-panel';
 export const INGRESS_NETWORK = 'panel-ingress';
@@ -75,6 +77,24 @@ export class DockerRuntime {
       return { online: true, engineVersion: info.ServerVersion, cpus: info.NCPU, memoryBytes: info.MemTotal,
         swarmState: info.Swarm?.LocalNodeState, ingressPort: this.ingressPort, httpsConfigured: Boolean(httpsAccess), ...(httpsAccess?{httpsAccess}:{} ) };
     } catch { return { online: false, error: 'Docker Engine is unavailable.', ingressPort: this.ingressPort }; }
+  }
+
+  async databasePortSuggestion(candidates: number[]): Promise<{port: number | null}> {
+    return {port: await suggestDatabasePort(this.docker, candidates, this.ingressPort)};
+  }
+
+  async databaseNetwork(serviceId: string): Promise<DatabaseNetworkStatus> {
+    const current = await this.docker.getService(`panel-app-${serviceId}`).inspect();
+    const spec = current.Spec as Docker.ServiceSpec;
+    if (spec.Labels?.['panel.owner'] !== OWNER || spec.Labels['panel.service'] !== serviceId || !['postgres','mariadb','redis'].includes(spec.Labels['panel.kind'] ?? '')) throw new Error('Managed database ownership cannot be verified.');
+    const projectId = spec.Labels['panel.project'];
+    if (!projectId || !/^[a-f0-9-]{36}$/.test(projectId)) throw new Error('Database project identity cannot be verified.');
+    const networkName = `panel-project-${projectId}`, network = await this.docker.getNetwork(networkName).inspect();
+    if (network.Labels?.['panel.owner'] !== OWNER || network.Labels['panel.project'] !== projectId) throw new Error('Database project network ownership cannot be verified.');
+    const aliases = spec.TaskTemplate?.Networks?.filter(item => item.Target === networkName || item.Target === network.Id).flatMap(item => item.Aliases ?? []) ?? [];
+    const port = spec.EndpointSpec?.Ports?.find(item => item.Protocol === 'tcp' && item.TargetPort === databaseTargetPort(spec.Labels!['panel.kind']) && item.PublishMode === 'host')?.PublishedPort ?? null;
+    if (current.Endpoint?.Ports && !databaseEndpointsMatch(spec.EndpointSpec, {Ports: current.Endpoint.Ports})) throw new Error('Database published ports are still converging.');
+    return {aliases, publishedPort: port, revision: Number(spec.Labels['panel.revision'])};
   }
 
   private async managedHttpsConfigured(nodeId?:string):Promise<'direct'|'external'|undefined> {
@@ -173,6 +193,7 @@ export class DockerRuntime {
   }
 
   async apply(service: Service, type: string, operationId: string, recovery?: RecoveryContext): Promise<ApplyResult> {
+    if(service.databaseAccess!==undefined && !databaseKind(service))throw new Error('External TCP access is available only for managed databases.');
     const name = `panel-app-${service.id}`;
     const binding=service.kind==='postgres'||service.kind==='mariadb'||service.kind==='redis'?readRestoreBinding(this.dataDir,service.id,service.kind):undefined;
     const volumeBindings=readVolumeBindings(this.dataDir,service.id);
@@ -238,6 +259,11 @@ export class DockerRuntime {
       throw new Error(`Deployment failed; recovered the previous runtime configuration. ${recovery.previousError || 'Interrupted rollback.'}`);
     }
 
+    if(type==='deploy' && databaseKind(service)) {
+      if(service.databaseAccess?.enabled)await assertDatabaseAccessNode(this.docker,existing?.Spec);
+      await assertDatabasePortFree(this.docker,service,existing?.Spec,this.ingressPort);
+    }
+
     let spec = recovery?.targetSpec;
     let imageDigest = spec ? containerSpec(spec)?.Image : undefined;
     let sourceCommit = spec?.Labels?.['panel.sourceCommit'];
@@ -259,6 +285,10 @@ export class DockerRuntime {
           const built = await buildSource(service, operationId, this.dataDir, this.socketPath, this.vault,{forceRebuild:service.deploymentOptions?.forceRebuild});
           const image = await this.docker.getImage(built.image).inspect();
           imageDigest = image.RepoDigests?.[0] || image.Id; sourceCommit = built.sourceCommit;
+        } else if(databaseKind(service) && previousSpec && service.deployedRevision!==null && service.imageDigest===containerSpec(previousSpec)?.Image && /(?:^|@)sha256:[a-f0-9]{64}$/.test(service.imageDigest??'')) {
+          // Configuration changes must retain the confirmed database image even
+          // when its source tag has moved since the previous deployment.
+          imageDigest=service.imageDigest!;
         } else imageDigest = await this.pull(service.image,registryAuth(service,service.image,this.vault));
         messages.push(`Resolved image: ${imageDigest}`);
         const projectNetwork = `panel-project-${service.projectId}`;
@@ -306,6 +336,7 @@ export class DockerRuntime {
         }
         spec = {
           Name: name, Labels: labels, Mode: { Replicated: { Replicas: service.replicas } },
+          ...(databaseKind(service) ? {EndpointSpec: databaseEndpoint(service)} : {}),
           TaskTemplate: { ContainerSpec: { Image: imageDigest, Init: true, Env: configuration.environment, Mounts: configuration.mounts,
               Secrets: configuration.secrets, ...(configuration.command ? { Command: configuration.command, Args: configuration.args } : {}),
               Labels: { 'panel.owner': OWNER, 'panel.service': service.id, 'panel.revision': String(service.revision), 'panel.operation': operationId } },
@@ -352,6 +383,10 @@ export class DockerRuntime {
       else {
         await this.waitReady(name, spec);
         await this.verifyService(spec, service.id);
+        if(databaseKind(service)) {
+          const applied = await this.docker.getService(name).inspect();
+          if (!databaseEndpointsMatch(spec.EndpointSpec, applied.Spec.EndpointSpec) || applied.Endpoint?.Ports && !databaseEndpointsMatch(spec.EndpointSpec, {Ports: applied.Endpoint.Ports})) throw new Error('The deployed database TCP ports do not match the requested configuration.');
+        }
       }
     } catch (error) {
       if (isUncertainRuntimeError(error)) throw error;

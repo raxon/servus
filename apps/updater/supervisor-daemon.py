@@ -364,6 +364,14 @@ class HostApply:
         except module.BackupError as error:
             raise supervisor.SupervisorError('Installation backup status is unavailable') from error
 
+    def installation_backup_history(self, cursor, maintenance):
+        module = self._backup_module()
+        try:
+            with module.BackupJournal(maintenance, supervisor) as journal:
+                return journal.history(cursor)
+        except module.BackupError as error:
+            raise supervisor.SupervisorError('Installation backup history is unavailable') from error
+
     def cancel_installation_backup(self, receipt, api_token, maintenance):
         module = self._backup_module()
         try:
@@ -941,6 +949,7 @@ def legacy_recovery_status(journal_dir,operation_id,restore_id,service_id):
 
 def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_path, approval_journal, accepted_env, *, apply=None, api_token=None):
     connection, _ = listener.accept()
+    history_request = False
     try:
         _, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
         if uid != 0:
@@ -948,15 +957,24 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
         deadline = time.monotonic() + 5
         request = supervisor._read_message(connection, deadline)
         kind = request.get('type')
-        if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_status', 'installation_backup_active'):
-            fields = {'version', 'type', 'receipt'} if kind in ('installation_backup_submit', 'installation_backup_cancel') else {'version', 'type', 'operationId'} if kind == 'installation_backup_status' else {'version', 'type'}
+        if kind in ('installation_backup_submit', 'installation_backup_cancel', 'installation_backup_status', 'installation_backup_active', 'installation_backup_history'):
+            fields = {'version', 'type', 'receipt'} if kind in ('installation_backup_submit', 'installation_backup_cancel') else {'version', 'type', 'operationId'} if kind == 'installation_backup_status' else {'version', 'type', 'cursor'} if kind == 'installation_backup_history' else {'version', 'type'}
             if (set(request) != fields or type(request.get('version')) is not int or request['version'] != 1 or
                     not isinstance(apply, HostApply) or
-                    (kind == 'installation_backup_status' and not supervisor._uuid4(request.get('operationId')))):
+                    (kind == 'installation_backup_status' and not supervisor._uuid4(request.get('operationId'))) or
+                    (kind == 'installation_backup_history' and request.get('cursor') is not None and not supervisor._uuid4(request['cursor']))):
                 raise supervisor.SupervisorError('Invalid or unavailable installation backup command')
+            history_request = kind == 'installation_backup_history'
             with supervisor.MaintenanceSupervisor(install_dir, gate_dir, journal_dir) as operation:
                 if kind == 'installation_backup_active':
                     response = {'version': 1, 'status': 'busy' if apply.installation_backup_active(operation) is not None else 'idle'}
+                elif kind == 'installation_backup_history':
+                    try:
+                        history = apply.installation_backup_history(request['cursor'], operation)
+                    except FileNotFoundError:
+                        response = {'version': 1, 'status': 'not_found'}
+                    else:
+                        response = {'version': 1, 'status': 'history', 'history': history}
                 elif kind == 'installation_backup_submit':
                     record = apply.submit_installation_backup(request['receipt'], api_token, operation)
                     response = {'version': 1, 'status': 'queued' if record['state'] == 'requested' else record['state'], 'backup': record}
@@ -1044,7 +1062,7 @@ def handle_command(listener, hub, install_dir, gate_dir, journal_dir, policy_pat
         supervisor._send_message(connection, {'version': 1, 'status': result}, time.monotonic() + 5)
     except Exception:
         try:
-            supervisor._send_message(connection, {'version': 1, 'status': 'failed'}, time.monotonic() + 1)
+            supervisor._send_message(connection, {'version': 1, 'status': 'unavailable' if history_request else 'failed'}, time.monotonic() + 1)
         except (supervisor.SupervisorError, OSError):
             pass
     finally:

@@ -1,0 +1,151 @@
+.database-external-access {
+  display: grid;
+  gap: 12px;
+  margin-block-start: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--canvas);
+}
+.database-external-heading,
+.database-external-heading h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.database-external-heading {
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+.database-external-heading h3 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+.database-external-heading svg {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.database-access-status {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 550;
+}
+.database-access-status[data-live="true"] {
+  color: #24603f;
+  border-color: #bbdfc9;
+  background: #e8f6ed;
+}
+.database-access-form {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.database-access-form .database-access-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 48px;
+  margin: 0;
+  padding: 6px 10px 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  cursor: pointer;
+}
+.database-access-toggle > span {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 550;
+}
+.database-access-toggle input[type="checkbox"][switch] {
+  accent-color: var(--green);
+  flex: 0 0 44px;
+  width: 44px;
+  height: 24px;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  font-size: 22px;
+  cursor: inherit;
+}
+.database-access-toggle input:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+.database-access-toggle:has(input:disabled) {
+  opacity: .65;
+  cursor: default;
+}
+.database-access-port {
+  display: grid;
+  gap: 7px;
+}
+.database-access-port label {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 550;
+}
+.database-access-port-controls,
+.database-access-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.database-access-port-controls input {
+  flex: 1 1 96px;
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.database-access-port-controls input:is(:user-invalid, [aria-invalid="true"]) {
+  border-color: #a9362c;
+}
+.database-access-form .button {
+  min-height: 44px;
+}
+.database-access-actions {
+  justify-content: flex-end;
+}
+.database-external-access .feature-helper,
+.database-access-pending,
+.database-access-error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.database-access-pending {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #eaf5ed;
+  color: #2e6046;
+}
+.database-access-error {
+  color: #a9362c;
+}
+.database-external-access > :is(.detail-row, .database-connection-string) {
+  margin: 0;
+  padding-block-end: 0;
+}
+@media (max-width: 600px) {
+  .database-access-port-controls input {
+    font-size: 16px;
+  }
+  .database-access-form :is(.button, .database-access-port-controls input) {
+    min-height: 48px;
+  }
+}

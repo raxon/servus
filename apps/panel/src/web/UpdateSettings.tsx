@@ -6,6 +6,7 @@ import { z } from "zod";
 import { FeatureModal } from "./feature-ui.js";
 import { api, RequestError } from "./api.js";
 import { ReleaseNotes } from "./ReleaseNotes.js";
+import { version as packageVersion } from "../../package.json";
 type UpdateDiscovery =
   | { status: "checking" | "unavailable" }
   | { status: "no_newer_version" | "ahead"; current: string; latest: string }
@@ -46,7 +47,7 @@ function readUpdate(): SavedUpdate | null {
 export function useUpdateDiscovery(enabled: boolean) {
   const capability = useQuery({
     queryKey: ["updates"],
-    queryFn: () => api<{ applyAvailable: boolean }>("/updates"),
+    queryFn: () => api<{ applyAvailable: boolean; currentVersion?: string }>("/updates"),
     enabled,
     retry: false,
     staleTime: 60_000,
@@ -121,6 +122,14 @@ export function UpdateSettings() {
   const [alreadyCurrent, setAlreadyCurrent] = useState<string | null>(null);
   const [resume, setResume] = useState(0);
   const { capability, discovery } = useUpdateDiscovery(true);
+  const health = useQuery({
+    queryKey: ["panel-health"],
+    queryFn: () => api<{ version?: string }>("/health"),
+    enabled: capability.isSuccess && !capability.data.currentVersion,
+    retry: false,
+    staleTime: 60_000,
+  });
+  const installedVersion = capability.data?.currentVersion ?? (health.data?.version === "unknown" ? undefined : health.data?.version);
   const policy = useQuery({queryKey: ["updates", "preferences"], queryFn: () => api<{preferences: Preferences}>("/updates/preferences"), enabled: Boolean(capability.data?.applyAvailable), retry: false});
 
   useEffect(() => {
@@ -249,7 +258,11 @@ export function UpdateSettings() {
   };
   return (
     <section id="updates" className="surface details-card central-settings">
-      <div className="card-heading"><RefreshCw size={19} aria-hidden="true" /><h2>Updates</h2></div>
+      <div className="card-heading"><RefreshCw size={19} aria-hidden="true" /><h3>Updates</h3></div>
+      <div className="detail-row">
+        <span>{installedVersion ? "Installed version" : "Package version"}</span>
+        <strong className="mono">{installedVersion ?? packageVersion}</strong>
+      </div>
       {capability.data?.applyAvailable ? <UpdatePolicySettings /> : null}
       {capability.isPending ? <p>Checking update settings...</p> : capability.error ? <p role="alert">Could not load update settings.</p> : !capability.data?.applyAvailable ? <p>Updates are not configured on this installation.</p> : run ? (
         <>

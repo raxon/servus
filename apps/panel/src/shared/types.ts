@@ -18,6 +18,7 @@ export interface DatabaseConfig { database: string; user: string; password?: str
 export interface ServiceConfiguration {
   kind?: ServiceKind; source?: SourceConfig; environment?: EnvironmentVariable[];
   domains?: DomainConfig[]; mounts?: MountConfig[]; resources?: ResourceConfig; database?: DatabaseConfig;
+  databaseAccess?: import('./database-access.js').DatabaseAccess;
   registry?:import('./source-credentials.js').RegistryCredential|null;
 }
 export interface Service extends ServiceConfiguration {
@@ -47,7 +48,11 @@ export interface ServicePatch extends ServiceConfiguration { expectedRevision: n
 export interface ContainerInfo { id: string; name: string; state: string }
 export interface ServiceMetrics { cpuPercent: number; memoryBytes: number; memoryLimitBytes: number; networkRxBytes: number; networkTxBytes: number; containers: number }
 export interface ServiceLogs { lines: string[] }
-export interface ConnectionInfo { host: string; port: number; database: string; user: string; password?: string }
+export interface ConnectionInfo {
+  host: string; port: number; database: string; user: string; password?: string;
+  legacyHost?: string; deployedRevision?: number; runtimeVerified?: boolean;
+  externalAccess?: { saved: import('./database-access.js').DatabaseAccess; deployed: import('./database-access.js').DatabaseAccess; pendingChanges: boolean; host: string | null };
+}
 export interface ClaimedJob {
   id: string; actionId: string; serviceId: string; type: ActionType; snapshot: Service;
   attempts: number; recovered: boolean; workerId: string; leaseUntil: string;

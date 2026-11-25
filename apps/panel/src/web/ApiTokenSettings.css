@@ -1,0 +1,28 @@
+.api-token-list { list-style:none; margin:20px 0 0; padding:0; }
+.api-token-row { display:flex; align-items:center; gap:12px; padding:18px 0; border-block-start:1px solid var(--border); }
+.api-token-symbol { display:grid; place-items:center; flex:0 0 36px; height:36px; border:1px solid var(--border); border-radius:10px; color:var(--muted); }
+.api-token-details { display:grid; flex:1; min-width:0; gap:5px; }
+.api-token-details strong { font-size:13px; font-weight:600; overflow-wrap:anywhere; }
+.api-token-details > span, .api-token-revoked { font-size:12px; color:var(--muted); line-height:1.6; }
+.api-token-empty { margin-block:20px; }
+.api-token-reference { display:flex; align-items:start; justify-content:space-between; gap:18px; padding-block-start:18px; border-block-start:1px solid var(--border); font-size:12px; }
+.api-token-reference details { max-width:62ch; }
+.api-token-reference summary { cursor:pointer; color:var(--muted); }
+.api-token-reference p { color:var(--muted); line-height:1.7; margin-block-end:0; }
+.api-token-reference code { overflow-wrap:anywhere; }
+.api-token-reference > a { display:inline-flex; flex-shrink:0; align-items:center; gap:4px; color:var(--muted); }
+.api-token-form .api-token-options { margin:0; padding:0; border:0; min-width:0; }
+.api-token-options legend { font-size:13px; font-weight:600; margin-block-end:8px; }
+.api-token-form .api-token-options label { display:flex; align-items:flex-start; gap:10px; padding:12px; margin-block:0 8px; border:1px solid var(--border); border-radius:9px; }
+.api-token-form .api-token-options label:has(input:checked) { border-color:var(--green); background:color-mix(in srgb,var(--green) 5%,transparent); }
+.api-token-form .api-token-options input { width:16px; height:16px; min-height:0; flex:0 0 16px; margin:2px 0 0; padding:0; }
+.api-token-options label span { display:grid; gap:5px; min-width:0; }
+.api-token-options strong { font-size:13px; font-weight:600; }
+.api-token-options small { font-size:12px; color:var(--muted); font-weight:400; line-height:1.5; }
+.api-token-options label:has(input:disabled) { opacity:.55; }
+.api-token-success { display:grid; gap:18px; padding:24px; }
+.api-token-success-note { display:flex; align-items:center; gap:8px; color:var(--green); font-size:13px; }
+.api-token-success label { display:grid; gap:8px; font-size:13px; font-weight:600; }
+.api-token-success textarea { resize:none; font:13px/1.6 monospace; overflow-wrap:anywhere; }
+.api-token-success > p { margin:0; font-size:12px; color:var(--muted); line-height:1.7; }
+@media(max-width:560px) { .api-token-reference { flex-direction:column; } .api-token-symbol { display:none; } .api-token-row { gap:8px; } .api-token-form :is(input:not([type=radio]),select), .api-token-success textarea { font-size:16px; } }

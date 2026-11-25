@@ -5,7 +5,7 @@ import {
   installationBackupApprovalSchema, installationBackupId, installationBackupInputSchema,
   signInstallationBackupApproval, signInstallationBackupCancellation, type InstallationBackupApproval, type InstallationBackupApprovalFields,
 } from './installation-backup-approval.js';
-import { cancelInstallationBackup, installationBackupCapability, installationBackupStatus, submitInstallationBackup, UpdaterClientError } from './updater-client.js';
+import { cancelInstallationBackup, installationBackupCapability, installationBackupHistory, installationBackupStatus, submitInstallationBackup, UpdaterClientError } from './updater-client.js';
 
 export interface InstallationBackupRoutesOptions {
   administrator: (request: FastifyRequest, mutation?: boolean) => {id: string};
@@ -46,6 +46,23 @@ export function registerInstallationBackups(app: FastifyInstance, options: Insta
     if(!options.applyEnabled||!options.socketPath||(!options.approvalSecretPath&&!options.signApproval))return{available:false,reason:'not_configured'};
     const capability=await installationBackupCapability({socketPath:options.socketPath});
     administrator(request);return capability;
+  });
+
+  app.get('/api/v1/installation-backups/history', {config: {rateLimit: {max: 30, timeWindow: '1 minute'}}}, async request => {
+    administrator(request);
+    const {cursor} = z.strictObject({cursor: installationBackupId.optional()}).parse(request.query);
+    if (!options.applyEnabled || !options.socketPath || (!options.approvalSecretPath && !options.signApproval))
+      return {available: false, reason: 'not_configured'};
+    let history;
+    try { history = await installationBackupHistory(cursor ?? null, endpoint()); }
+    catch (error) {
+      administrator(request);
+      if (error instanceof UpdaterClientError && error.certainty === 'definitive' && ['invalid_request', 'invalid_input'].includes(error.code))
+        return {available: false, reason: 'host_unsupported'};
+      backupError(error);
+    }
+    administrator(request);
+    return {available: true, ...history};
   });
 
   app.post('/api/v1/installation-backups', {bodyLimit: 2048, config: {rateLimit: {max: 5, timeWindow: '1 minute'}}}, async (request, reply) => {

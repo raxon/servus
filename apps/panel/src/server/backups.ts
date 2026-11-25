@@ -1,24 +1,27 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { createHash, randomUUID } from 'node:crypto';
+import type { Readable } from 'node:stream';
 import { z } from 'zod';
 import { agentDatabaseExport, AgentRequestError, type AgentRequestOptions } from '../agent/client.js';
 import { LocalDatabaseBackupStorage, type BackupExtension } from '../agent/backups.js';
-import { BACKUP_SCHEMA_SQL, backupCronMatches, describeBackupCron, parseBackupCron, type DatabaseBackup, type DatabaseBackupSettings } from '../shared/backups.js';
+import { backupCronMatches, describeBackupCron, parseBackupCron, expiredDatabaseBackups, type DatabaseBackup, type DatabaseBackupSettings } from '../shared/backups.js';
 import type { Service, SessionResponse, User } from '../shared/types.js';
 import { AppError } from './errors.js';
 import type { MaintenanceGate } from './maintenance.js';
 import type { Store } from './store.js';
 import { loadBackupDestination, registerBackupProviders } from './backup-providers.js';
+import { backupEncryptionOverhead, encryptDatabaseBackup, decryptDatabaseBackup } from './backup-encryption.js';
 import { readS3Backup, removeS3Backup, uploadS3Backup } from '../agent/s3-storage.js';
 
 interface BackupRow {
   id:string; service_id:string; actor_id:string; name:string; status:DatabaseBackup['status']; trigger:DatabaseBackup['trigger'];
   idempotency_key:string; request_hash:string; created_at:string; finished_at:string|null; size:number|null; sha256:string|null;
-  extension:BackupExtension|null; error:string|null; owner_id:string|null; lease_until:string|null; destination_ref:string|null; object_key:string|null;
+  extension:BackupExtension|null; error:string|null; owner_id:string|null; lease_until:string|null; destination_ref:string|null; object_key:string|null; encrypted:number; plaintext_size:number|null;
 }
-interface SettingsRow {service_id:string; actor_id:string; enabled:number; cron:string; retention:number; last_tick:string|null; updated_at:string;destination_ref:string|null}
+interface SettingsRow {service_id:string; actor_id:string; enabled:number; cron:string; retention:number; last_tick:string|null; updated_at:string;destination_ref:string|null;encrypted:number;retention_policy:string|null}
 export interface BackupOptions {
   store: Store;
+  session?:(req:FastifyRequest,mutation?:boolean)=>SessionResponse;
   serviceAccess:(req:FastifyRequest,id:string,write?:boolean)=>{auth:SessionResponse;service:Service};
   agentConnection?: AgentRequestOptions;
   databaseExport?: typeof agentDatabaseExport;
@@ -26,10 +29,11 @@ export interface BackupOptions {
   now?:()=>Date;
   startScheduler?:boolean;
 }
-const settingsSchema = z.object({enabled:z.boolean(),cron:z.string().trim().min(1).max(128),retention:z.number().int().min(1).max(100)}).strict();
+const retentionPolicySchema=z.discriminatedUnion('mode',[z.object({mode:z.literal('count')}).strict(),z.object({mode:z.literal('age'),days:z.number().int().min(1).max(3650)}).strict(),z.object({mode:z.literal('gfs'),hourly:z.number().int().min(0).max(168).default(0),yearly:z.number().int().min(0).max(10).default(0),daily:z.number().int().min(1).max(365),weekly:z.number().int().min(0).max(52),monthly:z.number().int().min(0).max(120)}).strict()]);
+const settingsSchema = z.object({enabled:z.boolean(),cron:z.string().trim().min(1).max(128),retention:z.number().int().min(1).max(100),encrypted:z.boolean().optional(),retentionPolicy:retentionPolicySchema.optional()}).strict();
 const nameSchema = z.object({name:z.string().trim().min(1).max(100).regex(/^[^\x00-\x1f\x7f]+$/).optional()}).strict();
 const leaseMs = 15 * 60_000;
-const toBackup = (row:BackupRow):DatabaseBackup => ({id:row.id,serviceId:row.service_id,name:row.name,status:row.status,trigger:row.trigger,createdAt:row.created_at,finishedAt:row.finished_at,size:row.size,sha256:row.sha256,extension:row.extension,error:row.error,destination:row.destination_ref?'s3':'local'});
+const toBackup = (row:BackupRow):DatabaseBackup => ({id:row.id,serviceId:row.service_id,name:row.name,status:row.status,trigger:row.trigger,createdAt:row.created_at,finishedAt:row.finished_at,size:row.size,sha256:row.sha256,extension:row.extension,error:row.error,destination:row.destination_ref?'s3':'local',encrypted:Boolean(row.encrypted)});
 
 function requireDatabase(service:Service) {
   if (!['postgres','mariadb','redis'].includes(service.kind ?? '')) throw new AppError('BACKUP_DATABASE_REQUIRED','Backups are available for managed databases.',400);
@@ -44,7 +48,6 @@ export class DatabaseBackups {
   private timer:ReturnType<typeof setInterval>|undefined;
   private closing = false;
   constructor(private readonly options:BackupOptions) {
-    options.store.db.transaction(()=>options.store.db.exec(BACKUP_SCHEMA_SQL)).immediate();
     this.storage = new LocalDatabaseBackupStorage(options.store.dataDir);
   }
   private now() {return (this.options.now ?? (()=>new Date()))();}
@@ -53,7 +56,7 @@ export class DatabaseBackups {
   settings(serviceId:string):DatabaseBackupSettings {
     const value=this.settingsRow(serviceId);
     const cron=value?.cron ?? '0 2 * * *';
-    return {enabled:Boolean(value?.enabled),cron,retention:value?.retention ?? 7,timeZone:'UTC',description:describeBackupCron(cron)};
+    return {enabled:Boolean(value?.enabled),cron,retention:value?.retention ?? 7,timeZone:'UTC',description:describeBackupCron(cron),encrypted:Boolean(value?.encrypted),retentionPolicy:value?.retention_policy?retentionPolicySchema.parse(JSON.parse(value.retention_policy)):{mode:'count'}};
   }
   saveSettings(service:Service,actor:User,input:unknown) {
     requireDatabase(service);
@@ -64,6 +67,7 @@ export class DatabaseBackups {
       this.options.store.db.prepare(`INSERT INTO database_backup_settings (service_id,actor_id,enabled,cron,retention,last_tick,updated_at) VALUES (?,?,?,?,?,?,?)
         ON CONFLICT(service_id) DO UPDATE SET actor_id=excluded.actor_id,enabled=excluded.enabled,cron=excluded.cron,retention=excluded.retention,last_tick=excluded.last_tick,updated_at=excluded.updated_at`)
         .run(service.id,actor.id,value.enabled?1:0,value.cron,value.retention,now.slice(0,16),now);
+      this.options.store.db.prepare('UPDATE database_backup_settings SET encrypted=?,retention_policy=? WHERE service_id=?').run(value.encrypted===undefined?(this.settingsRow(service.id)?.encrypted??0):value.encrypted?1:0,JSON.stringify(value.retentionPolicy??this.settings(service.id).retentionPolicy),service.id);
       this.options.store.recordAudit(actor.id,'database.backup.settings',service.id);
     }).immediate();
     return this.settings(service.id);
@@ -86,6 +90,7 @@ export class DatabaseBackups {
       const objectKey=destination?`${destination.prefix?`${destination.prefix}/`:''}servus/${service.id}/${id}.${extension}`:null;
       this.options.store.db.prepare(`INSERT INTO database_backups (id,service_id,actor_id,name,status,trigger,idempotency_key,request_hash,created_at,destination_ref,object_key) VALUES (?,?,?,?,'queued',?,?,?,?,?,?)`)
         .run(id,service.id,actor.id,name,trigger,key,hash,now,reference,objectKey);
+      this.options.store.db.prepare('UPDATE database_backups SET encrypted=? WHERE id=?').run(this.settingsRow(service.id)?.encrypted??0,id);
       this.options.store.recordAudit(actor.id,'database.backup.queued',service.id);
       return toBackup(this.row(id)!);
     }).immediate();
@@ -179,9 +184,11 @@ export class DatabaseBackups {
         if(typeof length!=='string'||!/^[1-9][0-9]*$/.test(length)||upstream.headers['x-export-extension']!==extension)throw new Error('Invalid export metadata.');
         if(!this.owns(row.id))throw new Error('Backup lease was lost.');
         store.db.prepare('UPDATE database_backups SET extension=? WHERE id=? AND owner_id=?').run(extension,row.id,this.owner);
-        const result=await this.storage.capture(row.id,extension,upstream,Number(length),{signal:controller.signal,publish:()=>{if(!this.owns(row.id))throw new Error('Backup lease was lost.');}});
+        const plaintextSize=Number(length);
+        const input=row.encrypted?encryptDatabaseBackup(upstream,store.vault.databaseBackupKey(row.id),row.id):upstream;
+        const result=await this.storage.capture(row.id,extension,input,plaintextSize+(row.encrypted?backupEncryptionOverhead:0),{encryptionOverhead:row.encrypted?backupEncryptionOverhead:0,signal:controller.signal,publish:()=>{if(!this.owns(row.id))throw new Error('Backup lease was lost.');}});
         if(!this.owns(row.id))throw new Error('Backup lease was lost.');
-        store.db.prepare('UPDATE database_backups SET size=?,sha256=? WHERE id=? AND owner_id=?').run(result.size,result.sha256,row.id,this.owner);
+        store.db.prepare('UPDATE database_backups SET size=?,sha256=?,plaintext_size=? WHERE id=? AND owner_id=?').run(result.size,result.sha256,plaintextSize,row.id,this.owner);
         if(row.destination_ref) {
           const current=this.row(row.id)!;
           await uploadS3Backup(loadBackupDestination(store,service.id,row.destination_ref),this.remoteIdentity(current),this.storage.read(row.id,extension,result.size,result.sha256),controller.signal);
@@ -206,19 +213,35 @@ export class DatabaseBackups {
   }
   private async retain(serviceId:string) {
     let complete=true;
-    const retention=this.settings(serviceId).retention;
-    const rows=this.options.store.db.prepare("SELECT * FROM database_backups WHERE service_id=? AND status='succeeded' ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?").all(serviceId,retention) as BackupRow[];
+    const settings=this.settings(serviceId);
+    const completed=this.options.store.db.prepare("SELECT * FROM database_backups WHERE service_id=? AND status='succeeded' ORDER BY created_at DESC,id DESC").all(serviceId) as BackupRow[];
+    const rows=expiredDatabaseBackups(completed.map(row=>({...row,createdAt:row.created_at})),settings.retention,settings.retentionPolicy??{mode:'count'},this.now());
     for(const row of rows) {
       try {await this.discardCompleted(row);this.options.store.db.prepare("UPDATE database_backups SET status='deleted' WHERE id=? AND status='succeeded'").run(row.id);}
       catch {complete=false;}
     }
     return complete;
   }
-  async read(serviceId:string,id:string) {
+  async read(serviceId:string,id:string,signal?:AbortSignal) {
     const row=z.string().uuid().safeParse(id).success?this.row(id):undefined;
     if(!row||row.service_id!==serviceId||row.status!=='succeeded'||!row.extension||!row.size)throw new AppError('BACKUP_NOT_FOUND','Database backup not found.',404);
-    try {return {backup:toBackup(row),stream:row.destination_ref?await readS3Backup(loadBackupDestination(this.options.store,serviceId,row.destination_ref),this.remoteIdentity(row)):this.storage.read(row.id,row.extension,row.size,row.sha256??undefined)};}
-    catch {throw new AppError('BACKUP_UNAVAILABLE','The backup file is unavailable or changed. Restore from another verified copy.',409);}
+    let stream:Readable|undefined,decrypted:Readable|undefined;
+    try {
+      stream=row.destination_ref?await readS3Backup(loadBackupDestination(this.options.store,serviceId,row.destination_ref),this.remoteIdentity(row)):this.storage.read(row.id,row.extension,row.size,row.sha256??undefined);
+      if(!row.encrypted)return {backup:toBackup(row),stream};
+      signal?.throwIfAborted();
+      const temporary=randomUUID();
+      decrypted=decryptDatabaseBackup(stream,this.options.store.vault.databaseBackupKey(row.id),row.id);
+      // capture publishes only after GCM authentication and the expected length pass.
+      const staged=await this.storage.capture(temporary,row.extension,decrypted,row.plaintext_size??undefined,{signal});
+      try {
+        const plaintext=this.storage.read(temporary,row.extension,staged.size,staged.sha256);
+        // The open file descriptor remains readable after unlink; no plaintext file remains.
+        this.storage.remove(temporary,row.extension);
+        return {backup:{...toBackup(row),size:staged.size,sha256:staged.sha256},stream:plaintext};
+      }catch(error){this.storage.remove(temporary,row.extension);throw error;}
+    }
+    catch {decrypted?.destroy();stream?.destroy();throw new AppError('BACKUP_UNAVAILABLE','The backup file is unavailable or changed. Restore from another verified copy.',409);}
   }
   async remove(serviceId:string,id:string,actor:User) {
     const row=z.string().uuid().safeParse(id).success?this.row(id):undefined;
@@ -245,7 +268,17 @@ export function registerBackups(app:FastifyInstance,options:BackupOptions) {
   app.get<{Params:{id:string;backupId:string}}>(`${prefix}/backups/:backupId/download`,async(req,reply)=>{
     const {auth,service}=options.serviceAccess(req,req.params.id);
     if(!options.store.canAccess(auth.user,service.projectId,true))throw new AppError('BACKUP_NOT_FOUND','Database backup not found.',404);
-    const {backup,stream}=await backups.read(service.id,req.params.backupId);
+    const controller=new AbortController();
+    const abort=()=>controller.abort();req.raw.once('aborted',abort);reply.raw.once('close',abort);
+    let result:Awaited<ReturnType<DatabaseBackups['read']>>;
+    try {result=await backups.read(service.id,req.params.backupId,controller.signal);}
+    finally{req.raw.removeListener('aborted',abort);reply.raw.removeListener('close',abort);}
+    const {backup,stream}=result;
+    try {
+      controller.signal.throwIfAborted();
+      const latest=options.serviceAccess(req,req.params.id);
+      if(!options.store.canAccess(latest.auth.user,latest.service.projectId,true))throw new AppError('BACKUP_NOT_FOUND','Database backup not found.',404);
+    }catch(error){stream.destroy();throw error;}
     options.store.recordAudit(auth.user.id,'database.backup.download',service.id);
     reply.header('Content-Type','application/octet-stream').header('Content-Length',backup.size!).header('Content-Disposition',`attachment; filename="servus-${backup.id}.${backup.extension}"`).header('X-Backup-SHA256',backup.sha256!);
     reply.raw.once('close',()=>stream.destroy());

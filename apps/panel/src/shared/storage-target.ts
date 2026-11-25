@@ -17,3 +17,16 @@ export function redactBackupDestination(value:S3Destination):BackupDestination {
   const {accessKeyId:_access,secretAccessKey:_secret,...safe}=value;
   return {...safe,credentialsConfigured:true};
 }
+
+export interface BackupStorageProfile {
+  id:string;
+  name:string;
+  destination:BackupDestination;
+  updatedAt:string;
+}
+export interface BackupStorageSelection {
+  destination:BackupDestination;
+  profileId:string|null;
+  profileName:string|null;
+  legacy:boolean;
+}

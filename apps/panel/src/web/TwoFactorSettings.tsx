@@ -41,8 +41,8 @@ export function TwoFactorSettings() {
   const clearError = () => { if (change.isError) change.reset(); };
 
   return <section className="surface details-card central-settings two-factor-settings" aria-labelledby={`${id}-heading`}>
-    <div className="card-heading"><ShieldCheck size={19} aria-hidden="true" /><h2 id={`${id}-heading`}>Two-factor authentication</h2></div>
-    <p id={`${id}-help`}>Protect local password sign-in with an authenticator app. Central sign-in uses your identity provider's authentication settings.</p>
+    <div className="card-heading"><ShieldCheck size={19} aria-hidden="true" /><h3 id={`${id}-heading`}>Two-factor authentication</h3></div>
+    <p id={`${id}-help`}>Protect local password sign-in with an authenticator app.</p>
     {status.isPending ? <p role="status">Loading authenticator settings...</p> : status.error ? <div className="error-notice" role="alert">{errorMessage(status.error)}</div> : !status.data?.available ? <p>Sign in with your local password to manage this authenticator.</p> : <>
       <p role="status">{enabled ? `Enabled. ${status.data.recoveryCodesRemaining} recovery codes remain.` : 'Not enabled.'}</p>
       {recoveryCodes ? <div>

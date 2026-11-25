@@ -40,6 +40,7 @@ import { CertificateRetryError, planCertificateRetry } from './certificate-retry
 import { configureHostDomain } from './host-domain.js';
 import { inspectHostCertificate } from './host-certificate.js';
 import { hostCertificateSchema } from '../shared/host-domain.js';
+import { databaseAccessSchema } from '../shared/database-access.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -60,6 +61,7 @@ const input = z.object({
     mounts: z.array(z.object({type:z.enum(['volume','file','bind']),name:z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/),target:z.string().startsWith('/').max(256),readOnly:z.boolean().optional(),content:z.string().max(32768).optional(),source:z.string().max(512).optional()})).max(20).optional(),
     resources: z.object({cpu:z.number().min(0.1).max(64),memoryMb:z.number().int().min(32).max(131072)}).optional(),
     database: z.object({database:z.string().min(1).max(63),user:z.string().min(1).max(63),passwordSecretRef:z.string().uuid().optional()}).strict().optional(),
+    databaseAccess: databaseAccessSchema.optional(),
     imageDigest:z.string().nullable().optional(),sourceCommit:z.string().nullable().optional(),deletedAt:z.string().nullable().optional(),
     rollbackImage:z.string().max(512).regex(/^(?:sha256:[a-f0-9]{64}|[a-zA-Z0-9][a-zA-Z0-9._/:@-]*@sha256:[a-f0-9]{64})$/).optional(),rollbackCommit:z.string().regex(/^[a-f0-9]{40,64}$/).optional(),
     deploymentOptions:z.object({forceRebuild:z.boolean().optional()}).strict().optional(),
@@ -71,7 +73,7 @@ type JournalRow = {
   previous_spec: string | null; previous_recorded: number; target_spec: string | null;
   operation_stage: 'applying' | 'rolling_back'; previous_error: string | null;
 };
-type AgentRuntime = Pick<DockerRuntime, 'status' | 'inspectService' | 'apply'> & Partial<Pick<DockerRuntime, 'containers' | 'metrics' | 'logs' | 'consoleContainer'>>;
+type AgentRuntime = Pick<DockerRuntime, 'status' | 'inspectService' | 'apply'> & Partial<Pick<DockerRuntime, 'containers' | 'metrics' | 'logs' | 'consoleContainer' | 'databaseNetwork' | 'databasePortSuggestion'>>;
 
 export async function createAgent(config = agentConfig(), runtime: AgentRuntime = new DockerRuntime(config.dockerSocket, config.ingressPort, config.ingressImage, config.dataDir), maintenance?: AgentMaintenanceGate) {
   const app = Fastify({ logger: false, bodyLimit: 512 * 1024 });
@@ -225,6 +227,21 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
   app.get<{Params:{id:string}}>('/services/:id/state', (req, reply) => {
     if (!z.string().uuid().safeParse(req.params.id).success) return reply.code(400).send({ error: { code: 'INVALID_ID', message: 'Invalid service identity.' } });
     return runtime.inspectService(req.params.id);
+  });
+
+  app.post<{Params:{id:string}}>('/services/:id/database-port-suggestion', async (req, reply) => {
+    if(!z.string().uuid().safeParse(req.params.id).success)return reply.code(400).send({error:{code:'INVALID_ID',message:'Invalid service identity'}});
+    const parsed=z.object({candidates:z.array(z.number().int().min(1024).max(65535)).min(1).max(64)}).strict().safeParse(req.body);
+    if(!parsed.success)return reply.code(400).send({error:{code:'INVALID_PORT_CANDIDATES',message:'Provide between 1 and 64 valid TCP port candidates'}});
+    const input=parsed.data;
+    if(!runtime.databasePortSuggestion)return reply.code(503).send({error:{code:'RUNTIME_UNAVAILABLE',message:'Database port inspection is unavailable'}});
+    return runtime.databasePortSuggestion(input.candidates);
+  });
+  app.get<{Params:{id:string}}>('/services/:id/database-network', async (req, reply) => {
+    const id=z.string().uuid().safeParse(req.params.id);
+    if(!id.success)return reply.code(400).send({error:{code:'INVALID_ID',message:'Invalid service identity'}});
+    if(!runtime.databaseNetwork)return reply.code(503).send({error:{code:'RUNTIME_UNAVAILABLE',message:'Database network inspection is unavailable'}});
+    return runtime.databaseNetwork(id.data);
   });
   const query = z.object({tail:z.coerce.number().int().min(1).max(500).default(100),since:z.string().datetime({offset:true}).optional()});
   for (const operation of ['logs','containers','metrics'] as const) app.get<{Params:{id:string};Querystring:{tail?:string;since?:string}}>(`/services/:id/${operation}`, async (req,reply) => {
