@@ -89,6 +89,22 @@ def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=N
         raise QuiescenceError('Container inspection is unavailable')
     data = os.path.realpath(data_dir)
     socket_path = os.path.realpath('/var/run/docker.sock')
+    active_ingress_scope = None
+    if trusted_ingress is not None:
+        for item in items:
+            if item['Id'] == trusted_ingress[0]:
+                config = item.get('Config') or {}
+                labels = config.get('Labels') or {}
+                identity = (item['Id'], labels.get('com.docker.swarm.service.name'), config.get('Image'), item.get('Image'))
+                if identity == trusted_ingress:
+                    service_id = labels.get('com.docker.swarm.service.id')
+                    node_id = labels.get('com.docker.swarm.node.id')
+                    task_id = labels.get('com.docker.swarm.task.id')
+                    if (isinstance(service_id, str) and service_id and
+                        isinstance(node_id, str) and node_id and
+                        isinstance(task_id, str) and task_id):
+                        active_ingress_scope = (service_id, node_id, task_id)
+                break
     for item in items:
         mounts = item.get('Mounts')
         if not isinstance(mounts, list) or any(not isinstance(mount, dict) or not isinstance(mount.get('Source'), str) or not mount['Source'].startswith('/') for mount in mounts):
@@ -109,14 +125,27 @@ def ensure_no_other_data_mounts(docker, expected, data_dir, *, trusted_ingress=N
                 raise QuiescenceError('Unsupported external container privileges')
             identity = (item['Id'], labels.get('com.docker.swarm.service.name'), config.get('Image'), item.get('Image'))
             trusted_external = trusted_ingress is not None and identity == trusted_ingress
+            if not trusted_external and trusted_ingress is not None and active_ingress_scope is not None:
+                state = item.get('State')
+                restart_policy = host.get('RestartPolicy')
+                task_id = labels.get('com.docker.swarm.task.id')
+                trusted_external = (
+                    (labels.get('com.docker.swarm.service.name'), config.get('Image'), item.get('Image')) == trusted_ingress[1:] and
+                    labels.get('com.docker.swarm.service.id') == active_ingress_scope[0] and
+                    labels.get('com.docker.swarm.node.id') == active_ingress_scope[1] and
+                    isinstance(task_id, str) and bool(task_id) and task_id != active_ingress_scope[2] and
+                    isinstance(state, dict) and state.get('Status') in ('exited', 'dead') and
+                    state.get('Running') is False and state.get('Paused') is False and
+                    state.get('Restarting') is False and state.get('Pid') == 0 and
+                    isinstance(restart_policy, dict) and restart_policy.get('Name') == 'no'
+                )
             for mount in mounts:
                 source = mount.get('Source')
                 if not isinstance(source, str) or not source:
                     continue
                 source = os.path.realpath(source)
                 if socket_path == source or socket_path.startswith(source.rstrip('/') + '/'):
-                    identity = (item['Id'], labels.get('com.docker.swarm.service.name'), config.get('Image'), item.get('Image'))
-                    if not (trusted_ingress is not None and identity == trusted_ingress and source == socket_path and mount.get('RW') is False):
+                    if not (trusted_external and source == socket_path and mount.get('RW') is False):
                         raise QuiescenceError('Unexpected container can access Docker API')
         for mount in mounts:
             source = mount.get('Source')

@@ -138,6 +138,56 @@ class DockerInventoryTest(unittest.TestCase):
         self.docker.call.return_value = ('\n'.join(item['Id'] for item in self.items) + '\n').encode()
         with self.assertRaises(module.QuiescenceError): self.check()
 
+    def test_allows_exited_historical_swarm_task_of_trusted_ingress_after_reboot(self):
+        self.ingress['Config']['Labels'].update({
+            'com.docker.swarm.service.id': 'svc123',
+            'com.docker.swarm.node.id': 'node456',
+            'com.docker.swarm.task.id': 'task-active',
+        })
+        historical = {
+            'Id': '1' * 64,
+            'Image': self.trusted[3],
+            'State': {'Status': 'exited', 'Running': False, 'Paused': False, 'Restarting': False, 'Pid': 0},
+            'Config': {
+                'Image': 'traefik:3.7.13',
+                'Labels': {
+                    'com.docker.swarm.service.name': 'panel-ingress',
+                    'com.docker.swarm.service.id': 'svc123',
+                    'com.docker.swarm.node.id': 'node456',
+                    'com.docker.swarm.task.id': 'task-old',
+                },
+            },
+            'HostConfig': {'Privileged': False, 'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0}},
+            'Mounts': [
+                {'Source': '/var/run/docker.sock', 'RW': False},
+                {'Type': 'bind', 'Source': '/var/lib/servus/host-domain', 'Destination': '/servus-host', 'RW': False},
+            ],
+        }
+        self.items.append(historical)
+        self.docker.call.return_value = ('\n'.join(item['Id'] for item in self.items) + '\n').encode()
+        self.check()
+
+        # Any running, differently scoped, differently imaged, restartable, or extra-mount container must still fail.
+        mutations = [
+            lambda: historical['State'].update({'Status': 'running', 'Running': True, 'Pid': 42}),
+            lambda: historical['State'].update({'Pid': 42}),
+            lambda: historical['HostConfig'].update({'RestartPolicy': {'Name': 'always'}}),
+            lambda: historical['Config']['Labels'].update({'com.docker.swarm.service.id': 'other-svc'}),
+            lambda: historical['Config']['Labels'].update({'com.docker.swarm.node.id': 'other-node'}),
+            lambda: historical['Config']['Labels'].update({'com.docker.swarm.task.id': 'task-active'}),
+            lambda: historical.update({'Image': 'sha256:' + '9' * 64}),
+            lambda: historical['Mounts'][0].update({'RW': True}),
+            lambda: historical['Mounts'][1].update({'Source': '/var/lib/servus/secrets'}),
+        ]
+        for idx, mutate in enumerate(mutations):
+            with self.subTest(case=idx):
+                snapshot = json.loads(json.dumps(historical))
+                mutate()
+                with self.assertRaises(module.QuiescenceError):
+                    self.check()
+                historical.clear()
+                historical.update(snapshot)
+
     def test_rejects_volume_aliases(self):
         self.docker.call.side_effect = [b'fixture\n', json.dumps([{'Driver': 'local', 'Options': {'type': 'none', 'device': '/var/lib/servus'}}]).encode()]
         with mock.patch.object(module, 'check_mount_topology'), mock.patch.object(module.os, 'stat') as stat, mock.patch.object(module.pathlib.Path, 'read_text', return_value=''):
