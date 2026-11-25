@@ -80,6 +80,10 @@ export class Worker {
     try { job = this.store.claimNextJob(this.id,this.leaseMs); }
     catch(error) { this.claimUncertain=true; throw error; }
     if(!job) return false;
+    return this.executeClaimed(job);
+  }
+
+  private async executeClaimed(job: NonNullable<ReturnType<Store['claimNextJob']>>): Promise<boolean> {
     this.uncertainActions.add(job.actionId);
     const snapshot = freezeSnapshot(job.snapshot);
     let ownsLease = true;
@@ -146,20 +150,22 @@ export class Worker {
           continue;
         }
         while (!this.stopping && !this.draining && this.activeJobs.size < limit) {
-          let claimed = false;
-          const slot = Promise.resolve().then(async () => {
-            const didWork = await this.processOne();
-            claimed = didWork;
-            return didWork;
-          });
+          if (!this.allowWork()) break;
+          let job: ReturnType<Store['claimNextJob']>;
+          try { job = this.store.claimNextJob(this.id, this.leaseMs); }
+          catch (error) { this.claimUncertain = true; throw error; }
+          if (!job) break;
+          const slot = Promise.resolve().then(() => this.executeClaimed(job));
           this.activeJobs.add(slot);
           void slot.then(() => { this.activeJobs.delete(slot); }, () => { this.activeJobs.delete(slot); });
-          // Let processOne synchronously claim the next queued job before checking again.
-          await Promise.resolve();
-          if (!claimed && this.activeJobs.size <= 1) break;
         }
-        if (this.activeJobs.size > 0) {
-          await Promise.race([...this.activeJobs, delay(500)]);
+        if (this.activeJobs.size >= limit) {
+          await Promise.race([...this.activeJobs]);
+        } else if (this.activeJobs.size > 0) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const poll = new Promise<void>(resolve => { timer = setTimeout(resolve, 500); timer.unref?.(); });
+          await Promise.race([...this.activeJobs, poll]);
+          if (timer) clearTimeout(timer);
         } else {
           await delay(500);
         }

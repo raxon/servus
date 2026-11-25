@@ -186,6 +186,17 @@ describe('P2-A workspace extras, trusted proxies & P2-C Compose private Git', ()
     await Promise.all([worker.once(), worker.once()]);
     await worker.drain(1000);
     expect(peak).toBe(2);
+
+    // Regression: worker.run() with concurrency > 1 must not spin when idle or partially filled
+    let claims = 0;
+    const origClaim = f.store.claimNextJob.bind(f.store);
+    f.store.claimNextJob = (...args) => { claims++; return origClaim(...args); };
+    const idleWorker = new Worker(f.store, 60000, { maxConcurrency: () => 4 });
+    const runPromise = idleWorker.run();
+    await new Promise(r => setTimeout(r, 120));
+    idleWorker.stopping = true;
+    await runPromise;
+    expect(claims).toBeLessThan(5);
   });
 
   it('validates trustedProxies on domains and compiles Traefik ipStrategy labels', async () => {
