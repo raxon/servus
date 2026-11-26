@@ -546,7 +546,7 @@ function Shell() {
               <Brand />
             )}
           </Link>
-          {!compactRail ? <span className="ep-version-chip">v0.6.1</span> : null}
+          {!compactRail ? <span className="ep-version-chip">v0.7.0</span> : null}
         </div>
         <nav aria-label="Main navigation">
           <Link
@@ -690,8 +690,9 @@ function Shell() {
             <button ref={navigationTrigger} type="button" className="button mobile-menu-button" aria-controls="workspace-navigation" aria-expanded={navigationOpen} popoverTarget={nativePopover ? "workspace-navigation" : undefined} onClick={nativePopover ? undefined : () => setNavigationOpen(!navigationOpen)}><Menu size={17} aria-hidden="true" />Menu</button>
             <div className="topbar-right">
               {path === "/" ? <div className={`search-field topbar-search ${keyboardNavigation ? "keyboard-navigation" : ""}`}>
-                <Search size={16} />
+                <Search size={16} aria-hidden="true" />
                 <input aria-label="Search projects and services" placeholder="Search projects and services..." value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
+                <button type="button" className="ep-search-pill-action" onClick={() => setPaletteOpen(true)} aria-label="Open quick search" title="Quick search (⌘K)">⌘K</button>
               </div> : null}
             </div>
           </header>

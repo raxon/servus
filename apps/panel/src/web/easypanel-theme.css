@@ -1,5 +1,8 @@
 /* ==========================================================================
-   Servus — EasyPanel v2.39.0 1:1 Visual System (Light & Dark via light-dark())
+   Servus — Soft Monochrome Pill & Elevated Card Design System (Light & Dark)
+   Inspired by modern soft-minimalist mobile/web interfaces:
+   Cloud Gray canvas (#F5F6F7), Pure White 20-24px elevated cards,
+   Obsidian Carbon (#191C1E) pill CTAs & active tabs, floating dark nav capsule.
    ========================================================================== */
 
 :root {
@@ -12,40 +15,50 @@
     color-scheme: light;
   }
 
-  /* Core EasyPanel surface palette */
-  --ep-rail-bg: light-dark(#fafafa, #09090b);
-  --ep-sheet-bg: light-dark(#ffffff, #111113);
-  --ep-frame-bg: light-dark(#f4f4f5, #18181b);
-  --ep-card-bg: light-dark(#ffffff, #09090b);
-  --ep-card-subtle: light-dark(#fafafa, #141417);
-  --ep-border: light-dark(#e4e4e7, #27272a);
-  --ep-border-strong: light-dark(#d4d4d8, #3f3f46);
-  --ep-hover: light-dark(#f4f4f5, #1f1f23);
-  --ep-active: light-dark(#ffffff, #1f1f23);
+  /* Core Soft Monochrome Palette */
+  --ep-rail-bg: light-dark(#f4f5f7, #0d0e10);
+  --ep-sheet-bg: light-dark(#f8f9fb, #121417);
+  --ep-frame-bg: light-dark(#eff1f4, #1b1d21);
+  --ep-card-bg: light-dark(#ffffff, #17191d);
+  --ep-card-subtle: light-dark(#f5f6f8, #1e2025);
+  --ep-border: light-dark(rgba(25, 28, 30, 0.08), rgba(255, 255, 255, 0.08));
+  --ep-border-strong: light-dark(rgba(25, 28, 30, 0.14), rgba(255, 255, 255, 0.15));
+  --ep-hover: light-dark(#eef0f3, #24272d);
+  --ep-active: light-dark(#191c1e, #f4f5f7);
+  --ep-active-ink: light-dark(#ffffff, #121417);
+
+  /* Soft Ambient Elevation */
+  --ep-shadow-xs: light-dark(0 1px 2px rgba(17, 19, 21, 0.04), 0 1px 2px rgba(0, 0, 0, 0.25));
+  --ep-shadow-sm: light-dark(0 4px 16px rgba(17, 19, 21, 0.045), 0 6px 20px rgba(0, 0, 0, 0.3));
+  --ep-shadow-md: light-dark(0 10px 30px rgba(17, 19, 21, 0.06), 0 14px 36px rgba(0, 0, 0, 0.42));
+  --ep-shadow-dock: light-dark(0 14px 34px rgba(17, 19, 21, 0.16), 0 14px 36px rgba(0, 0, 0, 0.55));
 
   /* Ink & Typography */
-  --ep-ink: light-dark(#09090b, #fafafa);
-  --ep-ink-2: light-dark(#3f3f46, #d4d4d8);
-  --ep-muted: light-dark(#71717a, #a1a1aa);
+  --ep-ink: light-dark(#14171a, #f5f6f8);
+  --ep-ink-2: light-dark(#3b4048, #d0d4dc);
+  --ep-muted: light-dark(#767d87, #9299a5);
 
-  /* Signature EasyPanel Emerald Accent */
-  --ep-emerald: light-dark(#059669, #10b981);
-  --ep-emerald-hover: light-dark(#047857, #059669);
-  --ep-emerald-soft: light-dark(#d1fae5, rgba(16, 185, 129, 0.16));
-  --ep-emerald-ink: light-dark(#047857, #34d399);
+  /* Primary Obsidian Carbon CTA + Semantic Emerald Status */
+  --ep-primary: light-dark(#191c1e, #f5f6f8);
+  --ep-primary-hover: light-dark(#2c3136, #ffffff);
+  --ep-primary-ink: light-dark(#ffffff, #121417);
+  --ep-emerald: light-dark(#191c1e, #f5f6f8);
+  --ep-emerald-hover: light-dark(#2d3237, #ffffff);
+  --ep-emerald-soft: light-dark(#e6f6ee, rgba(16, 185, 129, 0.16));
+  --ep-emerald-ink: light-dark(#0f7a4c, #34d399);
 
   /* Semantic Status Colors */
   --ep-danger: light-dark(#dc2626, #f87171);
   --ep-danger-soft: light-dark(#fef2f2, rgba(239, 68, 68, 0.14));
   --ep-danger-border: light-dark(#fecaca, rgba(239, 68, 68, 0.35));
-  --ep-warn: light-dark(#d97706, #fbbf24);
+  --ep-warn: light-dark(#b45309, #fbbf24);
   --ep-warn-soft: light-dark(#fffbeb, rgba(245, 158, 11, 0.14));
   --ep-warn-border: light-dark(#fde68a, rgba(245, 158, 11, 0.35));
   --ep-info: light-dark(#2563eb, #60a5fa);
   --ep-info-soft: light-dark(#eff6ff, rgba(59, 130, 246, 0.14));
   --ep-info-border: light-dark(#bfdbfe, rgba(59, 130, 246, 0.35));
 
-  /* Map legacy Servus variables so ALL existing components inherit Light/Dark seamlessly */
+  /* Legacy Servus variable mapping for 100% Light/Dark inheritance */
   --bg: var(--ep-rail-bg);
   --surface: var(--ep-card-bg);
   --surface-2: var(--ep-frame-bg);
@@ -53,8 +66,8 @@
   --ink-2: var(--ep-ink-2);
   --muted: var(--ep-muted);
   --border: var(--ep-border);
-  --accent: var(--ep-emerald);
-  --accent-soft: var(--ep-emerald-soft);
+  --accent: var(--ep-primary);
+  --accent-soft: var(--ep-frame-bg);
   --danger: var(--ep-danger);
   --warn: var(--ep-warn);
   --dashboard-ink: var(--ep-ink);
@@ -65,11 +78,11 @@
   --dashboard-danger: var(--ep-danger);
   --dashboard-danger-soft: var(--ep-danger-soft);
   --dashboard-danger-line: var(--ep-danger-border);
-  --dashboard-focus: var(--ep-emerald);
+  --dashboard-focus: var(--ep-primary);
   --source-soft: var(--ep-card-subtle);
   --source-line: var(--ep-border);
   --source-muted: var(--ep-muted);
-  --source-accent: var(--ep-emerald);
+  --source-accent: var(--ep-primary);
 }
 
 html,
@@ -80,40 +93,38 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Prevent scroll bleed behind native modal dialogs */
 dialog:modal {
   overscroll-behavior: contain;
 }
 dialog::backdrop {
   overflow: hidden;
   overscroll-behavior: contain;
-  background: rgba(9, 9, 11, 0.52);
-  backdrop-filter: blur(4px);
+  background: rgba(15, 17, 20, 0.45);
+  backdrop-filter: blur(8px);
 }
 
 /* ==========================================================================
-   Global EasyPanel App Shell (Expanded 240px vs Collapsed 56px Icon Rail)
+   Global App Shell (Soft Expanded 248px Sidebar & Floating Dark Rail 68px)
    ========================================================================== */
 .app-layout {
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr);
+  grid-template-columns: 248px minmax(0, 1fr);
   min-height: 100dvh;
   background: var(--ep-rail-bg);
 }
 
 .app-layout.is-rail-mode {
-  grid-template-columns: 56px minmax(0, 1fr);
+  grid-template-columns: 72px minmax(0, 1fr);
 }
 
-/* Primary Left Sidebar */
 .sidebar {
   position: sticky;
   top: 0;
   height: 100dvh;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 12px 10px;
+  gap: 8px;
+  padding: 18px 14px 16px;
   background: var(--ep-rail-bg);
   border-right: 0;
   color: var(--ep-ink);
@@ -123,10 +134,10 @@ dialog::backdrop {
 }
 
 .app-layout.is-rail-mode .sidebar {
-  width: 56px;
-  padding: 12px 8px;
+  width: 72px;
+  padding: 16px 10px;
   align-items: center;
-  border-right: 1px solid var(--ep-border);
+  border-right: 0;
 }
 
 .ep-brand-header {
@@ -134,7 +145,7 @@ dialog::backdrop {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 4px 6px 10px;
+  padding: 2px 6px 14px;
 }
 
 .app-layout.is-rail-mode .ep-brand-header {
@@ -145,7 +156,7 @@ dialog::backdrop {
 .brand-link {
   display: inline-flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   text-decoration: none;
   color: var(--ep-ink);
   min-width: 0;
@@ -154,23 +165,23 @@ dialog::backdrop {
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 9px;
-  font-size: 16px;
+  gap: 10px;
+  font-size: 17px;
   font-weight: 700;
-  letter-spacing: -0.025em;
+  letter-spacing: -0.03em;
   color: var(--ep-ink);
 }
 
 .brand-symbol {
   display: inline-grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
   background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
-  flex: 0 0 30px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  flex: 0 0 34px;
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .brand-symbol img {
@@ -181,77 +192,102 @@ dialog::backdrop {
 
 .ep-version-chip {
   font-size: 11px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--ep-muted);
+  background: var(--ep-card-bg);
+  border: 1px solid var(--ep-border);
+  padding: 3px 9px;
+  border-radius: 999px;
   font-variant-numeric: tabular-nums;
 }
 
-/* Primary Nav Items */
+/* Primary Pill Navigation */
 .sidebar nav[aria-label="Main navigation"] {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
   width: 100%;
 }
 
 .sidebar .nav-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  min-height: 36px;
-  padding: 7px 10px;
-  border-radius: 8px;
+  gap: 11px;
+  min-height: 42px;
+  padding: 8px 14px;
+  border-radius: 999px;
   color: var(--ep-ink-2);
   font-size: 13.5px;
-  font-weight: 500;
+  font-weight: 550;
   text-decoration: none;
   border: 1px solid transparent;
-  transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
-}
-
-.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item,
-.app-layout.is-rail-mode .ep-rail-btn {
-  color: light-dark(#52525b, #a1a1aa);
-}
-
-.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item svg,
-.app-layout.is-rail-mode .ep-rail-btn svg {
-  opacity: 1;
-  color: currentColor;
-}
-
-.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item:hover,
-.app-layout.is-rail-mode .ep-rail-btn:hover {
-  color: var(--ep-ink);
-  background: var(--ep-hover);
-}
-
-.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item.active,
-.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item[aria-current="page"] {
-  color: var(--ep-ink);
-  background: var(--ep-frame-bg);
-  border-color: var(--ep-border);
+  transition: background-color 150ms ease, color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
 }
 
 .sidebar .nav-item:hover {
-  background: var(--ep-hover);
+  background: var(--ep-card-bg);
   color: var(--ep-ink);
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .sidebar .nav-item.active,
 .sidebar .nav-item[aria-current="page"] {
   background: var(--ep-active);
-  color: var(--ep-ink);
-  border-color: var(--ep-border);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  color: var(--ep-active-ink);
+  border-color: transparent;
+  box-shadow: var(--ep-shadow-sm);
 }
 
-.app-layout.is-rail-mode .sidebar .nav-item {
-  width: 38px;
-  height: 38px;
+.sidebar .nav-item.active svg,
+.sidebar .nav-item[aria-current="page"] svg {
+  color: var(--ep-active-ink);
+}
+
+/* Signature Floating Dark Pill Capsule in Collapsed Rail Mode (TripGlide Dock Aesthetic) */
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] {
+  background: light-dark(#191c1e, #1d2026);
+  padding: 6px;
+  border-radius: 999px;
+  gap: 6px;
+  width: 52px;
+  align-items: center;
+  box-shadow: var(--ep-shadow-dock);
+  border: 1px solid light-dark(rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.09));
+}
+
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item {
+  width: 40px;
+  height: 40px;
+  min-height: 40px;
   padding: 0;
   justify-content: center;
   margin-inline: auto;
+  border-radius: 999px;
+  color: #9ba2ad;
+  background: transparent;
+  box-shadow: none;
+}
+
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item svg {
+  opacity: 1;
+  color: currentColor;
+}
+
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item.active,
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item[aria-current="page"] {
+  background: #ffffff;
+  color: #14171a;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25);
+}
+
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item.active svg,
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item[aria-current="page"] svg {
+  color: #14171a;
 }
 
 .app-layout.is-rail-mode .sidebar .nav-item .ep-nav-text {
@@ -266,15 +302,21 @@ dialog::backdrop {
   border: 0;
 }
 
-/* Sidebar bottom utility section */
+/* Sidebar Bottom Utility Card */
 .sidebar-bottom {
   margin-top: auto;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding-top: 10px;
+  gap: 8px;
+  padding-top: 12px;
   border-top: 1px solid var(--ep-border);
   width: 100%;
+}
+
+.app-layout.is-rail-mode .sidebar-bottom {
+  border-top: 0;
+  align-items: center;
+  gap: 6px;
 }
 
 .ep-sidebar-utility-btn {
@@ -283,17 +325,18 @@ dialog::backdrop {
   justify-content: space-between;
   gap: 8px;
   width: 100%;
-  min-height: 34px;
-  padding: 6px 10px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
+  min-height: 38px;
+  padding: 7px 13px;
+  border: 1px solid var(--ep-border);
+  border-radius: 999px;
+  background: var(--ep-card-bg);
   color: var(--ep-ink-2);
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 550;
   cursor: pointer;
   text-align: left;
-  transition: background-color 140ms ease, color 140ms ease;
+  box-shadow: var(--ep-shadow-xs);
+  transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
 }
 
 .ep-sidebar-utility-btn:hover {
@@ -312,13 +355,13 @@ dialog::backdrop {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 1px 6px;
-  border-radius: 5px;
+  padding: 2px 7px;
+  border-radius: 999px;
   border: 1px solid var(--ep-border);
-  background: var(--ep-card-bg);
+  background: var(--ep-frame-bg);
   color: var(--ep-muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 600;
   line-height: 1.4;
 }
@@ -327,47 +370,49 @@ dialog::backdrop {
   position: relative;
   display: inline-flex;
   align-items: center;
-  width: 30px;
-  height: 17px;
+  width: 34px;
+  height: 20px;
   border-radius: 999px;
   background: var(--ep-border-strong);
-  padding: 2px;
+  padding: 3px;
   transition: background-color 150ms ease;
 }
 
 .ep-mini-switch.is-on {
-  background: var(--ep-emerald);
+  background: var(--ep-primary);
 }
 
 .ep-mini-switch-thumb {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
   border-radius: 999px;
-  background: #ffffff;
+  background: light-dark(#ffffff, #14171a);
   transition: transform 150ms ease;
 }
 
 .ep-mini-switch.is-on .ep-mini-switch-thumb {
-  transform: translateX(13px);
+  transform: translateX(14px);
 }
 
 .ep-rail-btn {
   display: inline-grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
+  width: 40px;
+  height: 40px;
   margin-inline: auto;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
+  border: 1px solid var(--ep-border);
+  border-radius: 999px;
+  background: var(--ep-card-bg);
   color: var(--ep-ink-2);
   cursor: pointer;
-  transition: background-color 140ms ease, color 140ms ease;
+  box-shadow: var(--ep-shadow-xs);
+  transition: background-color 140ms ease, color 140ms ease, transform 140ms ease;
 }
 
 .ep-rail-btn:hover {
-  background: var(--ep-hover);
-  color: var(--ep-ink);
+  background: var(--ep-primary);
+  color: var(--ep-primary-ink);
+  border-color: transparent;
 }
 
 .ep-sidebar-host-row {
@@ -375,11 +420,11 @@ dialog::backdrop {
   align-items: center;
   justify-content: space-between;
   gap: 6px;
-  padding: 6px 10px;
-  border-radius: 8px;
+  padding: 7px 12px;
+  border-radius: 999px;
   background: var(--ep-frame-bg);
   color: var(--ep-muted);
-  font-size: 12px;
+  font-size: 11.5px;
 }
 
 .ep-sidebar-host-row strong {
@@ -394,19 +439,26 @@ dialog::backdrop {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--ep-emerald);
-  background: var(--ep-emerald-soft);
-  color: var(--ep-emerald-ink);
+  padding: 9px 13px;
+  border-radius: 16px;
+  border: 1px solid transparent;
+  background: var(--ep-primary);
+  color: var(--ep-primary-ink);
   font-size: 12px;
   text-decoration: none;
+  box-shadow: var(--ep-shadow-sm);
+}
+
+.sidebar-update strong,
+.sidebar-update small {
+  color: var(--ep-primary-ink);
 }
 
 .app-layout.is-rail-mode .sidebar-update {
-  width: 38px;
-  height: 38px;
+  width: 40px;
+  height: 40px;
   padding: 0;
+  border-radius: 999px;
   justify-content: center;
   margin-inline: auto;
 }
@@ -419,22 +471,23 @@ dialog::backdrop {
 .sidebar-user {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 6px 8px;
-  border-radius: 8px;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 999px;
   border: 1px solid var(--ep-border);
   background: var(--ep-card-bg);
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .user-avatar {
   display: inline-grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   border-radius: 999px;
-  background: var(--ep-emerald-soft);
-  color: var(--ep-emerald-ink);
-  font-size: 12px;
+  background: var(--ep-primary);
+  color: var(--ep-primary-ink);
+  font-size: 12.5px;
   font-weight: 700;
   flex: none;
 }
@@ -447,7 +500,7 @@ dialog::backdrop {
 
 .sidebar-user strong {
   font-size: 12.5px;
-  font-weight: 600;
+  font-weight: 650;
   color: var(--ep-ink);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -463,16 +516,17 @@ dialog::backdrop {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 2px 6px;
+  padding: 2px 8px;
 }
 
 .ep-sidebar-lang-row span {
-  font-size: 11.5px;
+  font-size: 12px;
+  font-weight: 500;
   color: var(--ep-muted);
 }
 
 /* ==========================================================================
-   Main Floating Sheet (EasyPanel Rounded Sheet Container)
+   Main Floating Rounded Sheet (Airy Soft Canvas)
    ========================================================================== */
 .app-main {
   display: flex;
@@ -480,7 +534,7 @@ dialog::backdrop {
   min-width: 0;
   min-height: 100dvh;
   background: var(--ep-rail-bg);
-  padding: 8px 8px 0 0;
+  padding: 12px 12px 0 0;
 }
 
 .app-layout.is-rail-mode .app-main {
@@ -495,13 +549,15 @@ dialog::backdrop {
   background: var(--ep-sheet-bg);
   border: 1px solid var(--ep-border);
   border-bottom: 0;
-  border-radius: 14px 14px 0 0;
+  border-radius: 26px 26px 0 0;
+  box-shadow: var(--ep-shadow-sm);
   overflow: clip;
 }
 
 .app-layout.is-rail-mode .ep-sheet-container {
   border: 0;
   border-radius: 0;
+  box-shadow: none;
   background: var(--ep-rail-bg);
 }
 
@@ -509,11 +565,11 @@ dialog::backdrop {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 10px 24px;
-  min-height: 52px;
-  background: var(--ep-sheet-bg);
-  border-bottom: 1px solid var(--ep-border);
+  gap: 14px;
+  padding: 14px 28px;
+  min-height: 64px;
+  background: transparent;
+  border-bottom: 0;
 }
 
 .app-layout.is-rail-mode .topbar {
@@ -523,7 +579,7 @@ dialog::backdrop {
 .breadcrumbs {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   font-size: 13px;
   color: var(--ep-muted);
   min-width: 0;
@@ -532,6 +588,7 @@ dialog::backdrop {
 .breadcrumbs a {
   color: var(--ep-muted);
   text-decoration: none;
+  font-weight: 500;
 }
 
 .breadcrumbs a:hover {
@@ -540,7 +597,7 @@ dialog::backdrop {
 
 .breadcrumbs strong {
   color: var(--ep-ink);
-  font-weight: 600;
+  font-weight: 650;
 }
 
 .topbar-right {
@@ -549,24 +606,26 @@ dialog::backdrop {
   gap: 10px;
 }
 
+/* Signature TripGlide Soft White Pill Search Bar */
 .search-field.topbar-search {
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-height: 36px;
-  padding: 0 11px;
-  border-radius: 8px;
+  gap: 10px;
+  min-height: 44px;
+  padding: 4px 6px 4px 16px;
+  border-radius: 999px;
   border: 1px solid var(--ep-border);
-  background: var(--ep-card-subtle);
+  background: var(--ep-card-bg);
   color: var(--ep-muted);
-  min-width: 240px;
+  min-width: 280px;
+  box-shadow: var(--ep-shadow-sm);
 }
 
 .search-field.topbar-search input {
   border: 0;
   background: transparent;
   color: var(--ep-ink);
-  font-size: 13px;
+  font-size: 13.5px;
   width: 100%;
   min-width: 0;
   outline: none;
@@ -574,12 +633,33 @@ dialog::backdrop {
   min-height: 34px;
 }
 
+.ep-search-pill-action {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 0;
+  background: var(--ep-primary);
+  color: var(--ep-primary-ink);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  flex: none;
+  transition: transform 140ms ease, background-color 140ms ease;
+}
+
+.ep-search-pill-action:hover {
+  background: var(--ep-primary-hover);
+  transform: scale(1.04);
+}
+
 .content {
   flex: 1;
   width: 100%;
-  max-width: 1280px;
+  max-width: 1300px;
   margin-inline: auto;
-  padding: 24px 28px 48px;
+  padding: 8px 28px 56px;
   min-width: 0;
   background: transparent;
 }
@@ -593,11 +673,11 @@ dialog::backdrop {
 }
 
 /* ==========================================================================
-   Dual-Panel Context Workspace (228px Context Sidebar + Main Floating Sheet)
+   Dual-Panel Context Workspace (236px Context Sidebar + 26px Rounded Sheet)
    ========================================================================== */
 .ep-dual-layout {
   display: grid;
-  grid-template-columns: 228px minmax(0, 1fr);
+  grid-template-columns: 236px minmax(0, 1fr);
   flex: 1;
   min-height: 100dvh;
   background: var(--ep-rail-bg);
@@ -610,7 +690,7 @@ dialog::backdrop {
   display: flex;
   flex-direction: column;
   background: var(--ep-rail-bg);
-  padding: 12px 10px 16px;
+  padding: 16px 12px 20px 6px;
   overflow-y: auto;
   gap: 10px;
 }
@@ -618,32 +698,34 @@ dialog::backdrop {
 .ep-context-sheet {
   min-width: 0;
   background: var(--ep-sheet-bg);
-  border-top: 1px solid var(--ep-border);
-  border-left: 1px solid var(--ep-border);
-  border-top-left-radius: 16px;
-  margin-top: 8px;
-  padding: 24px 30px 56px;
+  border: 1px solid var(--ep-border);
+  border-bottom: 0;
+  border-radius: 26px 26px 0 0;
+  margin: 12px 12px 0 0;
+  padding: 26px 32px 60px;
+  box-shadow: var(--ep-shadow-sm);
 }
 
 .ep-context-sheet-inner {
-  max-width: 1040px;
+  max-width: 1060px;
   margin-inline: auto;
   display: grid;
-  gap: 18px;
+  gap: 20px;
   min-width: 0;
 }
 
-/* Project Switcher inside Context Sidebar */
+/* Project Switcher Pill */
 .ep-project-switcher {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  border-radius: 9px;
-  background: var(--ep-frame-bg);
+  gap: 9px;
+  padding: 9px 14px;
+  border-radius: 999px;
+  background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
   color: var(--ep-ink);
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .ep-project-switcher select {
@@ -653,7 +735,7 @@ dialog::backdrop {
   color: var(--ep-ink);
   font: inherit;
   font-size: 13.5px;
-  font-weight: 600;
+  font-weight: 650;
   width: 100%;
   min-width: 0;
   padding-right: 18px;
@@ -663,7 +745,7 @@ dialog::backdrop {
 
 .ep-project-switcher-chevron {
   position: absolute;
-  right: 10px;
+  right: 12px;
   pointer-events: none;
   color: var(--ep-muted);
 }
@@ -672,9 +754,9 @@ dialog::backdrop {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 8px 2px;
+  padding: 6px 12px 2px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 650;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--ep-muted);
@@ -683,48 +765,50 @@ dialog::backdrop {
 .ep-context-add-btn {
   display: inline-grid;
   place-items: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  border: 0;
-  background: transparent;
-  color: var(--ep-muted);
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  border: 1px solid var(--ep-border);
+  background: var(--ep-card-bg);
+  color: var(--ep-ink-2);
   cursor: pointer;
 }
 
 .ep-context-add-btn:hover {
-  background: var(--ep-hover);
-  color: var(--ep-ink);
+  background: var(--ep-primary);
+  color: var(--ep-primary-ink);
+  border-color: transparent;
 }
 
 .ep-context-service-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
 }
 
 .ep-context-service-item {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 7px 10px;
-  border-radius: 8px;
+  gap: 10px;
+  padding: 8px 13px;
+  border-radius: 999px;
   color: var(--ep-ink-2);
   font-size: 13.5px;
-  font-weight: 500;
+  font-weight: 550;
   text-decoration: none;
-  transition: background-color 120ms ease, color 120ms ease;
+  transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
 }
 
 .ep-context-service-item:hover {
-  background: var(--ep-hover);
+  background: var(--ep-card-bg);
   color: var(--ep-ink);
 }
 
 .ep-context-service-item.is-active {
-  background: var(--ep-frame-bg);
-  color: var(--ep-ink);
+  background: var(--ep-active);
+  color: var(--ep-active-ink);
   font-weight: 600;
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .ep-context-service-item span.truncate {
@@ -734,8 +818,8 @@ dialog::backdrop {
 }
 
 .ep-dot {
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 999px;
   flex: none;
   background: var(--ep-muted);
@@ -743,7 +827,7 @@ dialog::backdrop {
 
 .ep-dot.status-dot-running {
   background: #10b981;
-  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.22);
 }
 
 .ep-dot.status-dot-failed {
@@ -758,14 +842,14 @@ dialog::backdrop {
 .ep-context-divider {
   border: 0;
   border-top: 1px solid var(--ep-border);
-  margin: 6px 0;
+  margin: 6px 8px;
 }
 
-/* Service / Settings Vertical Navigation in Context Sidebar */
+/* Service / Settings Vertical Pill Navigation */
 .ep-context-nav {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
 }
 
 .ep-context-nav a,
@@ -775,38 +859,39 @@ dialog::backdrop {
   justify-content: space-between;
   gap: 8px;
   width: 100%;
-  padding: 7px 10px;
-  border-radius: 8px;
+  padding: 8px 13px;
+  border-radius: 999px;
   border: 0;
   background: transparent;
   color: var(--ep-ink-2);
   font: inherit;
   font-size: 13.5px;
-  font-weight: 500;
+  font-weight: 550;
   text-decoration: none;
   cursor: pointer;
   text-align: left;
-  transition: background-color 120ms ease, color 120ms ease;
+  transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
 }
 
 .ep-context-nav a:hover,
 .ep-context-nav button:hover {
-  background: var(--ep-hover);
+  background: var(--ep-card-bg);
   color: var(--ep-ink);
 }
 
 .ep-context-nav a.selected,
 .ep-context-nav a[aria-current="page"],
 .ep-context-nav button[aria-selected="true"] {
-  background: var(--ep-frame-bg);
-  color: var(--ep-ink);
+  background: var(--ep-active);
+  color: var(--ep-active-ink);
   font-weight: 600;
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .ep-context-nav-label {
   display: inline-flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   min-width: 0;
 }
 
@@ -817,17 +902,24 @@ dialog::backdrop {
 
 .ep-context-nav a.selected .ep-context-nav-label svg,
 .ep-context-nav a[aria-current="page"] .ep-context-nav-label svg {
-  color: var(--ep-ink);
+  color: var(--ep-active-ink);
+}
+
+.ep-context-nav a.selected .tab-count,
+.ep-context-nav a[aria-current="page"] .tab-count {
+  background: light-dark(rgba(255, 255, 255, 0.2), rgba(0, 0, 0, 0.16));
+  color: var(--ep-active-ink);
 }
 
 /* ==========================================================================
-   Signature EasyPanel Framed Card (.ep-framed-card)
+   Elevated Soft Card System (.ep-framed-card & .surface)
    ========================================================================== */
 .ep-framed-card {
-  border-radius: 12px;
-  background: var(--ep-frame-bg);
+  border-radius: 22px;
+  background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
-  padding: 4px;
+  padding: 6px;
+  box-shadow: var(--ep-shadow-sm);
   min-width: 0;
 }
 
@@ -837,10 +929,10 @@ dialog::backdrop {
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 10px;
-  padding: 7px 12px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--ep-muted);
+  padding: 10px 16px;
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--ep-ink);
 }
 
 .ep-framed-head-actions {
@@ -850,30 +942,31 @@ dialog::backdrop {
 }
 
 .ep-framed-body {
-  background: var(--ep-card-bg);
-  border: 1px solid var(--ep-border);
-  border-radius: 9px;
-  padding: 16px;
+  background: var(--ep-card-subtle);
+  border: 0;
+  border-radius: 17px;
+  padding: 18px;
   min-width: 0;
 }
 
 /* ==========================================================================
-   Server Telemetry Sparklines (Top 4-column bar on Dashboard & Monitor)
+   Server Telemetry Sparklines (Soft Elevated White Cards)
    ========================================================================== */
 .ep-telemetry-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-  margin-bottom: 20px;
+  gap: 14px;
+  margin-bottom: 24px;
 }
 
 .ep-telemetry-card {
   display: grid;
-  gap: 4px;
-  padding: 14px 16px 10px;
-  border-radius: 12px;
+  gap: 5px;
+  padding: 18px 20px 14px;
+  border-radius: 22px;
   background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
+  box-shadow: var(--ep-shadow-sm);
   min-width: 0;
 }
 
@@ -887,21 +980,22 @@ dialog::backdrop {
 .ep-telemetry-label {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   font-size: 12.5px;
   font-weight: 600;
   color: var(--ep-muted);
 }
 
 .ep-telemetry-value {
-  font-size: 17px;
-  font-weight: 700;
+  font-size: 19px;
+  font-weight: 750;
+  letter-spacing: -0.02em;
   color: var(--ep-ink);
   font-variant-numeric: tabular-nums;
 }
 
 .ep-telemetry-sub {
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--ep-muted);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -911,30 +1005,31 @@ dialog::backdrop {
 
 .ep-sparkline-svg {
   width: 100%;
-  height: 40px;
+  height: 42px;
   display: block;
-  margin-top: 4px;
+  margin-top: 6px;
 }
 
 /* ==========================================================================
-   EasyPanel Buttons, Inputs, Badges & Legacy Surfaces Dark/Light Normalization
+   Obsidian Pill Buttons, Circular Icon Controls & Elevated Surfaces
    ========================================================================== */
 .button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 7px;
-  min-height: 36px;
-  padding: 0 13px;
-  border-radius: 8px;
+  min-height: 38px;
+  padding: 0 16px;
+  border-radius: 999px;
   border: 1px solid var(--ep-border);
   background: var(--ep-card-bg);
   color: var(--ep-ink);
   font-size: 13px;
-  font-weight: 550;
+  font-weight: 600;
   text-decoration: none;
   cursor: pointer;
-  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+  box-shadow: var(--ep-shadow-xs);
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, transform 140ms ease;
 }
 
 .button:hover:not(:disabled) {
@@ -943,20 +1038,21 @@ dialog::backdrop {
 }
 
 .button-primary {
-  background: var(--ep-emerald);
-  border-color: var(--ep-emerald);
-  color: #ffffff;
+  background: var(--ep-primary);
+  border-color: transparent;
+  color: var(--ep-primary-ink);
+  box-shadow: var(--ep-shadow-sm);
 }
 
 .button-primary:hover:not(:disabled) {
-  background: var(--ep-emerald-hover);
-  border-color: var(--ep-emerald-hover);
-  color: #ffffff;
+  background: var(--ep-primary-hover);
+  border-color: transparent;
+  color: var(--ep-primary-ink);
 }
 
 .button-small {
-  min-height: 31px;
-  padding: 0 10px;
+  min-height: 33px;
+  padding: 0 13px;
   font-size: 12.5px;
 }
 
@@ -964,18 +1060,20 @@ dialog::backdrop {
   background: var(--ep-danger-soft);
   border-color: var(--ep-danger-border);
   color: var(--ep-danger);
+  box-shadow: none;
 }
 
 .icon-button {
   display: inline-grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--ep-muted);
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  border: 1px solid var(--ep-border);
+  background: var(--ep-card-bg);
+  color: var(--ep-ink-2);
   cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease;
 }
 
 .icon-button:hover:not(:disabled) {
@@ -995,12 +1093,14 @@ dialog::backdrop {
   background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
   color: var(--ep-ink);
-  border-radius: 12px;
+  border-radius: 22px;
+  box-shadow: var(--ep-shadow-sm);
 }
 
 .modal {
-  padding: 22px;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.25);
+  padding: 24px;
+  border-radius: 26px;
+  box-shadow: 0 28px 72px rgba(0, 0, 0, 0.28);
 }
 
 .servus-input,
@@ -1009,9 +1109,18 @@ dialog::backdrop {
 input:not([type="checkbox"]):not([type="radio"]):not([type="color"]):not(.ep-cmd-input),
 select,
 textarea {
-  background: var(--ep-card-bg);
+  background: var(--ep-card-subtle);
   color: var(--ep-ink);
-  border-color: var(--ep-border-strong);
+  border: 1px solid var(--ep-border-strong);
+  border-radius: 14px;
+}
+
+.search-field.topbar-search input,
+.ep-search-inline input {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .servus-subpanel,
@@ -1023,13 +1132,16 @@ textarea {
 .servus-option-tile {
   background: var(--ep-card-subtle);
   border-color: var(--ep-border);
+  border-radius: 16px;
   color: var(--ep-ink);
 }
 
 .template-choice-card {
   background: var(--ep-card-bg);
   border-color: var(--ep-border);
+  border-radius: 18px;
   color: var(--ep-ink);
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .template-choice-card:hover:not(:disabled) {
@@ -1038,9 +1150,9 @@ textarea {
 }
 
 .template-choice-card[aria-pressed="true"] {
-  border-color: var(--ep-emerald);
-  background: var(--ep-emerald-soft);
-  box-shadow: 0 0 0 1px var(--ep-emerald);
+  border-color: var(--ep-primary);
+  background: var(--ep-card-subtle);
+  box-shadow: 0 0 0 2px var(--ep-primary);
 }
 
 .template-choice-pill,
@@ -1048,13 +1160,14 @@ textarea {
 .tab-count {
   background: var(--ep-frame-bg);
   color: var(--ep-muted);
+  border-radius: 999px;
 }
 
 .badge {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 2px 8px;
+  gap: 6px;
+  padding: 4px 10px;
   border-radius: 999px;
   font-size: 11.5px;
   font-weight: 600;
@@ -1087,10 +1200,10 @@ textarea {
 .ep-type-pill {
   display: inline-flex;
   align-items: center;
-  padding: 2px 8px;
-  border-radius: 6px;
-  background: var(--ep-emerald-soft);
-  color: var(--ep-emerald-ink);
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--ep-frame-bg);
+  color: var(--ep-ink);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -1106,86 +1219,58 @@ textarea {
   background: var(--ep-danger-soft);
   border: 1px solid var(--ep-danger-border);
   color: var(--ep-danger);
+  border-radius: 16px;
 }
 
 .change-notice {
   background: var(--ep-warn-soft);
   border: 1px solid var(--ep-warn-border);
   color: var(--ep-ink);
+  border-radius: 16px;
 }
 
 /* ==========================================================================
-   Dashboard 1:1 EasyPanel Layout
+   Dashboard — Airy Elevated Project & Service Cards
    ========================================================================== */
 .dashboard-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 12px;
-  margin-bottom: 16px;
+  gap: 14px;
+  margin-bottom: 20px;
 }
 
 .dashboard-heading h1 {
   margin: 0;
-  font-size: 24px;
-  font-weight: 700;
-  letter-spacing: -0.025em;
+  font-size: 28px;
+  font-weight: 750;
+  letter-spacing: -0.03em;
   color: var(--ep-ink);
 }
 
 .dashboard-scope {
   display: block;
-  font-size: 13px;
+  font-size: 13.5px;
   color: var(--ep-muted);
-  margin-top: 2px;
+  margin-top: 3px;
 }
 
-.dashboard-service-summary {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin: 0 0 16px;
-}
-
-.dashboard-service-summary > div {
-  padding: 12px 16px;
-  border-radius: 10px;
-  background: var(--ep-card-bg);
-  border: 1px solid var(--ep-border);
-}
-
-.dashboard-service-summary dt {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--ep-muted);
-}
-
-.dashboard-service-summary dd {
-  margin: 4px 0 0;
-  font-size: 22px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  color: var(--ep-ink);
-}
-
-.dashboard-service-summary > div.has-failure dd {
-  color: var(--ep-danger);
-}
-
-.dashboard-attention {
-  margin-bottom: 18px;
-  padding: 14px 16px;
-  background: var(--ep-card-bg);
-  border: 1px solid var(--ep-border);
+.dashboard-overview .dashboard-project-region {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .dashboard-project-group {
-  border-radius: 12px;
-  background: var(--ep-frame-bg);
+  border-radius: 24px;
+  background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
-  padding: 4px;
-  margin-bottom: 14px;
+  padding: 16px 18px 18px;
+  margin-bottom: 16px;
+  box-shadow: var(--ep-shadow-sm);
 }
 
 .dashboard-project-heading {
@@ -1193,22 +1278,24 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 8px 12px;
+  padding: 2px 4px 14px;
+  margin-bottom: 0;
 }
 
 .dashboard-project-heading > a {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   color: var(--ep-ink);
   text-decoration: none;
-  font-weight: 600;
+  font-weight: 650;
 }
 
 .dashboard-project-heading h3 {
   margin: 0;
-  font-size: 14.5px;
-  font-weight: 650;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
   color: var(--ep-ink);
 }
 
@@ -1221,10 +1308,10 @@ textarea {
 }
 
 .dashboard-project-group > div[id^="project-services-"] {
-  background: var(--ep-card-bg);
-  border: 1px solid var(--ep-border);
-  border-radius: 9px;
-  padding: 12px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
 }
 
 .dashboard-project-group > div[id^="project-services-"][hidden] {
@@ -1233,60 +1320,70 @@ textarea {
 
 .dashboard-services-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
+  gap: 12px;
   align-items: stretch;
 }
 
-.dashboard-service-entry {
+.dashboard-overview .dashboard-service-entry {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  height: 10.25rem;
   background: var(--ep-card-subtle);
   border: 1px solid var(--ep-border);
-  border-radius: 10px;
-  padding: 12px;
-  transition: border-color 140ms ease, background-color 140ms ease;
+  border-radius: 18px;
+  padding: 0;
+  transition: border-color 150ms ease, background-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
 }
 
-.dashboard-service-entry:hover {
+.dashboard-overview .dashboard-service-entry:hover {
   border-color: var(--ep-border-strong);
   background: var(--ep-hover);
+  box-shadow: var(--ep-shadow-xs);
 }
 
-.dashboard-service-entry.has-failure {
+.dashboard-overview .dashboard-service-entry.has-failure {
   border-color: var(--ep-danger-border);
+  background: var(--ep-danger-soft);
 }
 
-.dashboard-service-card {
+.dashboard-overview .dashboard-service-entry .dashboard-service-card {
   display: grid;
-  gap: 8px;
+  grid-template-rows: 2.9em 26px;
+  align-content: start;
+  gap: 10px;
+  height: 100%;
+  min-height: 0;
+  padding: 16px 18px;
   color: var(--ep-ink);
   text-decoration: none;
+  border-radius: 18px;
 }
 
 .dashboard-service-identity {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   min-width: 0;
 }
 
 .dashboard-service-icon {
   display: inline-grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
   background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
-  color: var(--ep-ink-2);
+  color: var(--ep-ink);
+  box-shadow: var(--ep-shadow-xs);
   flex: none;
 }
 
 .dashboard-service-identity strong {
-  font-size: 14px;
-  font-weight: 600;
+  font-size: 14.5px;
+  font-weight: 650;
   color: var(--ep-ink);
   white-space: nowrap;
   overflow: hidden;
@@ -1299,26 +1396,26 @@ textarea {
   justify-content: center;
   gap: 8px;
   width: 100%;
-  min-height: 46px;
-  margin-top: 8px;
-  border-radius: 10px;
+  min-height: 52px;
+  margin-top: 10px;
+  border-radius: 999px;
   border: 1.5px dashed var(--ep-border-strong);
-  background: transparent;
-  color: var(--ep-muted);
+  background: var(--ep-card-bg);
+  color: var(--ep-ink-2);
   font-size: 13.5px;
-  font-weight: 600;
+  font-weight: 650;
   cursor: pointer;
-  transition: border-color 140ms ease, color 140ms ease, background-color 140ms ease;
+  transition: border-color 150ms ease, color 150ms ease, background-color 150ms ease;
 }
 
 .ep-dashed-create-btn:hover {
-  border-color: var(--ep-emerald);
-  color: var(--ep-emerald-ink);
-  background: var(--ep-emerald-soft);
+  border-color: var(--ep-primary);
+  color: var(--ep-primary-ink);
+  background: var(--ep-primary);
 }
 
 /* ==========================================================================
-   Service Header & EasyPanel Action + Metrics Toolbar Card
+   Service Header & Soft Elevated Action + Metrics Bar
    ========================================================================== */
 .ep-service-header {
   display: flex;
@@ -1332,11 +1429,11 @@ textarea {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 9px;
   margin: 0;
-  font-size: 22px;
-  font-weight: 700;
-  letter-spacing: -0.025em;
+  font-size: 24px;
+  font-weight: 750;
+  letter-spacing: -0.03em;
   color: var(--ep-ink);
 }
 
@@ -1363,10 +1460,13 @@ textarea {
 }
 
 .ep-action-toolbar-frame {
-  border-radius: 12px;
-  background: var(--ep-frame-bg);
+  border-radius: 22px;
+  background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
-  padding: 4px;
+  padding: 12px 14px;
+  box-shadow: var(--ep-shadow-sm);
+  display: grid;
+  gap: 12px;
 }
 
 .ep-action-toolbar-top {
@@ -1374,18 +1474,20 @@ textarea {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 10px 12px;
-  background: var(--ep-card-bg);
-  border: 1px solid var(--ep-border);
-  border-radius: 9px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
 }
 
 .ep-action-toolbar-metrics {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 18px;
-  padding: 8px 14px 4px;
+  gap: 20px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: var(--ep-card-subtle);
   font-size: 12.5px;
   color: var(--ep-muted);
   font-variant-numeric: tabular-nums;
@@ -1393,16 +1495,16 @@ textarea {
 
 .ep-action-toolbar-metrics strong {
   color: var(--ep-ink);
-  font-weight: 600;
-  margin-left: 4px;
+  font-weight: 650;
+  margin-left: 5px;
 }
 
 /* ==========================================================================
-   Pages: Monitor, Domains, Actions (1:1 EasyPanel)
+   Pages: Monitor, Domains, Activity (Pill Segmented Tabs & Soft Rows)
    ========================================================================== */
 .ep-page {
   display: grid;
-  gap: 18px;
+  gap: 20px;
   min-width: 0;
 }
 
@@ -1416,29 +1518,30 @@ textarea {
 
 .ep-page-header h1 {
   margin: 0;
-  font-size: 24px;
-  font-weight: 700;
-  letter-spacing: -0.025em;
+  font-size: 28px;
+  font-weight: 750;
+  letter-spacing: -0.03em;
   color: var(--ep-ink);
 }
 
 .ep-page-header-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   flex-wrap: wrap;
 }
 
 .ep-search-inline {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  min-height: 32px;
-  padding: 0 10px;
-  border-radius: 8px;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 999px;
   border: 1px solid var(--ep-border);
   background: var(--ep-card-bg);
   color: var(--ep-muted);
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .ep-search-inline input {
@@ -1447,34 +1550,44 @@ textarea {
   color: var(--ep-ink);
   font-size: 13px;
   outline: none;
-  min-width: 160px;
+  min-width: 170px;
 }
 
+/* Signature TripGlide Pill Tab Bar (Black active pill + soft light inactive pills) */
 .ep-segmented {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  padding: 3px;
-  border-radius: 8px;
-  background: var(--ep-card-bg);
-  border: 1px solid var(--ep-border);
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0;
+  border-radius: 999px;
+  background: transparent;
+  border: 0;
 }
 
 .ep-segmented button {
-  border: 0;
-  border-radius: 6px;
-  padding: 5px 11px;
-  background: transparent;
-  color: var(--ep-muted);
-  font-size: 12.5px;
+  border: 1px solid var(--ep-border);
+  border-radius: 999px;
+  padding: 8px 16px;
+  background: var(--ep-card-bg);
+  color: var(--ep-ink-2);
+  font-size: 13px;
   font-weight: 600;
   cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+
+.ep-segmented button:hover {
+  background: var(--ep-hover);
+  color: var(--ep-ink);
 }
 
 .ep-segmented button.is-active,
 .ep-segmented button[aria-selected="true"] {
-  background: var(--ep-frame-bg);
-  color: var(--ep-ink);
+  background: var(--ep-active);
+  color: var(--ep-active-ink);
+  border-color: transparent;
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .ep-table-wrap {
@@ -1490,9 +1603,9 @@ textarea {
 
 .ep-data-table th {
   text-align: left;
-  padding: 9px 12px;
+  padding: 10px 14px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 650;
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--ep-muted);
@@ -1501,7 +1614,7 @@ textarea {
 }
 
 .ep-data-table td {
-  padding: 11px 12px;
+  padding: 13px 14px;
   border-bottom: 1px solid var(--ep-border);
   color: var(--ep-ink);
   font-variant-numeric: tabular-nums;
@@ -1515,13 +1628,13 @@ textarea {
 .ep-monitor-service-link {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   color: var(--ep-ink);
   text-decoration: none;
 }
 
 .ep-monitor-service-link:hover strong {
-  color: var(--ep-emerald);
+  text-decoration: underline;
 }
 
 .ep-monitor-project-name,
@@ -1538,7 +1651,7 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 4px;
+  padding: 11px 6px;
   border-bottom: 1px solid var(--ep-border);
   font-size: 13px;
 }
@@ -1573,9 +1686,9 @@ textarea {
 
 .ep-domain-source,
 .ep-domain-target {
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: var(--ep-frame-bg);
+  padding: 10px 15px;
+  border-radius: 999px;
+  background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
   font-size: 12.5px;
   color: var(--ep-ink);
@@ -1598,19 +1711,20 @@ textarea {
 .ep-icon-pill {
   display: inline-grid;
   place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 8px;
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
   border: 1px solid var(--ep-border);
-  background: var(--ep-card-subtle);
+  background: var(--ep-card-bg);
   color: var(--ep-ink-2);
   text-decoration: none;
   cursor: pointer;
 }
 
 .ep-icon-pill:hover {
-  background: var(--ep-hover);
-  color: var(--ep-ink);
+  background: var(--ep-primary);
+  color: var(--ep-primary-ink);
+  border-color: transparent;
 }
 
 .ep-icon-pill.is-star {
@@ -1623,26 +1737,29 @@ textarea {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 18px 8px;
+  padding: 20px 10px;
   color: var(--ep-muted);
   font-size: 13.5px;
 }
 
-/* EasyPanel Action Pills on /activity */
+/* Activity Pills */
 .action-table {
-  padding: 8px;
+  padding: 10px;
   display: grid;
-  gap: 6px;
+  gap: 8px;
 }
 
 .action-table-head {
-  padding: 6px 12px;
+  background: var(--ep-card-subtle);
   color: var(--ep-muted);
-  border-bottom: 1px solid var(--ep-border);
+  border-radius: 14px;
+  border: 0;
+  padding: 8px 14px;
+  font-size: 11px;
 }
 
 .action-row {
-  border-radius: 9px;
+  border-radius: 16px;
   border: 1px solid var(--ep-border);
   background: var(--ep-card-subtle);
   color: var(--ep-ink);
@@ -1658,14 +1775,14 @@ textarea {
    Command Palette (⌘K) Native Modal Dialog
    ========================================================================== */
 .ep-cmd-dialog {
-  width: min(560px, calc(100vw - 32px));
-  max-height: min(520px, 80dvh);
+  width: min(580px, calc(100vw - 32px));
+  max-height: min(540px, 80dvh);
   padding: 0;
   border: 1px solid var(--ep-border-strong);
-  border-radius: 14px;
+  border-radius: 26px;
   background: var(--ep-card-bg);
   color: var(--ep-ink);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.32);
+  box-shadow: 0 28px 72px rgba(0, 0, 0, 0.34);
   overflow: hidden;
   margin: auto;
 }
@@ -1685,8 +1802,8 @@ textarea {
 .ep-cmd-input-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 12px 14px;
+  gap: 12px;
+  padding: 16px 18px;
   border-bottom: 1px solid var(--ep-border);
 }
 
@@ -1701,22 +1818,22 @@ textarea {
   background: transparent;
   color: var(--ep-ink);
   font: inherit;
-  font-size: 14.5px;
+  font-size: 15px;
   outline: none;
   min-width: 0;
 }
 
 .ep-cmd-list {
   overflow-y: auto;
-  padding: 8px;
+  padding: 10px;
   display: grid;
   gap: 8px;
 }
 
 .ep-cmd-group-label {
-  padding: 4px 10px;
+  padding: 6px 12px 4px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 650;
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--ep-muted);
@@ -1725,11 +1842,11 @@ textarea {
 .ep-cmd-item {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 11px;
   width: 100%;
-  padding: 8px 10px;
+  padding: 10px 12px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 16px;
   background: transparent;
   color: var(--ep-ink);
   text-align: left;
@@ -1744,12 +1861,12 @@ textarea {
 .ep-cmd-item-icon {
   display: inline-grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
   background: var(--ep-card-subtle);
   border: 1px solid var(--ep-border);
-  color: var(--ep-ink-2);
+  color: var(--ep-ink);
   flex: none;
 }
 
@@ -1760,7 +1877,7 @@ textarea {
 
 .ep-cmd-item-main strong {
   font-size: 13.5px;
-  font-weight: 600;
+  font-weight: 650;
   color: var(--ep-ink);
 }
 
@@ -1770,14 +1887,14 @@ textarea {
 }
 
 .ep-cmd-empty {
-  padding: 24px 12px;
+  padding: 28px 12px;
   text-align: center;
   color: var(--ep-muted);
   font-size: 13.5px;
 }
 
 /* ==========================================================================
-   Dark Mode Overrides for Legacy Servus Stylesheets
+   Complete Proportions, Scaling & Dark/Light Normalization Across All Views
    ========================================================================== */
 .detail-row {
   border-color: var(--ep-border);
@@ -1802,17 +1919,19 @@ textarea {
 .servus-icon-badge {
   background: var(--ep-frame-bg);
   border-color: var(--ep-border);
-  color: var(--ep-ink-2);
+  border-radius: 12px;
+  color: var(--ep-ink);
 }
 
 .locale-switcher {
-  background: var(--ep-frame-bg);
+  background: var(--ep-card-bg);
   border-color: var(--ep-border);
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .locale-switcher button[aria-pressed="true"] {
-  background: var(--ep-ink);
-  color: var(--ep-card-bg);
+  background: var(--ep-primary);
+  color: var(--ep-primary-ink);
 }
 
 .mobile-menu-button {
@@ -1827,6 +1946,9 @@ textarea {
 
 .dashboard-overview .dashboard-collection-heading h2 {
   color: var(--ep-ink);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
 }
 
 /* Metrics History Dark/Light Normalization */
@@ -1841,16 +1963,19 @@ textarea {
 .metrics-window-group {
   background: var(--ep-frame-bg);
   border: 1px solid var(--ep-border);
+  border-radius: 999px;
+  padding: 3px;
 }
 
 .metrics-window-group button {
   color: var(--ep-muted);
+  border-radius: 999px;
 }
 
 .metrics-window-group button[aria-pressed="true"] {
-  background: var(--ep-card-bg);
-  color: var(--ep-ink);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
+  background: var(--ep-active);
+  color: var(--ep-active-ink);
+  box-shadow: var(--ep-shadow-xs);
 }
 
 .metrics-history-notes {
@@ -1860,6 +1985,7 @@ textarea {
 .metrics-chart-card {
   background: var(--ep-card-subtle);
   border-color: var(--ep-border);
+  border-radius: 18px;
 }
 
 .metrics-chart-title,
@@ -1880,13 +2006,17 @@ textarea {
 .setup-form-card {
   background: var(--ep-card-bg);
   border-color: var(--ep-border);
+  border-radius: 26px;
+  box-shadow: var(--ep-shadow-md);
 }
 
-/* ==========================================================================
-   Complete Proportions, Scaling & Dark/Light Normalization Across All Views
-   ========================================================================== */
+.setup-submit {
+  border-radius: 999px;
+  background: var(--ep-primary);
+  color: var(--ep-primary-ink);
+}
 
-/* Unified heading & primary text legibility */
+/* Unified Heading & Primary Text Legibility */
 .content :is(h1, h2, h3, h4),
 .modal :is(h1, h2, h3, h4),
 .card-heading :is(h2, h3),
@@ -1903,9 +2033,9 @@ textarea {
   color: var(--ep-muted);
 }
 
-/* Empty States (Project Empty, Settings Empty) */
+/* Empty States */
 .empty-services {
-  padding: 52px 28px;
+  padding: 56px 28px;
 }
 
 .empty-services p {
@@ -1920,14 +2050,15 @@ textarea {
 .empty-service-icon {
   background: var(--ep-frame-bg);
   border: 1px solid var(--ep-border);
-  color: var(--ep-ink-2);
+  border-radius: 20px;
+  color: var(--ep-ink);
 }
 
 .settings-empty {
   background: var(--ep-card-subtle);
   border: 1px dashed var(--ep-border-strong);
   color: var(--ep-ink);
-  border-radius: 10px;
+  border-radius: 18px;
 }
 
 .settings-empty strong {
@@ -1938,27 +2069,46 @@ textarea {
   color: var(--ep-muted);
 }
 
-/* Source Tab — 5 equal columns on wide desktop (no 4+1 orphan), clean dark/light cards */
+/* Source Tab — 5 Equal Soft Cards on Desktop */
 .source-card {
   background: var(--ep-card-bg);
   border-color: var(--ep-border);
+  border-radius: 22px;
   color: var(--ep-ink);
+  box-shadow: var(--ep-shadow-sm);
 }
 
 .source-card-header {
   border-bottom-color: var(--ep-border);
 }
 
-.source-card-icon {
+.source-card-icon,
+.source-intro-icon {
   background: var(--ep-frame-bg);
   border: 1px solid var(--ep-border);
+  border-radius: 14px;
+  color: var(--ep-ink);
+}
+
+.source-badge,
+.source-status {
+  background: var(--ep-frame-bg);
+  border: 1px solid var(--ep-border);
+  border-radius: 999px;
   color: var(--ep-ink-2);
 }
 
-.source-badge {
-  background: var(--ep-frame-bg);
-  border: 1px solid var(--ep-border);
-  color: var(--ep-ink-2);
+.source-status-dirty {
+  background: var(--ep-warn-soft);
+  border-color: var(--ep-warn-border);
+  color: var(--ep-warn);
+}
+
+.source-check-success {
+  background: var(--ep-emerald-soft);
+  border-color: transparent;
+  border-radius: 14px;
+  color: var(--ep-emerald-ink);
 }
 
 .source-choice-group legend,
@@ -1973,10 +2123,10 @@ textarea {
   border-color: var(--ep-border-strong);
   color: var(--ep-ink-2);
   min-height: 36px;
-  padding: 0 12px;
-  border-radius: 8px;
+  padding: 0 14px;
+  border-radius: 999px;
   font-size: 12.5px;
-  font-weight: 550;
+  font-weight: 600;
 }
 
 .source-choice-option > .source-choice-content:hover {
@@ -1985,21 +2135,22 @@ textarea {
 }
 
 .source-choice-option input:checked + span {
-  background: var(--ep-emerald);
-  border-color: var(--ep-emerald);
-  color: #ffffff;
+  background: var(--ep-primary);
+  border-color: transparent;
+  color: var(--ep-primary-ink);
 }
 
 .source-choice-detailed .source-choice-options {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
+  gap: 10px;
 }
 
 .source-choice-detailed .source-choice-content {
-  min-height: 82px;
-  padding: 12px 11px;
+  min-height: 86px;
+  padding: 14px 12px;
   gap: 8px;
+  border-radius: 18px;
   background: var(--ep-card-subtle);
   border: 1px solid var(--ep-border);
   color: var(--ep-muted);
@@ -2028,10 +2179,10 @@ textarea {
 }
 
 .source-choice-detailed input:checked + .source-choice-content {
-  background: var(--ep-emerald-soft);
-  border-color: var(--ep-emerald);
-  box-shadow: inset 0 0 0 1px var(--ep-emerald);
-  color: var(--ep-emerald-ink);
+  background: var(--ep-card-bg);
+  border-color: var(--ep-primary);
+  box-shadow: inset 0 0 0 1.5px var(--ep-primary), var(--ep-shadow-xs);
+  color: var(--ep-ink);
 }
 
 .source-choice-detailed input:checked + .source-choice-content strong {
@@ -2043,7 +2194,7 @@ textarea {
 }
 
 .source-choice-detailed .source-choice-check {
-  color: var(--ep-emerald);
+  color: var(--ep-ink);
 }
 
 .source-hint,
@@ -2053,36 +2204,13 @@ textarea {
   background: var(--ep-card-subtle);
   border: 1px solid var(--ep-border);
   color: var(--ep-ink-2);
-  border-radius: 10px;
-}
-
-.source-intro-icon {
-  background: var(--ep-frame-bg);
-  border-color: var(--ep-border);
-  color: var(--ep-ink-2);
-}
-
-.source-status {
-  background: var(--ep-frame-bg);
-  border-color: var(--ep-border);
-  color: var(--ep-ink-2);
-}
-
-.source-status-dirty {
-  background: var(--ep-warn-soft);
-  border-color: var(--ep-warn-border);
-  color: var(--ep-warn);
-}
-
-.source-check-success {
-  background: var(--ep-emerald-soft);
-  border-color: var(--ep-emerald);
-  color: var(--ep-emerald-ink);
+  border-radius: 16px;
 }
 
 .source-fieldset,
 .source-card fieldset {
   border-color: var(--ep-border);
+  border-radius: 16px;
   color: var(--ep-ink);
 }
 
@@ -2106,7 +2234,7 @@ textarea {
   background: var(--ep-card-subtle);
   color: var(--ep-ink);
   border: 1px solid var(--ep-border-strong);
-  border-radius: 9px;
+  border-radius: 14px;
 }
 
 .configuration-card label {
@@ -2114,10 +2242,10 @@ textarea {
 }
 
 .configuration-footer {
-  background: var(--ep-frame-bg);
+  background: var(--ep-card-subtle);
   border-top: 1px solid var(--ep-border);
   color: var(--ep-muted);
-  border-radius: 0 0 11px 11px;
+  border-radius: 0 0 21px 21px;
 }
 
 .configuration-footer span {
@@ -2128,6 +2256,7 @@ textarea {
 .domain-diagnostics-results > div {
   background: var(--ep-card-subtle);
   border: 1px solid var(--ep-border);
+  border-radius: 16px;
   color: var(--ep-ink);
 }
 
@@ -2154,7 +2283,7 @@ textarea {
   grid-template-areas:
     "history detail"
     "webhook detail";
-  gap: 16px;
+  gap: 18px;
   align-items: start;
 }
 
@@ -2164,37 +2293,30 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
 
 .deployment-history-heading select {
   background: var(--ep-card-bg);
   color: var(--ep-ink);
   border: 1px solid var(--ep-border-strong);
-  border-radius: 8px;
-  min-height: 34px;
-  padding: 0 28px 0 10px;
+  border-radius: 999px;
+  min-height: 36px;
+  padding: 0 30px 0 14px;
   font-size: 12.5px;
 }
 
-.action-table-head {
-  background: var(--ep-frame-bg);
-  color: var(--ep-muted);
-  border-radius: 8px;
-  border: 1px solid var(--ep-border);
-  font-size: 11px;
-}
-
 .action-glyph {
-  background: var(--ep-frame-bg);
+  background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
-  color: var(--ep-ink-2);
+  border-radius: 999px;
+  color: var(--ep-ink);
 }
 
 .deployment-history .action-row[aria-pressed="true"] {
-  background: var(--ep-emerald-soft);
-  border-color: var(--ep-emerald);
-  box-shadow: inset 3px 0 var(--ep-emerald);
+  background: var(--ep-card-bg);
+  border-color: var(--ep-primary);
+  box-shadow: inset 3px 0 var(--ep-primary), var(--ep-shadow-xs);
 }
 
 .deployment-history .action-row[aria-pressed="true"] .action-name strong {
@@ -2204,13 +2326,14 @@ textarea {
 .log-card {
   background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
-  border-radius: 12px;
+  border-radius: 22px;
   overflow: hidden;
   color: var(--ep-ink);
+  box-shadow: var(--ep-shadow-sm);
 }
 
 .log-heading {
-  background: var(--ep-frame-bg);
+  background: var(--ep-card-subtle);
   border-bottom: 1px solid var(--ep-border);
   color: var(--ep-ink);
 }
@@ -2237,13 +2360,14 @@ textarea {
   background: var(--ep-card-bg);
   color: var(--ep-ink);
   border: 1px solid var(--ep-border-strong);
-  border-radius: 7px;
-  min-height: 32px;
-  padding: 4px 10px;
+  border-radius: 999px;
+  min-height: 34px;
+  padding: 4px 12px;
 }
 
 .deploy-phases li {
   background: var(--ep-frame-bg);
+  border-radius: 999px;
   color: var(--ep-ink-2);
 }
 
@@ -2253,21 +2377,21 @@ textarea {
 }
 
 .log-body {
-  background: #09090b;
-  color: #e4e4e7;
+  background: #111316;
+  color: #e4e6eb;
   min-height: 220px;
 }
 
 .log-body .log-line time {
-  color: #71717a;
+  color: #7c8492;
 }
 
 .log-body .log-placeholder {
-  color: #a1a1aa;
+  color: #9ba2ad;
 }
 
 .log-footer {
-  background: var(--ep-frame-bg);
+  background: var(--ep-card-subtle);
   border-top: 1px solid var(--ep-border);
   color: var(--ep-muted);
 }
@@ -2282,15 +2406,15 @@ textarea {
 }
 
 .service-kind-grid {
-  gap: 8px;
+  gap: 10px;
 }
 
 .service-kind-choice {
   background: var(--ep-card-subtle);
   border: 1px solid var(--ep-border);
   color: var(--ep-ink);
-  padding: 11px 12px;
-  border-radius: 10px;
+  padding: 12px 14px;
+  border-radius: 18px;
 }
 
 .service-kind-choice:hover {
@@ -2299,9 +2423,9 @@ textarea {
 }
 
 .service-kind-choice.selected {
-  background: var(--ep-emerald-soft);
-  border-color: var(--ep-emerald);
-  box-shadow: inset 0 0 0 1px var(--ep-emerald);
+  background: var(--ep-card-bg);
+  border-color: var(--ep-primary);
+  box-shadow: inset 0 0 0 1.5px var(--ep-primary), var(--ep-shadow-xs);
 }
 
 .service-kind-choice strong {
@@ -2317,6 +2441,7 @@ textarea {
 .service-create-preview {
   background: var(--ep-card-subtle);
   border: 1px solid var(--ep-border);
+  border-radius: 20px;
   color: var(--ep-ink);
 }
 
@@ -2327,7 +2452,7 @@ textarea {
 
 .modal .service-create-form .service-create-footer,
 .modal-footer {
-  background: var(--ep-frame-bg);
+  background: var(--ep-card-subtle);
   border-top: 1px solid var(--ep-border);
   color: var(--ep-muted);
 }
@@ -2363,16 +2488,18 @@ textarea {
   gap: 12px;
 }
 
-/* Mobile Service Section Sheet Dark/Light */
+/* Mobile Service Section Sheet */
 .service-section-sheet {
   background: var(--ep-card-bg);
   border: 1px solid var(--ep-border);
+  border-radius: 26px;
   color: var(--ep-ink);
 }
 
 .service-section-group a {
   background: var(--ep-card-subtle);
   border-color: var(--ep-border);
+  border-radius: 999px;
   color: var(--ep-ink-2);
 }
 
@@ -2382,9 +2509,9 @@ textarea {
 }
 
 .service-section-group .selected {
-  background: var(--ep-emerald-soft);
-  border-color: var(--ep-emerald);
-  color: var(--ep-emerald-ink);
+  background: var(--ep-active);
+  border-color: transparent;
+  color: var(--ep-active-ink);
 }
 
 /* ==========================================================================
@@ -2392,18 +2519,17 @@ textarea {
    ========================================================================== */
 @media (max-width: 1220px) {
   .ep-dual-layout {
-    grid-template-columns: 204px minmax(0, 1fr);
+    grid-template-columns: 208px minmax(0, 1fr);
   }
   .ep-context-sheet {
-    padding: 18px 20px 44px;
+    padding: 20px 22px 48px;
   }
   .ep-action-toolbar-top {
     gap: 6px;
-    padding: 8px 10px;
   }
   .ep-action-toolbar-top .button {
-    min-height: 32px;
-    padding: 0 10px;
+    min-height: 34px;
+    padding: 0 12px;
     font-size: 12.5px;
   }
   .source-choice-detailed .source-choice-options {
@@ -2418,9 +2544,6 @@ textarea {
   }
 }
 
-/* ==========================================================================
-   Responsive Breakpoints (Mobile <= 800px & Tablet <= 980px — ZERO overflow)
-   ========================================================================== */
 @media (max-width: 1120px) {
   .ep-telemetry-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2429,7 +2552,7 @@ textarea {
 
 @media (max-width: 980px) {
   .app-layout.is-rail-mode {
-    grid-template-columns: 56px minmax(0, 1fr);
+    grid-template-columns: 68px minmax(0, 1fr);
   }
   .ep-dual-layout {
     grid-template-columns: minmax(0, 1fr);
@@ -2438,11 +2561,9 @@ textarea {
     display: none;
   }
   .ep-context-sheet {
-    margin-top: 0;
-    border-radius: 0;
-    border-left: 0;
-    border-top: 0;
-    padding: 18px 16px 40px;
+    margin: 8px 8px 0 0;
+    border-radius: 22px 22px 0 0;
+    padding: 18px 18px 44px;
   }
   .ep-domain-row {
     grid-template-columns: minmax(0, 1fr);
@@ -2458,21 +2579,24 @@ textarea {
     grid-template-columns: minmax(0, 1fr);
   }
   .app-layout.is-rail-mode .topbar {
-    display: flex;
+    display: grid;
   }
   .app-main {
     padding: 0;
   }
-  .ep-sheet-container {
+  .ep-sheet-container,
+  .ep-context-sheet {
+    margin: 0;
     border: 0;
     border-radius: 0;
+    box-shadow: none;
   }
   .topbar {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 10px;
-    padding: 10px 14px;
+    padding: 12px 16px;
   }
   .mobile-menu-button {
     display: inline-flex;
@@ -2485,7 +2609,7 @@ textarea {
     display: none;
   }
   .content {
-    padding: 16px 14px 36px;
+    padding: 8px 16px 40px;
   }
   .search-field.topbar-search {
     min-width: 0;
@@ -2494,10 +2618,7 @@ textarea {
   .ep-telemetry-strip {
     grid-template-columns: minmax(0, 1fr);
   }
-  .dashboard-service-summary {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  /* Mobile popover/drawer navigation opens cleanly anchored under the Menu button */
+  /* Mobile popover/drawer navigation anchored cleanly under the Menu button */
   .sidebar[popover]:not(:popover-open),
   .sidebar:not([popover])[data-navigation-open="false"] {
     display: none;
@@ -2506,28 +2627,44 @@ textarea {
   .sidebar:not([popover])[data-navigation-open="true"] {
     display: flex;
     position: fixed;
-    inset: 64px 12px auto auto;
-    width: min(260px, calc(100vw - 24px));
+    inset: 68px 12px auto auto;
+    width: min(268px, calc(100vw - 24px));
     height: auto;
-    max-height: calc(100dvh - 80px);
+    max-height: calc(100dvh - 84px);
     margin: 0;
     border: 1px solid var(--ep-border);
-    border-radius: 14px;
+    border-radius: 24px;
     background: var(--ep-card-bg);
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.24);
+    box-shadow: 0 20px 56px rgba(0, 0, 0, 0.24);
     z-index: 60;
   }
   .app-layout.is-rail-mode .sidebar {
-    width: min(260px, calc(100vw - 24px));
+    width: min(268px, calc(100vw - 24px));
     align-items: stretch;
-    padding: 12px;
+    padding: 14px;
   }
-  .app-layout.is-rail-mode .sidebar .nav-item {
+  .app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] {
+    background: transparent;
+    box-shadow: none;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    width: 100%;
+    align-items: stretch;
+    gap: 4px;
+  }
+  .app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item {
     width: auto;
     height: auto;
-    padding: 8px 10px;
+    min-height: 40px;
+    padding: 8px 14px;
     justify-content: flex-start;
     margin-inline: 0;
+    color: var(--ep-ink-2);
+  }
+  .app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item.active {
+    background: var(--ep-active);
+    color: var(--ep-active-ink);
   }
   .app-layout.is-rail-mode .sidebar .nav-item .ep-nav-text {
     position: static;
