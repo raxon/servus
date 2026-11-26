@@ -23,6 +23,7 @@ COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/apps/panel/dist ./dist
 COPY deployment/lifecycle-gate.sh /app/lifecycle-gate.sh
+COPY deployment/maintenance/maintenance.html /app/maintenance.html
 COPY package.json ./
 COPY scripts/servus-client.mjs scripts/servus.mjs scripts/servus-mcp.mjs ./scripts/
 COPY LICENSE ./

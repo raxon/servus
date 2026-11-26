@@ -107,6 +107,19 @@ async function verifyHostRoute(runtime:DockerRuntime,network:string,value:HostCe
   } finally {if(timer)clearTimeout(timer);try{await helper.remove({force:true});}catch{}}
 }
 
+export function hasActiveHostDomain(dataDir:string):boolean {
+  const path=join(dataDir,'host-domain','active.json');
+  try {return existsSync(path) && lstatSync(path).isFile();}
+  catch {return false;}
+}
+
+/** Reattach the managed Compose API container to panel-ingress after container recreation. */
+export async function ensureHostDomainIngress(runtime:DockerRuntime):Promise<boolean> {
+  if(!runtime.vault.hostConnection()?.hostname && !hasActiveHostDomain(runtime.dataDir))return false;
+  await connectPanelApi(runtime);
+  return true;
+}
+
 export async function configureHostDomain(runtime:DockerRuntime,journal:HttpsMigrationJournal,assertQuiescent:()=>void,value:HostCertificate):Promise<void> {
   validateHostCertificate(value);
   if(runtime.vault.hostConnection()?.hostname!==value.hostname)throw new Error('The host domain is not registered to this installation.');

@@ -27,6 +27,10 @@ describe('maintenance barrier',()=>{
     expect(await gate.drain(1000)).toEqual({status:'drained'});
     expect((await app.inject({url:'/api/v1/auth/session',headers})).statusCode).toBe(503);
     expect((await app.inject({method:'POST',url:'/api/v1/auth/logout',headers})).statusCode).toBe(503);
+    const htmlPage=await app.inject({url:'/settings',headers:{accept:'text/html'}});
+    expect(htmlPage.statusCode).toBe(503);
+    expect(htmlPage.headers['content-type']).toContain('text/html');
+    expect(htmlPage.body).toContain('/api/v1/auth/session');
     expect((await app.inject({url:'/api/v1/health'})).statusCode).toBe(200);
     expect((await app.inject({url:'/health'})).statusCode).toBe(200);
   });
@@ -52,7 +56,7 @@ describe('maintenance barrier',()=>{
     expect(await gate.drain(10)).toEqual({status:'timeout'});
     const finish=gate.drain(1000);pending.resolve();expect(await finish).toEqual({status:'drained'});
   });
-  it('keeps an aborted request uncertain after its handler eventually completes',async()=>{
+  it('waits for an aborted read-only API request without poisoning a later drain',async()=>{
     const pending=deferred<{online:boolean}>(),entered=deferred<void>();
     const dir=mkdtempSync(join(tmpdir(),'panel-maintenance-')),store=new Store(dir),gate=new MaintenanceGate();
     const app=await createApp({dataDir:dir,store,maintenance:gate,runtimeStatus:()=>{entered.resolve();return pending.promise;}});
@@ -63,7 +67,20 @@ describe('maintenance barrier',()=>{
     const request=fetch(`${address}/api/v1/runtime`,{headers:{cookie},signal:controller.signal}).catch(()=>undefined);
     await entered.promise;controller.abort();await request;await new Promise(resolve=>setTimeout(resolve,30));
     expect(await gate.drain(10)).toEqual({status:'timeout'});
-    const finish=gate.drain(1000);pending.resolve({online:true});expect(await finish).toEqual({status:'uncertain'});
+    const finish=gate.drain(1000);pending.resolve({online:true});expect(await finish).toEqual({status:'drained'});
+    expect(gate.uncertaintySources()).toEqual([]);
+  });
+  it('keeps an aborted mutating API request uncertain after its handler eventually completes',async()=>{
+    const pending=deferred<void>(),entered=deferred<void>();
+    const dir=mkdtempSync(join(tmpdir(),'panel-maintenance-')),store=new Store(dir),gate=new MaintenanceGate();
+    const app=await createApp({dataDir:dir,store,maintenance:gate});
+    cleanup.push(async()=>{await app.close();store.close();rmSync(dir,{recursive:true,force:true});});
+    app.post('/api/v1/slow-mutation',async()=>{entered.resolve();await pending.promise;return {ok:true};});
+    const address=await app.listen({host:'127.0.0.1',port:0});const controller=new AbortController();
+    const request=fetch(`${address}/api/v1/slow-mutation`,{method:'POST',headers:{'content-type':'application/json'},body:'{}',signal:controller.signal}).catch(()=>undefined);
+    await entered.promise;controller.abort();await request;await new Promise(resolve=>setTimeout(resolve,30));
+    expect(await gate.drain(10)).toEqual({status:'timeout'});
+    const finish=gate.drain(1000);pending.resolve();expect(await finish).toEqual({status:'uncertain'});
     expect(gate.uncertaintySources().some(source=>source==='request_aborted'||source==='response_closed')).toBe(true);
   });
   it('does not poison a later drain when a static asset download is cancelled',async()=>{

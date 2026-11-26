@@ -62,7 +62,7 @@ export class HostDomainManager {
   }
   async tick():Promise<void> {
     const saved=this.store.vault.hostConnection();
-    const interval=saved?.ready?6*3_600_000:60_000;
+    const interval=saved?.ready && !saved.lastError?6*3_600_000:60_000;
     if(saved?.lastAttemptAt && Date.now()-Date.parse(saved.lastAttemptAt)<interval)return;
     this.start();
   }

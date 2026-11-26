@@ -104,6 +104,21 @@ describe('host domain synchronization',()=>{
     store.vault.setHostConnection({...connection,lastError:'The host registry is unavailable'});
     expect(manager.status().lastError).toBe('The host registry is unavailable');
   });
+  it('retries ready host domains within a minute after a transient sync failure instead of waiting six hours',async()=>{
+    const {store,connection}=await fixture(true);
+    const transport=vi.fn(async(input:any)=>{
+      const url=String(input);
+      if(url.endsWith('/sync'))return Response.json({hostname:host,ip:'8.8.8.8',dnsStatus:'ready'});
+      if(url.endsWith('/certificate'))return Response.json({status:'pending',retryAfter:60});
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+    store.vault.setHostConnection({...connection,ready:true,lastAttemptAt:new Date(Date.now()-90_000).toISOString(),lastError:'The host registry could not be reached securely'});
+    const manager=new HostDomainManager(store,{apiOrigin:'https://api.servus.run',fetch:transport},async()=>({ok:true}),()=>{});
+    await manager.tick();
+    await manager.settled();
+    expect(transport).toHaveBeenCalled();
+    expect(manager.status().lastError).toBeUndefined();
+  });
 });
 
 describe('panel host-domain API and generated application domains',()=>{

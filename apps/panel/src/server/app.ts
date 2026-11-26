@@ -3,7 +3,7 @@ import cookie from '@fastify/cookie';
 import staticFiles from '@fastify/static';
 import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createHash, randomBytes, randomInt } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
@@ -98,6 +98,12 @@ export async function createApp(options: AppOptions) {
   const upgrades = new WeakSet<FastifyRequest>();
   const readOnlyStreams = new WeakSet<FastifyRequest>();
   let staticFilesRegistered = false;
+  const maintenancePageHtml = (() => {
+    for (const candidate of ['/app/maintenance.html', resolve(import.meta.dirname, '../../../../deployment/maintenance/maintenance.html')]) {
+      try { if (existsSync(candidate)) return readFileSync(candidate, 'utf8'); } catch { /* ignore */ }
+    }
+    return undefined;
+  })();
   if (maintenance) {
     app.addHook('onRoute', route => {
       if (!route.url.startsWith('/api/') || route.url === '/api/v1/health' || route.url.endsWith('/console')) return;
@@ -115,14 +121,20 @@ export async function createApp(options: AppOptions) {
       const path=req.raw.url?.split('?',1)[0];
       if ((path === '/health' || path === '/api/v1/health') && (req.method === 'GET' || req.method === 'HEAD')) return;
       const done=maintenance.admit();
-      if (!done) return reply.code(503).send({error:{code:'MAINTENANCE',message:'Service is temporarily unavailable'}});
+      if (!done) {
+        if (maintenancePageHtml && req.method === 'GET' && !path?.startsWith('/api/') && req.headers.accept?.includes('text/html')) {
+          return reply.code(503).header('Cache-Control', 'no-store').type('text/html; charset=utf-8').send(maintenancePageHtml);
+        }
+        return reply.code(503).send({error:{code:'MAINTENANCE',message:'Service is temporarily unavailable'}});
+      }
       requestReleases.set(req,done);
       const staticAsset=staticFilesRegistered&&(req.method==='GET'||req.method==='HEAD')&&req.routeOptions.url==='/*';
+      const readOnlyApi=(req.method==='GET'||req.method==='HEAD'||req.method==='OPTIONS')&&Boolean(req.routeOptions.url?.startsWith('/api/'));
       let finished=false;
       reply.raw.once('finish',()=>{finished=true;});
-      req.raw.once('aborted',()=>{if(!staticAsset&&!readOnlyStreams.has(req))maintenance.markUncertain('request_aborted');done();});
+      req.raw.once('aborted',()=>{if(!staticAsset&&!readOnlyApi&&!readOnlyStreams.has(req))maintenance.markUncertain('request_aborted');done();});
       reply.raw.once('close',()=>{
-        if (!staticAsset && !readOnlyStreams.has(req) && !upgrades.has(req) && !finished) maintenance.markUncertain('response_closed');
+        if (!staticAsset && !readOnlyApi && !readOnlyStreams.has(req) && !upgrades.has(req) && !finished) maintenance.markUncertain('response_closed');
         done();
       });
     });

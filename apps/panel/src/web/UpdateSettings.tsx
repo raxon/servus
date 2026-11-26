@@ -219,8 +219,9 @@ export function UpdateSettings() {
         if (controller.signal.aborted) return;
         if (error instanceof StorageError) { setFailure("Could not save update progress in this browser. Enable browser storage and try again."); return; }
         if (!(error instanceof RequestError) || error.status === 0 || error.status === 429 || error.status >= 500) {
-          setMessage("Waiting for the update service...");
-          timer = setTimeout(tick, error instanceof RequestError && error.status === 429 ? 60000 : 15000);
+          const restarting = error instanceof RequestError && (error.code === "MAINTENANCE" || error.status === 502 || error.status === 503);
+          setMessage(restarting && run.stage === "applying" ? "Installing the update and restarting Servus..." : "Waiting for the update service...");
+          timer = setTimeout(tick, error instanceof RequestError && error.status === 429 ? 60000 : restarting ? 5000 : 15000);
           return;
         }
         if (error instanceof RequestError && error.status === 404) {
@@ -282,7 +283,7 @@ export function UpdateSettings() {
       ) : (
         <>
           <p>Check for a new version of Servus.</p>
-          {completed ? <p role="status">Update installed.</p> : null}
+          {completed ? <p role="status">Update installed. <button type="button" className="button" onClick={() => window.location.reload()}>Reload panel</button></p> : null}
           {alreadyCurrent ? <p role="status">Version {alreadyCurrent} is already installed. The old saved update progress was cleared; no new installation was started.</p> : null}
           {discovery.error ? <div className="error-notice" role="alert">Could not check for updates. Try again.</div> : null}
           {failure ? <div className="error-notice" role="alert">{failure}</div> : null}
