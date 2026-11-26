@@ -7,7 +7,7 @@ import { WorkspaceShowcase } from './WorkspaceShowcase';
 
 const INSTALL_COMMAND = 'curl -fsSL https://servus.run/install.sh | sudo bash';
 const REPO_URL = 'https://github.com/raxon/servus';
-const RELEASE_URL = 'https://github.com/raxon/servus/releases/tag/v0.4.0';
+const RELEASE_URL = 'https://github.com/raxon/servus/releases/tag/v0.5.0';
 
 interface FeatureItem {
   icon: IconName;
@@ -392,7 +392,7 @@ function App() {
           <div className="hero-grid-bg" aria-hidden="true" />
           <div className="shell hero-inner">
             <a className="release-pill" href={RELEASE_URL} target="_blank" rel="noreferrer">
-              <span className="pill-tag">v0.4.0</span>
+              <span className="pill-tag">v0.5.0</span>
               <span className="pill-copy">
                 Signed linux/amd64 releases
                 <Icon name="arrow-up-right" size={14} />
@@ -652,7 +652,7 @@ function App() {
           <div className="status-banner" id="status">
             <div className="status-banner-badge">
               <Icon name="git" size={15} />
-              <span>CURRENT RELEASE · v0.4.0</span>
+              <span>CURRENT RELEASE · v0.5.0</span>
             </div>
             <p>
               Servus is in active beta for single-server Linux (amd64) Docker Swarm hosts. Validate
@@ -700,7 +700,7 @@ function App() {
               GitHub
             </a>
             <a href={RELEASE_URL} target="_blank" rel="noreferrer">
-              v0.4.0 Release
+              v0.5.0 Release
             </a>
             <a href="/install.sh">install.sh</a>
             <a href={`${REPO_URL}/blob/main/LICENSE`} target="_blank" rel="noreferrer">

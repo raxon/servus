@@ -4,9 +4,10 @@ import { z } from 'zod';
 import { agentRequest as defaultAgentRequest, AgentRequestError, type AgentRequestOptions } from '../agent/client.js';
 import { LocalDatabaseBackupStorage } from '../agent/backups.js';
 import { readS3Backup, removeS3Backup, uploadS3Backup, validateBackupEndpoint, type S3BackupIdentity } from '../agent/s3-storage.js';
+import { validateRemoteDestination } from '../agent/remote-backup-providers.js';
 import { backupCronMatches, describeBackupCron, parseBackupCron } from '../shared/backups.js';
 import { type VolumeBackup, type VolumeBackupSettings, type VolumeRestore } from '../shared/volume-backups.js';
-import { redactBackupDestination, s3DestinationSchema, type BackupDestination, type BackupStorageSelection } from '../shared/storage-target.js';
+import { destinationPrefix, redactBackupDestination, remoteDestinationSchema, type BackupDestination, type BackupStorageSelection, type RemoteBackupDestination } from '../shared/storage-target.js';
 import { loadBackupDestination, profileDestination, type ProfileRow } from './backup-providers.js';
 import type { Service, SessionResponse, User } from '../shared/types.js';
 import type { Store } from './store.js';
@@ -72,7 +73,7 @@ export class VolumeBackups {
     const setting=this.setting(serviceId,mountTarget),profile=setting?.profile_id?this.options.store.db.prepare('SELECT name FROM backup_storage_profiles WHERE id=?').get(setting.profile_id) as {name:string}|undefined:undefined;
     return {destination:this.destination(serviceId,mountTarget),profileId:setting?.profile_id??null,profileName:profile?.name??null,legacy:!!setting?.destination_ref&&!setting.profile_id};
   }
-  saveDestination(service:Service,actor:User,mountTarget:string,destination:z.infer<typeof s3DestinationSchema>|{type:'local'},profileId:string|null=null) {
+  saveDestination(service:Service,actor:User,mountTarget:string,destination:RemoteBackupDestination|{type:'local'},profileId:string|null=null) {
     requireMount(service,mountTarget);const now=this.now().toISOString();
     this.options.store.db.transaction(()=>{
       const reference=destination.type==='local'?null:this.options.store.putBackupDestinationSecret(service.id,JSON.stringify({kind:'backup-storage-v1',serviceId:service.id,destination}));
@@ -94,7 +95,7 @@ export class VolumeBackups {
       if(existing){if(existing.request_hash!==hash)throw new AppError('IDEMPOTENCY_CONFLICT','This key was used for a different volume backup.',409);return summary(existing);}
       this.idle(service.id);
       const id=randomUUID(),timestamp=this.now().toISOString(),reference=this.setting(service.id,input.mountTarget)?.destination_ref??null,destination=reference?loadBackupDestination(this.options.store,service.id,reference):null;
-      const objectKey=destination?`${destination.prefix?destination.prefix+'/':''}servus-volumes/${service.id}/${id}.tar`:null;
+      const objectKey=destination?`${destinationPrefix(destination)?destinationPrefix(destination)+'/':''}servus-volumes/${service.id}/${id}.tar`:null;
       db.prepare("INSERT INTO volume_backups(id,service_id,mount_target,actor_id,name,status,trigger,idempotency_key,request_hash,created_at,destination_ref,object_key) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)").run(id,service.id,input.mountTarget,actor.id,input.name??`Volume backup ${timestamp}`,trigger,key,hash,timestamp,reference,objectKey);
       this.options.store.recordAudit(actor.id,'volume.backup.queued',service.id);return summary(this.row(id)!);
     }).immediate();
@@ -283,8 +284,9 @@ export function registerVolumeBackups(app:FastifyInstance,options:VolumeBackupOp
       manager.saveDestination(access.service,access.auth.user,input.mountTarget,destination??{type:'local'},input.profileId);
       return manager.selection(access.service.id,input.mountTarget);
     }
-    const input=z.object({mountTarget:mountSchema,destination:z.discriminatedUnion('type',[z.object({type:z.literal('local')}).strict(),s3DestinationSchema])}).strict().parse(request.body);requireMount(access.service,input.mountTarget);
+    const input=z.object({mountTarget:mountSchema,destination:z.union([z.object({type:z.literal('local')}).strict(),remoteDestinationSchema])}).strict().parse(request.body);requireMount(access.service,input.mountTarget);
     if(input.destination.type==='s3')try{await validateBackupEndpoint(input.destination);}catch(error){throw new AppError('VOLUME_BACKUP_ENDPOINT',error instanceof Error?error.message:'Invalid backup endpoint.',400);}
+    else if(input.destination.type!=='local')try{await validateRemoteDestination(input.destination);}catch(error){throw new AppError('VOLUME_BACKUP_ENDPOINT',error instanceof Error?error.message:'Invalid backup endpoint.',400);}
     access=options.serviceAccess(request,request.params.id,true);return {destination:manager.saveDestination(access.service,access.auth.user,input.mountTarget,input.destination)};
   });
   app.get<{Params:{id:string;backupId:string}}>(`${prefix}/volume-backups/:backupId/download`,async(request,reply)=>{const {service,auth}=options.serviceAccess(request,request.params.id);if(!options.store.canAccess(auth.user,service.projectId,true))throw new AppError('NOT_FOUND','Volume backup not found.',404);const {backup,stream}=await manager.read(service.id,request.params.backupId);try{const latest=options.serviceAccess(request,request.params.id);if(!options.store.canAccess(latest.auth.user,latest.service.projectId,true))throw new AppError('NOT_FOUND','Volume backup not found.',404);}catch(error){stream.destroy();throw error;}options.store.recordAudit(auth.user.id,'volume.backup.download',service.id);reply.header('Content-Type','application/octet-stream').header('Content-Length',backup.size!).header('X-Backup-SHA256',backup.sha256!).header('Content-Disposition',`attachment; filename="servus-volume-${backup.id}.tar"`);reply.raw.once('close',()=>stream.destroy());return reply.send(stream);});

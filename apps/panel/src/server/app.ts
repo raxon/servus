@@ -38,6 +38,9 @@ import { registerHostAdmin } from './host-admin.js';
 import { registerSourceUploads, sourceUploadExists } from './source-uploads.js';
 import { registerRemoteMcp } from './remote-mcp.js';
 import { registerDbAdminTools } from './db-admin-tools.js';
+import { registerPlatformSettings } from './platform-settings.js';
+import { registerProjectTransfer } from './project-transfer.js';
+import { registerDedicatedModules } from './dedicated-modules.js';
 import { registerVolumeBackups } from './volume-backups.js';
 import { registerGithubRepositories } from './github-repositories.js';
 import { registerReleaseNotes } from './release-notes.js';
@@ -241,6 +244,9 @@ export async function createApp(options: AppOptions) {
   registerRemoteMcp(app,apiTokens);
   registerHostAdmin(app,{store,administrator,allowedOrigins,agentConnection:options.agentConnection,runtimeRequest,maintenance,onUpgrade:req=>{upgrades.add(req);requestReleases.get(req)?.();}});
   registerDbAdminTools(app,{store,serviceAccess,runtimeRequest,agentConnection:options.agentConnection});
+  registerPlatformSettings(app,{dataDir:options.dataDir,store,administrator});
+  registerProjectTransfer(app,{dataDir:options.dataDir,store,session,projectAccess,administrator,createComposeWorkload:compose.createWorkload});
+  registerDedicatedModules(app,{store,session,projectAccess});
   registerReleaseNotes(app,{administrator});
   registerGithubRepositories(app,{store,administrator});
   app.get(`${prefix}/integrations/github`,async req=>{

@@ -7,7 +7,21 @@ import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createHash } from 'node:crypto';
 import { isPrivateAddress } from '../shared/network-address.js';
-import type { S3Destination } from '../shared/storage-target.js';
+import type { RemoteBackupDestination, S3Destination } from '../shared/storage-target.js';
+import {
+  dropboxDelete,
+  dropboxDownload,
+  dropboxUpload,
+  ftpDelete,
+  ftpDownload,
+  ftpUpload,
+  gdriveDelete,
+  gdriveDownload,
+  gdriveUpload,
+  sftpDelete,
+  sftpDownload,
+  sftpUpload,
+} from './remote-backup-providers.js';
 
 export async function validateBackupEndpoint(value:S3Destination) {
   const endpoint=new URL(value.endpoint),host=endpoint.hostname.replace(/^\[|\]$/g,'');
@@ -36,13 +50,23 @@ export interface S3BackupIdentity {serviceId:string;backupId:string;objectKey:st
 function assertIdentity(destination:S3Destination,identity:S3BackupIdentity) {
   if(!/^[a-f0-9-]{36}$/.test(identity.serviceId)||!/^[a-f0-9-]{36}$/.test(identity.backupId)||!Number.isSafeInteger(identity.size)||identity.size<1||!/^[a-f0-9]{64}$/.test(identity.sha256))throw new Error('Invalid remote backup identity.');
   const prefix=destination.prefix?`${destination.prefix}/`:'';
-  const scope=identity.scope==='volume'?'servus-volumes':'servus',extensions=identity.scope==='volume'?'tar':'(?:dump|sql|rdb)',start=`${prefix}${scope}/${identity.serviceId}/`;
+  const scope=identity.scope==='volume'?'servus-volumes':'servus',extensions=identity.scope==='volume'?'tar':'(?:dump|sql|rdb|archive)',start=`${prefix}${scope}/${identity.serviceId}/`;
   if(!new RegExp(`^${identity.backupId}\\.${extensions}$`).test(identity.objectKey.slice(start.length))||!identity.objectKey.startsWith(start))throw new Error('Remote backup key does not match its service and operation.');
 }
 function matches(metadata:Record<string,string>|undefined,size:number|undefined,identity:S3BackupIdentity) {
   return size===identity.size&&metadata?.['servus-backup']===identity.backupId&&metadata?.['servus-service']===identity.serviceId&&metadata?.sha256===identity.sha256;
 }
-export async function uploadS3Backup(destination:S3Destination,identity:S3BackupIdentity,input:Readable,signal?:AbortSignal) {
+function verifyRemoteBuffer(buffer: Buffer, identity: S3BackupIdentity): Readable {
+  if (buffer.length !== identity.size) throw new Error('Remote backup size does not match recorded metadata.');
+  const digest = createHash('sha256').update(buffer).digest('hex');
+  if (digest !== identity.sha256) throw new Error('Remote backup checksum verification failed.');
+  return Readable.from([buffer]);
+}
+export async function uploadS3Backup(destination:RemoteBackupDestination,identity:S3BackupIdentity,input:Readable,signal?:AbortSignal) {
+  if (destination.type === 'sftp') { try { await sftpUpload(destination, identity.objectKey, input); } finally { input.destroy(); } return; }
+  if (destination.type === 'ftp') { try { await ftpUpload(destination, identity.objectKey, input); } finally { input.destroy(); } return; }
+  if (destination.type === 'gdrive') { try { await gdriveUpload(destination, identity.objectKey.replaceAll('/', '_'), input); } finally { input.destroy(); } return; }
+  if (destination.type === 'dropbox') { try { await dropboxUpload(destination, identity.objectKey, input); } finally { input.destroy(); } return; }
   assertIdentity(destination,identity);const client=await clientFor(destination);
   try {
     await client.send(new PutObjectCommand({Bucket:destination.bucket,Key:identity.objectKey,Body:input,ContentLength:identity.size,IfNoneMatch:'*',StorageClass:destination.storageClass,
@@ -52,7 +76,11 @@ export async function uploadS3Backup(destination:S3Destination,identity:S3Backup
     if(!matches(head.Metadata,head.ContentLength,identity))throw new Error('Remote backup metadata does not match the exported database.');
   } finally {input.destroy();client.destroy();}
 }
-export async function readS3Backup(destination:S3Destination,identity:S3BackupIdentity) {
+export async function readS3Backup(destination:RemoteBackupDestination,identity:S3BackupIdentity) {
+  if (destination.type === 'sftp') return verifyRemoteBuffer(await sftpDownload(destination, identity.objectKey), identity);
+  if (destination.type === 'ftp') return verifyRemoteBuffer(await ftpDownload(destination, identity.objectKey), identity);
+  if (destination.type === 'gdrive') return verifyRemoteBuffer(await gdriveDownload(destination, identity.objectKey), identity);
+  if (destination.type === 'dropbox') return verifyRemoteBuffer(await dropboxDownload(destination, `/${destination.path ? `${destination.path}/` : ''}${identity.objectKey}`), identity);
   assertIdentity(destination,identity);const client=await clientFor(destination);
   try {
     const output=await client.send(new GetObjectCommand({Bucket:destination.bucket,Key:identity.objectKey}));
@@ -64,7 +92,11 @@ export async function readS3Backup(destination:S3Destination,identity:S3BackupId
     return checked;
   } catch(error) {client.destroy();throw error;}
 }
-export async function removeS3Backup(destination:S3Destination,identity:S3BackupIdentity) {
+export async function removeS3Backup(destination:RemoteBackupDestination,identity:S3BackupIdentity) {
+  if (destination.type === 'sftp') { await sftpDelete(destination, identity.objectKey); return; }
+  if (destination.type === 'ftp') { await ftpDelete(destination, identity.objectKey); return; }
+  if (destination.type === 'gdrive') { await gdriveDelete(destination, identity.objectKey); return; }
+  if (destination.type === 'dropbox') { await dropboxDelete(destination, `/${destination.path ? `${destination.path}/` : ''}${identity.objectKey}`); return; }
   assertIdentity(destination,identity);const client=await clientFor(destination);
   try {
     let head;

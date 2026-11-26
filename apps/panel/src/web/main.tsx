@@ -88,6 +88,9 @@ import { BackupStorageSettings } from "./BackupStorageSettings.js";
 import { HostMetricsCard } from "./HostMetricsCard.js";
 import { HostAdminPanel } from "./HostAdminPanel.js";
 import { DatabaseAdminTools } from "./DatabaseAdminTools.js";
+import { I18nProvider } from "./i18n.js";
+import { PlatformSettings } from "./PlatformSettings.js";
+import { ProjectTransferAndModules } from "./ProjectTransferAndModules.js";
 import { AlertsSettings } from "./AlertsSettings.js";
 import { BuildConcurrencySettings } from "./BuildConcurrencySettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
@@ -848,6 +851,7 @@ function ProjectPage() {
       {projectId?<TemplateProjects projectId={projectId} canWrite={project?.canWrite===true}/>:null}
       {projectId?<ComposeProjects projectId={projectId} canWrite={project?.canWrite===true}/>:null}
       {projectId?<ProjectExtras projectId={projectId} services={services.data ?? []} canWrite={project?.canWrite===true}/>:null}
+      {projectId && project ? <ProjectTransferAndModules projectId={projectId} projectName={project.name} admin={user.role === "admin"} canWrite={project.canWrite === true} /> : null}
       <div className="section-heading activity-heading">
         <div>
           <h2>Project activity</h2>
@@ -1690,6 +1694,7 @@ function SettingsPage() {
         </section>
 
         <HostAdminPanel />
+        <PlatformSettings />
       </> : null}
 
       <section className="settings-group" id="account-access" aria-labelledby="settings-account-heading">
@@ -1769,8 +1774,10 @@ declare module "@tanstack/react-router" {
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <AuthGate />
-      <PanelNotifications />
+      <I18nProvider>
+        <AuthGate />
+        <PanelNotifications />
+      </I18nProvider>
     </QueryClientProvider>
   </React.StrictMode>,
 );

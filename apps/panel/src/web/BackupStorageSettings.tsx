@@ -8,7 +8,7 @@ import { FeatureError, FeatureLoading, FeatureModal } from "./feature-ui.js";
 type Draft = {
   id?: string;
   name: string;
-  provider: "local" | "s3" | "r2";
+  provider: "local" | "s3" | "r2" | "sftp" | "ftp" | "gdrive" | "dropbox";
   endpoint: string;
   region: string;
   bucket: string;
@@ -16,6 +16,17 @@ type Draft = {
   storageClass: string;
   accessKeyId: string;
   secretAccessKey: string;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  privateKey: string;
+  tls: boolean;
+  folderId: string;
+  accessToken: string;
+  refreshToken: string;
+  clientId: string;
+  clientSecret: string;
 };
 
 const blank: Draft = {
@@ -28,7 +39,27 @@ const blank: Draft = {
   storageClass: "STANDARD",
   accessKeyId: "",
   secretAccessKey: "",
+  host: "",
+  port: 22,
+  username: "",
+  password: "",
+  privateKey: "",
+  tls: true,
+  folderId: "",
+  accessToken: "",
+  refreshToken: "",
+  clientId: "",
+  clientSecret: "",
 };
+
+function describeDestination(dest: BackupStorageProfile["destination"]): string {
+  if (dest.type === "local") return "Local server storage";
+  if (dest.type === "s3") return `${dest.provider === "r2" ? "Cloudflare R2" : "S3 compatible"} · ${dest.bucket}`;
+  if (dest.type === "sftp") return `SFTP · ${dest.username}@${dest.host}:${dest.port}`;
+  if (dest.type === "ftp") return `${dest.tls ? "FTPS" : "FTP"} · ${dest.username}@${dest.host}:${dest.port}`;
+  if (dest.type === "gdrive") return `Google Drive · folder ${dest.folderId}`;
+  return `Dropbox · /${dest.path || "backups"}`;
+}
 
 export function BackupStorageSettings() {
   const id = useId();
@@ -42,19 +73,70 @@ export function BackupStorageSettings() {
     queryFn: () => api<{ profiles: BackupStorageProfile[] }>("/backup-storage"),
   });
   const refresh = () => { void client.invalidateQueries({ queryKey: ["backup-storage"] }); };
+
+  function buildDestination(d: Draft) {
+    if (d.provider === "local") return { type: "local" };
+    if (d.provider === "s3" || d.provider === "r2") {
+      return {
+        type: "s3",
+        provider: d.provider,
+        endpoint: d.endpoint,
+        region: d.region,
+        bucket: d.bucket,
+        prefix: d.prefix,
+        storageClass: d.storageClass,
+        ...(d.accessKeyId ? { accessKeyId: d.accessKeyId } : {}),
+        ...(d.secretAccessKey ? { secretAccessKey: d.secretAccessKey } : {}),
+      };
+    }
+    if (d.provider === "sftp") {
+      return {
+        type: "sftp",
+        host: d.host,
+        port: d.port,
+        username: d.username,
+        path: d.prefix,
+        ...(d.password ? { password: d.password } : {}),
+        ...(d.privateKey ? { privateKey: d.privateKey } : {}),
+      };
+    }
+    if (d.provider === "ftp") {
+      return {
+        type: "ftp",
+        host: d.host,
+        port: d.port,
+        username: d.username,
+        tls: d.tls,
+        path: d.prefix,
+        ...(d.password ? { password: d.password } : {}),
+      };
+    }
+    if (d.provider === "gdrive") {
+      return {
+        type: "gdrive",
+        folderId: d.folderId,
+        ...(d.accessToken ? { accessToken: d.accessToken } : {}),
+        ...(d.refreshToken ? { refreshToken: d.refreshToken } : {}),
+        ...(d.clientId ? { clientId: d.clientId } : {}),
+        ...(d.clientSecret ? { clientSecret: d.clientSecret } : {}),
+      };
+    }
+    return {
+      type: "dropbox",
+      path: d.prefix,
+      ...(d.accessToken ? { accessToken: d.accessToken } : {}),
+      ...(d.refreshToken ? { refreshToken: d.refreshToken } : {}),
+      ...(d.clientId ? { appKey: d.clientId } : {}),
+      ...(d.clientSecret ? { appSecret: d.clientSecret } : {}),
+    };
+  }
+
   const save = useMutation({
     gcTime: 0,
-    mutationFn: ({ id: profileId, name, provider, endpoint, region, bucket, prefix, storageClass, accessKeyId, secretAccessKey }: Draft) =>
-      api(`/backup-storage${profileId ? `/${profileId}` : ""}`, {
-        method: profileId ? "PUT" : "POST",
-        body: {
-          name,
-          destination: provider === "local" ? { type: "local" } : {
-            type: "s3", provider, endpoint, region, bucket, prefix, storageClass,
-            ...(accessKeyId ? { accessKeyId } : {}),
-            ...(secretAccessKey ? { secretAccessKey } : {}),
-          },
-        },
+    mutationFn: (d: Draft) =>
+      api(`/backup-storage${d.id ? `/${d.id}` : ""}`, {
+        method: d.id ? "PUT" : "POST",
+        body: { name: d.name, destination: buildDestination(d) },
       }),
     onSuccess: () => { save.reset(); setDraft(null); setSaved(true); refresh(); },
   });
@@ -67,10 +149,19 @@ export function BackupStorageSettings() {
     const { destination } = profile;
     save.reset();
     setSaved(false);
-    setDraft({
-      ...blank, id: profile.id, name: profile.name,
-      ...(destination.type === "s3" ? destination : { provider: "local" }),
-    });
+    if (destination.type === "s3") {
+      setDraft({ ...blank, id: profile.id, name: profile.name, ...destination });
+    } else if (destination.type === "sftp") {
+      setDraft({ ...blank, id: profile.id, name: profile.name, provider: "sftp", host: destination.host, port: destination.port, username: destination.username, prefix: destination.path });
+    } else if (destination.type === "ftp") {
+      setDraft({ ...blank, id: profile.id, name: profile.name, provider: "ftp", host: destination.host, port: destination.port, username: destination.username, tls: destination.tls, prefix: destination.path });
+    } else if (destination.type === "gdrive") {
+      setDraft({ ...blank, id: profile.id, name: profile.name, provider: "gdrive", folderId: destination.folderId, clientId: destination.clientId ?? "" });
+    } else if (destination.type === "dropbox") {
+      setDraft({ ...blank, id: profile.id, name: profile.name, provider: "dropbox", prefix: destination.path, clientId: destination.appKey ?? "" });
+    } else {
+      setDraft({ ...blank, id: profile.id, name: profile.name, provider: "local" });
+    }
   }
 
   function update(values: Partial<Draft>) {
@@ -87,7 +178,7 @@ export function BackupStorageSettings() {
       <div className="settings-card-header">
         <div className="settings-card-intro">
           <div className="card-heading"><HardDrive size={19} aria-hidden="true" /><h3 id={`${id}-heading`}>Backup storage</h3></div>
-          <p>Manage storage profiles for database and volume backups.</p>
+          <p>Manage storage profiles for database and volume backups (Local, S3, Cloudflare R2, SFTP, FTP/FTPS, Google Drive, Dropbox).</p>
         </div>
         <button className="button button-primary" type="button" onClick={() => { save.reset(); setSaved(false); setDraft({ ...blank }); }}>
           <Plus size={16} aria-hidden="true" />Add storage
@@ -103,7 +194,7 @@ export function BackupStorageSettings() {
               </span>
               <div className="settings-list-copy">
                 <strong>{profile.name}</strong>
-                <span>{profile.destination.type === "local" ? "Local server storage" : `${profile.destination.provider === "r2" ? "Cloudflare R2" : "S3 compatible"} · ${profile.destination.bucket}`}</span>
+                <span>{describeDestination(profile.destination)}</span>
               </div>
               <div className="settings-list-actions">
                 <button className="button button-small" type="button" onClick={() => edit(profile)} aria-label={`Edit ${profile.name}`}>
@@ -126,7 +217,7 @@ export function BackupStorageSettings() {
       ) : !query.error ? (
         <div className="settings-empty">
           <HardDrive size={23} aria-hidden="true" />
-          <div><strong>No storage profiles yet</strong><p>Backups can already use this server. Add a profile to store copies in S3 or Cloudflare R2.</p></div>
+          <div><strong>No storage profiles yet</strong><p>Backups can already use this server. Add a profile to store copies in S3, R2, SFTP, FTP, Google Drive or Dropbox.</p></div>
         </div>
       ) : null}
       {saved ? <p className="settings-feedback" role="status">Storage profile saved.</p> : null}
@@ -145,14 +236,25 @@ export function BackupStorageSettings() {
                 <label htmlFor={`${id}-provider`}>Storage provider
                   <select id={`${id}-provider`} name="provider" value={draft.provider} onChange={(event) => {
                     const provider = event.target.value as Draft["provider"];
-                    update({ provider, region: provider === "r2" ? "auto" : blank.region, endpoint: provider === "r2" ? "" : blank.endpoint, storageClass: blank.storageClass });
+                    update({
+                      provider,
+                      port: provider === "ftp" ? 21 : 22,
+                      region: provider === "r2" ? "auto" : blank.region,
+                      endpoint: provider === "r2" ? "" : blank.endpoint,
+                      storageClass: blank.storageClass,
+                    });
                   }}>
                     <option value="local">This server</option>
                     <option value="s3">Amazon S3 / compatible</option>
                     <option value="r2">Cloudflare R2</option>
+                    <option value="sftp">SFTP (SSH)</option>
+                    <option value="ftp">FTP / FTPS</option>
+                    <option value="gdrive">Google Drive</option>
+                    <option value="dropbox">Dropbox</option>
                   </select>
                 </label>
-                {draft.provider !== "local" ? <>
+
+                {(draft.provider === "s3" || draft.provider === "r2") ? <>
                   <label htmlFor={`${id}-endpoint`}>Endpoint URL
                     <input id={`${id}-endpoint`} name="endpoint" type="url" required maxLength={512} value={draft.endpoint} onChange={(event) => update({ endpoint: event.target.value })} placeholder="https://account.r2.cloudflarestorage.com" spellCheck={false} autoCapitalize="none" />
                   </label>
@@ -182,7 +284,42 @@ export function BackupStorageSettings() {
                     </label>
                     <p className="settings-form-note">{draft.id && !keepCredentials ? "Changing the endpoint or provider requires both credentials." : "Credentials are encrypted on this server."}</p>
                   </fieldset>
+                </> : (draft.provider === "sftp" || draft.provider === "ftp") ? <>
+                  <div className="settings-form-pair">
+                    <label>Host<input required value={draft.host} onChange={(e) => update({ host: e.target.value })} placeholder="storage.example.com" /></label>
+                    <label>Port<input type="number" min={1} max={65535} required value={draft.port} onChange={(e) => update({ port: Number(e.target.value) })} /></label>
+                    <label>Username<input required value={draft.username} onChange={(e) => update({ username: e.target.value })} /></label>
+                    <label>Remote folder<input value={draft.prefix} onChange={(e) => update({ prefix: e.target.value })} placeholder="backups" /></label>
+                  </div>
+                  {draft.provider === "ftp" ? (
+                    <label className="checkbox-label"><input type="checkbox" checked={draft.tls} onChange={(e) => update({ tls: e.target.checked })} /> Use TLS (FTPS)</label>
+                  ) : null}
+                  <label>Password{draft.id ? " (leave blank to keep)" : ""}
+                    <input type="password" autoComplete="new-password" required={!draft.id && draft.provider === "ftp"} value={draft.password} onChange={(e) => update({ password: e.target.value })} />
+                  </label>
+                  {draft.provider === "sftp" ? (
+                    <label>Private key (optional PEM)
+                      <textarea className="mono" rows={3} value={draft.privateKey} onChange={(e) => update({ privateKey: e.target.value })} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
+                    </label>
+                  ) : null}
+                </> : draft.provider === "gdrive" ? <>
+                  <label>Google Drive Folder ID<input required value={draft.folderId} onChange={(e) => update({ folderId: e.target.value })} placeholder="1AbCdEfGhIjKlMnOpQr" /></label>
+                  <label>Access token<input type="password" value={draft.accessToken} onChange={(e) => update({ accessToken: e.target.value })} placeholder="ya29...." /></label>
+                  <div className="settings-form-pair">
+                    <label>OAuth refresh token (optional)<input type="password" value={draft.refreshToken} onChange={(e) => update({ refreshToken: e.target.value })} /></label>
+                    <label>Client ID (optional)<input value={draft.clientId} onChange={(e) => update({ clientId: e.target.value })} /></label>
+                  </div>
+                  <label>Client secret (optional)<input type="password" value={draft.clientSecret} onChange={(e) => update({ clientSecret: e.target.value })} /></label>
+                </> : draft.provider === "dropbox" ? <>
+                  <label>Dropbox folder path<input value={draft.prefix} onChange={(e) => update({ prefix: e.target.value })} placeholder="backups" /></label>
+                  <label>Access token<input type="password" value={draft.accessToken} onChange={(e) => update({ accessToken: e.target.value })} placeholder="sl...." /></label>
+                  <div className="settings-form-pair">
+                    <label>OAuth refresh token (optional)<input type="password" value={draft.refreshToken} onChange={(e) => update({ refreshToken: e.target.value })} /></label>
+                    <label>App key (optional)<input value={draft.clientId} onChange={(e) => update({ clientId: e.target.value })} /></label>
+                  </div>
+                  <label>App secret (optional)<input type="password" value={draft.clientSecret} onChange={(e) => update({ clientSecret: e.target.value })} /></label>
                 </> : <p className="settings-form-note">Uses the private backup directory on this server.</p>}
+
                 {draft.id ? <p className="settings-form-note">Select and save this profile again in each service to apply changes to future backups.</p> : null}
               </fieldset>
               <FeatureError error={save.error} />

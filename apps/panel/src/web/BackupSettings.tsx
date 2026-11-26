@@ -71,7 +71,7 @@ function DatabaseBackupDestination({serviceId,canWrite,admin,mountTarget}:{servi
       <option value="local">This server (default)</option>
       {current.data?.legacy?<option value="legacy">Existing service destination (saved credentials)</option>:null}
       {unavailable?<option value={current.data?.profileId??''}>{current.data?.profileName??'Removed profile'} (saved destination)</option>:null}
-      {profiles.data?.profiles.map(profile=><option key={profile.id} value={profile.id}>{profile.name} · {profile.destination.type==='local'?'Local':profile.destination.provider==='r2'?'R2':'S3'}</option>)}
+      {profiles.data?.profiles.map(profile=><option key={profile.id} value={profile.id}>{profile.name} · {profile.destination.type==='local'?'Local':profile.destination.type==='s3'?(profile.destination.provider==='r2'?'R2':'S3'):profile.destination.type.toUpperCase()}</option>)}
     </select>
     <p className="feature-helper">Profiles are managed in instance Settings. Saving takes a copy of the selected profile for future backups. Select and save again to apply profile updates; existing backups retain their original location and credentials.</p>
     {current.data?.legacy?<p className="backup-notice">Your existing destination remains active until you choose another profile.</p>:null}

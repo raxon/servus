@@ -10,6 +10,7 @@ import { AppError } from './errors.js';
 import type { MaintenanceGate } from './maintenance.js';
 import type { Store } from './store.js';
 import { loadBackupDestination, registerBackupProviders } from './backup-providers.js';
+import { destinationPrefix } from '../shared/storage-target.js';
 import { backupEncryptionOverhead, encryptDatabaseBackup, decryptDatabaseBackup } from './backup-encryption.js';
 import { readS3Backup, removeS3Backup, uploadS3Backup } from '../agent/s3-storage.js';
 
@@ -87,7 +88,7 @@ export class DatabaseBackups {
       const id=randomUUID(),now=this.now().toISOString(),name=value.name ?? `Backup ${now}`,reference=this.settingsRow(service.id)?.destination_ref??null;
       const destination=reference?loadBackupDestination(this.options.store,service.id,reference):null;
       const extension={postgres:'dump',mariadb:'sql',mysql:'sql',redis:'rdb',mongodb:'archive'}[service.kind as 'postgres'|'mariadb'|'mysql'|'redis'|'mongodb'];
-      const objectKey=destination?`${destination.prefix?`${destination.prefix}/`:''}servus/${service.id}/${id}.${extension}`:null;
+      const objectKey=destination?`${destinationPrefix(destination)?`${destinationPrefix(destination)}/`:''}servus/${service.id}/${id}.${extension}`:null;
       this.options.store.db.prepare(`INSERT INTO database_backups (id,service_id,actor_id,name,status,trigger,idempotency_key,request_hash,created_at,destination_ref,object_key) VALUES (?,?,?,?,'queued',?,?,?,?,?,?)`)
         .run(id,service.id,actor.id,name,trigger,key,hash,now,reference,objectKey);
       this.options.store.db.prepare('UPDATE database_backups SET encrypted=? WHERE id=?').run(this.settingsRow(service.id)?.encrypted??0,id);

@@ -141,7 +141,7 @@ export function WorkspaceShowcase() {
           <div className="sidebar-brand">
             <ServusMark size={20} />
             <span>Servus</span>
-            <span className="sidebar-version">v0.4.0</span>
+            <span className="sidebar-version">v0.5.0</span>
           </div>
 
           <div className="sidebar-host">
