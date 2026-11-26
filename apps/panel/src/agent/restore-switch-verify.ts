@@ -15,7 +15,7 @@ export async function verifyRestoreDatabase(options:{docker:Docker;plan:RestoreS
     ? 'PGCONNECT_TIMEOUT=3 PGPASSWORD="$(cat /run/secrets/panel-db-password)" exec psql --host=127.0.0.1 --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --no-password --tuples-only --command="SELECT 1"'
     : options.kind==='redis' ? 'REDISCLI_AUTH="$(cat /run/secrets/panel-db-password)" exec redis-cli --no-auth-warning -h 127.0.0.1 ping'
     : options.kind==='mysql' ? 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" exec mysql --connect-timeout=3 --protocol=TCP --host=127.0.0.1 --user="$MYSQL_USER" --database="$MYSQL_DATABASE" --batch --skip-column-names --execute="SELECT 1"'
-    : options.kind==='mongodb' ? 'MONGO_PASS="$(cat /run/secrets/panel-db-password)" exec mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_PASS" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok"'
+    : options.kind==='mongodb' ? 'MONGO_PASS="$(cat /run/secrets/panel-db-password)"; exec mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_PASS" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok"'
     : 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" exec mariadb --connect-timeout=3 --protocol=TCP --host=127.0.0.1 --user="$MARIADB_USER" --database="$MARIADB_DATABASE" --batch --skip-column-names --execute="SELECT 1"';
   for(let attempt=0;attempt<attempts;attempt++){
     const service=await options.docker.getService(name).inspect(),node=(await options.docker.info()).Swarm?.NodeID;

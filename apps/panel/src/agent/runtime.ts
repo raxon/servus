@@ -326,7 +326,7 @@ export class DockerRuntime {
         domains.forEach((domain, index) => {
           Object.assign(labels, compileDomainLabels(service.id, index, domain, Boolean(host && isHostApplication(domain.hostname, host))));
         });
-        const limits = service.resources || { cpu: 1, memoryMb: 256 };
+        const limits = service.resources || { cpu: 1, memoryMb: service.kind === 'mysql' || service.kind === 'mongodb' ? 512 : 256 };
         let placement;
         if (stateful(service)) {
           const node = (await this.docker.info()).Swarm?.NodeID;
@@ -446,7 +446,7 @@ export class DockerRuntime {
               : kind === 'mysql'
                 ? 'MYSQL_PWD="$(cat /run/secrets/panel-db-password)" exec mysql --connect-timeout=3 --protocol=TCP --host=127.0.0.1 --user="$MYSQL_USER" --database="$MYSQL_DATABASE" --batch --skip-column-names --execute="SELECT 1"'
                 : kind === 'mongodb'
-                  ? 'MONGO_PASS="$(cat /run/secrets/panel-db-password)" exec mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_PASS" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok"'
+                  ? 'MONGO_PASS="$(cat /run/secrets/panel-db-password)"; exec mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_PASS" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok"'
                   : 'REDISCLI_AUTH="$(cat /run/secrets/panel-db-password)" exec redis-cli --no-auth-warning -h 127.0.0.1 ping';
           try {
             const result = await execOutput(this.docker, container.id, ['/bin/sh', '-c', command]);
