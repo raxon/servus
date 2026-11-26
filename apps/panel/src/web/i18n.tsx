@@ -6,6 +6,9 @@ import { api } from "./api.js";
 const DICTIONARY: Record<SupportedLocale, Record<string, string>> = {
   en: {
     "nav.overview": "Overview",
+    "nav.activity": "Activity",
+    "nav.monitor": "Monitor",
+    "nav.domains": "Domains",
     "nav.projects": "Projects",
     "nav.settings": "Settings",
     "nav.signOut": "Sign out",
@@ -27,6 +30,9 @@ const DICTIONARY: Record<SupportedLocale, Record<string, string>> = {
   },
   pl: {
     "nav.overview": "Przegląd",
+    "nav.activity": "Aktywność",
+    "nav.monitor": "Monitor",
+    "nav.domains": "Domeny",
     "nav.projects": "Projekty",
     "nav.settings": "Ustawienia",
     "nav.signOut": "Wyloguj",
@@ -92,6 +98,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
       document.title = brandingQuery.data.brandName;
     }
     if (brandingQuery.data.accentColor) {
+      document.documentElement.style.setProperty("--ep-emerald", brandingQuery.data.accentColor);
       document.documentElement.style.setProperty("--accent", brandingQuery.data.accentColor);
     }
   }, [brandingQuery.data]);

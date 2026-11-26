@@ -18,7 +18,9 @@ export function PlatformSettings() {
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
-    if (query.data) setDraft(query.data);
+    if (query.data && typeof query.data.brandName === "string") {
+      setDraft({ ...DEFAULT_BRANDING, ...query.data });
+    }
   }, [query.data]);
 
   const save = useMutation({

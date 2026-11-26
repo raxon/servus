@@ -33,20 +33,24 @@ import {
   Activity,
   ArrowRight,
   ArrowUpRight,
+  BarChart3,
   Box,
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronsUpDown,
   Circle,
   CircleAlert,
-  Clock3,
+  Code2,
+  Cpu,
   Database,
-  Download,
   ExternalLink,
+  FileText,
   Folder,
   GitBranch,
   Globe2,
   HardDrive,
+  Home,
   KeyRound,
   Layers3,
   LayoutGrid,
@@ -57,8 +61,10 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Rocket,
   Search,
   Server,
+  Settings,
   Settings2,
   ShieldCheck,
   Sparkles,
@@ -72,6 +78,7 @@ import type {
   Project,
   RuntimeStatus,
   Service,
+  ServiceMetrics,
   DomainConfig,
   SessionResponse,
 } from "../shared/types.js";
@@ -93,7 +100,11 @@ import { BackupStorageSettings } from "./BackupStorageSettings.js";
 import { HostMetricsCard } from "./HostMetricsCard.js";
 import { HostAdminPanel } from "./HostAdminPanel.js";
 import { DatabaseAdminTools } from "./DatabaseAdminTools.js";
-import { I18nProvider, useI18n } from "./i18n.js";
+import { I18nProvider, LocaleSwitcher, useI18n } from "./i18n.js";
+import { ThemeProvider, SidebarThemeToggle } from "./theme.js";
+import { CommandPalette } from "./CommandPalette.js";
+import { MonitorPage } from "./MonitorPage.js";
+import { DomainsPage } from "./DomainsPage.js";
 import { PlatformSettings } from "./PlatformSettings.js";
 import { DedicatedModulesSection, ProjectMigrationSection } from "./ProjectTransferAndModules.js";
 import { AlertsSettings } from "./AlertsSettings.js";
@@ -114,6 +125,7 @@ import "./styles.css";
 import "./Settings.css";
 import "./ServiceOperations.css";
 import "./workspace-polish.css";
+import "./easypanel-theme.css";
 
 const createQueryClient = () => new QueryClient({
   defaultOptions: {
@@ -386,8 +398,36 @@ function useActions(projectId?: string) {
 
 const ProjectSearchContext = createContext("");
 
+function formatCompactBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx++;
+  }
+  return `${value.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
+
+function serviceTabIcon(id: ServiceTab) {
+  switch (id) {
+    case "overview": return <LayoutGrid size={15} aria-hidden="true" />;
+    case "source": return <Code2 size={15} aria-hidden="true" />;
+    case "deployments": return <Rocket size={15} aria-hidden="true" />;
+    case "environment": return <KeyRound size={15} aria-hidden="true" />;
+    case "domains": return <Globe2 size={15} aria-hidden="true" />;
+    case "storage": return <HardDrive size={15} aria-hidden="true" />;
+    case "backups": return <Database size={15} aria-hidden="true" />;
+    case "resources": return <Cpu size={15} aria-hidden="true" />;
+    case "logs": return <FileText size={15} aria-hidden="true" />;
+    case "console": return <Terminal size={15} aria-hidden="true" />;
+  }
+}
+
 function Shell() {
   const { user } = useAuth();
+  const { t } = useI18n();
   const client = useQueryClient();
   const sessionClient = useContext(SessionClientContext)!;
   const path = useRouterState({ select: (state) => state.location.pathname });
@@ -397,12 +437,26 @@ function Shell() {
   const navigationTrigger = useRef<HTMLButtonElement>(null);
   const [mobileNavigation, setMobileNavigation] = useState(() => window.matchMedia("(max-width: 800px)").matches);
   const [navigationOpen, setNavigationOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [quickCreateProject, setQuickCreateProject] = useState(false);
   const nativePopover = "popover" in HTMLElement.prototype;
+  const isDualPane = path.startsWith("/projects/") || path.startsWith("/services/") || path === "/settings";
+
   useEffect(() => {
     const media = window.matchMedia("(max-width: 800px)");
     const update = () => setMobileNavigation(media.matches);
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
+  }, []);
+  useEffect(() => {
+    const onShortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen((open) => !open);
+      }
+    };
+    window.addEventListener("keydown", onShortcut);
+    return () => window.removeEventListener("keydown", onShortcut);
   }, []);
   useEffect(() => {
     const navigation = navigationRef.current;
@@ -464,11 +518,16 @@ function Shell() {
       ? "Project"
       : path === "/activity"
         ? "Activity"
-        : path === "/settings"
-          ? "Settings"
-          : "Overview";
+        : path === "/monitor"
+          ? "Monitor"
+          : path === "/domains"
+            ? "Domains"
+            : path === "/settings"
+              ? "Settings"
+              : "Overview";
+  const compactRail = isDualPane && !mobileNavigation;
   return (
-    <div className="app-layout">
+    <div className={`app-layout ${isDualPane ? "is-rail-mode" : ""}`}>
       <a className="skip-link" href="#main-content">
         Skip to content
       </a>
@@ -477,104 +536,178 @@ function Shell() {
         if (nativePopover && navigationRef.current?.matches(":popover-open")) navigationRef.current.hidePopover();
         setNavigationOpen(false);
       }}>
-        <Link to="/" className="brand-link" aria-label="Servus overview">
-          <Brand />
-        </Link>
-        <div className="nav-label">WORKSPACE</div>
+        <div className="ep-brand-header">
+          <Link to="/" className="brand-link" aria-label="Servus overview">
+            {compactRail ? (
+              <span className="brand-symbol" aria-hidden="true">
+                <img src="/brand/servus.svg" width="22" height="22" alt="" />
+              </span>
+            ) : (
+              <Brand />
+            )}
+          </Link>
+          {!compactRail ? <span className="ep-version-chip">v0.6.0</span> : null}
+        </div>
         <nav aria-label="Main navigation">
-          <Link to="/" aria-current={path === "/" ? "page" : undefined} className={`nav-item ${path === "/" ? "active" : ""}`}>
-            <LayoutGrid size={18} />
-            Overview
+          <Link
+            to="/"
+            aria-current={path === "/" ? "page" : undefined}
+            className={`nav-item ${path === "/" ? "active" : ""}`}
+            title={t("nav.overview", "Overview")}
+          >
+            <Home size={17} aria-hidden="true" />
+            <span className="ep-nav-text">Overview</span>
           </Link>
           <Link
             to="/activity"
             aria-current={path === "/activity" ? "page" : undefined}
             className={`nav-item ${path === "/activity" ? "active" : ""}`}
+            title={t("nav.activity", "Activity")}
           >
-            <Activity size={18} />
-            Activity
+            <Activity size={17} aria-hidden="true" />
+            <span className="ep-nav-text">Activity</span>
+          </Link>
+          <Link
+            to="/monitor"
+            aria-current={path === "/monitor" ? "page" : undefined}
+            className={`nav-item ${path === "/monitor" ? "active" : ""}`}
+            title={t("nav.monitor", "Monitor")}
+          >
+            <BarChart3 size={17} aria-hidden="true" />
+            <span className="ep-nav-text">Monitor</span>
+          </Link>
+          <Link
+            to="/domains"
+            aria-current={path === "/domains" ? "page" : undefined}
+            className={`nav-item ${path === "/domains" ? "active" : ""}`}
+            title={t("nav.domains", "Domains")}
+          >
+            <Globe2 size={17} aria-hidden="true" />
+            <span className="ep-nav-text">Domains</span>
           </Link>
           <Link
             to="/settings"
             aria-current={path === "/settings" ? "page" : undefined}
             className={`nav-item ${path === "/settings" ? "active" : ""}`}
+            title={t("nav.settings", "Settings")}
           >
-            <Settings2 size={18} />
-            Settings
+            <Settings size={17} aria-hidden="true" />
+            <span className="ep-nav-text">Settings</span>
           </Link>
         </nav>
-        <div className="nav-label project-nav-label">
-          PROJECTS<span>{projects.data?.length ?? ""}</span>
-        </div>
-        <div className="sidebar-projects">
-          {projects.isPending ? (
-            <div className="sidebar-project-skeleton" role="status" aria-label="Loading projects"><span className="sr-only">Loading projects</span><span aria-hidden="true" className="skeleton-block skeleton-title" /><span aria-hidden="true" className="skeleton-block skeleton-project-title" /><span aria-hidden="true" className="skeleton-block skeleton-title" /></div>
-          ) : projects.error ? (
-            <p className="sidebar-hint">Projects unavailable.</p>
-          ) : projects.data?.length ? (
-            projects.data.map((project) => (
-              <Link
-                key={project.id}
-                to="/projects/$projectId"
-                params={{ projectId: project.id }}
-                className={`project-nav ${path === `/projects/${project.id}` ? "active" : ""}`}
-              >
-                <Folder size={16} />
-                <span>{project.name}</span>
-              </Link>
-            ))
-          ) : (
-            <p className="sidebar-hint">Your projects will appear here.</p>
-          )}
-        </div>
+
         <div className="sidebar-bottom">
-          {availableUpdate ? <Link to="/settings" hash="updates" className="sidebar-update" aria-label={`Update available: ${availableUpdate.tag}`}>
-            <RefreshCw size={16} aria-hidden="true" />
-            <span><strong>Update available</strong><small>{availableUpdate.tag}</small></span>
-            <ChevronRight size={15} aria-hidden="true" />
-          </Link> : null}
-          <div className="sidebar-user">
-            <span className="user-avatar">{user.email[0]?.toUpperCase()}</span>
-            <span>
-              <strong>{user.email.split("@")[0]}</strong>
-              <small>
-                {user.role === "admin" ? "Administrator" : "Member"}
-              </small>
-            </span>
-            <button
-              className="icon-button logout-button"
-              onClick={() => logout.mutate()}
-              disabled={logout.isPending}
-              aria-label="Sign out"
-              title="Sign out"
+          {availableUpdate ? (
+            <Link
+              to="/settings"
+              hash="updates"
+              className="sidebar-update"
+              aria-label={`Update available: ${availableUpdate.tag}`}
+              title={`Update available: ${availableUpdate.tag}`}
             >
-              <LogOut size={16} />
-            </button>
-          </div>
+              <RefreshCw size={15} aria-hidden="true" />
+              <span><strong>Update available</strong><small>{availableUpdate.tag}</small></span>
+              <ChevronRight size={14} aria-hidden="true" />
+            </Link>
+          ) : null}
+
+          {compactRail ? (
+            <>
+              <button
+                type="button"
+                className="ep-rail-btn"
+                onClick={() => setPaletteOpen(true)}
+                aria-label="Quick search"
+                title="Quick search (⌘K)"
+              >
+                <Search size={17} aria-hidden="true" />
+              </button>
+              <SidebarThemeToggle compact />
+              <button
+                type="button"
+                className="ep-rail-btn logout-button"
+                onClick={() => logout.mutate()}
+                disabled={logout.isPending}
+                aria-label="Sign out"
+                title="Sign out"
+              >
+                <LogOut size={17} aria-hidden="true" />
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="ep-sidebar-utility-btn"
+                onClick={() => setPaletteOpen(true)}
+              >
+                <span className="ep-sidebar-utility-label">
+                  <Search size={15} aria-hidden="true" />
+                  <span>Quick Search</span>
+                </span>
+                <kbd className="ep-kbd">⌘K</kbd>
+              </button>
+              <SidebarThemeToggle />
+              <div className="ep-sidebar-lang-row">
+                <span>Language</span>
+                <LocaleSwitcher />
+              </div>
+              <div className="ep-sidebar-host-row" title={window.location.host}>
+                <Server size={13} aria-hidden="true" />
+                <strong className="mono">{window.location.hostname}</strong>
+              </div>
+              <div className="sidebar-user">
+                <span className="user-avatar">{user.email[0]?.toUpperCase()}</span>
+                <span>
+                  <strong>{user.email.split("@")[0]}</strong>
+                  <small>{user.role === "admin" ? "Administrator" : "Member"}</small>
+                </span>
+                <button
+                  className="icon-button logout-button"
+                  onClick={() => logout.mutate()}
+                  disabled={logout.isPending}
+                  aria-label="Sign out"
+                  title="Sign out"
+                >
+                  <LogOut size={16} />
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </aside>
       <div className="app-main">
-        <header className={`topbar ${path === "/" ? "topbar-dashboard" : ""}`}>
-          <nav className="breadcrumbs" aria-label="Breadcrumb">
-            <Link to="/">Workspace</Link>
-            <ChevronRight size={14} aria-hidden="true" />
-            {serviceId ? <>
-              {projectId ? <><Link to="/projects/$projectId" params={{ projectId }}>{currentProject?.name ?? "Project"}</Link><ChevronRight size={14} aria-hidden="true" /></> : null}
-              <strong aria-current="page">{currentService.data?.name ?? "Service"}</strong>
-            </> : <strong aria-current="page">{routeProjectId ? currentProject?.name ?? "Project" : locationName}</strong>}
-          </nav>
-          <button ref={navigationTrigger} type="button" className="button mobile-menu-button" aria-controls="workspace-navigation" aria-expanded={navigationOpen} popoverTarget={nativePopover ? "workspace-navigation" : undefined} onClick={nativePopover ? undefined : () => setNavigationOpen(!navigationOpen)}><Menu size={17} aria-hidden="true" />Menu</button>
-          <div className="topbar-right">
-            {path === "/" ? <div className={`search-field topbar-search ${keyboardNavigation ? "keyboard-navigation" : ""}`}>
-              <Search size={16} />
-              <input aria-label="Search projects and services" placeholder="Search projects and services..." value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
-            </div> : null}
-          </div>
-        </header>
-        <main id="main-content" className={`content ${path === "/" ? "content-dashboard" : ""}`} ref={mainRef} tabIndex={-1}>
-          <ProjectSearchContext.Provider value={projectSearch}><Outlet /></ProjectSearchContext.Provider>
-        </main>
+        <div className="ep-sheet-container">
+          <header className={`topbar ${path === "/" ? "topbar-dashboard" : ""}`}>
+            <nav className="breadcrumbs" aria-label="Breadcrumb">
+              <Link to="/">Workspace</Link>
+              <ChevronRight size={14} aria-hidden="true" />
+              {serviceId ? <>
+                {projectId ? <><Link to="/projects/$projectId" params={{ projectId }}>{currentProject?.name ?? "Project"}</Link><ChevronRight size={14} aria-hidden="true" /></> : null}
+                <strong aria-current="page">{currentService.data?.name ?? "Service"}</strong>
+              </> : <strong aria-current="page">{routeProjectId ? currentProject?.name ?? "Project" : locationName}</strong>}
+            </nav>
+            <button ref={navigationTrigger} type="button" className="button mobile-menu-button" aria-controls="workspace-navigation" aria-expanded={navigationOpen} popoverTarget={nativePopover ? "workspace-navigation" : undefined} onClick={nativePopover ? undefined : () => setNavigationOpen(!navigationOpen)}><Menu size={17} aria-hidden="true" />Menu</button>
+            <div className="topbar-right">
+              {path === "/" ? <div className={`search-field topbar-search ${keyboardNavigation ? "keyboard-navigation" : ""}`}>
+                <Search size={16} />
+                <input aria-label="Search projects and services" placeholder="Search projects and services..." value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
+              </div> : null}
+            </div>
+          </header>
+          <main id="main-content" className={`content ${path === "/" ? "content-dashboard" : ""} ${isDualPane ? "is-dual-pane" : ""}`} ref={mainRef} tabIndex={-1}>
+            <ProjectSearchContext.Provider value={projectSearch}><Outlet /></ProjectSearchContext.Provider>
+          </main>
+        </div>
       </div>
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        projects={projects.data ?? []}
+        canCreateProject={user.role === "admin"}
+        onCreateProject={() => setQuickCreateProject(true)}
+      />
+      {quickCreateProject ? <CreateProject onClose={() => setQuickCreateProject(false)} /> : null}
     </div>
   );
 }
@@ -708,12 +841,96 @@ function Dashboard() {
   </>;
 }
 
-type ProjectTab = "services" | "compose" | "templates" | "environment" | "activity" | "migration";
-const PROJECT_TABS: readonly ProjectTab[] = ["services", "compose", "templates", "environment", "activity", "migration"];
+type ProjectTab = "services" | "compose" | "templates" | "settings" | "environment" | "activity" | "migration";
+const PROJECT_TABS: readonly ProjectTab[] = ["services", "compose", "templates", "settings", "environment", "activity", "migration"];
+
+function ProjectContextSidebar({
+  projects,
+  currentProject,
+  services,
+  activeServiceId,
+  canWrite,
+  onAddService,
+  children,
+}: {
+  projects: Project[];
+  currentProject: Project | undefined;
+  services: Service[];
+  activeServiceId?: string;
+  canWrite: boolean;
+  onAddService?: () => void;
+  children?: React.ReactNode;
+}) {
+  const navigate = useNavigate();
+  const safeProjects = Array.isArray(projects) ? projects : [];
+  const safeServices = Array.isArray(services) ? services : [];
+  return (
+    <aside className="ep-context-sidebar" aria-label="Project navigation">
+      <div className="ep-project-switcher">
+        <Folder size={15} aria-hidden="true" />
+        <select
+          aria-label="Switch project"
+          value={currentProject?.id ?? ""}
+          onChange={(event) => {
+            if (event.target.value) {
+              void navigate({ to: "/projects/$projectId", params: { projectId: event.target.value } });
+            }
+          }}
+        >
+          {safeProjects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        <ChevronsUpDown size={14} className="ep-project-switcher-chevron" aria-hidden="true" />
+      </div>
+
+      <div className="ep-context-section-head">
+        <span>Services</span>
+        {canWrite && onAddService ? (
+          <button
+            type="button"
+            className="ep-context-add-btn"
+            onClick={onAddService}
+            aria-label="Create service in project"
+            title="Create service"
+          >
+            <Plus size={14} aria-hidden="true" />
+          </button>
+        ) : null}
+      </div>
+
+      <div className="ep-context-service-list">
+        {safeServices.length ? (
+          safeServices.map((svc) => (
+            <Link
+              key={svc.id}
+              to="/services/$serviceId"
+              params={{ serviceId: svc.id }}
+              className={`ep-context-service-item ${activeServiceId === svc.id ? "is-active" : ""}`}
+            >
+              <span className={`ep-dot status-dot-${svc.state}`} aria-hidden="true" />
+              <span className="truncate">{svc.name}</span>
+            </Link>
+          ))
+        ) : (
+          <p className="sidebar-hint" style={{ paddingInline: 8, margin: "4px 0" }}>No services yet</p>
+        )}
+      </div>
+
+      {children ? (
+        <>
+          <hr className="ep-context-divider" />
+          {children}
+        </>
+      ) : null}
+    </aside>
+  );
+}
 
 function ProjectPage() {
   const { user } = useAuth();
-  const { t } = useI18n();
   const { projectId } = useParams({ strict: false });
   const { tab: requestedTab } = projectRoute.useSearch();
   const navigate = useNavigate();
@@ -721,8 +938,27 @@ function ProjectPage() {
   const project = projects.data?.find((item) => item.id === projectId);
   const actions = useActions(projectId);
   const [create, setCreate] = useState(false);
-  const activeTab: ProjectTab = requestedTab ?? "services";
-  const tabRefs = useRef<Partial<Record<ProjectTab, HTMLButtonElement | null>>>({});
+
+  // Normalize legacy deep links into the clean EasyPanel 1:1 views:
+  // - templates / compose -> Templates & Create Hub (with sub-tabs Templates | Modules | Compose)
+  // - settings / environment / migration -> Project Settings (Shared Env, Saved Scripts, Export/Import, Danger Zone)
+  const resolvedView: "services" | "templates" | "settings" | "activity" =
+    requestedTab === "templates" || requestedTab === "compose"
+      ? "templates"
+      : requestedTab === "settings" || requestedTab === "environment" || requestedTab === "migration"
+        ? "settings"
+        : requestedTab === "activity"
+          ? "activity"
+          : "services";
+
+  const [catalogSubTab, setCatalogSubTab] = useState<"templates" | "modules" | "compose">(
+    requestedTab === "compose" ? "compose" : "templates",
+  );
+
+  useEffect(() => {
+    if (requestedTab === "compose") setCatalogSubTab("compose");
+    else if (requestedTab === "templates") setCatalogSubTab("templates");
+  }, [requestedTab]);
 
   const services = useQuery({
     queryKey: ["services", projectId],
@@ -731,14 +967,7 @@ function ProjectPage() {
     refetchInterval: 2_000,
   });
 
-  const composeQuery = useQuery({
-    queryKey: ["compose-project", projectId],
-    queryFn: ({ signal }) => api<{ id: string }[]>(`/projects/${projectId}/compose`, { signal }),
-    enabled: !!projectId,
-    refetchInterval: 5_000,
-  });
-
-  const selectTab = (next: ProjectTab) => {
+  const openView = (next: "services" | "templates" | "settings" | "activity") => {
     if (!projectId) return;
     void navigate({
       to: "/projects/$projectId",
@@ -747,244 +976,257 @@ function ProjectPage() {
       viewTransition: false,
       resetScroll: false,
     });
-    tabRefs.current[next]?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  };
-
-  const tabItems: Array<{ id: ProjectTab; label: string; icon: React.ComponentType<{ size?: number; "aria-hidden"?: boolean }>; count?: number }> = [
-    { id: "services", label: t("project.tab.services", "Services"), icon: Box, count: services.data?.length },
-    { id: "compose", label: t("project.tab.compose", "Compose"), icon: Layers3, count: composeQuery.data?.length },
-    { id: "templates", label: t("project.tab.templates", "Templates & Modules"), icon: Sparkles },
-    { id: "environment", label: t("project.tab.environment", "Environment & Scripts"), icon: KeyRound },
-    { id: "activity", label: t("project.tab.activity", "Activity"), icon: Activity, count: actions.data?.length },
-    ...(project?.canWrite ? [{ id: "migration" as const, label: t("project.tab.migration", "Migration"), icon: Download }] : []),
-  ];
-
-  const handleTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, currentId: ProjectTab) => {
-    const ids = tabItems.map((item) => item.id);
-    const idx = ids.indexOf(currentId);
-    let target: ProjectTab | undefined;
-    if (event.key === "ArrowRight") target = ids[(idx + 1) % ids.length];
-    else if (event.key === "ArrowLeft") target = ids[(idx - 1 + ids.length) % ids.length];
-    else if (event.key === "Home") target = ids[0];
-    else if (event.key === "End") target = ids[ids.length - 1];
-    if (!target) return;
-    event.preventDefault();
-    tabRefs.current[target]?.focus();
-    selectTab(target);
   };
 
   return (
-    <>
-      <div className="page-heading">
-        <div>
-          <div className="eyebrow">PROJECT</div>
-          <h1 className="project-title">
-            <Folder size={29} />
-            {project?.name ?? "Project"}
-          </h1>
-          <div className="project-meta">
-            <span>
-              <Box size={15} aria-hidden="true" />
-              {services.isPending ? "Loading services" : services.error ? "Services unavailable" : `${services.data?.length ?? 0} ${services.data?.length === 1 ? "service" : "services"}`}
-            </span>
-            {composeQuery.data?.length ? (
-              <span>
-                <Layers3 size={15} aria-hidden="true" />
-                {composeQuery.data.length} {composeQuery.data.length === 1 ? "Compose stack" : "Compose stacks"}
-              </span>
-            ) : null}
-            {project ? (
-              <span>
-                <Clock3 size={15} aria-hidden="true" />
-                Created {formatDate(project.createdAt)}
-              </span>
-            ) : null}
+    <div className="ep-dual-layout">
+      <ProjectContextSidebar
+        projects={projects.data ?? (project ? [project] : [])}
+        currentProject={project}
+        services={services.data ?? []}
+        canWrite={project?.canWrite === true}
+        onAddService={() => setCreate(true)}
+      />
+
+      <div className="ep-context-sheet">
+        <div className="ep-context-sheet-inner">
+          <div className="ep-service-header">
+            <h1 className="ep-service-crumb-title">
+              <Link to="/projects/$projectId" params={{ projectId: projectId! }}>
+                {project?.name ?? "Project"}
+              </Link>
+              {resolvedView === "templates" ? (
+                <>
+                  <span className="ep-service-crumb-sep">/</span>
+                  <span>Templates</span>
+                </>
+              ) : resolvedView === "settings" ? (
+                <>
+                  <span className="ep-service-crumb-sep">/</span>
+                  <span>Settings</span>
+                </>
+              ) : null}
+            </h1>
+
+            <div className="ep-service-top-actions">
+              {project?.canWrite ? (
+                <button
+                  type="button"
+                  className="button button-primary"
+                  onClick={() => setCreate(true)}
+                >
+                  <Plus size={15} aria-hidden="true" />
+                  New service
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className={`button ${resolvedView === "templates" ? "button-primary" : ""}`}
+                onClick={() => openView(resolvedView === "templates" ? "services" : "templates")}
+              >
+                <Sparkles size={15} aria-hidden="true" />
+                Templates
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Project settings"
+                title="Project settings"
+                aria-pressed={resolvedView === "settings"}
+                onClick={() => openView(resolvedView === "settings" ? "services" : "settings")}
+              >
+                <Settings size={17} aria-hidden="true" />
+              </button>
+            </div>
           </div>
-        </div>
-        <div className="heading-actions">
-          {project?.canWrite ? (
-            <ProjectSettings
-              project={project}
-              onDeleted={() => void navigate({ to: "/" })}
-            />
-          ) : null}
-          {project?.canWrite ? (
-            <button
-              type="button"
-              className="button button-primary"
-              onClick={() => setCreate(true)}
-            >
-              <Plus size={17} aria-hidden="true" />
-              New service
-            </button>
-          ) : null}
-        </div>
-      </div>
 
-      <div className="project-tabs" role="tablist" aria-label="Project sections">
-        {tabItems.map((item) => {
-          const Icon = item.icon;
-          const isSelected = activeTab === item.id;
-          return (
-            <button
-              key={item.id}
-              ref={(node) => { tabRefs.current[item.id] = node; }}
-              id={`project-tab-${item.id}`}
-              type="button"
-              role="tab"
-              aria-selected={isSelected}
-              tabIndex={isSelected ? 0 : -1}
-              onClick={() => selectTab(item.id)}
-              onKeyDown={(event) => handleTabKeyDown(event, item.id)}
-            >
-              <Icon size={15} aria-hidden={true} />
-              <span>{item.label}</span>
-              {typeof item.count === "number" && item.count > 0 ? <span className="tab-count">{item.count}</span> : null}
-            </button>
-          );
-        })}
-      </div>
-
-      <div className="project-tab-panel" role="tabpanel" aria-labelledby={`project-tab-${activeTab}`}>
-        {activeTab === "services" ? (
-          <>
-            <ErrorNotice error={services.error} />
-            {services.isPending ? (
-              <Skeleton kind="table" label="Loading services" />
-            ) : services.error ? null : services.data?.length ? (
-              <div className="services-table surface">
-                <div className="service-table-head">
-                  <span>Service</span>
-                  <span>Source</span>
-                  <span>Status</span>
-                  <span>Configuration</span>
-                  <span />
-                </div>
-                {services.data.map((service) => (
-                  <Link
-                    to="/services/$serviceId"
-                    params={{ serviceId: service.id }}
-                    key={service.id}
-                    className="service-row"
-                  >
-                    <div className="service-name">
-                      <span className="service-glyph">
-                        {service.kind && service.kind !== "app" ? <Database size={18} /> : <Box size={19} />}
-                      </span>
-                      <span>
-                        <strong>{service.name}</strong>
-                        <small>{service.hostname}</small>
-                      </span>
-                    </div>
-                    <span
-                      className="mono truncate"
-                      title={
-                        service.source?.type === "git"
-                          ? `${service.source.repository} · ${service.source.branch}`
-                          : service.source?.type === "dockerfile"
-                            ? "Inline Dockerfile"
-                            : service.source?.type === "upload"
-                              ? `Upload · ${service.source.filename ?? service.source.uploadId}`
-                              : service.image
-                      }
-                    >
-                      {service.source?.type === "git"
-                        ? `Git · ${service.source.branch}`
-                        : service.source?.type === "dockerfile"
-                          ? "Inline Dockerfile"
-                          : service.source?.type === "upload"
-                            ? `Upload · ${service.source.filename ?? "archive"}`
-                            : service.image}
-                    </span>
-                    <Badge status={service.state} />
-                    <span
-                      className={`revision-indicator ${service.revision !== service.deployedRevision ? "has-changes" : ""}`}
-                    >
-                      {service.revision === service.deployedRevision ? (
-                        <>
-                          <Check size={14} />
-                          Up to date
-                        </>
-                      ) : (
-                        <>
-                          <Circle size={9} />
-                          Pending deployment
-                        </>
-                      )}
-                    </span>
-                    <ChevronRight size={16} />
-                  </Link>
-                ))}
-              </div>
-            ) : (
-              <div className="surface empty-services">
-                <div className="empty-service-icon">
-                  <Box size={34} strokeWidth={1.4} />
-                </div>
-                <h2>No services yet</h2>
-                <p>
-                  Deploy a Docker image, Git repository, inline Dockerfile, or code archive,
-                  <br />
-                  or launch a ready-to-use template or Compose stack.
-                </p>
-                {project?.canWrite ? (
-                  <div className="project-empty-actions">
-                    <button
-                      type="button"
-                      className="button button-primary"
-                      onClick={() => setCreate(true)}
-                    >
-                      <Plus size={16} aria-hidden="true" />
-                      Create service
-                    </button>
-                    <button
-                      type="button"
-                      className="button"
-                      onClick={() => selectTab("templates")}
-                    >
-                      <Sparkles size={15} aria-hidden="true" />
-                      Browse templates &amp; modules
-                    </button>
-                    <button
-                      type="button"
-                      className="button"
-                      onClick={() => selectTab("compose")}
-                    >
-                      <Layers3 size={15} aria-hidden="true" />
-                      Compose workloads
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            )}
-          </>
-        ) : activeTab === "compose" ? (
-          projectId ? <ComposeProjects projectId={projectId} canWrite={project?.canWrite === true} /> : null
-        ) : activeTab === "templates" ? (
-          projectId ? (
+          {resolvedView === "services" ? (
             <>
-              <TemplateProjects projectId={projectId} canWrite={project?.canWrite === true} />
-              <DedicatedModulesSection projectId={projectId} canWrite={project?.canWrite === true} />
+              <ErrorNotice error={services.error} />
+              {services.isPending ? (
+                <Skeleton kind="table" label="Loading services" />
+              ) : services.error ? null : services.data?.length ? (
+                <div className="ep-framed-card">
+                  <div className="ep-framed-head">
+                    <span>Services ({services.data.length})</span>
+                  </div>
+                  <div className="ep-framed-body" style={{ padding: 0, overflow: "hidden" }}>
+                    <div className="services-table" style={{ border: 0, borderRadius: 0 }}>
+                      <div className="service-table-head">
+                        <span>Service</span>
+                        <span>Source</span>
+                        <span>Status</span>
+                        <span>Configuration</span>
+                        <span />
+                      </div>
+                      {services.data.map((service) => (
+                        <Link
+                          to="/services/$serviceId"
+                          params={{ serviceId: service.id }}
+                          key={service.id}
+                          className="service-row"
+                        >
+                          <div className="service-name">
+                            <span className="service-glyph">
+                              {service.kind && service.kind !== "app" ? <Database size={17} /> : <Box size={17} />}
+                            </span>
+                            <span>
+                              <strong>{service.name}</strong>
+                              <small>{service.hostname}</small>
+                            </span>
+                          </div>
+                          <span
+                            className="mono truncate"
+                            title={
+                              service.source?.type === "git"
+                                ? `${service.source.repository} · ${service.source.branch}`
+                                : service.source?.type === "dockerfile"
+                                  ? "Inline Dockerfile"
+                                  : service.source?.type === "upload"
+                                    ? `Upload · ${service.source.filename ?? service.source.uploadId}`
+                                    : service.image
+                            }
+                          >
+                            {service.source?.type === "git"
+                              ? `Git · ${service.source.branch}`
+                              : service.source?.type === "dockerfile"
+                                ? "Inline Dockerfile"
+                                : service.source?.type === "upload"
+                                  ? `Upload · ${service.source.filename ?? "archive"}`
+                                  : service.image}
+                          </span>
+                          <Badge status={service.state} />
+                          <span
+                            className={`revision-indicator ${service.revision !== service.deployedRevision ? "has-changes" : ""}`}
+                          >
+                            {service.revision === service.deployedRevision ? (
+                              <>
+                                <Check size={14} />
+                                Up to date
+                              </>
+                            ) : (
+                              <>
+                                <Circle size={9} />
+                                Pending deployment
+                              </>
+                            )}
+                          </span>
+                          <ChevronRight size={16} />
+                        </Link>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="surface empty-services">
+                  <div className="empty-service-icon">
+                    <Box size={34} strokeWidth={1.4} />
+                  </div>
+                  <h2>Your project is empty</h2>
+                  <p>
+                    Create a service from a Docker image, Git repository, inline Dockerfile, or archive,
+                    <br />
+                    or launch a ready-to-use template, WordPress, Box, or Compose stack.
+                  </p>
+                  {project?.canWrite ? (
+                    <div className="project-empty-actions">
+                      <button
+                        type="button"
+                        className="button button-primary"
+                        onClick={() => setCreate(true)}
+                      >
+                        <Plus size={16} aria-hidden="true" />
+                        Create service
+                      </button>
+                      <button
+                        type="button"
+                        className="button"
+                        onClick={() => openView("templates")}
+                      >
+                        <Sparkles size={15} aria-hidden="true" />
+                        Browse Templates
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              )}
             </>
-          ) : null
-        ) : activeTab === "environment" ? (
-          projectId ? <ProjectExtras projectId={projectId} services={services.data ?? []} canWrite={project?.canWrite === true} /> : null
-        ) : activeTab === "activity" ? (
-          <>
-            <ErrorNotice error={actions.error} />
-            {!actions.error ? <ActionsTable actions={actions.data ?? []} loading={actions.isPending} /> : null}
-          </>
-        ) : activeTab === "migration" ? (
-          projectId && project ? (
-            <ProjectMigrationSection projectId={projectId} projectName={project.name} admin={user.role === "admin"} canWrite={project.canWrite === true} />
-          ) : null
-        ) : null}
+          ) : resolvedView === "templates" && projectId ? (
+            <div className="ep-page">
+              <div className="ep-segmented" role="tablist" aria-label="Create options">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={catalogSubTab === "templates"}
+                  className={catalogSubTab === "templates" ? "is-active" : ""}
+                  onClick={() => setCatalogSubTab("templates")}
+                >
+                  Templates
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={catalogSubTab === "modules"}
+                  className={catalogSubTab === "modules" ? "is-active" : ""}
+                  onClick={() => setCatalogSubTab("modules")}
+                >
+                  WordPress &amp; Box
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={catalogSubTab === "compose"}
+                  className={catalogSubTab === "compose" ? "is-active" : ""}
+                  onClick={() => setCatalogSubTab("compose")}
+                >
+                  Compose
+                </button>
+              </div>
+              {catalogSubTab === "templates" ? (
+                <TemplateProjects projectId={projectId} canWrite={project?.canWrite === true} />
+              ) : catalogSubTab === "modules" ? (
+                <DedicatedModulesSection projectId={projectId} canWrite={project?.canWrite === true} />
+              ) : (
+                <ComposeProjects projectId={projectId} canWrite={project?.canWrite === true} />
+              )}
+            </div>
+          ) : resolvedView === "settings" && projectId && project ? (
+            <div className="ep-page">
+              <ProjectExtras projectId={projectId} services={services.data ?? []} canWrite={project.canWrite === true} />
+              <ProjectMigrationSection projectId={projectId} projectName={project.name} admin={user.role === "admin"} canWrite={project.canWrite === true} />
+              {project.canWrite ? (
+                <div className="ep-framed-card">
+                  <div className="ep-framed-head">
+                    <span>Project Danger Zone</span>
+                  </div>
+                  <div className="ep-framed-body" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+                    <div>
+                      <strong>Manage or delete project</strong>
+                      <p className="servus-help">Rename this project or permanently delete it and all of its services.</p>
+                    </div>
+                    <ProjectSettings project={project} onDeleted={() => void navigate({ to: "/" })} />
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : resolvedView === "activity" ? (
+            <>
+              <ErrorNotice error={actions.error} />
+              {!actions.error ? <ActionsTable actions={actions.data ?? []} loading={actions.isPending} /> : null}
+            </>
+          ) : null}
+        </div>
       </div>
 
       {create && projectId ? (
-        <CreateService projectId={projectId} admin={user.role === "admin"} serviceNames={services.data?.map((service) => service.name) ?? []} onClose={() => setCreate(false)} />
+        <CreateService
+          projectId={projectId}
+          admin={user.role === "admin"}
+          serviceNames={services.data?.map((service) => service.name) ?? []}
+          onClose={() => setCreate(false)}
+        />
       ) : null}
-    </>
+    </div>
   );
 }
 
@@ -1111,13 +1353,16 @@ function ServiceSections({
         className={tab === item.id ? "selected" : ""}
         onClick={() => dialog.current?.close()}
       >
-        <span>{item.label}</span>
+        <span className="ep-context-nav-label">
+          {serviceTabIcon(item.id)}
+          <span>{item.label}</span>
+        </span>
         {item.id === "deployments" && actionCount > 0 ? <span className="tab-count">{actionCount}</span> : null}
       </Link>
     );
   }
   if (!compact) {
-    return <nav className="service-tabs feature-tabs" aria-label="Service sections">{serviceTabs.map(sectionLink)}</nav>;
+    return <nav className="ep-context-nav" aria-label="Service sections">{serviceTabs.map(sectionLink)}</nav>;
   }
   const current = serviceTabs.find(item => item.id === tab)!;
   return (
@@ -1162,6 +1407,7 @@ function ServicePage() {
   const { tab = "overview", action: selectedAction } = serviceRoute.useSearch();
   const [compact, setCompact] = useState(() => window.matchMedia(compactServiceLayout).matches);
   const [actionsOpen, setActionsOpen] = useState(false);
+  const [createInProject, setCreateInProject] = useState(false);
   const secondaryDisclosure = useRef<HTMLDetailsElement>(null);
   const [deploymentStatus, setDeploymentStatus] = useState("");
   useEffect(() => {
@@ -1185,6 +1431,19 @@ function ServicePage() {
     queryFn: () => api<Service>(`/services/${serviceId}`),
     enabled: !!serviceId,
     refetchInterval: destroying ? false : 2_000,
+  });
+  const projectServicesQuery = useQuery({
+    queryKey: ["services", serviceQuery.data?.projectId],
+    queryFn: () => api<Service[]>(`/projects/${serviceQuery.data!.projectId}/services`),
+    enabled: !!serviceQuery.data?.projectId,
+    refetchInterval: 5_000,
+  });
+  const liveMetricsQuery = useQuery({
+    queryKey: ["service-metrics", serviceId],
+    queryFn: () => api<ServiceMetrics>(`/services/${serviceId}/metrics`),
+    enabled: !!serviceId && serviceQuery.data?.state === "running",
+    refetchInterval: 5_000,
+    retry: false,
   });
   const changesQuery = useQuery({
     queryKey: ["configuration-changes", serviceId, serviceQuery.data?.revision, serviceQuery.data?.deployedRevision],
@@ -1215,17 +1474,20 @@ function ServicePage() {
   });
   if (serviceQuery.isPending)
     return (
-      <Skeleton kind="service" label="Loading service" />
+      <div className="ep-context-sheet" style={{ margin: 0, border: 0 }}>
+        <Skeleton kind="service" label="Loading service" />
+      </div>
     );
   if (!serviceQuery.data)
     return (
-      <ErrorNotice
-        error={serviceQuery.error ?? new Error("Service not found.")}
-      />
+      <div className="ep-context-sheet" style={{ margin: 0, border: 0 }}>
+        <ErrorNotice error={serviceQuery.error ?? new Error("Service not found.")} />
+      </div>
     );
   const service = serviceQuery.data;
+  const currentProject = projects.data?.find((project) => project.id === service.projectId);
   const database = !!service.kind && service.kind !== "app";
-  const canWrite = projects.data?.find(project => project.id === service.projectId)?.canWrite === true;
+  const canWrite = currentProject?.canWrite === true;
   const busy = !!(
     destroying ||
     execute.isPending ||
@@ -1277,228 +1539,304 @@ function ServicePage() {
       />
     </>
   ) : null;
+  const projectServices = Array.isArray(projectServicesQuery.data) ? projectServicesQuery.data : [service];
+  const liveMetrics = liveMetricsQuery.data;
   return (
-    <>
-      <div className="page-heading service-heading">
-        <div>
-          <div className="eyebrow">
-            {database
-              ? `${service.kind?.toUpperCase()} SERVICE`
-              : "APPLICATION SERVICE"}
+    <div className="ep-dual-layout">
+      <ProjectContextSidebar
+        projects={projects.data ?? (currentProject ? [currentProject] : [])}
+        currentProject={currentProject}
+        services={projectServices}
+        activeServiceId={service.id}
+        canWrite={canWrite}
+        onAddService={() => setCreateInProject(true)}
+      >
+        {!compact ? (
+          <ServiceSections serviceId={service.id} tab={tab} selectedAction={selectedAction} actionCount={actions.length} compact={false} />
+        ) : null}
+      </ProjectContextSidebar>
+
+      <div className="ep-context-sheet">
+        <div className="ep-context-sheet-inner">
+          <div className="service-heading" style={{ display: "grid", gap: 14, marginBottom: 0 }}>
+            <div className="ep-service-header">
+              <div>
+                <h1 className="ep-service-crumb-title">
+                  <Link to="/projects/$projectId" params={{ projectId: service.projectId }}>
+                    {currentProject?.name ?? "Project"}
+                  </Link>
+                  <span className="ep-service-crumb-sep">/</span>
+                  <span>{service.name}</span>
+                  <span className={`ep-type-pill ${database ? "is-db" : ""}`}>
+                    {database ? service.kind : "APP"}
+                  </span>
+                  <Badge status={service.state} />
+                </h1>
+                <p className="mono service-image" style={{ margin: "4px 0 0", fontSize: 12.5 }}>{sourceLabel}</p>
+              </div>
+              <div className="ep-service-top-actions">
+                {canWrite ? (
+                  <button type="button" className="button button-small" onClick={() => setCreateInProject(true)}>
+                    <Plus size={14} aria-hidden="true" /> Service
+                  </button>
+                ) : null}
+                <Link
+                  to="/projects/$projectId"
+                  params={{ projectId: service.projectId }}
+                  search={{ tab: "templates" }}
+                  className="button button-small"
+                >
+                  <Sparkles size={14} aria-hidden="true" /> Templates
+                </Link>
+                <Link
+                  to="/projects/$projectId"
+                  params={{ projectId: service.projectId }}
+                  search={{ tab: "settings" }}
+                  className="icon-button"
+                  aria-label="Project settings"
+                  title="Project settings"
+                >
+                  <Settings size={16} aria-hidden="true" />
+                </Link>
+              </div>
+            </div>
+
+            <div className="ep-action-toolbar-frame">
+              <div className="ep-action-toolbar-top service-heading-actions">
+                {canWrite && (
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    onClick={() => execute.mutate("deploy")}
+                    disabled={busy}
+                  >
+                    {busy ? <Spinner label="In progress" /> : <><Play size={15} aria-hidden="true" /> Deploy</>}
+                  </button>
+                )}
+                {!database && appUrl ? (
+                  <a
+                    href={appUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="button"
+                  >
+                    <ExternalLink size={15} />
+                    Open app
+                  </a>
+                ) : null}
+                {canWrite ? (
+                  <details
+                    ref={secondaryDisclosure}
+                    className="service-actions-disclosure"
+                    open={!compact || actionsOpen}
+                    onToggle={event => { if (compact) setActionsOpen(event.currentTarget.open); }}
+                    onKeyDown={event => {
+                      if (compact && event.key === "Escape" && event.currentTarget.open && !(event.target as Element).closest("dialog")) {
+                        event.preventDefault();
+                        event.currentTarget.open = false;
+                        event.currentTarget.querySelector("summary")?.focus();
+                      }
+                    }}
+                  >
+                    <summary className="button">Actions <ChevronDown size={15} aria-hidden="true" /></summary>
+                    <div className="service-action-options">{secondaryActions}</div>
+                  </details>
+                ) : null}
+              </div>
+              <div className="ep-action-toolbar-metrics" aria-label="Live service resource summary">
+                <span>CPU <strong>{liveMetrics ? `${liveMetrics.cpuPercent.toFixed(1)}%` : "0.0%"}</strong></span>
+                <span>Memory <strong>{liveMetrics ? formatCompactBytes(liveMetrics.memoryBytes) : "0 B"}</strong></span>
+                <span>
+                  Network I/O{" "}
+                  <strong>
+                    {liveMetrics
+                      ? `${formatCompactBytes(liveMetrics.networkRxBytes)} / ${formatCompactBytes(liveMetrics.networkTxBytes)}`
+                      : "0 B / 0 B"}
+                  </strong>
+                </span>
+              </div>
+            </div>
           </div>
-          <h1>
-            <span className="service-title-icon">
-              <Box size={27} />
-            </span>
-            {service.name}
-            <Badge status={service.state} />
-          </h1>
-          <p className="mono service-image">{sourceLabel}</p>
-        </div>
-        <div className="heading-actions service-heading-actions">
-          {canWrite && <button
-            type="button"
-            className="button button-primary"
-            onClick={() => execute.mutate("deploy")}
-            disabled={busy}
-          >
-            {busy ? <Spinner label="In progress" /> : <><Play size={15} aria-hidden="true" /> Deploy</>}
-          </button>}
-          {!database && appUrl ? (
-            <a
-              href={appUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="button"
-            >
-              <ExternalLink size={15} />
-              Open app
-            </a>
+
+          {compact ? (
+            <ServiceSections serviceId={service.id} tab={tab} selectedAction={selectedAction} actionCount={actions.length} compact={true} />
           ) : null}
-          {canWrite ? (
-            <details
-              ref={secondaryDisclosure}
-              className="service-actions-disclosure"
-              open={!compact || actionsOpen}
-              onToggle={event => { if (compact) setActionsOpen(event.currentTarget.open); }}
-              onKeyDown={event => {
-                if (compact && event.key === "Escape" && event.currentTarget.open && !(event.target as Element).closest("dialog")) {
-                  event.preventDefault();
-                  event.currentTarget.open = false;
-                  event.currentTarget.querySelector("summary")?.focus();
-                }
-              }}
-            >
-              <summary className="button">Actions <ChevronDown size={15} aria-hidden="true" /></summary>
-              <div className="service-action-options">{secondaryActions}</div>
-            </details>
+
+          <ErrorNotice error={execute.error} />
+          {service.lastError && !(tab === "deployments" && actions[0]?.status === "failed" && actionId === actions[0].id) ? (
+            <div className="error-notice">
+              <CircleAlert size={17} />
+              <span>{service.lastError}</span>
+            </div>
           ) : null}
+          {changed ? (
+            <div id="configuration-changes" className="change-notice">
+              <GitBranch size={17} />
+              <div>
+                <strong>
+                  {service.deployedRevision === null
+                    ? "Waiting for the first deployment"
+                    : "Configuration changes are ready"}
+                </strong>
+                <span>
+                  Saved revision {service.revision}
+                  {service.deployedRevision !== null
+                    ? ` · Last deployed revision ${service.deployedRevision}`
+                    : ""}
+                  . Deploy to apply the saved settings.
+                </span>
+                {changesQuery.data?.status === "available" ? <span>{changesQuery.data.sections.length ? `Changed: ${changesQuery.data.sections.join(", ")}.` : "No configuration differences found."}</span> : changesQuery.data?.status === "unavailable" ? <span>Details for the running revision are unavailable.</span> : null}
+              </div>
+            </div>
+          ) : null}
+
+          {tab === "deployments" ? (
+            <div className="operations-grid deployment-workspace">
+              <div className="deployment-history">
+                <div className="section-heading deployment-history-heading">
+                  <h2>Deployments and operations</h2>
+                  <label>
+                    <span className="sr-only">Filter deployment history by status</span>
+                    <select value={deploymentStatus} onChange={event => setDeploymentStatus(event.target.value)}>
+                      <option value="">All statuses</option>
+                      <option value="failed">Failed</option>
+                      <option value="succeeded">Succeeded</option>
+                      <option value="queued">Queued</option>
+                      <option value="running">Running</option>
+                      <option value="cancelled">Cancelled</option>
+                    </select>
+                  </label>
+                </div>
+                <ErrorNotice error={actionsQuery.error} />
+                {!actionsQuery.isError ? <ActionsTable
+                  actions={filteredActions}
+                  loading={actionsQuery.isPending}
+                  onSelect={(action) => selectAction(action.id)}
+                  selectedId={actionId}
+                  emptyMessage={deploymentStatus ? "No operations match this status." : undefined}
+                /> : null}
+              </div>
+              <ActionLog key={`${service.id}:${actionId ?? ""}`} actionId={actionId} service={service} busy={busy} onRedeployed={canWrite ? action => {selectAction(action.id);void client.invalidateQueries({queryKey:["service-actions",serviceId]});void client.invalidateQueries({queryKey:["service",serviceId]});} : undefined} />
+              {canWrite && service.source?.type === "git" ? <div className="deployment-webhook">
+                <DeployWebhookSettings service={service} canWrite={canWrite}/>
+              </div> : null}
+            </div>
+          ) : tab !== "overview" ? (
+            <ServiceConfigurationPanel
+              key={`${service.id}-${tab}`}
+              service={service}
+              tab={tab}
+              admin={user.role === "admin"}
+              canWrite={canWrite}
+            />
+          ) : (
+            <>
+              <ServiceMetricsPanel service={service} />
+              <div className="service-overview-grid">
+                {database ? (
+                  <>
+                    <DatabaseConnection service={service} admin={user.role === "admin"} canWrite={canWrite} />
+                    <DatabaseAdminTools service={service} canWrite={canWrite} />
+                  </>
+                ) : (
+                  <section className="surface details-card">
+                    <div className="card-heading">
+                      <Globe2 size={18} />
+                      <h2>Networking</h2>
+                    </div>
+                    <div className="detail-row">
+                      <span>Primary hostname</span>
+                      {appUrl && primaryDomain ? (
+                        <a
+                          className="mono"
+                          href={appUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {primaryDomain.hostname}
+                          <ArrowUpRight size={13} />
+                        </a>
+                      ) : (
+                        <strong>Private service</strong>
+                      )}
+                    </div>
+                    <div className="detail-row">
+                      <span>Configured domains</span>
+                      <strong>{domains.length}</strong>
+                    </div>
+                    <div className="detail-row">
+                      <span>Container port</span>
+                      <strong className="mono">{service.port}</strong>
+                    </div>
+                    <div className="detail-row">
+                      <span>Ingress</span>
+                      <strong>
+                        HTTP{" "}
+                        <span className="muted mono">
+                          :{runtime.data?.ingressPort ?? 18080}
+                        </span>
+                      </strong>
+                    </div>
+                  </section>
+                )}
+                <section className="surface details-card">
+                  <div className="card-heading">
+                    <Layers3 size={18} />
+                    <h2>Deployment</h2>
+                  </div>
+                  <div className="detail-row">
+                    <span>Type</span>
+                    <strong>{service.kind ?? "app"}</strong>
+                  </div>
+                  <div className="detail-row">
+                    <span>Replicas</span>
+                    <strong>{service.replicas}</strong>
+                  </div>
+                  <div className="detail-row">
+                    <span>Saved revision</span>
+                    <strong className="mono">{service.revision}</strong>
+                  </div>
+                  <div className="detail-row">
+                    <span>Deployed revision</span>
+                    <strong className="mono">
+                      {service.deployedRevision ?? "Not deployed"}
+                    </strong>
+                  </div>
+                  {service.sourceCommit ? (
+                    <div className="detail-row">
+                      <span>Built commit</span>
+                      <strong className="mono" title={service.sourceCommit}>
+                        {service.sourceCommit.slice(0, 12)}
+                      </strong>
+                    </div>
+                  ) : null}
+                  {service.imageDigest ? (
+                    <div className="detail-row">
+                      <span>Image digest</span>
+                      <strong
+                        className="mono digest-value"
+                        title={service.imageDigest}
+                      >
+                        {service.imageDigest}
+                      </strong>
+                    </div>
+                  ) : null}
+                </section>
+              </div>
+            </>
+          )}
         </div>
       </div>
-      <ServiceSections serviceId={service.id} tab={tab} selectedAction={selectedAction} actionCount={actions.length} compact={compact} />
-      <ErrorNotice error={execute.error} />
-      {service.lastError && !(tab === "deployments" && actions[0]?.status === "failed" && actionId === actions[0].id) ? (
-        <div className="error-notice">
-          <CircleAlert size={17} />
-          <span>{service.lastError}</span>
-        </div>
-      ) : null}
-      {changed ? (
-        <div id="configuration-changes" className="change-notice">
-          <GitBranch size={17} />
-          <div>
-            <strong>
-              {service.deployedRevision === null
-                ? "Waiting for the first deployment"
-                : "Configuration changes are ready"}
-            </strong>
-            <span>
-              Saved revision {service.revision}
-              {service.deployedRevision !== null
-                ? ` · Last deployed revision ${service.deployedRevision}`
-                : ""}
-              . Deploy to apply the saved settings.
-            </span>
-            {changesQuery.data?.status === "available" ? <span>{changesQuery.data.sections.length ? `Changed: ${changesQuery.data.sections.join(", ")}.` : "No configuration differences found."}</span> : changesQuery.data?.status === "unavailable" ? <span>Details for the running revision are unavailable.</span> : null}
-          </div>
-        </div>
-      ) : null}
-      {tab === "deployments" ? (
-        <div className="operations-grid deployment-workspace">
-          <div className="deployment-history">
-            <div className="section-heading deployment-history-heading">
-              <h2>Deployments and operations</h2>
-              <label>
-                <span className="sr-only">Filter deployment history by status</span>
-                <select value={deploymentStatus} onChange={event => setDeploymentStatus(event.target.value)}>
-                  <option value="">All statuses</option>
-                  <option value="failed">Failed</option>
-                  <option value="succeeded">Succeeded</option>
-                  <option value="queued">Queued</option>
-                  <option value="running">Running</option>
-                  <option value="cancelled">Cancelled</option>
-                </select>
-              </label>
-            </div>
-            <ErrorNotice error={actionsQuery.error} />
-            {!actionsQuery.isError ? <ActionsTable
-              actions={filteredActions}
-              loading={actionsQuery.isPending}
-              onSelect={(action) => selectAction(action.id)}
-              selectedId={actionId}
-              emptyMessage={deploymentStatus ? "No operations match this status." : undefined}
-            /> : null}
-          </div>
-          <ActionLog key={`${service.id}:${actionId ?? ""}`} actionId={actionId} service={service} busy={busy} onRedeployed={canWrite ? action => {selectAction(action.id);void client.invalidateQueries({queryKey:["service-actions",serviceId]});void client.invalidateQueries({queryKey:["service",serviceId]});} : undefined} />
-          {canWrite && service.source?.type === "git" ? <div className="deployment-webhook">
-            <DeployWebhookSettings service={service} canWrite={canWrite}/>
-          </div> : null}
-        </div>
-      ) : tab !== "overview" ? (
-        <ServiceConfigurationPanel
-          key={`${service.id}-${tab}`}
-          service={service}
-          tab={tab}
+
+      {createInProject ? (
+        <CreateService
+          projectId={service.projectId}
           admin={user.role === "admin"}
-          canWrite={canWrite}
+          serviceNames={projectServicesQuery.data?.map((s) => s.name) ?? [service.name]}
+          onClose={() => setCreateInProject(false)}
         />
-      ) : (
-        <>
-          <ServiceMetricsPanel service={service} />
-          <div className="service-overview-grid">
-            {database ? (
-              <>
-                <DatabaseConnection service={service} admin={user.role === "admin"} canWrite={canWrite} />
-                <DatabaseAdminTools service={service} canWrite={canWrite} />
-              </>
-            ) : (
-              <section className="surface details-card">
-                <div className="card-heading">
-                  <Globe2 size={18} />
-                  <h2>Networking</h2>
-                </div>
-                <div className="detail-row">
-                  <span>Primary hostname</span>
-                  {appUrl && primaryDomain ? (
-                    <a
-                      className="mono"
-                      href={appUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {primaryDomain.hostname}
-                      <ArrowUpRight size={13} />
-                    </a>
-                  ) : (
-                    <strong>Private service</strong>
-                  )}
-                </div>
-                <div className="detail-row">
-                  <span>Configured domains</span>
-                  <strong>{domains.length}</strong>
-                </div>
-                <div className="detail-row">
-                  <span>Container port</span>
-                  <strong className="mono">{service.port}</strong>
-                </div>
-                <div className="detail-row">
-                  <span>Ingress</span>
-                  <strong>
-                    HTTP{" "}
-                    <span className="muted mono">
-                      :{runtime.data?.ingressPort ?? 18080}
-                    </span>
-                  </strong>
-                </div>
-              </section>
-            )}
-            <section className="surface details-card">
-              <div className="card-heading">
-                <Layers3 size={18} />
-                <h2>Deployment</h2>
-              </div>
-              <div className="detail-row">
-                <span>Type</span>
-                <strong>{service.kind ?? "app"}</strong>
-              </div>
-              <div className="detail-row">
-                <span>Replicas</span>
-                <strong>{service.replicas}</strong>
-              </div>
-              <div className="detail-row">
-                <span>Saved revision</span>
-                <strong className="mono">{service.revision}</strong>
-              </div>
-              <div className="detail-row">
-                <span>Deployed revision</span>
-                <strong className="mono">
-                  {service.deployedRevision ?? "Not deployed"}
-                </strong>
-              </div>
-              {service.sourceCommit ? (
-                <div className="detail-row">
-                  <span>Built commit</span>
-                  <strong className="mono" title={service.sourceCommit}>
-                    {service.sourceCommit.slice(0, 12)}
-                  </strong>
-                </div>
-              ) : null}
-              {service.imageDigest ? (
-                <div className="detail-row">
-                  <span>Image digest</span>
-                  <strong
-                    className="mono digest-value"
-                    title={service.imageDigest}
-                  >
-                    {service.imageDigest}
-                  </strong>
-                </div>
-              ) : null}
-            </section>
-          </div>
-        </>
-      )}
-    </>
+      ) : null}
+    </div>
   );
 }
 
@@ -1707,126 +2045,181 @@ function ActivityPage() {
   );
 }
 
+function MonitorRoutePage() {
+  const { user } = useAuth();
+  const projects = useProjects();
+  return <MonitorPage projects={projects.data ?? []} admin={user.role === "admin"} />;
+}
+
+function DomainsRoutePage() {
+  const projects = useProjects();
+  const runtime = useRuntime();
+  return <DomainsPage projects={projects.data ?? []} runtime={runtime.data} />;
+}
+
 function SettingsPage() {
   const runtime = useRuntime();
   const { user } = useAuth();
   const admin = user.role === "admin";
   return (
-    <div className="settings-page">
-      <header className="page-heading settings-heading">
-        <h1>Settings</h1>
-      </header>
-      <nav className="settings-jump" aria-label="Settings sections">
-        <a href="#instance"><Server size={16} aria-hidden="true" />Instance</a>
-        {admin ? <a href="#connectivity"><Globe2 size={16} aria-hidden="true" />Connectivity</a> : null}
-        {admin ? <a href="#settings-backups"><Database size={16} aria-hidden="true" />Backups</a> : null}
-        {admin ? <a href="#host-administration"><HardDrive size={16} aria-hidden="true" />Host</a> : null}
-        {admin ? <a href="#platform-branding"><Palette size={16} aria-hidden="true" />Branding</a> : null}
-        <a href="#account-access"><ShieldCheck size={16} aria-hidden="true" />Account &amp; access</a>
-      </nav>
+    <div className="ep-dual-layout">
+      <aside className="ep-context-sidebar" aria-label="Settings menu">
+        <div className="ep-context-section-head"><span>User</span></div>
+        <nav className="ep-context-nav" aria-label="Settings sections">
+          <a href="#account-access">
+            <span className="ep-context-nav-label">
+              <ShieldCheck size={15} aria-hidden="true" />
+              <span>Account &amp; access</span>
+            </span>
+          </a>
+          <div className="ep-context-section-head" style={{ marginTop: 10 }}><span>Server</span></div>
+          <a href="#instance">
+            <span className="ep-context-nav-label">
+              <Server size={15} aria-hidden="true" />
+              <span>Instance</span>
+            </span>
+          </a>
+          {admin ? (
+            <>
+              <a href="#connectivity">
+                <span className="ep-context-nav-label">
+                  <Globe2 size={15} aria-hidden="true" />
+                  <span>Connectivity</span>
+                </span>
+              </a>
+              <a href="#settings-backups">
+                <span className="ep-context-nav-label">
+                  <Database size={15} aria-hidden="true" />
+                  <span>Backups</span>
+                </span>
+              </a>
+              <a href="#host-administration">
+                <span className="ep-context-nav-label">
+                  <HardDrive size={15} aria-hidden="true" />
+                  <span>Host</span>
+                </span>
+              </a>
+              <a href="#platform-branding">
+                <span className="ep-context-nav-label">
+                  <Palette size={15} aria-hidden="true" />
+                  <span>Branding</span>
+                </span>
+              </a>
+            </>
+          ) : null}
+        </nav>
+      </aside>
 
-      <section className="settings-group" id="instance" aria-labelledby="settings-instance-heading">
-        <h2 id="settings-instance-heading">Instance</h2>
-        <ErrorNotice error={runtime.error} />
-        <div className="instance-grid">
-          <section className="surface details-card">
-            <div className="card-heading">
-              <Server size={19} />
-              <h3>Docker runtime</h3>
-            </div>
-            <div className="detail-row">
-              <span>Connection</span>
-              <strong>
-                {runtime.isPending
-                  ? "Checking"
-                  : runtime.data?.online
-                    ? "Connected"
-                    : "Offline"}
-              </strong>
-            </div>
-            <div className="detail-row">
-              <span>Engine version</span>
-              <strong className="mono">
-                {runtime.data?.engineVersion ?? "Unavailable"}
-              </strong>
-            </div>
-            <div className="detail-row">
-              <span>CPUs</span>
-              <strong>{runtime.data?.cpus ?? "Unavailable"}</strong>
-            </div>
-            <div className="detail-row">
-              <span>Memory capacity</span>
-              <strong>
-                {runtime.data?.memoryBytes
-                  ? `${(runtime.data.memoryBytes / 1024 ** 3).toFixed(1)} GiB`
-                  : "Unavailable"}
-              </strong>
-            </div>
-            <div className="detail-row">
-              <span>Swarm state</span>
-              <strong>{runtime.data?.swarmState ?? "Unavailable"}</strong>
-            </div>
-            <div className="detail-row">
-              <span>HTTP ingress port</span>
-              <strong className="mono">
-                {runtime.data?.ingressPort ?? 18080}
-              </strong>
-            </div>
-            {runtime.data?.error ? (
-              <div className="error-notice">
-                <CircleAlert size={16} />
-                {runtime.data.error}
+      <div className="ep-context-sheet">
+        <div className="ep-context-sheet-inner settings-page">
+          <header className="ep-page-header settings-heading">
+            <h1>Settings</h1>
+          </header>
+
+          <section className="settings-group" id="instance" aria-labelledby="settings-instance-heading">
+            <h2 id="settings-instance-heading">Instance</h2>
+            <ErrorNotice error={runtime.error} />
+            <div className="instance-grid">
+              <section className="surface details-card">
+                <div className="card-heading">
+                  <Server size={19} />
+                  <h3>Docker runtime</h3>
+                </div>
+                <div className="detail-row">
+                  <span>Connection</span>
+                  <strong>
+                    {runtime.isPending
+                      ? "Checking"
+                      : runtime.data?.online
+                        ? "Connected"
+                        : "Offline"}
+                  </strong>
+                </div>
+                <div className="detail-row">
+                  <span>Engine version</span>
+                  <strong className="mono">
+                    {runtime.data?.engineVersion ?? "Unavailable"}
+                  </strong>
+                </div>
+                <div className="detail-row">
+                  <span>CPUs</span>
+                  <strong>{runtime.data?.cpus ?? "Unavailable"}</strong>
+                </div>
+                <div className="detail-row">
+                  <span>Memory capacity</span>
+                  <strong>
+                    {runtime.data?.memoryBytes
+                      ? `${(runtime.data.memoryBytes / 1024 ** 3).toFixed(1)} GiB`
+                      : "Unavailable"}
+                  </strong>
+                </div>
+                <div className="detail-row">
+                  <span>Swarm state</span>
+                  <strong>{runtime.data?.swarmState ?? "Unavailable"}</strong>
+                </div>
+                <div className="detail-row">
+                  <span>HTTP ingress port</span>
+                  <strong className="mono">
+                    {runtime.data?.ingressPort ?? 18080}
+                  </strong>
+                </div>
+                {runtime.data?.error ? (
+                  <div className="error-notice">
+                    <CircleAlert size={16} />
+                    {runtime.data.error}
+                  </div>
+                ) : null}
+              </section>
+              <div className="settings-instance-side">
+                <section className="surface details-card">
+                  <div className="card-heading">
+                    <ShieldCheck size={19} />
+                    <h3>Workspace access</h3>
+                  </div>
+                  <div className="detail-row">
+                    <span>Signed in as</span>
+                    <strong>{user.email}</strong>
+                  </div>
+                  <div className="detail-row">
+                    <span>Role</span>
+                    <strong className="capitalize">{user.role}</strong>
+                  </div>
+                </section>
+                {admin ? <HostMetricsCard /> : null}
+                {admin ? <UpdateSettings /> : null}
               </div>
-            ) : null}
+            </div>
           </section>
-          <div className="settings-instance-side">
-            <section className="surface details-card">
-              <div className="card-heading">
-                <ShieldCheck size={19} />
-                <h3>Workspace access</h3>
-              </div>
-              <div className="detail-row">
-                <span>Signed in as</span>
-                <strong>{user.email}</strong>
-              </div>
-              <div className="detail-row">
-                <span>Role</span>
-                <strong className="capitalize">{user.role}</strong>
-              </div>
+
+          {admin ? <>
+            <section className="settings-group" id="connectivity" aria-labelledby="settings-connectivity-heading">
+              <h2 id="settings-connectivity-heading">Connectivity</h2>
+              <HostDomainSettings />
+              <HttpsSettings configured={runtime.data?.httpsConfigured === true} access={runtime.data?.httpsAccess} recoveryRequired={runtime.data?.ingressRecoveryRequired === true} busy={runtime.data?.ingressBusy === true} />
+              <GithubSettings />
+              <AlertsSettings />
+              <BuildConcurrencySettings />
             </section>
-            {admin ? <HostMetricsCard /> : null}
-            {admin ? <UpdateSettings /> : null}
-          </div>
+
+            <section className="settings-group" id="settings-backups" aria-labelledby="settings-backups-heading">
+              <h2 id="settings-backups-heading">Backups</h2>
+              <BackupStorageSettings />
+              <InstallationBackupSettings userId={user.id} />
+            </section>
+
+            <HostAdminPanel />
+            <PlatformSettings />
+          </> : null}
+
+          <section className="settings-group" id="account-access" aria-labelledby="settings-account-heading">
+            <h2 id="settings-account-heading">Account &amp; access</h2>
+            <LocalPasswordSettings />
+            <TwoFactorSettings />
+            <ApiTokenSettings canCreateProject={admin} />
+            {admin ? <ProjectAccess /> : null}
+          </section>
         </div>
-      </section>
-
-      {admin ? <>
-        <section className="settings-group" id="connectivity" aria-labelledby="settings-connectivity-heading">
-          <h2 id="settings-connectivity-heading">Connectivity</h2>
-          <HostDomainSettings />
-          <HttpsSettings configured={runtime.data?.httpsConfigured === true} access={runtime.data?.httpsAccess} recoveryRequired={runtime.data?.ingressRecoveryRequired === true} busy={runtime.data?.ingressBusy === true} />
-          <GithubSettings />
-          <AlertsSettings />
-          <BuildConcurrencySettings />
-        </section>
-
-        <section className="settings-group" id="settings-backups" aria-labelledby="settings-backups-heading">
-          <h2 id="settings-backups-heading">Backups</h2>
-          <BackupStorageSettings />
-          <InstallationBackupSettings userId={user.id} />
-        </section>
-
-        <HostAdminPanel />
-        <PlatformSettings />
-      </> : null}
-
-      <section className="settings-group" id="account-access" aria-labelledby="settings-account-heading">
-        <h2 id="settings-account-heading">Account &amp; access</h2>
-        <LocalPasswordSettings />
-        <TwoFactorSettings />
-        <ApiTokenSettings canCreateProject={admin} />
-        {admin ? <ProjectAccess /> : null}
-      </section>
+      </div>
     </div>
   );
 }
@@ -1873,6 +2266,16 @@ const activityRoute = createRoute({
   }),
   component: ActivityPage,
 });
+const monitorRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/monitor",
+  component: MonitorRoutePage,
+});
+const domainsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/domains",
+  component: DomainsRoutePage,
+});
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings",
@@ -1884,6 +2287,8 @@ const router = createRouter({
     projectRoute,
     serviceRoute,
     activityRoute,
+    monitorRoute,
+    domainsRoute,
     settingsRoute,
   ]),
   defaultPreload: "intent",
@@ -1899,11 +2304,13 @@ declare module "@tanstack/react-router" {
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <I18nProvider>
-        <AuthGate />
-        <PanelNotifications />
-      </I18nProvider>
-    </QueryClientProvider>
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <I18nProvider>
+          <AuthGate />
+          <PanelNotifications />
+        </I18nProvider>
+      </QueryClientProvider>
+    </ThemeProvider>
   </React.StrictMode>,
 );

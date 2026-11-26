@@ -129,7 +129,10 @@ export function HostAdminPanel() {
     setConsoleInput("");
   }
 
-  const usage = usageQuery.data;
+  const usage = usageQuery.data && usageQuery.data.images && usageQuery.data.containers && usageQuery.data.volumes && usageQuery.data.buildCache
+    ? usageQuery.data
+    : undefined;
+  const eventsList = Array.isArray(eventsQuery.data?.events) ? eventsQuery.data.events : [];
   const canPrune = danglingImages || unusedImages || buildCache || stoppedContainers;
 
   return (
@@ -351,9 +354,9 @@ export function HostAdminPanel() {
           </div>
         </div>
         {eventsQuery.error ? <div className="error-notice" role="alert">{errorMessage(eventsQuery.error)}</div> : null}
-        {eventsQuery.data?.events.length ? (
+        {eventsList.length ? (
           <div className="host-events-list">
-            {eventsQuery.data.events.map((ev) => (
+            {eventsList.map((ev) => (
               <div className="detail-row" key={ev.id}>
                 <span style={{ minWidth: 0 }}>
                   <strong className="mono">{ev.operation}</strong>

@@ -14,29 +14,13 @@ try {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto(base);
-  const summary = page.locator('.dashboard-service-summary');
-  await expect(summary.locator('dd')).toHaveText(['9', '1', '1']);
   await expect(page.getByText('Docker connected', { exact: true })).toBeVisible();
-  const attention = page.getByRole('region', { name: 'Needs attention' });
-  await expect(attention.getByRole('listitem')).toHaveCount(3);
-  const attentionFilter = attention.getByRole('combobox', { name: 'Filter attention by status' });
-  await attentionFilter.selectOption('failed');
-  await expect(attention.getByRole('listitem')).toHaveCount(1);
-  await expect(attention.getByRole('link', { name: 'Open logs for api' })).toHaveAttribute('href', '/services/api?tab=logs');
-  await attentionFilter.selectOption('changes');
-  await expect(attention.getByRole('listitem')).toHaveCount(1);
-  await expect(attention.getByRole('link', { name: 'Review changes for website' }))
-    .toHaveAttribute('href', '/services/website?tab=overview#configuration-changes');
-  await attention.getByRole('link', { name: 'Review changes for website' }).click();
-  await expect(page.locator('#configuration-changes')).toContainText('Saved revision 3 · Last deployed revision 2');
-  await expect(page.locator('#configuration-changes')).toContainText('Changed: Environment.');
-  await page.goBack();
-  await attentionFilter.selectOption('all');
+  await expect(page.locator('.dashboard-service-summary')).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Needs attention' })).toHaveCount(0);
   const projects = page.locator('#dashboard-projects-title');
   await expect(page.locator('.dashboard-service-card')).toHaveCount(9);
   await expect(page.locator('.dashboard-project-heading h3').first()).toHaveText('Production');
   await expect(page.locator('.dashboard-service-identity strong').first()).toHaveText('api');
-  assert.equal(await attention.getByRole('link', { name: 'Open logs for api' }).evaluate(el => el.getBoundingClientRect().bottom < innerHeight), true, 'Failure and its action fit above the fold');
 
   await expect(page.locator('#dashboard-filters')).toHaveCount(0);
   await expect(page.getByRole('combobox', { name: 'Sort projects', exact: true })).toHaveCount(0);
@@ -124,7 +108,6 @@ try {
     await loadingPage.goto(base);
     await expect(loadingPage.locator('#project-services-production')).toBeVisible();
     await expect(loadingPage.locator('#project-services-production').getByRole('status', { name: 'Loading services', exact: true })).toBeVisible();
-    await expect(loadingPage.locator('.dashboard-service-summary dd')).toHaveText(['—','—','—']);
     await loadingPage.screenshot({ path: `${output}/loading.png` });
     release();
     await expect(loadingPage.locator('#project-services-production .dashboard-service-card')).toHaveCount(4);
@@ -133,9 +116,6 @@ try {
   fixture.unavailableProject = 'production';
   await page.reload();
   await expect(page.getByRole('alert').filter({ hasText: 'Service data unavailable.' })).toBeVisible();
-  await expect(summary.locator('dd')).toHaveText(['—','—','—']);
-  await expect(attention.getByText('Some project data is unavailable.', { exact: false })).toBeVisible();
-  await expect(attention.getByRole('link', { name: 'Open logs for api' })).toHaveCount(0);
   await expect(page.locator('.dashboard-project-heading h3').first()).toHaveText('Production');
   await page.screenshot({ path: `${output}/unavailable.png`, fullPage: true });
   fixture.unavailableProject = null;
@@ -146,7 +126,7 @@ try {
   await expect(projects).toHaveText('Projects 0');
   await page.screenshot({ path: `${output}/empty.png`, fullPage: true });
   assert.deepEqual(errors, []);
-  console.log('PASS: measured totals, attention filters and direct actions, partial data, project cards, search, persistence, 4 responsive widths and workspace navigation');
+  console.log('PASS: EasyPanel 1:1 dashboard, project cards, search, persistence, 4 responsive widths and workspace navigation');
 } finally {
   await browser.close();
   await server.close();
