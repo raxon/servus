@@ -320,7 +320,7 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
       const { kind, database, user, newPassword } = parsed.data;
       let script = '';
       if (kind === 'postgres') {
-        script = `set -eu; PGPASSWORD="$(cat /run/secrets/panel-db-password)"; export PGPASSWORD; exec psql -X -w -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -v db_user="$ROTATE_DB_USER" -v new_pass="$ROTATE_NEW_PASSWORD" -c "SELECT format('ALTER USER %I WITH PASSWORD %L', :'db_user', :'new_pass') \\gexec"`;
+        script = `set -eu; PGPASSWORD="$(cat /run/secrets/panel-db-password)"; export PGPASSWORD; exec psql -X -w -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -v db_user="$ROTATE_DB_USER" -v new_pass="$ROTATE_NEW_PASSWORD" <<'SQL'\nSELECT format('ALTER USER %I WITH PASSWORD %L', :'db_user', :'new_pass') \\gexec\nSQL`;
       } else if (kind === 'mariadb') {
         script = `set -eu; MYSQL_PWD="$(cat /run/secrets/panel-db-root-password)"; export MYSQL_PWD; exec mariadb --no-defaults -h 127.0.0.1 -u root -e "ALTER USER '\${ROTATE_DB_USER}'@'%' IDENTIFIED BY '\${ROTATE_NEW_PASSWORD}'; FLUSH PRIVILEGES;"`;
       } else if (kind === 'mysql') {

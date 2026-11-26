@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { connection, request } from './servus-client.mjs';
 
 export function createMcpServer(config=connection()) {
-  const server=new McpServer({name:'servus',version:'0.2.1'});
+  const server=new McpServer({name:'servus',version:'0.2.2'});
   const read={readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:true};
   const mutate={readOnlyHint:false,destructiveHint:true,idempotentHint:true,openWorldHint:true};
   const run=async(path,options={})=>{

@@ -457,7 +457,12 @@ export class DockerRuntime {
       }
       throw new Error('Database authentication/readiness could not be verified.');
     }
-    for (const hostname of routeHostnames(spec)) await this.probeRoute(hostname,redirectedRouteHostnames(spec).has(hostname));
+    const restricted = restrictedRouteHostnames(spec);
+    for (const hostname of routeHostnames(spec)) {
+      const allowed = restricted.get(hostname);
+      if (allowed) await this.probeRoute(hostname, redirectedRouteHostnames(spec).has(hostname), allowed);
+      else await this.probeRoute(hostname, redirectedRouteHostnames(spec).has(hostname));
+    }
   }
 
   private async inspect(name: string): Promise<ServiceInspection | undefined> {
@@ -536,7 +541,7 @@ export class DockerRuntime {
     throw new Error('Timed out stopping application tasks.');
   }
 
-  private async probeRoute(hostname: string,https = false): Promise<void> {
+  private async probeRoute(hostname: string, https = false, allowedStatuses?: Set<number>): Promise<void> {
     for (let attempt = 0; attempt < 30; attempt++) {
       try {
         if(https) {if(await verifyPublicHttpsRoute(hostname))return;}
@@ -545,7 +550,7 @@ export class DockerRuntime {
           const target = containers[0];
           if (!target) throw new Error('Ingress is starting.');
           const status = await ingressStatus(this.docker, target.Id, hostname);
-          if (status >= 200 && status < 400) return;
+          if ((status >= 200 && status < 400) || allowedStatuses?.has(status)) return;
         }
       } catch (error) {
         if (isUncertainRuntimeError(error)) throw error;
@@ -600,6 +605,20 @@ export function redirectedRouteHostnames(spec:Docker.ServiceSpec):Set<string> {
     if(host && value.split(',').some(name=>labels[`traefik.http.middlewares.${name}.redirectscheme.scheme`]==='https'))hosts.add(host);
   }
   return hosts;
+}
+export function restrictedRouteHostnames(spec:Docker.ServiceSpec):Map<string,Set<number>> {
+  const labels=spec.Labels??{},result=new Map<string,Set<number>>();
+  for(const [key,value] of Object.entries(labels)) {
+    if(!key.startsWith('traefik.http.routers.')||!key.endsWith('.middlewares'))continue;
+    const prefix=key.slice(0,-'.middlewares'.length),host=labels[`${prefix}.rule`]?.match(/^Host\(`([^`]+)`\)/)?.[1];
+    if(!host)continue;
+    const names=value.split(',').map(item=>item.trim()).filter(Boolean);
+    const allowed=result.get(host)??new Set<number>();
+    if(names.some(name=>Boolean(labels[`traefik.http.middlewares.${name}.ipallowlist.sourcerange`])))allowed.add(403);
+    if(names.some(name=>Boolean(labels[`traefik.http.middlewares.${name}.basicauth.users`])))allowed.add(401);
+    if(allowed.size)result.set(host,allowed);
+  }
+  return result;
 }
 function isNotFound(error: unknown) { return (error as { statusCode?: number })?.statusCode === 404; }
 export function message(error: unknown) { return error instanceof Error ? error.message : 'Unexpected runtime error'; }
