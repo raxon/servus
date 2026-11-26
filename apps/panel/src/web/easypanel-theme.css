@@ -66,6 +66,10 @@
   --dashboard-danger-soft: var(--ep-danger-soft);
   --dashboard-danger-line: var(--ep-danger-border);
   --dashboard-focus: var(--ep-emerald);
+  --source-soft: var(--ep-card-subtle);
+  --source-line: var(--ep-border);
+  --source-muted: var(--ep-muted);
+  --source-accent: var(--ep-emerald);
 }
 
 html,
@@ -205,15 +209,28 @@ dialog::backdrop {
   transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
 }
 
-.app-layout.is-rail-mode .sidebar .nav-item,
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item,
 .app-layout.is-rail-mode .ep-rail-btn {
-  color: var(--ep-muted);
+  color: light-dark(#52525b, #a1a1aa);
 }
 
-.app-layout.is-rail-mode .sidebar .nav-item:hover,
-.app-layout.is-rail-mode .sidebar .nav-item.active,
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item svg,
+.app-layout.is-rail-mode .ep-rail-btn svg {
+  opacity: 1;
+  color: currentColor;
+}
+
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item:hover,
 .app-layout.is-rail-mode .ep-rail-btn:hover {
   color: var(--ep-ink);
+  background: var(--ep-hover);
+}
+
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item.active,
+.app-layout.is-rail-mode aside.sidebar nav[aria-label="Main navigation"] a.nav-item[aria-current="page"] {
+  color: var(--ep-ink);
+  background: var(--ep-frame-bg);
+  border-color: var(--ep-border);
 }
 
 .sidebar .nav-item:hover {
@@ -1863,6 +1880,542 @@ textarea {
 .setup-form-card {
   background: var(--ep-card-bg);
   border-color: var(--ep-border);
+}
+
+/* ==========================================================================
+   Complete Proportions, Scaling & Dark/Light Normalization Across All Views
+   ========================================================================== */
+
+/* Unified heading & primary text legibility */
+.content :is(h1, h2, h3, h4),
+.modal :is(h1, h2, h3, h4),
+.card-heading :is(h2, h3),
+.configuration-intro h2,
+.section-heading h2,
+.action-name strong,
+.service-create-preview :is(h3, dd),
+.deploy-revision strong {
+  color: var(--ep-ink);
+}
+
+.card-heading svg,
+.configuration-intro svg {
+  color: var(--ep-muted);
+}
+
+/* Empty States (Project Empty, Settings Empty) */
+.empty-services {
+  padding: 52px 28px;
+}
+
+.empty-services p {
+  background: transparent;
+  color: var(--ep-muted);
+  border: 0;
+  padding: 0;
+  max-width: 480px;
+  margin-inline: auto;
+}
+
+.empty-service-icon {
+  background: var(--ep-frame-bg);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-ink-2);
+}
+
+.settings-empty {
+  background: var(--ep-card-subtle);
+  border: 1px dashed var(--ep-border-strong);
+  color: var(--ep-ink);
+  border-radius: 10px;
+}
+
+.settings-empty strong {
+  color: var(--ep-ink);
+}
+
+.settings-empty p {
+  color: var(--ep-muted);
+}
+
+/* Source Tab — 5 equal columns on wide desktop (no 4+1 orphan), clean dark/light cards */
+.source-card {
+  background: var(--ep-card-bg);
+  border-color: var(--ep-border);
+  color: var(--ep-ink);
+}
+
+.source-card-header {
+  border-bottom-color: var(--ep-border);
+}
+
+.source-card-icon {
+  background: var(--ep-frame-bg);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-ink-2);
+}
+
+.source-badge {
+  background: var(--ep-frame-bg);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-ink-2);
+}
+
+.source-choice-group legend,
+.source-choice-detailed legend,
+.source-section-head,
+.source-field > label {
+  color: var(--ep-ink);
+}
+
+.source-choice-option > .source-choice-content {
+  background: var(--ep-card-subtle);
+  border-color: var(--ep-border-strong);
+  color: var(--ep-ink-2);
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 550;
+}
+
+.source-choice-option > .source-choice-content:hover {
+  background: var(--ep-hover);
+  color: var(--ep-ink);
+}
+
+.source-choice-option input:checked + span {
+  background: var(--ep-emerald);
+  border-color: var(--ep-emerald);
+  color: #ffffff;
+}
+
+.source-choice-detailed .source-choice-options {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.source-choice-detailed .source-choice-content {
+  min-height: 82px;
+  padding: 12px 11px;
+  gap: 8px;
+  background: var(--ep-card-subtle);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-muted);
+}
+
+.source-choice-detailed .source-choice-copy {
+  gap: 4px;
+  padding-right: 12px;
+}
+
+.source-choice-detailed strong {
+  color: var(--ep-ink);
+  font-size: 12.5px;
+  line-height: 1.3;
+}
+
+.source-choice-detailed small {
+  color: var(--ep-muted);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.source-choice-detailed .source-choice-option:hover input:not(:checked, :disabled) + .source-choice-content {
+  background: var(--ep-hover);
+  border-color: var(--ep-border-strong);
+}
+
+.source-choice-detailed input:checked + .source-choice-content {
+  background: var(--ep-emerald-soft);
+  border-color: var(--ep-emerald);
+  box-shadow: inset 0 0 0 1px var(--ep-emerald);
+  color: var(--ep-emerald-ink);
+}
+
+.source-choice-detailed input:checked + .source-choice-content strong {
+  color: var(--ep-ink);
+}
+
+.source-choice-detailed input:checked + .source-choice-content small {
+  color: var(--ep-ink-2);
+}
+
+.source-choice-detailed .source-choice-check {
+  color: var(--ep-emerald);
+}
+
+.source-hint,
+.source-tip,
+.source-access-note,
+.info-notice {
+  background: var(--ep-card-subtle);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-ink-2);
+  border-radius: 10px;
+}
+
+.source-intro-icon {
+  background: var(--ep-frame-bg);
+  border-color: var(--ep-border);
+  color: var(--ep-ink-2);
+}
+
+.source-status {
+  background: var(--ep-frame-bg);
+  border-color: var(--ep-border);
+  color: var(--ep-ink-2);
+}
+
+.source-status-dirty {
+  background: var(--ep-warn-soft);
+  border-color: var(--ep-warn-border);
+  color: var(--ep-warn);
+}
+
+.source-check-success {
+  background: var(--ep-emerald-soft);
+  border-color: var(--ep-emerald);
+  color: var(--ep-emerald-ink);
+}
+
+.source-fieldset,
+.source-card fieldset {
+  border-color: var(--ep-border);
+  color: var(--ep-ink);
+}
+
+.source-card fieldset legend {
+  color: var(--ep-ink-2);
+}
+
+/* Environment, Resources, Storage & Configuration Cards */
+.configuration-intro {
+  border-bottom-color: var(--ep-border);
+}
+
+.configuration-intro p {
+  color: var(--ep-muted);
+}
+
+.configuration-card textarea,
+.configuration-card input:not([type="checkbox"]):not([type="radio"]):not([type="color"]),
+.configuration-card select,
+.environment-editor {
+  background: var(--ep-card-subtle);
+  color: var(--ep-ink);
+  border: 1px solid var(--ep-border-strong);
+  border-radius: 9px;
+}
+
+.configuration-card label {
+  color: var(--ep-ink-2);
+}
+
+.configuration-footer {
+  background: var(--ep-frame-bg);
+  border-top: 1px solid var(--ep-border);
+  color: var(--ep-muted);
+  border-radius: 0 0 11px 11px;
+}
+
+.configuration-footer span {
+  color: var(--ep-muted);
+}
+
+/* Domain Diagnostics Cards */
+.domain-diagnostics-results > div {
+  background: var(--ep-card-subtle);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-ink);
+}
+
+.domain-diagnostics-results strong {
+  color: var(--ep-ink);
+}
+
+.domain-diagnostics-results span {
+  color: var(--ep-ink-2);
+}
+
+.domain-diagnostics-results small {
+  color: var(--ep-muted);
+}
+
+.domain-dns-check > .info-notice {
+  color: var(--ep-ink-2);
+}
+
+/* Activity & Deployments Workspace */
+.deployment-workspace {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.9fr) minmax(0, 1.35fr);
+  grid-template-areas:
+    "history detail"
+    "webhook detail";
+  gap: 16px;
+  align-items: start;
+}
+
+.deployment-history .deployment-history-heading {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.deployment-history-heading select {
+  background: var(--ep-card-bg);
+  color: var(--ep-ink);
+  border: 1px solid var(--ep-border-strong);
+  border-radius: 8px;
+  min-height: 34px;
+  padding: 0 28px 0 10px;
+  font-size: 12.5px;
+}
+
+.action-table-head {
+  background: var(--ep-frame-bg);
+  color: var(--ep-muted);
+  border-radius: 8px;
+  border: 1px solid var(--ep-border);
+  font-size: 11px;
+}
+
+.action-glyph {
+  background: var(--ep-frame-bg);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-ink-2);
+}
+
+.deployment-history .action-row[aria-pressed="true"] {
+  background: var(--ep-emerald-soft);
+  border-color: var(--ep-emerald);
+  box-shadow: inset 3px 0 var(--ep-emerald);
+}
+
+.deployment-history .action-row[aria-pressed="true"] .action-name strong {
+  color: var(--ep-ink);
+}
+
+.log-card {
+  background: var(--ep-card-bg);
+  border: 1px solid var(--ep-border);
+  border-radius: 12px;
+  overflow: hidden;
+  color: var(--ep-ink);
+}
+
+.log-heading {
+  background: var(--ep-frame-bg);
+  border-bottom: 1px solid var(--ep-border);
+  color: var(--ep-ink);
+}
+
+.deploy-diagnosis,
+.operation-tools,
+.build-log-details {
+  background: var(--ep-card-subtle);
+  border-color: var(--ep-border);
+  color: var(--ep-ink);
+}
+
+.operation-meta,
+.deploy-revision small,
+.build-log-details p {
+  color: var(--ep-muted);
+}
+
+.operation-tools label {
+  color: var(--ep-ink-2);
+}
+
+.operation-tools input {
+  background: var(--ep-card-bg);
+  color: var(--ep-ink);
+  border: 1px solid var(--ep-border-strong);
+  border-radius: 7px;
+  min-height: 32px;
+  padding: 4px 10px;
+}
+
+.deploy-phases li {
+  background: var(--ep-frame-bg);
+  color: var(--ep-ink-2);
+}
+
+.deploy-phases .failed {
+  background: var(--ep-danger-soft);
+  color: var(--ep-danger);
+}
+
+.log-body {
+  background: #09090b;
+  color: #e4e4e7;
+  min-height: 220px;
+}
+
+.log-body .log-line time {
+  color: #71717a;
+}
+
+.log-body .log-placeholder {
+  color: #a1a1aa;
+}
+
+.log-footer {
+  background: var(--ep-frame-bg);
+  border-top: 1px solid var(--ep-border);
+  color: var(--ep-muted);
+}
+
+/* Create Service Modal & Service Preview */
+.modal-heading {
+  border-bottom-color: var(--ep-border);
+}
+
+.modal-heading p {
+  color: var(--ep-muted);
+}
+
+.service-kind-grid {
+  gap: 8px;
+}
+
+.service-kind-choice {
+  background: var(--ep-card-subtle);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-ink);
+  padding: 11px 12px;
+  border-radius: 10px;
+}
+
+.service-kind-choice:hover {
+  background: var(--ep-hover);
+  border-color: var(--ep-border-strong);
+}
+
+.service-kind-choice.selected {
+  background: var(--ep-emerald-soft);
+  border-color: var(--ep-emerald);
+  box-shadow: inset 0 0 0 1px var(--ep-emerald);
+}
+
+.service-kind-choice strong {
+  color: var(--ep-ink);
+  font-size: 13px;
+}
+
+.service-kind-choice small {
+  color: var(--ep-muted);
+  font-size: 11.5px;
+}
+
+.service-create-preview {
+  background: var(--ep-card-subtle);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-ink);
+}
+
+.service-create-preview dt,
+.service-create-preview p {
+  color: var(--ep-muted);
+}
+
+.modal .service-create-form .service-create-footer,
+.modal-footer {
+  background: var(--ep-frame-bg);
+  border-top: 1px solid var(--ep-border);
+  color: var(--ep-muted);
+}
+
+.service-create-footer > small {
+  color: var(--ep-muted);
+}
+
+/* Runtime Metrics & History Charts Scaling */
+.metrics-grid,
+.service-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 14px;
+}
+
+.service-metrics-grid > div {
+  min-width: 0;
+}
+
+.metrics-grid strong,
+.service-metrics-grid strong,
+.metric-value {
+  font-size: clamp(18px, 1.65vw, 24px);
+  line-height: 1.25;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: var(--ep-ink);
+}
+
+.metrics-charts-grid {
+  grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+  gap: 12px;
+}
+
+/* Mobile Service Section Sheet Dark/Light */
+.service-section-sheet {
+  background: var(--ep-card-bg);
+  border: 1px solid var(--ep-border);
+  color: var(--ep-ink);
+}
+
+.service-section-group a {
+  background: var(--ep-card-subtle);
+  border-color: var(--ep-border);
+  color: var(--ep-ink-2);
+}
+
+.service-section-group a:hover {
+  background: var(--ep-hover);
+  color: var(--ep-ink);
+}
+
+.service-section-group .selected {
+  background: var(--ep-emerald-soft);
+  border-color: var(--ep-emerald);
+  color: var(--ep-emerald-ink);
+}
+
+/* ==========================================================================
+   Responsive Scaling Proportions (1220px Laptop, 980px Tablet, 800px Mobile)
+   ========================================================================== */
+@media (max-width: 1220px) {
+  .ep-dual-layout {
+    grid-template-columns: 204px minmax(0, 1fr);
+  }
+  .ep-context-sheet {
+    padding: 18px 20px 44px;
+  }
+  .ep-action-toolbar-top {
+    gap: 6px;
+    padding: 8px 10px;
+  }
+  .ep-action-toolbar-top .button {
+    min-height: 32px;
+    padding: 0 10px;
+    font-size: 12.5px;
+  }
+  .source-choice-detailed .source-choice-options {
+    grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+  }
+  .deployment-workspace {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "history"
+      "detail"
+      "webhook";
+  }
 }
 
 /* ==========================================================================
