@@ -546,13 +546,13 @@ function Shell() {
               <Brand />
             )}
           </Link>
-          {!compactRail ? <span className="ep-version-chip">v0.7.2</span> : null}
+          {!compactRail ? <span className="ep-version-chip">v0.7.3</span> : null}
         </div>
         <nav aria-label="Main navigation">
           <Link
             to="/"
             aria-current={path === "/" ? "page" : undefined}
-            className={`nav-item ${path === "/" ? "active" : ""}`}
+            className={`nav-item ${path === "/" || path.startsWith("/projects/") || path.startsWith("/services/") ? "active" : ""}`}
             title={t("nav.overview", "Overview")}
           >
             <Home size={17} aria-hidden="true" />
