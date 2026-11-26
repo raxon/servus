@@ -12,6 +12,12 @@ const DICTIONARY: Record<SupportedLocale, Record<string, string>> = {
     "settings.branding": "Branding, language & status pages",
     "settings.hostAdmin": "Host administration",
     "settings.backups": "Backups",
+    "project.tab.services": "Services",
+    "project.tab.compose": "Compose",
+    "project.tab.templates": "Templates & Modules",
+    "project.tab.environment": "Environment & Scripts",
+    "project.tab.activity": "Activity",
+    "project.tab.migration": "Migration",
     "project.export": "Export project",
     "project.import": "Import project",
     "modules.wordpress": "Managed WordPress",
@@ -20,17 +26,23 @@ const DICTIONARY: Record<SupportedLocale, Record<string, string>> = {
     "common.cancel": "Cancel",
   },
   pl: {
-    "nav.overview": "Przeglad",
+    "nav.overview": "Przegląd",
     "nav.projects": "Projekty",
     "nav.settings": "Ustawienia",
     "nav.signOut": "Wyloguj",
-    "settings.branding": "Branding, jezyk i strony bledow",
+    "settings.branding": "Branding, język i strony błędów",
     "settings.hostAdmin": "Administracja hostem",
     "settings.backups": "Kopie zapasowe",
+    "project.tab.services": "Usługi",
+    "project.tab.compose": "Compose",
+    "project.tab.templates": "Szablony i moduły",
+    "project.tab.environment": "Środowisko i skrypty",
+    "project.tab.activity": "Aktywność",
+    "project.tab.migration": "Migracja",
     "project.export": "Eksportuj projekt",
     "project.import": "Importuj projekt",
-    "modules.wordpress": "Zarzadzany WordPress",
-    "modules.box": "Srodowisko Box",
+    "modules.wordpress": "Zarządzany WordPress",
+    "modules.box": "Środowisko Box",
     "common.save": "Zapisz",
     "common.cancel": "Anuluj",
   },
@@ -103,19 +115,11 @@ export function useI18n() {
 export function LocaleSwitcher() {
   const { locale, setLocale } = useI18n();
   return (
-    <div role="group" aria-label="Language" style={{ display: "inline-flex", gap: 4 }}>
-      <button
-        type="button"
-        className={`button button-small${locale === "en" ? " button-primary" : ""}`}
-        onClick={() => setLocale("en")}
-      >
+    <div role="group" aria-label="Language" className="locale-switcher">
+      <button type="button" aria-pressed={locale === "en"} onClick={() => setLocale("en")}>
         EN
       </button>
-      <button
-        type="button"
-        className={`button button-small${locale === "pl" ? " button-primary" : ""}`}
-        onClick={() => setLocale("pl")}
-      >
+      <button type="button" aria-pressed={locale === "pl"} onClick={() => setLocale("pl")}>
         PL
       </button>
     </div>

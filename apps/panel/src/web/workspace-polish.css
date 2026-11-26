@@ -1,0 +1,924 @@
+/* Cohesive workspace polish across Project, Service, and Settings screens. */
+
+/* Registered properties for smooth edge fades on scrollable tablists. */
+@property --tab-fade-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@property --tab-fade-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+/* ==========================================================================
+   Project Workspace Tabs (single-row, non-color selected indicator)
+   ========================================================================== */
+.project-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  scroll-snap-type: inline proximity;
+  scroll-padding-inline: 24px;
+  border-block-end: 1px solid var(--border);
+  margin: 22px 0 24px;
+  padding-block-end: 0;
+  --tab-fade-size: 2rem;
+}
+.project-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+@supports (animation-timeline: scroll(self inline)) {
+  .project-tabs {
+    mask:
+      linear-gradient(black, black) no-clip subtract,
+      linear-gradient(to right, black, transparent) 0 0 / var(--tab-fade-start) 100% no-repeat no-clip,
+      linear-gradient(to right, transparent, black) 100% 0 / var(--tab-fade-end) 100% no-repeat no-clip;
+    animation: tab-reveal-start linear both, tab-hide-end linear both;
+    animation-timeline: scroll(self inline);
+    animation-range: 0 var(--tab-fade-size), calc(100% - var(--tab-fade-size)) 100%;
+  }
+}
+
+@keyframes tab-reveal-start {
+  to {
+    --tab-fade-start: var(--tab-fade-size);
+  }
+}
+
+@keyframes tab-hide-end {
+  from {
+    --tab-fade-end: var(--tab-fade-size);
+  }
+}
+
+.project-tabs [role="tab"] {
+  position: relative;
+  flex: none;
+  scroll-snap-align: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 12px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  border-radius: 8px 8px 0 0;
+  transition: color 150ms ease, background-color 150ms ease;
+}
+
+.project-tabs [role="tab"]:hover {
+  color: var(--ink);
+  background: rgba(23, 28, 25, 0.035);
+}
+
+.project-tabs [role="tab"]:focus-visible {
+  outline: 2px solid #5f7266;
+  outline-offset: -2px;
+}
+
+.project-tabs [role="tab"][aria-selected="true"] {
+  color: var(--ink);
+}
+
+.project-tabs [role="tab"][aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  inset: auto 8px 0;
+  border-block-end: 2px solid var(--ink);
+}
+
+.project-tabs [role="tab"] .tab-count {
+  min-width: 20px;
+  height: 19px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #ecefe9;
+  color: #536058;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.project-tabs [role="tab"][aria-selected="true"] .tab-count {
+  background: #1d2420;
+  color: #fff;
+}
+
+.project-tab-panel {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+}
+
+/* Quick action strip below empty services */
+.project-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* ==========================================================================
+   Unified Servus Form Controls & Card Primitives
+   ========================================================================== */
+.servus-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  align-content: start;
+}
+
+.servus-field > label,
+.servus-field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 550;
+  color: #3f4b43;
+  margin: 0;
+}
+
+.servus-field > small,
+.servus-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.servus-input,
+.servus-select,
+.servus-textarea {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  padding: 9px 12px;
+  border: 1px solid #d5dcd6;
+  border-radius: 9px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.servus-select {
+  padding-inline-end: 30px;
+}
+
+.servus-textarea {
+  min-height: 92px;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.servus-input:hover:not(:disabled),
+.servus-select:hover:not(:disabled),
+.servus-textarea:hover:not(:disabled) {
+  border-color: #b8c3ba;
+}
+
+.servus-input:focus-visible,
+.servus-select:focus-visible,
+.servus-textarea:focus-visible {
+  outline: 2px solid #5f7266;
+  outline-offset: 1px;
+  border-color: #5f7266;
+}
+
+.servus-input:disabled,
+.servus-select:disabled,
+.servus-textarea:disabled {
+  background: #f4f6f4;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.servus-input::placeholder,
+.servus-textarea::placeholder {
+  color: #8c968f;
+}
+
+.servus-inline-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.servus-inline-row > .servus-input {
+  flex: 1 1 200px;
+}
+
+.servus-inline-row > .servus-select {
+  flex: 0 1 180px;
+}
+
+.servus-section-divider {
+  border: 0;
+  border-block-start: 1px solid var(--border);
+  margin: 18px 0;
+}
+
+.servus-subpanel {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fafbf9;
+  min-width: 0;
+}
+
+.servus-icon-badge {
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #f5f7f4;
+  color: #3d4b42;
+}
+
+/* Balanced 2-column grids for equal-weight cards & fields */
+.servus-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+  min-width: 0;
+}
+
+.servus-grid-2-stretch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: stretch;
+  min-width: 0;
+}
+
+/* ==========================================================================
+   Project Extras (Shared Env + Saved Scripts)
+   ========================================================================== */
+.project-extras-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  align-items: start;
+  min-width: 0;
+}
+
+.project-extras-grid > .details-card {
+  min-width: 0;
+  margin: 0;
+}
+
+/* ==========================================================================
+   Templates Catalog & Dedicated Modules
+   ========================================================================== */
+.template-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(300px, 0.9fr);
+  gap: 18px;
+  align-items: start;
+  min-width: 0;
+}
+
+.template-catalog-card {
+  display: grid;
+  gap: 16px;
+  padding: 22px;
+  min-width: 0;
+}
+
+.template-catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.template-choice-card {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fff;
+  color: var(--ink);
+  text-align: left;
+  min-width: 0;
+  transition: border-color 150ms ease, background-color 150ms ease, box-shadow 150ms ease;
+}
+
+.template-choice-card:hover:not(:disabled) {
+  border-color: #aeb8b0;
+  background: #fafbf9;
+}
+
+.template-choice-card[aria-pressed="true"] {
+  border-color: #1d2420;
+  background: #f5f7f4;
+  box-shadow: 0 0 0 1px #1d2420;
+}
+
+.template-choice-card:focus-visible {
+  outline: 2px solid #5f7266;
+  outline-offset: 2px;
+}
+
+.template-choice-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.template-choice-head strong {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.template-choice-pill {
+  flex: none;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #eef1ed;
+  color: #546158;
+  font-size: 10.5px;
+  font-weight: 550;
+}
+
+.template-choice-desc {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-clamp: 2;
+  overflow: clip;
+}
+
+.template-choice-meta {
+  font-size: 11px;
+  color: #6b766f;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.template-deploy-card {
+  position: sticky;
+  top: 20px;
+  display: grid;
+  gap: 14px;
+  padding: 22px;
+  min-width: 0;
+}
+
+.template-deploy-card form {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.template-selected-meta {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #f8faf7;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.template-selected-meta strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.module-card {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fafbf9;
+  min-width: 0;
+}
+
+.module-card-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.module-card-header h4 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.module-card-header p {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.module-card-fields {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  min-width: 0;
+}
+
+.module-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+
+/* ==========================================================================
+   Dark Terminal Output (Host Console, Script Output)
+   ========================================================================== */
+.servus-terminal-box {
+  border: 1px solid #2a332d;
+  border-radius: 10px;
+  background: #171c19;
+  color: #e4ebe5;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.servus-terminal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid #28312b;
+  background: #1d2420;
+  font-size: 12px;
+  color: #c2cec4;
+}
+
+.servus-terminal-pre {
+  margin: 0;
+  padding: 12px 14px;
+  max-height: 280px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #e4ebe5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ==========================================================================
+   Host Administration (Docker Storage KPIs, Prune Options, Audit List)
+   ========================================================================== */
+.host-storage-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.host-storage-kpi {
+  display: grid;
+  gap: 4px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fafbf9;
+  min-width: 0;
+}
+
+.host-storage-kpi span {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.host-storage-kpi strong {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.host-storage-kpi small {
+  font-size: 11px;
+  color: #6b766f;
+  font-variant-numeric: tabular-nums;
+}
+
+.servus-option-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.servus-option-tile {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink);
+  transition: border-color 140ms ease, background-color 140ms ease;
+}
+
+.servus-option-tile:hover {
+  border-color: #b7c2b9;
+}
+
+.servus-option-tile:has(input:checked) {
+  border-color: #4f7e60;
+  background: #f4f9f5;
+}
+
+.servus-option-tile input {
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  margin: 2px 0 0;
+  flex: none;
+  accent-color: #257a49;
+}
+
+.host-preset-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.host-events-list {
+  max-height: 300px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0 14px;
+  background: #fff;
+}
+
+.host-events-list .detail-row:first-child {
+  border-top: 0;
+}
+
+.host-event-meta {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.host-event-time {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   Branding, Color Picker & Locale Switcher
+   ========================================================================== */
+.servus-color-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.servus-color-swatch {
+  width: 44px;
+  height: 42px;
+  min-height: 42px;
+  padding: 3px;
+  border: 1px solid #d5dcd6;
+  border-radius: 9px;
+  background: #fff;
+  cursor: pointer;
+  flex: none;
+}
+
+.servus-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 15px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fafbf9;
+}
+
+.servus-toggle-row strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.servus-toggle-row small {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.servus-toggle-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  min-height: 0;
+  flex: none;
+  accent-color: #257a49;
+}
+
+.locale-switcher {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #f3f5f2;
+}
+
+.locale-switcher button {
+  min-height: 30px;
+  min-width: 38px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.locale-switcher button[aria-pressed="true"] {
+  background: #1d2420;
+  color: #fff;
+}
+
+/* ==========================================================================
+   Build Concurrency Inline Row & Alerts Subsections
+   ========================================================================== */
+.concurrency-form {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.concurrency-input-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.concurrency-input-group .servus-input {
+  width: 112px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.alerts-subsection {
+  display: grid;
+  gap: 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.alerts-subsection-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.alerts-subsection-header h4 {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+/* ==========================================================================
+   Service Logs Filter Bar, Database Admin Tools & Source Choice Grid Fix
+   ========================================================================== */
+.logs-filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.logs-filter-bar .servus-input {
+  flex: 1 1 220px;
+  min-height: 38px;
+}
+
+.logs-filter-bar .servus-select {
+  width: auto;
+  min-width: 125px;
+  min-height: 38px;
+}
+
+.db-admin-actions {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.db-admin-actions > .servus-field {
+  flex: 1 1 190px;
+  max-width: 280px;
+}
+
+/* Balanced 5-option Source Choice Grid */
+.source-choice-detailed .source-choice-options {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.source-choice-detailed .source-choice-content {
+  min-height: 88px;
+  padding: 15px 14px;
+}
+
+.source-field > select {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid #d5dcd6;
+  border-radius: 9px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+}
+
+.source-field > select:focus-visible {
+  outline: 2px solid var(--source-accent, #5f7266);
+  outline-offset: 2px;
+}
+
+/* Compose Workload Cards */
+.compose-card-list {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.compose-workload-card {
+  display: grid;
+  gap: 12px;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fafbf9;
+  min-width: 0;
+}
+
+.compose-workload-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.compose-workload-head h3 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.compose-radio-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.compose-radio-row > label {
+  flex: 1 1 160px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.compose-radio-row > label:has(input:checked) {
+  border-color: #1d2420;
+  background: #f5f7f4;
+}
+
+.compose-radio-row input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  margin: 0;
+  flex: none;
+  accent-color: #1d2420;
+}
+
+/* ==========================================================================
+   Responsive Breakpoints (zero horizontal overflow at 375px / 768px / 1440px)
+   ========================================================================== */
+@media (max-width: 1040px) {
+  .template-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .template-deploy-card {
+    position: static;
+  }
+}
+
+@media (max-width: 900px) {
+  .project-extras-grid,
+  .servus-grid-2,
+  .servus-grid-2-stretch {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .servus-option-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .servus-input,
+  .servus-select,
+  .servus-textarea {
+    font-size: 16px;
+    min-height: 44px;
+  }
+  .template-catalog-card,
+  .template-deploy-card {
+    padding: 16px;
+  }
+  .module-card {
+    padding: 16px;
+  }
+}

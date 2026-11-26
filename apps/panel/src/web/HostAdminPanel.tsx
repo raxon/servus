@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, HardDrive, RefreshCw, Terminal as TerminalIcon, Trash2 } from "lucide-react";
 import type { DockerDiskUsage, DockerPruneResult, HostAuditEvent, HostExecResult } from "../shared/host-admin.js";
@@ -17,6 +17,7 @@ function formatBytes(bytes: number): string {
 }
 
 export function HostAdminPanel() {
+  const id = useId();
   const client = useQueryClient();
   const [danglingImages, setDanglingImages] = useState(true);
   const [unusedImages, setUnusedImages] = useState(false);
@@ -39,7 +40,10 @@ export function HostAdminPanel() {
   const eventsQuery = useQuery({
     queryKey: ["host-events", eventFilter],
     queryFn: ({ signal }) =>
-      api<{ events: HostAuditEvent[] }>(`/host/events?limit=50${eventFilter.trim() ? `&q=${encodeURIComponent(eventFilter.trim())}` : ""}`, { signal }),
+      api<{ events: HostAuditEvent[] }>(
+        `/host/events?limit=50${eventFilter.trim() ? `&q=${encodeURIComponent(eventFilter.trim())}` : ""}`,
+        { signal },
+      ),
     retry: false,
   });
 
@@ -147,47 +151,70 @@ export function HostAdminPanel() {
         </div>
 
         {usageQuery.error ? <div className="error-notice" role="alert">{errorMessage(usageQuery.error)}</div> : null}
+
         {usage ? (
-          <>
-            <div className="detail-row">
+          <div className="host-storage-kpis">
+            <div className="host-storage-kpi">
               <span>Images ({usage.images.count})</span>
-              <strong className="mono">{formatBytes(usage.images.totalSizeBytes)} ({formatBytes(usage.images.reclaimableBytes)} reclaimable)</strong>
+              <strong className="mono">{formatBytes(usage.images.totalSizeBytes)}</strong>
+              <small>{formatBytes(usage.images.reclaimableBytes)} reclaimable</small>
             </div>
-            <div className="detail-row">
-              <span>Containers ({usage.containers.runningCount} running / {usage.containers.stoppedCount} stopped)</span>
+            <div className="host-storage-kpi">
+              <span>Containers</span>
               <strong className="mono">{formatBytes(usage.containers.totalSizeBytes)}</strong>
+              <small>{usage.containers.runningCount} running · {usage.containers.stoppedCount} stopped</small>
             </div>
-            <div className="detail-row">
-              <span>Volumes ({usage.volumes.count}, {usage.volumes.activeCount} active - protected)</span>
+            <div className="host-storage-kpi">
+              <span>Volumes ({usage.volumes.count})</span>
               <strong className="mono">{formatBytes(usage.volumes.totalSizeBytes)}</strong>
+              <small>{usage.volumes.activeCount} active (protected)</small>
             </div>
-            <div className="detail-row">
-              <span>Build cache ({usage.buildCache.count} entries)</span>
-              <strong className="mono">{formatBytes(usage.buildCache.totalSizeBytes)} ({formatBytes(usage.buildCache.reclaimableBytes)} reclaimable)</strong>
+            <div className="host-storage-kpi">
+              <span>Build cache ({usage.buildCache.count})</span>
+              <strong className="mono">{formatBytes(usage.buildCache.totalSizeBytes)}</strong>
+              <small>{formatBytes(usage.buildCache.reclaimableBytes)} reclaimable</small>
             </div>
-            <div className="detail-row">
+            <div className="host-storage-kpi">
               <span>Total reclaimable</span>
               <strong className="mono">{formatBytes(usage.totalReclaimableBytes)}</strong>
+              <small>Safe to prune</small>
             </div>
-          </>
-        ) : usageQuery.isPending ? <p role="status">Loading Docker storage...</p> : null}
+          </div>
+        ) : usageQuery.isPending ? (
+          <p className="servus-help" role="status">Loading Docker storage...</p>
+        ) : null}
 
-        <div style={{ display: "grid", gap: 8, marginTop: 12 }}>
-          <label className="checkbox-label"><input type="checkbox" checked={danglingImages} onChange={(e) => setDanglingImages(e.target.checked)} /> Dangling images (untagged layers)</label>
-          <label className="checkbox-label"><input type="checkbox" checked={unusedImages} onChange={(e) => setUnusedImages(e.target.checked)} /> All unused images (not attached to any container)</label>
-          <label className="checkbox-label"><input type="checkbox" checked={buildCache} onChange={(e) => setBuildCache(e.target.checked)} /> Docker BuildKit cache</label>
-          <label className="checkbox-label"><input type="checkbox" checked={stoppedContainers} onChange={(e) => setStoppedContainers(e.target.checked)} /> Stopped containers</label>
-          <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 4 }}>
+        <div className="servus-subpanel">
+          <div className="servus-option-grid">
+            <label className="servus-option-tile">
+              <input type="checkbox" checked={danglingImages} onChange={(e) => setDanglingImages(e.target.checked)} />
+              <span>Dangling images (untagged layers)</span>
+            </label>
+            <label className="servus-option-tile">
+              <input type="checkbox" checked={unusedImages} onChange={(e) => setUnusedImages(e.target.checked)} />
+              <span>All unused images (not attached to containers)</span>
+            </label>
+            <label className="servus-option-tile">
+              <input type="checkbox" checked={buildCache} onChange={(e) => setBuildCache(e.target.checked)} />
+              <span>Docker BuildKit cache</span>
+            </label>
+            <label className="servus-option-tile">
+              <input type="checkbox" checked={stoppedContainers} onChange={(e) => setStoppedContainers(e.target.checked)} />
+              <span>Stopped containers</span>
+            </label>
+          </div>
+          <div className="servus-inline-row">
             <button type="button" className="button button-primary" disabled={!canPrune || pruneMutation.isPending} onClick={() => pruneMutation.mutate()}>
-              <Trash2 size={15} aria-hidden="true" /> {pruneMutation.isPending ? "Pruning..." : "Prune selected"}
+              <Trash2 size={15} aria-hidden="true" />
+              {pruneMutation.isPending ? "Pruning..." : "Prune selected"}
             </button>
             {pruneMutation.data ? (
-              <span role="status" className="mono">
+              <span role="status" className="servus-help mono">
                 Reclaimed {formatBytes(pruneMutation.data.totalReclaimedBytes)} ({pruneMutation.data.imagesDeleted} images, {pruneMutation.data.containersDeleted} containers)
               </span>
             ) : null}
           </div>
-          {pruneMutation.error ? <div className="error-notice" role="alert">{errorMessage(pruneMutation.error)}</div> : null}
+          {pruneMutation.error ? <div className="error-notice" role="alert" style={{ margin: 0 }}>{errorMessage(pruneMutation.error)}</div> : null}
         </div>
       </section>
 
@@ -206,62 +233,95 @@ export function HostAdminPanel() {
         </div>
 
         <form
-          style={{ display: "grid", gap: 8 }}
+          className="module-card-fields"
           onSubmit={(e) => {
             e.preventDefault();
             if (command.trim() && !execMutation.isPending) execMutation.mutate(command.trim());
           }}
         >
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <div className="host-preset-bar">
             {["cat /proc/loadavg && head -n 3 /proc/meminfo", "df -h", "docker service ls", "docker ps --format 'table {{.Names}}\\t{{.Status}}'"].map((preset) => (
-              <button key={preset} type="button" className="button button-small" onClick={() => { setCommand(preset); execMutation.mutate(preset); }}>
+              <button
+                key={preset}
+                type="button"
+                className="button button-small"
+                onClick={() => {
+                  setCommand(preset);
+                  execMutation.mutate(preset);
+                }}
+              >
                 {preset.startsWith("cat /proc") ? "load & mem" : `${preset.split(" ")[0]} ${preset.split(" ")[1] ?? ""}`}
               </button>
             ))}
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
+
+          <div className="servus-inline-row">
             <input
-              className="mono"
-              style={{ flex: 1 }}
+              id={`${id}-cmd`}
+              className="servus-input mono"
               value={command}
               onChange={(e) => setCommand(e.target.value)}
               placeholder="Enter diagnostic shell command..."
               aria-label="Host diagnostic command"
+              spellCheck={false}
             />
             <button type="submit" className="button button-primary" disabled={execMutation.isPending || !command.trim()}>
               {execMutation.isPending ? "Running..." : "Run"}
             </button>
           </div>
-          {execMutation.error ? <div className="error-notice" role="alert">{errorMessage(execMutation.error)}</div> : null}
+
+          {execMutation.error ? <div className="error-notice" role="alert" style={{ margin: 0 }}>{errorMessage(execMutation.error)}</div> : null}
           {execMutation.data ? (
-            <pre className="mono" style={{ maxHeight: 240, overflow: "auto", padding: 10, borderRadius: 8, background: "var(--surface-muted, rgba(0,0,0,0.2))", fontSize: 12 }}>
-              {execMutation.data.output || "(no output)"}
-              {`\n[exit ${execMutation.data.exitCode} in ${execMutation.data.durationMs}ms${execMutation.data.truncated ? ", truncated" : ""}]`}
-            </pre>
+            <div className="servus-terminal-box">
+              <div className="servus-terminal-head">
+                <span className="mono">Diagnostic output</span>
+                <span className="mono">
+                  exit {execMutation.data.exitCode} · {execMutation.data.durationMs}ms{execMutation.data.truncated ? " · truncated" : ""}
+                </span>
+              </div>
+              <pre className="servus-terminal-pre">{execMutation.data.output || "(no output)"}</pre>
+            </div>
           ) : null}
         </form>
 
         {consoleOpen ? (
-          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <strong className="mono">Interactive shell ({consoleStatus})</strong>
-              <button type="button" className="button button-small" onClick={() => { wsRef.current?.close(); setConsoleOpen(false); setConsoleStatus("idle"); }}>Close</button>
+          <div className="servus-subpanel" style={{ marginTop: 14 }}>
+            <div className="servus-terminal-box">
+              <div className="servus-terminal-head">
+                <strong className="mono">Interactive shell ({consoleStatus})</strong>
+                <button
+                  type="button"
+                  className="button button-small"
+                  onClick={() => {
+                    wsRef.current?.close();
+                    setConsoleOpen(false);
+                    setConsoleStatus("idle");
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+              <pre className="servus-terminal-pre">{consoleLines.join("\n")}</pre>
             </div>
-            <pre className="mono" style={{ maxHeight: 220, overflow: "auto", padding: 10, borderRadius: 8, background: "var(--surface-muted, rgba(0,0,0,0.25))", fontSize: 12, whiteSpace: "pre-wrap" }}>
-              {consoleLines.join("\n")}
-            </pre>
-            <div style={{ display: "flex", gap: 8 }}>
+            <div className="servus-inline-row">
               <input
-                className="mono"
-                style={{ flex: 1 }}
+                className="servus-input mono"
                 value={consoleInput}
                 disabled={consoleStatus !== "connected"}
                 onChange={(e) => setConsoleInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); sendInteractiveLine(); } }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    sendInteractiveLine();
+                  }
+                }}
                 placeholder="Type command and press Enter..."
                 aria-label="Interactive host shell input"
+                spellCheck={false}
               />
-              <button type="button" className="button" disabled={consoleStatus !== "connected" || !consoleInput} onClick={sendInteractiveLine}>Send</button>
+              <button type="button" className="button" disabled={consoleStatus !== "connected" || !consoleInput} onClick={sendInteractiveLine}>
+                Send
+              </button>
             </div>
           </div>
         ) : null}
@@ -276,32 +336,46 @@ export function HostAdminPanel() {
             </div>
             <p>Recent administrative and deployment events recorded by Servus.</p>
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div className="servus-inline-row">
             <input
+              className="servus-input"
+              style={{ width: 220, flex: "0 1 220px", minHeight: 38 }}
               value={eventFilter}
               onChange={(e) => setEventFilter(e.target.value)}
               placeholder="Filter operation or user..."
               aria-label="Filter host events"
             />
-            <button type="button" className="button button-small" onClick={() => void eventsQuery.refetch()} disabled={eventsQuery.isFetching}>
+            <button type="button" className="button button-small" onClick={() => void eventsQuery.refetch()} disabled={eventsQuery.isFetching} aria-label="Refresh host events">
               <RefreshCw size={14} aria-hidden="true" />
             </button>
           </div>
         </div>
         {eventsQuery.error ? <div className="error-notice" role="alert">{errorMessage(eventsQuery.error)}</div> : null}
         {eventsQuery.data?.events.length ? (
-          <div style={{ maxHeight: 280, overflow: "auto" }}>
+          <div className="host-events-list">
             {eventsQuery.data.events.map((ev) => (
               <div className="detail-row" key={ev.id}>
-                <span>
+                <span style={{ minWidth: 0 }}>
                   <strong className="mono">{ev.operation}</strong>
-                  <small style={{ display: "block", opacity: 0.75 }}>{ev.actorEmail ?? ev.actorId} · {ev.resourceId}</small>
+                  <small className="host-event-meta">
+                    {ev.actorEmail ?? ev.actorId} · {ev.resourceId}
+                  </small>
                 </span>
-                <span className="mono" style={{ fontSize: 12 }}>{new Date(ev.createdAt).toLocaleString()}</span>
+                <span className="host-event-time mono">{new Date(ev.createdAt).toLocaleString()}</span>
               </div>
             ))}
           </div>
-        ) : eventsQuery.isPending ? <p role="status">Loading host events...</p> : <p>No matching events found.</p>}
+        ) : eventsQuery.isPending ? (
+          <p className="servus-help" role="status">Loading host events...</p>
+        ) : (
+          <div className="settings-empty">
+            <Activity size={18} aria-hidden="true" />
+            <div>
+              <strong>No matching events</strong>
+              <p>Try clearing the filter or run an administrative action to see new audit entries.</p>
+            </div>
+          </div>
+        )}
       </section>
     </section>
   );

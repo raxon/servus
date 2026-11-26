@@ -31,56 +31,59 @@ export function ServiceLogsHistory({ serviceId }: { serviceId: string }) {
       <div className="feature-panel-heading">
         <div>
           <h3>Archived logs</h3>
-          <p>
-            Search redacted log lines collected over the last {history.data?.retentionDays ?? 7} days.
-          </p>
+          <p>Search redacted log lines collected over the last {history.data?.retentionDays ?? 7} days.</p>
         </div>
       </div>
+
       <form
-        className="heading-actions"
-        style={{ flexWrap: 'wrap', gap: 8, marginBottom: 12 }}
+        className="logs-filter-bar"
         onSubmit={(event) => {
           event.preventDefault();
           setSubmittedQuery(draftQuery.trim());
         }}
       >
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span className="sr-only">Search query</span>
-          <input
-            type="search"
-            placeholder="Filter logs by text..."
-            value={draftQuery}
-            maxLength={200}
-            onChange={(event) => setDraftQuery(event.target.value)}
-          />
-        </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span className="sr-only">Time window</span>
-          <select aria-label="Archive time window" value={window} onChange={(event) => setWindow(event.target.value as LogWindow)}>
-            <option value="1h">Last 1h</option>
-            <option value="6h">Last 6h</option>
-            <option value="24h">Last 24h</option>
-            <option value="7d">Last 7d</option>
-          </select>
-        </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span className="sr-only">Log level</span>
-          <select aria-label="Archive log level" value={level} onChange={(event) => setLevel(event.target.value as LogLevel | 'all')}>
-            <option value="all">All levels</option>
-            <option value="error">Errors</option>
-            <option value="warn">Warnings</option>
-            <option value="info">Info</option>
-          </select>
-        </label>
+        <input
+          type="search"
+          className="servus-input"
+          aria-label="Search archived logs"
+          placeholder="Filter logs by text..."
+          value={draftQuery}
+          maxLength={200}
+          onChange={(event) => setDraftQuery(event.target.value)}
+        />
+        <select
+          className="servus-select"
+          aria-label="Archive time window"
+          value={window}
+          onChange={(event) => setWindow(event.target.value as LogWindow)}
+        >
+          <option value="1h">Last 1h</option>
+          <option value="6h">Last 6h</option>
+          <option value="24h">Last 24h</option>
+          <option value="7d">Last 7d</option>
+        </select>
+        <select
+          className="servus-select"
+          aria-label="Archive log level"
+          value={level}
+          onChange={(event) => setLevel(event.target.value as LogLevel | 'all')}
+        >
+          <option value="all">All levels</option>
+          <option value="error">Errors</option>
+          <option value="warn">Warnings</option>
+          <option value="info">Info</option>
+        </select>
         <button className="button button-small" type="submit" disabled={history.isFetching}>
-          <Search size={14} />
+          <Search size={14} aria-hidden="true" />
           Search archive
         </button>
       </form>
+
       <FeatureError error={history.error} />
       {history.data?.truncated ? (
         <p className="feature-helper" role="status">
-          Archive capacity reached; oldest log lines were trimmed.{history.data.earliestAvailableAt ? ` Earliest available: ${new Date(history.data.earliestAvailableAt).toLocaleString()}.` : ''}
+          Archive capacity reached; oldest log lines were trimmed.
+          {history.data.earliestAvailableAt ? ` Earliest available: ${new Date(history.data.earliestAvailableAt).toLocaleString()}.` : ''}
         </p>
       ) : null}
       <pre className="runtime-log-output" role="log" aria-label="Archived application logs">

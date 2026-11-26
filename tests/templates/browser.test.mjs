@@ -25,7 +25,7 @@ async function fixture(canWrite=true) {
       :path.endsWith('/services')||path.endsWith('/compose')||path.endsWith('/actions')||path==='/api/v1/actions'?[]:{};
     return route.fulfill({json:data});
   });
-  await page.goto(`${base}/projects/template-project`);const form=page.getByRole('form',{name:'Application templates',exact:true});await expect(form).toBeVisible();return {page,form,requests};
+  await page.goto(`${base}/projects/template-project?tab=templates`);const form=page.getByRole('form',{name:'Application templates',exact:true});await expect(form).toBeVisible();return {page,form,requests};
 }
 try {
   const {page,form,requests}=await fixture();await expect(form.getByRole('combobox',{name:'Application',exact:true})).toHaveValue('wordpress');

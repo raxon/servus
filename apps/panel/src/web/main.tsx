@@ -41,15 +41,19 @@ import {
   CircleAlert,
   Clock3,
   Database,
+  Download,
   ExternalLink,
   Folder,
   GitBranch,
   Globe2,
+  HardDrive,
+  KeyRound,
   Layers3,
   LayoutGrid,
   LoaderCircle,
   Menu,
   LogOut,
+  Palette,
   Play,
   Plus,
   RefreshCw,
@@ -57,6 +61,7 @@ import {
   Server,
   Settings2,
   ShieldCheck,
+  Sparkles,
   Square,
   Terminal,
   X,
@@ -88,9 +93,9 @@ import { BackupStorageSettings } from "./BackupStorageSettings.js";
 import { HostMetricsCard } from "./HostMetricsCard.js";
 import { HostAdminPanel } from "./HostAdminPanel.js";
 import { DatabaseAdminTools } from "./DatabaseAdminTools.js";
-import { I18nProvider } from "./i18n.js";
+import { I18nProvider, useI18n } from "./i18n.js";
 import { PlatformSettings } from "./PlatformSettings.js";
-import { ProjectTransferAndModules } from "./ProjectTransferAndModules.js";
+import { DedicatedModulesSection, ProjectMigrationSection } from "./ProjectTransferAndModules.js";
 import { AlertsSettings } from "./AlertsSettings.js";
 import { BuildConcurrencySettings } from "./BuildConcurrencySettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
@@ -108,6 +113,7 @@ import type { ServiceTab } from "./ServiceFeatures.js";
 import "./styles.css";
 import "./Settings.css";
 import "./ServiceOperations.css";
+import "./workspace-polish.css";
 
 const createQueryClient = () => new QueryClient({
   defaultOptions: {
@@ -702,20 +708,71 @@ function Dashboard() {
   </>;
 }
 
+type ProjectTab = "services" | "compose" | "templates" | "environment" | "activity" | "migration";
+const PROJECT_TABS: readonly ProjectTab[] = ["services", "compose", "templates", "environment", "activity", "migration"];
+
 function ProjectPage() {
   const { user } = useAuth();
+  const { t } = useI18n();
   const { projectId } = useParams({ strict: false });
+  const { tab: requestedTab } = projectRoute.useSearch();
   const navigate = useNavigate();
   const projects = useProjects();
   const project = projects.data?.find((item) => item.id === projectId);
   const actions = useActions(projectId);
   const [create, setCreate] = useState(false);
+  const activeTab: ProjectTab = requestedTab ?? "services";
+  const tabRefs = useRef<Partial<Record<ProjectTab, HTMLButtonElement | null>>>({});
+
   const services = useQuery({
     queryKey: ["services", projectId],
     queryFn: () => api<Service[]>(`/projects/${projectId}/services`),
     enabled: !!projectId,
     refetchInterval: 2_000,
   });
+
+  const composeQuery = useQuery({
+    queryKey: ["compose-project", projectId],
+    queryFn: ({ signal }) => api<{ id: string }[]>(`/projects/${projectId}/compose`, { signal }),
+    enabled: !!projectId,
+    refetchInterval: 5_000,
+  });
+
+  const selectTab = (next: ProjectTab) => {
+    if (!projectId) return;
+    void navigate({
+      to: "/projects/$projectId",
+      params: { projectId },
+      search: next === "services" ? {} : { tab: next },
+      viewTransition: false,
+      resetScroll: false,
+    });
+    tabRefs.current[next]?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  };
+
+  const tabItems: Array<{ id: ProjectTab; label: string; icon: React.ComponentType<{ size?: number; "aria-hidden"?: boolean }>; count?: number }> = [
+    { id: "services", label: t("project.tab.services", "Services"), icon: Box, count: services.data?.length },
+    { id: "compose", label: t("project.tab.compose", "Compose"), icon: Layers3, count: composeQuery.data?.length },
+    { id: "templates", label: t("project.tab.templates", "Templates & Modules"), icon: Sparkles },
+    { id: "environment", label: t("project.tab.environment", "Environment & Scripts"), icon: KeyRound },
+    { id: "activity", label: t("project.tab.activity", "Activity"), icon: Activity, count: actions.data?.length },
+    ...(project?.canWrite ? [{ id: "migration" as const, label: t("project.tab.migration", "Migration"), icon: Download }] : []),
+  ];
+
+  const handleTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, currentId: ProjectTab) => {
+    const ids = tabItems.map((item) => item.id);
+    const idx = ids.indexOf(currentId);
+    let target: ProjectTab | undefined;
+    if (event.key === "ArrowRight") target = ids[(idx + 1) % ids.length];
+    else if (event.key === "ArrowLeft") target = ids[(idx - 1 + ids.length) % ids.length];
+    else if (event.key === "Home") target = ids[0];
+    else if (event.key === "End") target = ids[ids.length - 1];
+    if (!target) return;
+    event.preventDefault();
+    tabRefs.current[target]?.focus();
+    selectTab(target);
+  };
+
   return (
     <>
       <div className="page-heading">
@@ -730,6 +787,12 @@ function ProjectPage() {
               <Box size={15} aria-hidden="true" />
               {services.isPending ? "Loading services" : services.error ? "Services unavailable" : `${services.data?.length ?? 0} ${services.data?.length === 1 ? "service" : "services"}`}
             </span>
+            {composeQuery.data?.length ? (
+              <span>
+                <Layers3 size={15} aria-hidden="true" />
+                {composeQuery.data.length} {composeQuery.data.length === 1 ? "Compose stack" : "Compose stacks"}
+              </span>
+            ) : null}
             {project ? (
               <span>
                 <Clock3 size={15} aria-hidden="true" />
@@ -745,123 +808,181 @@ function ProjectPage() {
               onDeleted={() => void navigate({ to: "/" })}
             />
           ) : null}
-          {project?.canWrite ? <button
-            className="button button-primary"
-            onClick={() => setCreate(true)}
-          >
-            <Plus size={17} />
-            New service
-          </button> : null}
-        </div>
-      </div>
-      <div className="section-heading">
-        <div>
-          <h2>Services</h2>
-          <p>Your application workloads and their current state.</p>
-        </div>
-      </div>
-      <ErrorNotice error={services.error} />
-      {services.isPending ? (
-        <Skeleton kind="table" label="Loading services" />
-      ) : services.error ? null : services.data?.length ? (
-        <div className="services-table surface">
-          <div className="service-table-head">
-            <span>Service</span>
-            <span>Source</span>
-            <span>Status</span>
-            <span>Configuration</span>
-            <span />
-          </div>
-          {services.data.map((service) => (
-            <Link
-              to="/services/$serviceId"
-              params={{ serviceId: service.id }}
-              key={service.id}
-              className="service-row"
+          {project?.canWrite ? (
+            <button
+              type="button"
+              className="button button-primary"
+              onClick={() => setCreate(true)}
             >
-              <div className="service-name">
-                <span className="service-glyph">
-                  <Box size={19} />
-                </span>
-                <span>
-                  <strong>{service.name}</strong>
-                  <small>{service.hostname}</small>
-                </span>
-              </div>
-              <span
-                className="mono truncate"
-                title={
-                  service.source?.type === "git"
-                    ? `${service.source.repository} · ${service.source.branch}`
-                    : service.source?.type === "dockerfile"
-                      ? "Inline Dockerfile"
-                      : service.source?.type === "upload"
-                        ? `Upload · ${service.source.filename ?? service.source.uploadId}`
-                        : service.image
-                }
-              >
-                {service.source?.type === "git"
-                  ? `Git · ${service.source.branch}`
-                  : service.source?.type === "dockerfile"
-                    ? "Inline Dockerfile"
-                    : service.source?.type === "upload"
-                      ? `Upload · ${service.source.filename ?? "archive"}`
-                      : service.image}
-              </span>
-              <Badge status={service.state} />
-              <span
-                className={`revision-indicator ${service.revision !== service.deployedRevision ? "has-changes" : ""}`}
-              >
-                {service.revision === service.deployedRevision ? (
-                  <>
-                    <Check size={14} />
-                    Up to date
-                  </>
-                ) : (
-                  <>
-                    <Circle size={9} />
-                    Pending deployment
-                  </>
-                )}
-              </span>
-              <ChevronRight size={16} />
-            </Link>
-          ))}
-        </div>
-      ) : (
-        <div className="surface empty-services">
-          <div className="empty-service-icon">
-            <Box size={34} strokeWidth={1.4} />
-          </div>
-          <h2>No services yet</h2>
-          <p>
-            Start with a Docker image. Configure a hostname,
-            <br />
-            deploy it, and watch the operation here.
-          </p>
-          <button
-            className="button button-primary"
-            onClick={() => setCreate(true)}
-          >
-            <Plus size={16} />
-            Create service
-          </button>
-        </div>
-      )}
-      {projectId?<TemplateProjects projectId={projectId} canWrite={project?.canWrite===true}/>:null}
-      {projectId?<ComposeProjects projectId={projectId} canWrite={project?.canWrite===true}/>:null}
-      {projectId?<ProjectExtras projectId={projectId} services={services.data ?? []} canWrite={project?.canWrite===true}/>:null}
-      {projectId && project ? <ProjectTransferAndModules projectId={projectId} projectName={project.name} admin={user.role === "admin"} canWrite={project.canWrite === true} /> : null}
-      <div className="section-heading activity-heading">
-        <div>
-          <h2>Project activity</h2>
-          <p>Deployment progress and recent operations.</p>
+              <Plus size={17} aria-hidden="true" />
+              New service
+            </button>
+          ) : null}
         </div>
       </div>
-      <ErrorNotice error={actions.error} />
-      {!actions.error ? <ActionsTable actions={actions.data ?? []} loading={actions.isPending} /> : null}
+
+      <div className="project-tabs" role="tablist" aria-label="Project sections">
+        {tabItems.map((item) => {
+          const Icon = item.icon;
+          const isSelected = activeTab === item.id;
+          return (
+            <button
+              key={item.id}
+              ref={(node) => { tabRefs.current[item.id] = node; }}
+              id={`project-tab-${item.id}`}
+              type="button"
+              role="tab"
+              aria-selected={isSelected}
+              tabIndex={isSelected ? 0 : -1}
+              onClick={() => selectTab(item.id)}
+              onKeyDown={(event) => handleTabKeyDown(event, item.id)}
+            >
+              <Icon size={15} aria-hidden={true} />
+              <span>{item.label}</span>
+              {typeof item.count === "number" && item.count > 0 ? <span className="tab-count">{item.count}</span> : null}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="project-tab-panel" role="tabpanel" aria-labelledby={`project-tab-${activeTab}`}>
+        {activeTab === "services" ? (
+          <>
+            <ErrorNotice error={services.error} />
+            {services.isPending ? (
+              <Skeleton kind="table" label="Loading services" />
+            ) : services.error ? null : services.data?.length ? (
+              <div className="services-table surface">
+                <div className="service-table-head">
+                  <span>Service</span>
+                  <span>Source</span>
+                  <span>Status</span>
+                  <span>Configuration</span>
+                  <span />
+                </div>
+                {services.data.map((service) => (
+                  <Link
+                    to="/services/$serviceId"
+                    params={{ serviceId: service.id }}
+                    key={service.id}
+                    className="service-row"
+                  >
+                    <div className="service-name">
+                      <span className="service-glyph">
+                        {service.kind && service.kind !== "app" ? <Database size={18} /> : <Box size={19} />}
+                      </span>
+                      <span>
+                        <strong>{service.name}</strong>
+                        <small>{service.hostname}</small>
+                      </span>
+                    </div>
+                    <span
+                      className="mono truncate"
+                      title={
+                        service.source?.type === "git"
+                          ? `${service.source.repository} · ${service.source.branch}`
+                          : service.source?.type === "dockerfile"
+                            ? "Inline Dockerfile"
+                            : service.source?.type === "upload"
+                              ? `Upload · ${service.source.filename ?? service.source.uploadId}`
+                              : service.image
+                      }
+                    >
+                      {service.source?.type === "git"
+                        ? `Git · ${service.source.branch}`
+                        : service.source?.type === "dockerfile"
+                          ? "Inline Dockerfile"
+                          : service.source?.type === "upload"
+                            ? `Upload · ${service.source.filename ?? "archive"}`
+                            : service.image}
+                    </span>
+                    <Badge status={service.state} />
+                    <span
+                      className={`revision-indicator ${service.revision !== service.deployedRevision ? "has-changes" : ""}`}
+                    >
+                      {service.revision === service.deployedRevision ? (
+                        <>
+                          <Check size={14} />
+                          Up to date
+                        </>
+                      ) : (
+                        <>
+                          <Circle size={9} />
+                          Pending deployment
+                        </>
+                      )}
+                    </span>
+                    <ChevronRight size={16} />
+                  </Link>
+                ))}
+              </div>
+            ) : (
+              <div className="surface empty-services">
+                <div className="empty-service-icon">
+                  <Box size={34} strokeWidth={1.4} />
+                </div>
+                <h2>No services yet</h2>
+                <p>
+                  Deploy a Docker image, Git repository, inline Dockerfile, or code archive,
+                  <br />
+                  or launch a ready-to-use template or Compose stack.
+                </p>
+                {project?.canWrite ? (
+                  <div className="project-empty-actions">
+                    <button
+                      type="button"
+                      className="button button-primary"
+                      onClick={() => setCreate(true)}
+                    >
+                      <Plus size={16} aria-hidden="true" />
+                      Create service
+                    </button>
+                    <button
+                      type="button"
+                      className="button"
+                      onClick={() => selectTab("templates")}
+                    >
+                      <Sparkles size={15} aria-hidden="true" />
+                      Browse templates &amp; modules
+                    </button>
+                    <button
+                      type="button"
+                      className="button"
+                      onClick={() => selectTab("compose")}
+                    >
+                      <Layers3 size={15} aria-hidden="true" />
+                      Compose workloads
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </>
+        ) : activeTab === "compose" ? (
+          projectId ? <ComposeProjects projectId={projectId} canWrite={project?.canWrite === true} /> : null
+        ) : activeTab === "templates" ? (
+          projectId ? (
+            <>
+              <TemplateProjects projectId={projectId} canWrite={project?.canWrite === true} />
+              <DedicatedModulesSection projectId={projectId} canWrite={project?.canWrite === true} />
+            </>
+          ) : null
+        ) : activeTab === "environment" ? (
+          projectId ? <ProjectExtras projectId={projectId} services={services.data ?? []} canWrite={project?.canWrite === true} /> : null
+        ) : activeTab === "activity" ? (
+          <>
+            <ErrorNotice error={actions.error} />
+            {!actions.error ? <ActionsTable actions={actions.data ?? []} loading={actions.isPending} /> : null}
+          </>
+        ) : activeTab === "migration" ? (
+          projectId && project ? (
+            <ProjectMigrationSection projectId={projectId} projectName={project.name} admin={user.role === "admin"} canWrite={project.canWrite === true} />
+          ) : null
+        ) : null}
+      </div>
+
       {create && projectId ? (
-        <CreateService projectId={projectId} admin={user.role === "admin"} serviceNames={services.data?.map(service => service.name) ?? []} onClose={() => setCreate(false)} />
+        <CreateService projectId={projectId} admin={user.role === "admin"} serviceNames={services.data?.map((service) => service.name) ?? []} onClose={() => setCreate(false)} />
       ) : null}
     </>
   );
@@ -1599,6 +1720,8 @@ function SettingsPage() {
         <a href="#instance"><Server size={16} aria-hidden="true" />Instance</a>
         {admin ? <a href="#connectivity"><Globe2 size={16} aria-hidden="true" />Connectivity</a> : null}
         {admin ? <a href="#settings-backups"><Database size={16} aria-hidden="true" />Backups</a> : null}
+        {admin ? <a href="#host-administration"><HardDrive size={16} aria-hidden="true" />Host</a> : null}
+        {admin ? <a href="#platform-branding"><Palette size={16} aria-hidden="true" />Branding</a> : null}
         <a href="#account-access"><ShieldCheck size={16} aria-hidden="true" />Account &amp; access</a>
       </nav>
 
@@ -1728,6 +1851,9 @@ const dashboardRoute = createRoute({
 const projectRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/projects/$projectId",
+  validateSearch: (search: Record<string, unknown>): { tab?: ProjectTab } => ({
+    tab: typeof search.tab === "string" && (PROJECT_TABS as readonly string[]).includes(search.tab) ? (search.tab as ProjectTab) : undefined,
+  }),
   component: ProjectPage,
 });
 const serviceRoute = createRoute({
