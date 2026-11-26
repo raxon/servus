@@ -32,8 +32,10 @@ export class ApiTokens {
     const user:User={id:row.userId,email:row.email,role:row.role,createdAt:row.createdAt};
     const route=request.routeOptions.url??'',params=request.params as Record<string,string>;
     const read=request.method==='GET'||(request.method==='HEAD'&&route==='/api/v1/compose/:id/actions'),write=request.method==='POST'||request.method==='PATCH'||request.method==='PUT';
+    const isMcpEndpoint = route === '/api/v1/mcp' && ['POST', 'GET', 'DELETE'].includes(request.method);
     let projectId:string|undefined;
-    if(read&&route==='/api/v1/projects')projectId=row.projectId;
+    if(isMcpEndpoint)projectId=row.projectId;
+    else if(read&&route==='/api/v1/projects')projectId=row.projectId;
     else if((read&&['/api/v1/projects/:id','/api/v1/projects/:id/services','/api/v1/projects/:id/compose','/api/v1/projects/:id/env','/api/v1/projects/:id/scripts'].includes(route))||
       (request.method==='POST'&&route==='/api/v1/projects/:id/compose')||
       (request.method==='PUT'&&route==='/api/v1/projects/:id/env')||
@@ -49,8 +51,8 @@ export class ApiTokens {
       (request.method==='POST'&&['/api/v1/compose/:id/deploy','/api/v1/compose/:id/start','/api/v1/compose/:id/stop','/api/v1/compose/:id/restart','/api/v1/compose/:id/destroy'].includes(route)))
       projectId=(this.store.db.prepare(`SELECT project_id FROM compose_workloads WHERE id=? ${read&&route==='/api/v1/compose/:id/actions'?'':'AND deleted_at IS NULL'}`).get(params.id!) as {project_id:string}|undefined)?.project_id;
     else throw new AppError('TOKEN_SCOPE','This endpoint requires an interactive session',403);
-    if(projectId!==row.projectId||!this.store.canAccess(user,row.projectId,!read))throw new AppError('NOT_FOUND','Resource not found',404);
-    if(!read&&row.scope!=='deploy')throw new AppError('TOKEN_SCOPE','This token only allows reading',403);
+    if(projectId!==row.projectId||!this.store.canAccess(user,row.projectId,!read && !isMcpEndpoint))throw new AppError('NOT_FOUND','Resource not found',404);
+    if(!read && !isMcpEndpoint && row.scope!=='deploy')throw new AppError('TOKEN_SCOPE','This token only allows reading',403);
     this.identities.set(request,{id:row.id,projectId:row.projectId,scope:row.scope,user});
     this.store.db.prepare('UPDATE api_tokens SET last_used_at=? WHERE id=?').run(new Date().toISOString(),row.id);
     return {user,csrfToken:''};
@@ -88,6 +90,7 @@ export function publicApiDocument() {
   const parameter=(name:string)=>({name,in:'path',required:true,schema:{type:'string',format:'uuid'}});
   const get=(summary:string,parameters:unknown[]=[])=>({summary,parameters,security:[{bearerAuth:[]}],responses:{'200':{description:'Authorized result'},'401':{description:'Invalid token'},'404':{description:'Resource unavailable'}}});
   const paths:Record<string,unknown>={
+    '/mcp':{post:{summary:'Remote Streamable HTTP Model Context Protocol (MCP) endpoint authenticated with a project Bearer token',security:[{bearerAuth:[]}],responses:{'200':{description:'JSON-RPC 2.0 MCP response'},'401':{description:'Invalid token'}}}},
     '/projects':{get:get('List the token project')},
     '/projects/{id}':{get:get('Inspect a project',[parameter('id')])},
     '/projects/{id}/services':{get:get('List project services',[parameter('id')])},

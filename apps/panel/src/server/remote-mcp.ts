@@ -1,0 +1,127 @@
+import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { z } from 'zod';
+import { BUILD_INFO } from './generated-build-info.js';
+import type { ApiTokens } from './api-tokens.js';
+import { AppError } from './errors.js';
+
+function createHttpMcpServer(app: FastifyInstance, authorization: string) {
+  const server = new McpServer({ name: 'servus', version: BUILD_INFO.version || '0.3.0' });
+  const read = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+  const mutate = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false };
+
+  const run = async (
+    path: string,
+    options: { method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'; body?: unknown; key?: string } = {},
+  ) => {
+    try {
+      const headers: Record<string, string> = { authorization };
+      if (options.key) headers['idempotency-key'] = options.key;
+      if (options.body !== undefined) headers['content-type'] = 'application/json';
+      const response = await app.inject({
+        method: options.method ?? 'GET',
+        url: `/api/v1${path}`,
+        headers,
+        payload: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+      });
+      const text = response.body;
+      if (response.statusCode >= 400) {
+        let message = `Request failed (${response.statusCode})`;
+        try {
+          const parsed = JSON.parse(text) as { error?: { message?: string } };
+          if (parsed.error?.message) message = parsed.error.message;
+        } catch { /* fallback */ }
+        return { isError: true, content: [{ type: 'text' as const, text: message }] };
+      }
+      return { content: [{ type: 'text' as const, text }] };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{ type: 'text' as const, text: error instanceof Error ? error.message : 'Request failed' }],
+      };
+    }
+  };
+
+  server.registerTool('list_projects', { description: 'List the project authorized by this token.', annotations: read }, () => run('/projects'));
+  server.registerTool('list_services', { description: 'List services in the authorized project.', inputSchema: { projectId: z.string().uuid() }, annotations: read }, ({ projectId }) => run(`/projects/${projectId}/services`));
+  server.registerTool('inspect_service', { description: 'Read saved service configuration with secrets masked.', inputSchema: { serviceId: z.string().uuid() }, annotations: read }, ({ serviceId }) => run(`/services/${serviceId}`));
+  server.registerTool('inspect_action', { description: 'Read an action and its events; poll until succeeded or failed.', inputSchema: { actionId: z.string().uuid() }, annotations: read }, ({ actionId }) => run(`/actions/${actionId}`));
+  server.registerTool('cancel_action', { description: 'Cancel a queued action or request cancellation of an active build.', inputSchema: { actionId: z.string().uuid() }, annotations: mutate }, ({ actionId }) => run(`/actions/${actionId}/cancel`, { method: 'POST', body: {} }));
+  server.registerTool('read_logs', { description: 'Read recent service logs.', inputSchema: { serviceId: z.string().uuid() }, annotations: read }, ({ serviceId }) => run(`/services/${serviceId}/logs`));
+  server.registerTool(
+    'read_logs_history',
+    {
+      description: 'Search and filter archived service logs over 1h, 6h, 24h or 7d.',
+      inputSchema: {
+        serviceId: z.string().uuid(),
+        window: z.enum(['1h', '6h', '24h', '7d']).default('24h'),
+        q: z.string().max(200).optional(),
+        level: z.enum(['all', 'error', 'warn', 'info']).default('all'),
+        limit: z.number().int().min(1).max(500).default(200),
+      },
+      annotations: read,
+    },
+    ({ serviceId, window, q, level, limit }) => {
+      const params = new URLSearchParams({ window, level, limit: String(limit), ...(q ? { q } : {}) });
+      return run(`/services/${serviceId}/logs/history?${params.toString()}`);
+    },
+  );
+  server.registerTool('read_metrics', { description: 'Read current service CPU, memory, network and container count measurements.', inputSchema: { serviceId: z.string().uuid() }, annotations: read }, ({ serviceId }) => run(`/services/${serviceId}/metrics`));
+  server.registerTool('read_metrics_history', { description: 'Read historical service metrics over 1h, 6h or 24h.', inputSchema: { serviceId: z.string().uuid(), window: z.enum(['1h', '6h', '24h']).default('1h') }, annotations: read }, ({ serviceId, window }) => run(`/services/${serviceId}/metrics/history?window=${window}`));
+  server.registerTool('list_database_backups', { description: 'List database backups recorded for a managed database service.', inputSchema: { serviceId: z.string().uuid() }, annotations: read }, ({ serviceId }) => run(`/services/${serviceId}/backups`));
+  server.registerTool('create_database_backup', { description: 'Queue a manual backup for a deployed managed database.', inputSchema: { serviceId: z.string().uuid(), idempotencyKey: z.string().min(1).max(128), name: z.string().trim().min(1).max(100).optional() }, annotations: mutate }, ({ serviceId, idempotencyKey, name }) => run(`/services/${serviceId}/backups`, { method: 'POST', body: name ? { name } : {}, key: idempotencyKey }));
+  server.registerTool('deploy_service', { description: 'Deploy saved service configuration.', inputSchema: { serviceId: z.string().uuid(), idempotencyKey: z.string().min(1).max(128), forceRebuild: z.boolean().default(false) }, annotations: mutate }, ({ serviceId, idempotencyKey, forceRebuild }) => run(`/services/${serviceId}/deploy`, { method: 'POST', body: { forceRebuild }, key: idempotencyKey }));
+  server.registerTool('control_service', { description: 'Start, stop or restart a deployed service.', inputSchema: { serviceId: z.string().uuid(), operation: z.enum(['start', 'stop', 'restart']), idempotencyKey: z.string().min(1).max(128) }, annotations: mutate }, ({ serviceId, operation, idempotencyKey }) => run(`/services/${serviceId}/${operation}`, { method: 'POST', body: {}, key: idempotencyKey }));
+  server.registerTool('list_compose', { description: 'List Compose workloads in the authorized project.', inputSchema: { projectId: z.string().uuid() }, annotations: read }, ({ projectId }) => run(`/projects/${projectId}/compose`));
+  server.registerTool('inspect_compose', { description: 'Read Compose workload metadata.', inputSchema: { workloadId: z.string().uuid() }, annotations: read }, ({ workloadId }) => run(`/compose/${workloadId}`));
+  server.registerTool('read_compose_actions', { description: 'Read Compose action history.', inputSchema: { workloadId: z.string().uuid() }, annotations: read }, ({ workloadId }) => run(`/compose/${workloadId}/actions`));
+  server.registerTool('read_compose_logs', { description: 'Read recent Compose service logs.', inputSchema: { workloadId: z.string().uuid() }, annotations: read }, ({ workloadId }) => run(`/compose/${workloadId}/logs`));
+  server.registerTool('read_compose_metrics', { description: 'Read current Compose metrics.', inputSchema: { workloadId: z.string().uuid() }, annotations: read }, ({ workloadId }) => run(`/compose/${workloadId}/metrics`));
+  server.registerTool('deploy_compose', { description: 'Deploy saved Compose configuration.', inputSchema: { workloadId: z.string().uuid(), idempotencyKey: z.string().min(1).max(128) }, annotations: mutate }, ({ workloadId, idempotencyKey }) => run(`/compose/${workloadId}/deploy`, { method: 'POST', body: {}, key: idempotencyKey }));
+  server.registerTool('control_compose', { description: 'Start, stop or restart a deployed Compose workload.', inputSchema: { workloadId: z.string().uuid(), operation: z.enum(['start', 'stop', 'restart']), idempotencyKey: z.string().min(1).max(128) }, annotations: mutate }, ({ workloadId, operation, idempotencyKey }) => run(`/compose/${workloadId}/${operation}`, { method: 'POST', body: {}, key: idempotencyKey }));
+  server.registerTool('create_compose', { description: 'Create and deploy a new inline Compose workload.', inputSchema: { projectId: z.string().uuid(), name: z.string().min(1).max(63), yaml: z.string().min(1).max(262144), idempotencyKey: z.string().min(1).max(128) }, annotations: mutate }, ({ projectId, name, yaml, idempotencyKey }) => run(`/projects/${projectId}/compose`, { method: 'POST', body: { name, source: { type: 'inline', yaml }, domains: [] }, key: idempotencyKey }));
+  server.registerTool('update_compose', { description: 'Update an inline Compose workload using optimistic revision locking.', inputSchema: { workloadId: z.string().uuid(), expectedRevision: z.number().int().positive(), yaml: z.string().min(1).max(262144) }, annotations: mutate }, ({ workloadId, expectedRevision, yaml }) => run(`/compose/${workloadId}`, { method: 'PATCH', body: { expectedRevision, source: { type: 'inline', yaml }, domains: [] } }));
+  server.registerTool('destroy_compose', { description: 'Destroy a Compose workload and its runtime containers.', inputSchema: { workloadId: z.string().uuid(), confirm: z.literal(true), idempotencyKey: z.string().min(1).max(128) }, annotations: mutate }, ({ workloadId, confirm, idempotencyKey }) => run(`/compose/${workloadId}/destroy`, { method: 'POST', body: { confirm }, key: idempotencyKey }));
+  server.registerTool('list_project_env', { description: 'List shared project environment variables with secret values masked.', inputSchema: { projectId: z.string().uuid() }, annotations: read }, ({ projectId }) => run(`/projects/${projectId}/env`));
+  server.registerTool('list_project_scripts', { description: 'List saved operational scripts for the authorized project.', inputSchema: { projectId: z.string().uuid() }, annotations: read }, ({ projectId }) => run(`/projects/${projectId}/scripts`));
+  server.registerTool('run_project_script', { description: 'Execute a saved operational script inside a running service container.', inputSchema: { projectId: z.string().uuid(), scriptId: z.string().uuid(), serviceId: z.string().uuid().optional() }, annotations: mutate }, ({ projectId, scriptId, serviceId }) => run(`/projects/${projectId}/scripts/${scriptId}/run`, { method: 'POST', body: { ...(serviceId ? { serviceId } : {}) } }));
+
+  return server;
+}
+
+export function registerRemoteMcp(app: FastifyInstance, apiTokens: ApiTokens) {
+  const handle = async (req: FastifyRequest, reply: import('fastify').FastifyReply) => {
+    // Authenticate bearer token strictly without session cookies
+    apiTokens.authenticate(req);
+    const authorization = req.headers.authorization;
+    if (typeof authorization !== 'string') throw new AppError('UNAUTHORIZED', 'Bearer token required', 401);
+
+    if (req.method === 'GET' || req.method === 'DELETE') {
+      return reply.code(405).header('Allow', 'POST').send({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Stateless Streamable HTTP MCP endpoint only accepts POST requests.' },
+        id: null,
+      });
+    }
+
+    const server = createHttpMcpServer(app, authorization);
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+
+    reply.hijack();
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req.raw, reply.raw, req.body);
+    } finally {
+      await transport.close().catch(() => {});
+      await server.close().catch(() => {});
+    }
+  };
+
+  app.post('/api/v1/mcp', handle);
+  app.get('/api/v1/mcp', handle);
+  app.delete('/api/v1/mcp', handle);
+}

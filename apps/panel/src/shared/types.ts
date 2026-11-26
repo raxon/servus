@@ -10,7 +10,12 @@ export interface GitCredential { username: string; token?: string; secretRef?: s
 export type {RegistryCredential,GitSshCredential} from './source-credentials.js';
 export interface DeploymentOptions { forceRebuild?: boolean }
 export interface BuildResourceConfig { cpuQuotaPercent?: number; memoryMb?: number; timeoutSeconds?: number }
-export type SourceConfig = { type: 'image' } | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string; envFile?: string; buildResources?: BuildResourceConfig; credential?: GitCredential; sharedGithub?: boolean;ssh?:import('./source-credentials.js').GitSshCredential };
+export type SourceBuilder = 'dockerfile' | 'auto' | 'railpack' | 'nixpacks' | 'buildpacks';
+export type SourceConfig =
+  | { type: 'image' }
+  | { type: 'git'; repository: string; branch: string; context: string; dockerfile: string; builder?: SourceBuilder; envFile?: string; buildResources?: BuildResourceConfig; credential?: GitCredential; sharedGithub?: boolean; ssh?: import('./source-credentials.js').GitSshCredential }
+  | { type: 'dockerfile'; dockerfileContent: string; envFile?: string; buildResources?: BuildResourceConfig }
+  | { type: 'upload'; uploadId: string; filename?: string; sha256?: string; context?: string; dockerfile?: string; builder?: SourceBuilder; envFile?: string; buildResources?: BuildResourceConfig };
 export interface EnvironmentVariable { name: string; value?: string; secret?: boolean; secretRef?: string }
 export interface DomainBasicAuth { users: string[] }
 export interface DomainTrustedProxies { depth?: number; excludedIps?: string[] }

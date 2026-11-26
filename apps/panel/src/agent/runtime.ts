@@ -274,7 +274,7 @@ export class DockerRuntime {
     if (!spec) {
       if (type === 'deploy') {
         if(service.rollbackImage && service.kind && service.kind!=='app')throw new Error('Historical deployment is only available for applications.');
-        if(service.kind==='postgres'&&!previousSpec&&service.deployedRevision===null&&(!['postgres:17-alpine','postgres:18-alpine'].includes(service.image)||service.source?.type==='git'))throw new Error('New PostgreSQL services require the managed postgres:17-alpine or postgres:18-alpine image.');
+        if(service.kind==='postgres'&&!previousSpec&&service.deployedRevision===null&&(!['postgres:17-alpine','postgres:18-alpine'].includes(service.image)||(service.source&&service.source.type!=='image')))throw new Error('New PostgreSQL services require the managed postgres:17-alpine or postgres:18-alpine image.');
         if (service.kind==='postgres'&&previousSpec?.Labels?.['panel.postgres-auth']===postgresScramVersion) {
           imageDigest=containerSpec(previousSpec)?.Image;
           if(!imageDigest||!/(?:^|@)sha256:[a-f0-9]{64}$/.test(imageDigest))throw new Error('The previous PostgreSQL image is not pinned. Back up the database and use an explicit upgrade procedure.');
@@ -285,7 +285,7 @@ export class DockerRuntime {
           const image=await this.docker.getImage(service.rollbackImage).inspect();
           if(service.rollbackImage.startsWith('sha256:') ? image.Id!==service.rollbackImage : !image.RepoDigests?.includes(service.rollbackImage))throw new Error('The historical image cannot be verified.');
           imageDigest=service.rollbackImage;sourceCommit=service.rollbackCommit;
-        } else if (service.source?.type === 'git') {
+        } else if (service.source && service.source.type !== 'image') {
           const built = await buildSource(service, operationId, this.dataDir, this.socketPath, this.vault,{forceRebuild:service.deploymentOptions?.forceRebuild});
           const image = await this.docker.getImage(built.image).inspect();
           imageDigest = image.RepoDigests?.[0] || image.Id; sourceCommit = built.sourceCommit;

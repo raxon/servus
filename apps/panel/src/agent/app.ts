@@ -42,6 +42,7 @@ import { configureHostDomain } from './host-domain.js';
 import { inspectHostCertificate } from './host-certificate.js';
 import { hostCertificateSchema } from '../shared/host-domain.js';
 import { databaseAccessSchema } from '../shared/database-access.js';
+import { registerHostAdminAgent } from './host-admin.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -55,7 +56,12 @@ const input = z.object({
     state: z.enum(['pending', 'running', 'stopped', 'deploying', 'failed', 'unknown']),
     createdAt: z.string(), updatedAt: z.string(), lastError: z.string().nullable(),
     kind: z.enum(['app','postgres','redis','mariadb','mysql','mongodb']).optional(),
-    source: z.discriminatedUnion('type', [z.object({type:z.literal('image')}), z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256),envFile:z.string().max(255).optional(),buildResources:z.object({cpuQuotaPercent:z.number().int().min(10).max(1600).optional(),memoryMb:z.number().int().min(128).max(65536).optional(),timeoutSeconds:z.number().int().min(30).max(1800).optional()}).strict().optional(),credential:z.object({username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().optional(),ssh:z.object({knownHosts:z.string().min(1).max(16384),secretRef:z.string().uuid(),publicKey:z.string().max(1000)}).strict().optional()})]).optional(),
+    source: z.discriminatedUnion('type', [
+      z.object({type:z.literal('image')}),
+      z.object({type:z.literal('git'),repository:z.string().url(),branch:z.string().min(1).max(128),context:z.string().max(256),dockerfile:z.string().max(256),builder:z.enum(['dockerfile','auto','railpack','nixpacks','buildpacks']).optional(),envFile:z.string().max(255).optional(),buildResources:z.object({cpuQuotaPercent:z.number().int().min(10).max(1600).optional(),memoryMb:z.number().int().min(128).max(65536).optional(),timeoutSeconds:z.number().int().min(30).max(1800).optional()}).strict().optional(),credential:z.object({username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().optional(),ssh:z.object({knownHosts:z.string().min(1).max(16384),secretRef:z.string().uuid(),publicKey:z.string().max(1000)}).strict().optional()}),
+      z.object({type:z.literal('dockerfile'),dockerfileContent:z.string().min(4).max(65536),envFile:z.string().max(255).optional(),buildResources:z.object({cpuQuotaPercent:z.number().int().min(10).max(1600).optional(),memoryMb:z.number().int().min(128).max(65536).optional(),timeoutSeconds:z.number().int().min(30).max(1800).optional()}).strict().optional()}),
+      z.object({type:z.literal('upload'),uploadId:z.string().uuid(),filename:z.string().max(255).optional(),sha256:z.string().regex(/^[a-f0-9]{64}$/).optional(),context:z.string().max(256).optional(),dockerfile:z.string().max(256).optional(),builder:z.enum(['dockerfile','auto','railpack','nixpacks','buildpacks']).optional(),envFile:z.string().max(255).optional(),buildResources:z.object({cpuQuotaPercent:z.number().int().min(10).max(1600).optional(),memoryMb:z.number().int().min(128).max(65536).optional(),timeoutSeconds:z.number().int().min(30).max(1800).optional()}).strict().optional()}),
+    ]).optional(),
     registry:z.object({server:z.string().min(1).max(253),username:z.string().min(1).max(256),secretRef:z.string().uuid()}).strict().nullable().optional(),
     environment: z.array(z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32768).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).refine(value=>!value.secret||Boolean(value.secretRef)&&value.value===undefined)).max(100).optional(),
     domains: z.array(z.object({hostname,port:z.number().int().min(1).max(65535),primary:z.boolean().optional(),https:z.boolean().optional(),redirectHttps:z.boolean().optional(),pathPrefix:z.string().min(1).max(128).optional(),stripPrefix:z.boolean().optional(),ipAllowList:z.array(z.string().min(3).max(64)).min(1).max(32).optional(),trustedProxies:z.object({depth:z.number().int().min(1).max(10).optional(),excludedIps:z.array(z.string().min(3).max(64)).min(1).max(32).optional()}).strict().optional(),basicAuth:z.object({users:z.array(z.string().min(10).max(200)).min(1).max(20)}).strict().optional(),redirectTarget:z.string().url().max(500).optional(),redirectPermanent:z.boolean().optional()})).max(20).optional(),
@@ -171,6 +177,12 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     return {...await runtime.status(),ingressRecoveryRequired:unresolved,ingressBusy};
   });
   app.get('/host/metrics', async () => collectHostMetrics(config.dataDir));
+  registerHostAdminAgent(app, {
+    getDocker: () => (runtime instanceof DockerRuntime ? runtime.docker : undefined),
+    dockerSocket: config.dockerSocket,
+    vault,
+    maintenance,
+  });
   app.post('/host-domain/configure',async(req,reply)=>{
     const parsed=hostCertificateSchema.safeParse(req.body);
     if(!parsed.success)return reply.code(400).send({error:{code:'INVALID_HOST_CERTIFICATE',message:'Invalid host certificate request.'}});

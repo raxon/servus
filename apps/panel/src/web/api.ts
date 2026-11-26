@@ -20,11 +20,11 @@ export function setCsrfToken(value: string) {
 
 export async function api<T>(
   path: string,
-  options: { method?: string; body?: unknown; binary?: Blob; csrf?: boolean; idempotent?: boolean; signal?: AbortSignal } = {},
+  options: { method?: string; body?: unknown; binary?: Blob; headers?: Record<string, string>; csrf?: boolean; idempotent?: boolean; signal?: AbortSignal } = {},
 ): Promise<T> {
   const method = options.method ?? "GET";
   const requestEpoch = sessionEpoch;
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = { Accept: "application/json", ...(options.headers ?? {}) };
   if (options.body !== undefined && options.binary !== undefined) throw new Error("A request cannot contain both JSON and binary data.");
   if (options.binary !== undefined) headers["Content-Type"] = "application/octet-stream";
   else if (options.body !== undefined) headers["Content-Type"] = "application/json";

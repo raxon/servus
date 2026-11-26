@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { isPrivateAddress } from '../shared/network-address.js';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { SecretVault } from '../shared/secrets.js';
-import type { Service } from '../shared/types.js';
+import type { BuildResourceConfig, Service, SourceBuilder } from '../shared/types.js';
+import { extractSourceArchive, generateBuilderDockerfile } from './builders.js';
 import { gitCredentials } from './git-credentials.js';
 import { gitSshCredentials } from './git-ssh.js';
 import { parseSshRepository } from '../shared/source-credentials.js';
@@ -112,11 +114,81 @@ async function run(command: string, args: string[], cwd: string, log: string, va
   });
 }
 
+function resolveDockerfileForContext(
+  context: string,
+  workspace: string,
+  dockerfileOption: string | undefined,
+  builderOption: SourceBuilder | undefined,
+  port: number,
+  log: string,
+  checkOnly: boolean,
+): string {
+  const builder: SourceBuilder = builderOption ?? 'dockerfile';
+  const requestedDockerfile = dockerfileOption || 'Dockerfile';
+  let existingDockerfile: string | undefined;
+  try {
+    const candidate = confined(context, requestedDockerfile);
+    if (statSync(candidate).isFile()) existingDockerfile = candidate;
+  } catch {
+    existingDockerfile = undefined;
+  }
+
+  if (builder === 'dockerfile') {
+    if (!existingDockerfile) {
+      if (checkOnly) throw new SourceCheckError('SOURCE_DOCKERFILE', 'The Dockerfile is missing, inaccessible or outside the build context.');
+      throw new Error('The Dockerfile must be a regular file.');
+    }
+    return existingDockerfile;
+  }
+
+  if (builder === 'auto' && existingDockerfile) {
+    appendFileSync(log, `${new Date().toISOString()} [servus] Auto builder detected existing ${requestedDockerfile}\n`, { mode: 0o600 });
+    return existingDockerfile;
+  }
+
+  const plan = generateBuilderDockerfile(context, workspace, builder, port);
+  appendFileSync(log, `${new Date().toISOString()} [servus] Builder=${plan.builder} detected stack=${plan.stack} (${plan.summary})\n`, { mode: 0o600 });
+  return plan.dockerfilePath;
+}
+
+async function runDockerBuild(
+  service: Service,
+  operationId: string,
+  dockerSocket: string,
+  vault: SecretVault,
+  workspace: string,
+  context: string,
+  dockerfile: string,
+  sourceCommit: string,
+  log: string,
+  credentials: string[],
+  buildResources: BuildResourceConfig | undefined,
+  envFile: string | undefined,
+  forceRebuild: boolean | undefined,
+): Promise<{ image: string; sourceCommit: string }> {
+  if (envFile) writeGeneratedEnv(context, envFile, dockerfile, service.environment ?? [], service.id, vault);
+  const image = `panel-build:${operationId}`;
+  const args = ['--host', `unix://${dockerSocket}`, 'buildx', 'build', '--load', '--progress=plain', '--label', 'panel.owner=self-hosted-panel', '--label', `panel.service=${service.id}`, '-t', image, '-f', dockerfile];
+  if (forceRebuild) args.push('--no-cache', '--pull');
+  if (buildResources?.memoryMb) args.push('--memory', `${buildResources.memoryMb}m`);
+  if (buildResources?.cpuQuotaPercent) args.push('--cpu-period', '100000', '--cpu-quota', String(buildResources.cpuQuotaPercent * 1000));
+  const buildTimeoutMs = (buildResources?.timeoutSeconds ?? 600) * 1000;
+  for (const item of service.environment || []) {
+    if (item.secretRef) {
+      const file = join(workspace, `secret-${item.name}`); writeFileSync(file, vault.getServiceSecret(item.secretRef, service.id, 'environment'), { mode: 0o600 });
+      args.push('--secret', `id=${item.name},src=${file}`);
+    } else if (!item.secret) args.push('--build-arg', `${item.name}=${item.value || ''}`);
+  }
+  args.push('--build-arg', `SOURCE_COMMIT=${sourceCommit}`, '--label', `panel.source.commit=${sourceCommit}`, context);
+  appendFileSync(log, `${new Date().toISOString()} [servus] Building immutable source ${sourceCommit}\n`, { mode: 0o600 });
+  await run('docker', args, context, log, vault, credentials, buildTimeoutMs, { ...process.env, DOCKER_BUILDKIT: '1' }, false, { serviceId: service.id, operationId });
+  appendFileSync(log, `${new Date().toISOString()} [servus] Build completed\n`, { mode: 0o600 });
+  return { image, sourceCommit };
+}
+
 export async function buildSource(service: Service, operationId: string, dataDir: string, dockerSocket: string, vault: SecretVault, options: { checkOnly?: boolean; sharedGithub?: boolean; forceRebuild?: boolean } = {}): Promise<{ image: string; sourceCommit: string }> {
-  if (service.source?.type !== 'git') throw new Error('A Git source is required.');
   const source = service.source;
-  const resolved=new URL(source.repository).protocol==='ssh:'?{url:parseSshRepository(source.repository).url}:await resolveRepository(source.repository),repository=resolved.url;
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/.test(source.branch) || source.branch.includes('..') || source.branch.endsWith('/')) throw new Error('Invalid Git branch.');
+  if (!source || source.type === 'image') throw new Error('A buildable source (git, dockerfile or upload) is required.');
   const credentials = options.checkOnly ? [] : (service.environment || []).filter(item => item.secretRef).flatMap(item => {
     const value = vault.getServiceSecret(item.secretRef!, service.id, 'environment');
     const escaped = JSON.stringify(value).slice(1, -1);
@@ -125,6 +197,48 @@ export async function buildSource(service: Service, operationId: string, dataDir
   const directory = join(dataDir, 'builds'); mkdirSync(directory, { recursive: true, mode: 0o700 });
   const workspace = mkdtempSync(join(directory, `${operationId}-`));
   const log = buildLogPath(dataDir, service.id, operationId);
+
+  if (source.type === 'dockerfile') {
+    try {
+      const context = join(workspace, 'code');
+      mkdirSync(context, { recursive: true, mode: 0o700 });
+      const dockerfile = join(context, 'Dockerfile');
+      writeFileSync(dockerfile, source.dockerfileContent, { mode: 0o600 });
+      const sourceCommit = createHash('sha256').update(source.dockerfileContent, 'utf8').digest('hex');
+      appendFileSync(log, `${new Date().toISOString()} [servus] Building from inline Dockerfile (${sourceCommit.slice(0, 12)})\n`, { mode: 0o600 });
+      if (options.checkOnly) return { image: '', sourceCommit };
+      return await runDockerBuild(service, operationId, dockerSocket, vault, workspace, context, dockerfile, sourceCommit, log, credentials, source.buildResources, source.envFile, options.forceRebuild);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      if (options.checkOnly) rmSync(log, { force: true });
+    }
+  }
+
+  if (source.type === 'upload') {
+    try {
+      if (!/^[a-f0-9-]{36}$/i.test(source.uploadId)) throw new Error('Invalid uploaded archive identity.');
+      const archivePath = join(dataDir, 'source-uploads', service.projectId, `${source.uploadId}.tar.gz`);
+      if (!existsSync(archivePath)) throw new Error('Uploaded source archive was not found for this project.');
+      const archiveBytes = readFileSync(archivePath);
+      const sourceCommit = createHash('sha256').update(archiveBytes).digest('hex');
+      if (source.sha256 && source.sha256 !== sourceCommit) throw new Error('Uploaded source archive digest mismatch.');
+      const checkout = join(workspace, 'code');
+      mkdirSync(checkout, { recursive: true, mode: 0o700 });
+      appendFileSync(log, `${new Date().toISOString()} [servus] Extracting uploaded archive ${source.filename ?? source.uploadId} (${sourceCommit.slice(0, 12)})\n`, { mode: 0o600 });
+      await extractSourceArchive(archivePath, checkout);
+      const context = confined(checkout, source.context || '.');
+      if (!statSync(context).isDirectory()) throw new Error('The build context must be a directory.');
+      const dockerfile = resolveDockerfileForContext(context, workspace, source.dockerfile, source.builder ?? 'auto', service.port || 80, log, Boolean(options.checkOnly));
+      if (options.checkOnly) return { image: '', sourceCommit };
+      return await runDockerBuild(service, operationId, dockerSocket, vault, workspace, context, dockerfile, sourceCommit, log, credentials, source.buildResources, source.envFile, options.forceRebuild);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      if (options.checkOnly) rmSync(log, { force: true });
+    }
+  }
+
+  const resolved=new URL(source.repository).protocol==='ssh:'?{url:parseSshRepository(source.repository).url}:await resolveRepository(source.repository),repository=resolved.url;
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/.test(source.branch) || source.branch.includes('..') || source.branch.endsWith('/')) throw new Error('Invalid Git branch.');
   appendFileSync(log, `${new Date().toISOString()} [servus] Fetching source branch ${source.branch}\n`, { mode: 0o600 });
   const gitEnv:NodeJS.ProcessEnv = {PATH:'/usr/local/bin:/usr/bin:/bin',HOME:workspace,LANG:'C',GIT_TERMINAL_PROMPT:'0',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_ASKPASS:'/bin/false',
     GIT_CONFIG_COUNT:'2',GIT_CONFIG_KEY_0:'protocol.file.allow',GIT_CONFIG_VALUE_0:'never',GIT_CONFIG_KEY_1:'http.followRedirects',GIT_CONFIG_VALUE_1:'false'};
@@ -178,30 +292,11 @@ export async function buildSource(service: Service, operationId: string, dataDir
     }
     if(helper){await helper.close();helper=undefined;delete gitEnv.SERVUS_GIT_SOCKET;}
     if(sshHelper){sshHelper.close();sshHelper=undefined;delete gitEnv.GIT_SSH_COMMAND;delete gitEnv.GIT_SSH_VARIANT;}
-    let context:string,dockerfile:string;
+    let context:string;
     try {context=confined(checkout,source.context || '.');if(!statSync(context).isDirectory())throw new Error('The build context must be a directory.');}
     catch(error){if(options.checkOnly)throw new SourceCheckError('SOURCE_CONTEXT','The build context is missing, inaccessible or outside the repository.');throw error;}
-    try {dockerfile=confined(context,source.dockerfile || 'Dockerfile');if(!statSync(dockerfile).isFile())throw new Error('The Dockerfile must be a regular file.');}
-    catch(error){if(options.checkOnly)throw new SourceCheckError('SOURCE_DOCKERFILE','The Dockerfile is missing, inaccessible or outside the build context.');throw error;}
+    const dockerfile = resolveDockerfileForContext(context, workspace, source.dockerfile, source.builder, service.port || 80, log, Boolean(options.checkOnly));
     if (options.checkOnly) return { image: '', sourceCommit };
-    if (source.envFile) writeGeneratedEnv(context, source.envFile, dockerfile, service.environment ?? [], service.id, vault);
-    const image = `panel-build:${operationId}`;
-    const args = ['--host', `unix://${dockerSocket}`, 'buildx', 'build', '--load', '--progress=plain', '--label', 'panel.owner=self-hosted-panel', '--label', `panel.service=${service.id}`, '-t', image, '-f', dockerfile];
-    if (options.forceRebuild) args.push('--no-cache', '--pull');
-    const buildResources = source.buildResources;
-    if (buildResources?.memoryMb) args.push('--memory', `${buildResources.memoryMb}m`);
-    if (buildResources?.cpuQuotaPercent) args.push('--cpu-period', '100000', '--cpu-quota', String(buildResources.cpuQuotaPercent * 1000));
-    const buildTimeoutMs = (buildResources?.timeoutSeconds ?? 600) * 1000;
-    for (const item of service.environment || []) {
-      if (item.secretRef) {
-        const file = join(workspace, `secret-${item.name}`); writeFileSync(file, vault.getServiceSecret(item.secretRef,service.id,'environment'), { mode: 0o600 });
-        args.push('--secret', `id=${item.name},src=${file}`);
-      } else if (!item.secret) args.push('--build-arg', `${item.name}=${item.value || ''}`);
-    }
-    args.push('--build-arg', `SOURCE_COMMIT=${sourceCommit}`, '--label', `panel.source.commit=${sourceCommit}`, context);
-    appendFileSync(log, `${new Date().toISOString()} [servus] Building immutable source ${sourceCommit}\n`);
-    await run('docker', args, checkout, log, vault, credentials, buildTimeoutMs, { ...process.env, DOCKER_BUILDKIT: '1' }, false, { serviceId: service.id, operationId });
-    appendFileSync(log, `${new Date().toISOString()} [servus] Build completed\n`);
-    return { image, sourceCommit };
+    return await runDockerBuild(service, operationId, dockerSocket, vault, workspace, context, dockerfile, sourceCommit, log, credentials, source.buildResources, source.envFile, options.forceRebuild);
   } finally { if(helper)await helper.close();sshHelper?.close();rmSync(workspace, { recursive: true, force: true });if(options.checkOnly)rmSync(log,{force:true}); }
 }

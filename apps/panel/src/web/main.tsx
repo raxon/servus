@@ -86,6 +86,7 @@ import { UpdateSettings, useUpdateDiscovery } from "./UpdateSettings.js";
 import { InstallationBackupSettings } from "./InstallationBackupSettings.js";
 import { BackupStorageSettings } from "./BackupStorageSettings.js";
 import { HostMetricsCard } from "./HostMetricsCard.js";
+import { HostAdminPanel } from "./HostAdminPanel.js";
 import { AlertsSettings } from "./AlertsSettings.js";
 import { BuildConcurrencySettings } from "./BuildConcurrencySettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
@@ -788,12 +789,20 @@ function ProjectPage() {
                 title={
                   service.source?.type === "git"
                     ? `${service.source.repository} · ${service.source.branch}`
-                    : service.image
+                    : service.source?.type === "dockerfile"
+                      ? "Inline Dockerfile"
+                      : service.source?.type === "upload"
+                        ? `Upload · ${service.source.filename ?? service.source.uploadId}`
+                        : service.image
                 }
               >
                 {service.source?.type === "git"
                   ? `Git · ${service.source.branch}`
-                  : service.image}
+                  : service.source?.type === "dockerfile"
+                    ? "Inline Dockerfile"
+                    : service.source?.type === "upload"
+                      ? `Upload · ${service.source.filename ?? "archive"}`
+                      : service.image}
               </span>
               <Badge status={service.state} />
               <span
@@ -1110,8 +1119,12 @@ function ServicePage() {
   const appUrl = applicationUrl(primaryDomain, runtime.data?.ingressPort ?? 18080);
   const sourceLabel =
     service.source?.type === "git"
-      ? `${service.source.repository} · ${service.source.branch}`
-      : service.image;
+      ? `${service.source.repository} · ${service.source.branch}${service.source.builder && service.source.builder !== "dockerfile" ? ` (${service.source.builder})` : ""}`
+      : service.source?.type === "dockerfile"
+        ? "Inline Dockerfile"
+        : service.source?.type === "upload"
+          ? `Uploaded archive · ${service.source.filename ?? service.source.uploadId}`
+          : service.image;
   const secondaryActions = canWrite ? (
     <>
       {service.deployedRevision !== null && <>
@@ -1123,7 +1136,7 @@ function ServicePage() {
           {service.state === "stopped" ? "Start" : "Stop"}
         </button>
       </>}
-      {service.source?.type === "git" ? <button className="button" type="button" disabled={busy} onClick={() => execute.mutate("force-rebuild")}>Force rebuild</button> : null}
+      {service.source && service.source.type !== "image" ? <button className="button" type="button" disabled={busy} onClick={() => execute.mutate("force-rebuild")}>Force rebuild</button> : null}
       <DestroyService
         service={service}
         busy={busy}
@@ -1671,6 +1684,8 @@ function SettingsPage() {
           <BackupStorageSettings />
           <InstallationBackupSettings userId={user.id} />
         </section>
+
+        <HostAdminPanel />
       </> : null}
 
       <section className="settings-group" id="account-access" aria-labelledby="settings-account-heading">

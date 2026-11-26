@@ -47,7 +47,11 @@ export function ApiTokenSettings({ canCreateProject = false }: { canCreateProjec
       {token.revokedAt?<span className="api-token-revoked">Revoked</span>:<button className="button button-small" type="button" disabled={revoke.isPending} aria-label={`Revoke ${token.name}`} onClick={()=>revoke.mutate(token.id)}>Revoke</button>}
     </li>)}</ul>:!tokens.error?<div className="settings-empty api-token-empty"><KeyRound size={24} aria-hidden="true"/><div><strong>No API tokens yet</strong><p>Create a project token when you’re ready to connect an external tool.</p></div></div>:null}
     <div className="api-token-reference">
-      <details><summary>MCP client setup</summary><p>From the Servus repository, launch <code>node scripts/servus-mcp.mjs</code> over stdio. Set <code>SERVUS_URL</code> to your panel address and <code>SERVUS_TOKEN</code> to a project token in your client’s environment.</p></details>
+      <details>
+        <summary>MCP client setup (Remote HTTP &amp; stdio)</summary>
+        <p><strong>Remote HTTP MCP:</strong> point any Streamable HTTP MCP client to <code>{typeof window !== 'undefined' ? `${window.location.origin}/api/v1/mcp` : '/api/v1/mcp'}</code> with header <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+        <p><strong>Local stdio MCP:</strong> from the Servus repository, launch <code>node scripts/servus-mcp.mjs</code> with <code>SERVUS_URL</code> and <code>SERVUS_TOKEN</code> set in your client environment.</p>
+      </details>
       <a href="/api/v1/openapi.json" target="_blank" rel="noreferrer">OpenAPI specification<ArrowUpRight size={14} aria-hidden="true"/></a>
     </div>
     {open?<FeatureModal title={secret?'Token created':'Create API token'} description={secret?'Copy your token now. It will only be shown once.':'Tokens belong to one project, expire after 30 days and retain your current project permissions.'} dismissible={!create.isPending} onClose={closeDialog}>

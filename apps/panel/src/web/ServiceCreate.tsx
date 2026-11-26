@@ -8,12 +8,14 @@ import type {
   Service,
   ServiceInput,
   ServiceKind,
+  SourceBuilder,
   SourceConfig,
 } from "../shared/types.js";
+import type { SourceUploadRecord } from "../shared/host-admin.js";
 import { api } from "./api.js";
 import { useGithubConnection } from "./GithubSettings.js";
 import { useHostDomain } from "./HostDomainSettings.js";
-import { SourceChoiceFields, githubRepositoryUrl, type SourceChoice } from "./source-choice.js";
+import { SOURCE_BUILDERS, SourceChoiceFields, githubRepositoryUrl, type SourceChoice } from "./source-choice.js";
 import { validEnvFilePath } from "../shared/build-options.js";
 import { GithubSourcePicker } from "./GithubSourcePicker.js";
 import {RegistryFields,SshFields,type RegistryDraft} from './SourceCredentialFields.js';
@@ -106,6 +108,18 @@ export function CreateService({
   const [branch, setBranch] = useState("main");
   const [context, setContext] = useState(".");
   const [dockerfile, setDockerfile] = useState("Dockerfile");
+  const [builder, setBuilder] = useState<SourceBuilder>("dockerfile");
+  const [dockerfileContent, setDockerfileContent] = useState("FROM nginx:alpine\nEXPOSE 80\n");
+  const [uploadRecord, setUploadRecord] = useState<SourceUploadRecord | null>(null);
+  const uploadMutation = useMutation({
+    mutationFn: (file: File) =>
+      api<SourceUploadRecord>(`/projects/${projectId}/source-uploads`, {
+        method: "POST",
+        binary: file,
+        headers: { "X-Upload-Filename": file.name.replace(/[^A-Za-z0-9._-]/g, "_") || "source.tar.gz" },
+      }),
+    onSuccess: (record) => setUploadRecord(record),
+  });
   const [generateEnv, setGenerateEnv] = useState(false);
   const [envFile, setEnvFile] = useState(".env");
   const [knownHosts,setKnownHosts]=useState('');
@@ -117,16 +131,20 @@ export function CreateService({
   const mutation = useMutation({
     mutationFn: () => {
       const source: SourceConfig =
-        kind === "app" && sourceType !== "image"
-          ? { type: "git", repository: sourceType === "github" ? githubRepositoryUrl(githubRepository) : repository, branch, context, dockerfile, ...(generateEnv ? { envFile } : {}), ...(sshSource?{ssh:{knownHosts}}:sourceType === "github" && github.data?.connected ? {sharedGithub: true} : sourceType === "git" && privateGit ? { credential: { username: gitUsername, token: gitToken } } : {}) }
-          : { type: "image" };
+        kind !== "app" || sourceType === "image"
+          ? { type: "image" }
+          : sourceType === "dockerfile"
+            ? { type: "dockerfile", dockerfileContent, ...(generateEnv ? { envFile } : {}) }
+            : sourceType === "upload"
+              ? { type: "upload", uploadId: uploadRecord?.id ?? "", filename: uploadRecord?.filename, sha256: uploadRecord?.sha256, context, dockerfile, builder: builder === "dockerfile" ? "auto" : builder, ...(generateEnv ? { envFile } : {}) }
+              : { type: "git", repository: sourceType === "github" ? githubRepositoryUrl(githubRepository) : repository, branch, context, dockerfile, ...(builder !== "dockerfile" ? { builder } : {}), ...(generateEnv ? { envFile } : {}), ...(sshSource?{ssh:{knownHosts}}:sourceType === "github" && github.data?.connected ? {sharedGithub: true} : sourceType === "git" && privateGit ? { credential: { username: gitUsername, token: gitToken } } : {}) };
       const body: Omit<ServiceInput,'hostname'> & {hostname?:string} = {
         name: serviceName,
         kind,
         source,
         image:
           image ||
-          (source.type === "git"
+          (source.type !== "image"
             ? "panel-build:pending"
             : kinds.find((item) => item.kind === kind)!.image),
         ...(kind==='app' && automaticDomain && !hostname?{}:{hostname:hostname || `${serviceName}.localhost`}),
@@ -251,6 +269,43 @@ export function CreateService({
             </label>
             {kind==='app'?<details className="service-registry-settings"><summary>Private registry access{registry.registryEnabled ? ' (enabled)' : ''}</summary><RegistryFields value={registry} needsPassword onChange={patch=>setRegistry(value=>({...value,...patch}))}/></details>:null}
             </>
+          ) : sourceType === "dockerfile" ? (
+            <label>
+              Inline Dockerfile
+              <textarea
+                className="mono"
+                rows={8}
+                required
+                value={dockerfileContent}
+                onChange={(event) => setDockerfileContent(event.target.value)}
+                placeholder={"FROM nginx:alpine\nEXPOSE 80\n"}
+              />
+              <small>Built directly by Docker BuildKit when deployed.</small>
+            </label>
+          ) : sourceType === "upload" ? (
+            <>
+              <label>
+                Upload source archive (.tar.gz)
+                <input
+                  type="file"
+                  accept=".tar.gz,.tgz,application/gzip"
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    if (file) uploadMutation.mutate(file);
+                  }}
+                />
+                <small>{uploadRecord ? `Uploaded ${uploadRecord.filename} (${uploadRecord.sizeBytes} B)` : "Upload a gzipped tarball containing your app source."}</small>
+              </label>
+              {uploadMutation.error ? <FeatureError error={uploadMutation.error} /> : null}
+              <label>
+                Builder
+                <select value={builder === "dockerfile" ? "auto" : builder} onChange={(event) => setBuilder(event.target.value as SourceBuilder)}>
+                  {SOURCE_BUILDERS.map((item) => (
+                    <option key={item.value} value={item.value}>{item.label} - {item.description}</option>
+                  ))}
+                </select>
+              </label>
+            </>
           ) : (
             <>
               {sourceType === "github" && admin && github.data?.connected ? <GithubSourcePicker repository={githubRepository} branch={branch} disabled={mutation.isPending} onChange={selection => { setGithubRepository(selection.repository); setBranch(selection.branch); }} /> : null}
@@ -279,6 +334,15 @@ export function CreateService({
                   onChange={(event) => setBranch(event.target.value)}
                   required
                 />
+              </label>
+              <label>
+                Builder
+                <select value={builder} onChange={(event) => setBuilder(event.target.value as SourceBuilder)}>
+                  {SOURCE_BUILDERS.map((item) => (
+                    <option key={item.value} value={item.value}>{item.label} - {item.description}</option>
+                  ))}
+                </select>
+                <small>Use Dockerfile or zero-config Railpack / Nixpacks / Buildpacks / Auto-detect.</small>
               </label>
               <div className="form-grid">
                 <label>
@@ -412,7 +476,7 @@ export function CreateService({
           <h3>Service preview</h3>
           <dl>
             <div><dt>Name</dt><dd>{serviceName}</dd></div>
-            <div><dt>Source</dt><dd>{sourceType === "image" ? image || "Choose a Docker image" : `${sourceType === "github" ? githubRepository || "Choose a GitHub repository" : repository || "Enter a repository URL"} · ${branch || "Choose a ref"}`}</dd></div>
+            <div><dt>Source</dt><dd>{sourceType === "image" ? image || "Choose a Docker image" : sourceType === "dockerfile" ? "Inline Dockerfile" : sourceType === "upload" ? (uploadRecord ? `Upload · ${uploadRecord.filename}` : "Upload a .tar.gz archive") : `${sourceType === "github" ? githubRepository || "Choose a GitHub repository" : repository || "Enter a repository URL"} · ${branch || "Choose a ref"}`}</dd></div>
             <div><dt>{kind === "app" ? "Address" : "Network"}</dt><dd>{kind !== "app" ? "Private project network" : hostname || (automaticDomain ? `Automatic HTTPS address under ${hostDomain.data?.hostname}, assigned on creation` : `${serviceName}.localhost (local use)`)}</dd></div>
             <div><dt>Container port</dt><dd>{port || "Enter a port"}</dd></div>
           </dl>
@@ -427,7 +491,7 @@ export function CreateService({
           <button
             className="button button-primary"
             type="submit"
-            disabled={mutation.isPending||sshSource&&!admin}
+            disabled={mutation.isPending || uploadMutation.isPending || (sourceType === "upload" && !uploadRecord) || (sshSource && !admin)}
           >
             {mutation.isPending ? (
               <FeatureLoading label="Creating service" />

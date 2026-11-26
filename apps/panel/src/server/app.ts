@@ -34,6 +34,9 @@ import { registerMetricsHistory } from './metrics-history.js';
 import { registerLogsHistory } from './logs-history.js';
 import { registerAlerts } from './alerts.js';
 import { registerWorkspaceExtras } from './workspace-extras.js';
+import { registerHostAdmin } from './host-admin.js';
+import { registerSourceUploads, sourceUploadExists } from './source-uploads.js';
+import { registerRemoteMcp } from './remote-mcp.js';
 import { registerVolumeBackups } from './volume-backups.js';
 import { registerGithubRepositories } from './github-repositories.js';
 import { registerReleaseNotes } from './release-notes.js';
@@ -233,6 +236,9 @@ export async function createApp(options: AppOptions) {
   registerInstallationBackups(app,{administrator,socketPath:options.updaterSocketPath,applyEnabled:options.updaterApplyEnabled,approvalSecretPath:options.installationBackupApprovalSecretPath});
   registerAlerts(app,{store,administrator,metricsHistory,agentRequest:runtimeRequest,agentConnection:options.agentConnection,maintenance,startEvaluator:options.alertsEvaluator?.start,intervalMs:options.alertsEvaluator?.intervalMs,now:options.alertsEvaluator?.now,fetch:options.alertsEvaluator?.fetch});
   registerWorkspaceExtras(app,{store,session,projectAccess,administrator,agentRequest:runtimeRequest,agentConnection:options.agentConnection});
+  registerSourceUploads(app,{dataDir:options.dataDir,store,session,projectAccess});
+  registerRemoteMcp(app,apiTokens);
+  registerHostAdmin(app,{store,administrator,allowedOrigins,agentConnection:options.agentConnection,runtimeRequest,maintenance,onUpgrade:req=>{upgrades.add(req);requestReleases.get(req)?.();}});
   registerReleaseNotes(app,{administrator});
   registerGithubRepositories(app,{store,administrator});
   app.get(`${prefix}/integrations/github`,async req=>{
@@ -262,6 +268,14 @@ export async function createApp(options: AppOptions) {
   }
   function approvePublishedPorts(user:User, configuration:import('../shared/types.js').ServiceConfiguration) {
     if(configuration.ports?.length && user.role!=='admin')throw new AppError('FORBIDDEN','Only administrators can publish host TCP/UDP ports',403);
+  }
+  function approveUploadSource(projectId: string, configuration: { source?: import('../shared/types.js').SourceConfig }) {
+    if (configuration.source?.type !== 'upload') return;
+    const record = sourceUploadExists(options.dataDir, projectId, configuration.source.uploadId);
+    if (!record) throw new AppError('UPLOAD_NOT_FOUND', 'Uploaded source archive was not found in this project', 404);
+    if (configuration.source.sha256 && configuration.source.sha256 !== record.sha256) throw new AppError('UPLOAD_DIGEST_MISMATCH', 'Uploaded archive digest does not match the stored file', 400);
+    configuration.source.filename = record.filename;
+    configuration.source.sha256 = record.sha256;
   }
   app.get(`${prefix}/settings/https`,async req=>{
     administrator(req);
@@ -336,6 +350,7 @@ export async function createApp(options: AppOptions) {
     approveSharedGithub(user,input);
     approveDatabaseAccess(user,input);
     approvePublishedPorts(user,input);
+    approveUploadSource(req.params.id,input);
     const result=store.createService(req.params.id,input,user.id,key);
     return reply.code(202).send(result);
   });
@@ -402,7 +417,7 @@ export async function createApp(options: AppOptions) {
     if(service.source?.type!=='git')throw new AppError('GIT_SOURCE','Save a Git source before checking it',400);
     if(service.source.sharedGithub && auth.user.role!=='admin')throw new AppError('FORBIDDEN','Only administrators can check the shared GitHub connection',403);
     const raw=req.body && typeof req.body==='object' && Object.keys(req.body).length===0 ? undefined : req.body;
-    const changes=z.object({repository:z.string().url().max(1000),branch:z.string().min(1).max(128),context:z.string().max(255),dockerfile:z.string().max(255)}).strict().optional().parse(raw);
+    const changes=z.object({repository:z.string().url().max(1000),branch:z.string().min(1).max(128),context:z.string().max(255),dockerfile:z.string().max(255),builder:z.enum(['dockerfile','auto','railpack','nixpacks','buildpacks']).optional()}).strict().optional().parse(raw);
     const candidate=changes ? {...service.source,...changes} : service.source;
     if ((service.source.credential && !service.source.sharedGithub || service.source.ssh) && candidate.repository!==service.source.repository) throw new AppError('SECRET_REFERENCE','Save a separate credential for this repository before checking it',403);
     const parsed=parseServicePatch({expectedRevision:service.revision,source:candidate});
@@ -422,6 +437,7 @@ export async function createApp(options: AppOptions) {
     approveSharedGithub(auth.user,input);
     approveDatabaseAccess(auth.user,input);
     approvePublishedPorts(auth.user,input);
+    approveUploadSource(service.projectId,input);
     if (input.source && auth.user.role !== 'admin' && service.source?.type === 'git' && service.source.sharedGithub) throw new AppError('FORBIDDEN','Only administrators can change a source using the shared GitHub connection',403);
     if(input.source&&auth.user.role!=='admin'&&service.source?.type==='git'&&service.source.ssh)throw new AppError('FORBIDDEN','Only administrators can change a source using an SSH deploy key',403);
     if (input.source?.type === 'git' && input.source.credential?.secretRef) {

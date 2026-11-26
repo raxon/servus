@@ -18,9 +18,12 @@ const buildResourcesSchema = z.object({
   memoryMb: z.number().int().min(128).max(65536).optional(),
   timeoutSeconds: z.number().int().min(30).max(1800).optional(),
 }).strict();
+const sourceBuilderSchema = z.enum(['dockerfile', 'auto', 'railpack', 'nixpacks', 'buildpacks']);
 const sourceSchema = z.discriminatedUnion('type',[
   z.object({type:z.literal('image')}).strict(),
-  z.object({type:z.literal('git'),repository:z.string().url().max(1000),branch:z.string().min(1).max(200).regex(/^[^\s\x00-\x1f~^:?*\[\\]+$/),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),envFile:z.string().refine(validEnvFilePath,'Use a relative file path outside Git and build configuration files').optional(),buildResources:buildResourcesSchema.optional(),sharedGithub:z.boolean().optional(),ssh:gitSshCredentialSchema.optional(),credential:z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),secretRef:z.string().uuid().optional()}).strict().refine(v=>Boolean(v.token)!==Boolean(v.secretRef)).optional()}).strict(),
+  z.object({type:z.literal('git'),repository:z.string().url().max(1000),branch:z.string().min(1).max(200).regex(/^[^\s\x00-\x1f~^:?*\[\\]+$/),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),builder:sourceBuilderSchema.optional(),envFile:z.string().refine(validEnvFilePath,'Use a relative file path outside Git and build configuration files').optional(),buildResources:buildResourcesSchema.optional(),sharedGithub:z.boolean().optional(),ssh:gitSshCredentialSchema.optional(),credential:z.object({username:z.string().min(1).max(256).regex(/^[^\x00-\x20\x7f:=]+$/),token:z.string().min(1).max(4096).regex(/^[^\x00-\x20\x7f]+$/).optional(),secretRef:z.string().uuid().optional()}).strict().refine(v=>Boolean(v.token)!==Boolean(v.secretRef)).optional()}).strict(),
+  z.object({type:z.literal('dockerfile'),dockerfileContent:z.string().min(4).max(65536).refine(v=>!v.includes('\0') && /^\s*(?:#[^\n]*\n|\s)*FROM\s+\S+/im.test(v),'Inline Dockerfile must include a FROM instruction'),envFile:z.string().refine(validEnvFilePath,'Use a relative file path outside Git and build configuration files').optional(),buildResources:buildResourcesSchema.optional()}).strict(),
+  z.object({type:z.literal('upload'),uploadId:z.string().uuid(),filename:z.string().max(255).optional(),sha256:z.string().regex(/^[a-f0-9]{64}$/).optional(),context:z.string().max(255).default('.'),dockerfile:z.string().max(255).default('Dockerfile'),builder:sourceBuilderSchema.default('auto'),envFile:z.string().refine(validEnvFilePath,'Use a relative file path outside Git and build configuration files').optional(),buildResources:buildResourcesSchema.optional()}).strict(),
 ]);
 const envSchema = z.object({name:z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),value:z.string().max(32000).optional(),secret:z.boolean().optional(),secretRef:z.string().uuid().optional()}).strict();
 const pathPrefixSchema = z.string().min(1).max(128).refine(
@@ -102,7 +105,7 @@ export function normalizeServiceInput(value: unknown): ServiceInput {
   const parsed=newServiceSchema.parse(value),kind=parsed.kind??'app';
   const defaults={postgres:{image:'postgres:17-alpine',port:5432},redis:{image:'redis:7-alpine',port:6379},mariadb:{image:'mariadb:11.4',port:3306},mysql:{image:'mysql:8.4',port:3306},mongodb:{image:'mongo:7',port:27017}};
   const db=kind==='app'?undefined:defaults[kind];
-  if(kind==='app'&&!parsed.image&&parsed.source?.type!=='git')throw new AppError('IMAGE_REQUIRED','An application image or Git source is required');
+  if(kind==='app'&&!parsed.image&&(!parsed.source||parsed.source.type==='image'))throw new AppError('IMAGE_REQUIRED','An application image or build source is required');
   const primary=parsed.domains?.find(domain=>domain.primary)??parsed.domains?.[0];
   const hostname=primary?.hostname??parsed.hostname??`${parsed.name}.internal`;
   const result:ServiceInput={...parsed,kind,image:parsed.image??db?.image??'panel-build:pending',port:primary?.port??parsed.port??db?.port??80,hostname,source:parsed.source??{type:'image'}};
@@ -119,7 +122,7 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
     databaseAccessSchema.parse(config.databaseAccess);
     if(config.databaseAccess.enabled && !databasePortAllowed(config.databaseAccess.publishedPort,Number(process.env.PANEL_PORT??4180)))throw new AppError('DATABASE_PORT_RESERVED','This TCP port is reserved for the panel API');
   }
-  if(config.registry){if(kind!=='app'||config.source?.type==='git')throw new AppError('REGISTRY_SOURCE','Private registry credentials are available for application image sources');if('image'in config&&canonicalRegistry(config.registry.server)!==imageRegistry(String(config.image)))throw new AppError('REGISTRY_MISMATCH','Registry credentials must match the image registry');}
+  if(config.registry){if(kind!=='app'||(config.source&&config.source.type!=='image'))throw new AppError('REGISTRY_SOURCE','Private registry credentials are available for application image sources');if('image'in config&&canonicalRegistry(config.registry.server)!==imageRegistry(String(config.image)))throw new AppError('REGISTRY_MISMATCH','Registry credentials must match the image registry');}
   const unique=(values:string[],name:string)=>{if(new Set(values).size!==values.length)throw new AppError('DUPLICATE_CONFIG',`${name} must be unique`);};
   unique((config.environment??[]).map(item=>item.name),'Environment names');
   unique((config.domains??[]).map(item=>`${item.hostname}:${item.pathPrefix??'/'}`),'Domain routes');
@@ -150,7 +153,7 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
   }
   const hasWritableMount=(config.mounts??[]).some(mount=>!(mount.readOnly??(mount.type==='file')));
   if((kind!=='app'||hasWritableMount)&&config.deploymentStrategy?.order==='start-first')throw new AppError('STATEFUL_DEPLOYMENT_ORDER','Stateful services require stop-first deployment order',400);
-  if(kind!=='app'&&config.source?.type==='git')throw new AppError('DATABASE_SOURCE','Database services use managed images');
+  if(kind!=='app'&&config.source&&config.source.type!=='image')throw new AppError('DATABASE_SOURCE','Database services use managed images');
   for(const env of config.environment??[]) {
     if(env.secretRef&&!env.secret)throw new AppError('SECRET_REFERENCE','Secret references require secret mode');
     if(kind!=='app'&&/^(POSTGRES_|MARIADB_|MYSQL_|REDIS_|MONGO_)/.test(env.name))throw new AppError('RESERVED_VARIABLE','Database connection variables are managed by the panel');
@@ -162,6 +165,11 @@ export function validateConfiguration(config: ServiceConfiguration & {replicas?:
     if(mount.type==='bind') {
       const path=relative(resolve(process.env.PANEL_MANAGED_BIND_ROOT??'/var/lib/panel/mounts'),resolve(mount.source!));
       if(!path||path==='..'||path.startsWith(`..${sep}`)||isAbsolute(path))throw new AppError('BIND_SOURCE','Bind mounts must stay within the approved managed bind directory');
+    }
+  }
+  if(config.source?.type==='upload') {
+    for(const path of [config.source.context ?? '.', config.source.dockerfile ?? 'Dockerfile']) {
+      if(path.startsWith('/')||path.split(/[\\/]/).includes('..')||path.includes('\0'))throw new AppError('GIT_PATH','Build paths must stay within the uploaded archive');
     }
   }
   if(config.source?.type==='git') {
