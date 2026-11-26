@@ -37,6 +37,7 @@ import { registerWorkspaceExtras } from './workspace-extras.js';
 import { registerHostAdmin } from './host-admin.js';
 import { registerSourceUploads, sourceUploadExists } from './source-uploads.js';
 import { registerRemoteMcp } from './remote-mcp.js';
+import { registerDbAdminTools } from './db-admin-tools.js';
 import { registerVolumeBackups } from './volume-backups.js';
 import { registerGithubRepositories } from './github-repositories.js';
 import { registerReleaseNotes } from './release-notes.js';
@@ -239,6 +240,7 @@ export async function createApp(options: AppOptions) {
   registerSourceUploads(app,{dataDir:options.dataDir,store,session,projectAccess});
   registerRemoteMcp(app,apiTokens);
   registerHostAdmin(app,{store,administrator,allowedOrigins,agentConnection:options.agentConnection,runtimeRequest,maintenance,onUpgrade:req=>{upgrades.add(req);requestReleases.get(req)?.();}});
+  registerDbAdminTools(app,{store,serviceAccess,runtimeRequest,agentConnection:options.agentConnection});
   registerReleaseNotes(app,{administrator});
   registerGithubRepositories(app,{store,administrator});
   app.get(`${prefix}/integrations/github`,async req=>{

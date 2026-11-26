@@ -43,6 +43,8 @@ import { inspectHostCertificate } from './host-certificate.js';
 import { hostCertificateSchema } from '../shared/host-domain.js';
 import { databaseAccessSchema } from '../shared/database-access.js';
 import { registerHostAdminAgent } from './host-admin.js';
+import { registerDbAdminToolsAgent } from './db-admin-tools.js';
+import { registerPostgresMigrationAgent } from './postgres-migration.js';
 
 const hostname = z.string().max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/);
 const input = z.object({
@@ -181,6 +183,16 @@ export async function createAgent(config = agentConfig(), runtime: AgentRuntime 
     getDocker: () => (runtime instanceof DockerRuntime ? runtime.docker : undefined),
     dockerSocket: config.dockerSocket,
     vault,
+    maintenance,
+  });
+  registerDbAdminToolsAgent(app, {
+    getDocker: () => (runtime instanceof DockerRuntime ? runtime.docker : undefined),
+    vault,
+    maintenance,
+  });
+  registerPostgresMigrationAgent(app, {
+    dockerSocket: config.dockerSocket,
+    consoleContainer: runtime.consoleContainer ? (id, containerId) => runtime.consoleContainer!(id, containerId) : undefined,
     maintenance,
   });
   app.post('/host-domain/configure',async(req,reply)=>{

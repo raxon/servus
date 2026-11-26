@@ -262,13 +262,13 @@ export function SourcePanel({ service, admin }: { service: Service; admin: boole
 
         <section className="source-section">
           <div className="source-section-heading"><FileCode2 size={17} aria-hidden="true" /><h3>Build settings</h3></div>
-          <label>
-            Builder
-            <select name="builder" value={builder} onChange={event => update({ builder: event.target.value as SourceBuilder })}>
+          <div className="source-field">
+            <label htmlFor={`${id}-builder`}>Builder</label>
+            <select id={`${id}-builder`} name="builder" value={builder} onChange={event => update({ builder: event.target.value as SourceBuilder })}>
               {SOURCE_BUILDERS.map(item => <option key={item.value} value={item.value}>{item.label} - {item.description}</option>)}
             </select>
             <small>Choose Dockerfile or zero-config Railpack / Nixpacks / Buildpacks / Auto-detect.</small>
-          </label>
+          </div>
           <details className="source-build-advanced" open={buildSettingsOpen || Boolean(fieldError("SOURCE_CONTEXT") || fieldError("SOURCE_DOCKERFILE"))} onToggle={event => setBuildSettingsOpen(event.currentTarget.open)}>
             <summary>Advanced build settings</summary>
             <div className="source-build-grid">

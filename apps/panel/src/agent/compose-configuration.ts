@@ -8,23 +8,50 @@ const mount = z.union([z.string().max(512), z.object({ type: z.literal('volume')
 const environment = z.union([z.array(z.string().max(32768).regex(/^[A-Za-z_][A-Za-z0-9_]*=/)).max(100), z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.union([z.string().max(32768), z.number(), z.boolean()]))]);
 const healthcheck = z.object({ test: z.union([z.string().max(4096), z.array(z.string().max(4096)).max(30)]), interval: z.string().regex(/^\d+(ms|s|m|h)$/).optional(), timeout: z.string().regex(/^\d+(ms|s|m|h)$/).optional(), start_period: z.string().regex(/^\d+(ms|s|m|h)$/).optional(), retries: z.number().int().min(1).max(100).optional() }).strict();
 const buildPath=z.string().min(1).max(255).regex(/^[A-Za-z0-9_.\/-]+$/).refine(value=>!value.startsWith('/'),'Build paths must be relative to the pinned checkout');
-const buildOptions=z.object({context:buildPath.default('.'),dockerfile:buildPath.optional(),dockerfile_inline:z.string().min(1).max(65536).optional(),args:z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),z.union([z.string().max(4096),z.number().finite(),z.boolean()])).optional(),target:z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/).optional()}).strict().refine(value=>!(value.dockerfile&&value.dockerfile_inline),'Use dockerfile or dockerfile_inline, not both').refine(value=>Buffer.byteLength(JSON.stringify(value.args??{}))<=16384,'Build arguments exceed 16 KiB');
+const additionalContextValue = z.string().min(1).max(300).refine(
+  value => value.startsWith('docker-image://') ? /^docker-image:\/\/[a-zA-Z0-9][a-zA-Z0-9._/:@-]+$/.test(value) : buildPath.safeParse(value).success,
+  'Additional build contexts must be a relative path inside the checkout or a docker-image:// reference',
+);
+const secretIdSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/);
+const RESERVED_COMPOSE_PORTS = new Set([22, 80, 443, 2375, 2376, 2377, 4789, 7946, 4180, 18080]);
+function parseControlledComposePort(entry: string | { target: number; published: number; protocol?: 'tcp' | 'udp' }): { published: number; target: number; protocol: 'tcp' | 'udp' } | null {
+  if (typeof entry === 'string') {
+    const match = /^(\d{1,5}):(\d{1,5})(?:\/(tcp|udp))?$/.exec(entry.trim());
+    if (!match) return null;
+    const published = Number(match[1]);
+    const targetPort = Number(match[2]);
+    const protocol = (match[3] as 'tcp' | 'udp' | undefined) ?? 'tcp';
+    if (published < 1024 || published > 65535 || targetPort < 1 || targetPort > 65535 || RESERVED_COMPOSE_PORTS.has(published)) return null;
+    return { published, target: targetPort, protocol };
+  }
+  const { published, target: targetPort, protocol = 'tcp' } = entry;
+  if (!Number.isInteger(published) || published < 1024 || published > 65535 || !Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535 || RESERVED_COMPOSE_PORTS.has(published)) return null;
+  return { published, target: targetPort, protocol };
+}
+const controlledPortEntry = z.union([
+  z.string().max(32),
+  z.object({ target: z.number().int().min(1).max(65535), published: z.number().int().min(1024).max(65535), protocol: z.enum(['tcp', 'udp']).optional() }).strict(),
+]).refine(value => parseControlledComposePort(value) !== null, 'Published Compose ports must use an unprivileged host port (1024-65535) outside reserved panel and Swarm ports');
+const buildOptions=z.object({context:buildPath.default('.'),dockerfile:buildPath.optional(),dockerfile_inline:z.string().min(1).max(65536).optional(),args:z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(128),z.union([z.string().max(4096),z.number().finite(),z.boolean()])).optional(),target:z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/).optional(),additional_contexts:z.record(secretIdSchema,additionalContextValue).optional(),secrets:z.array(secretIdSchema).max(20).optional(),ssh:z.array(z.enum(['default'])).max(1).optional()}).strict().refine(value=>!(value.dockerfile&&value.dockerfile_inline),'Use dockerfile or dockerfile_inline, not both').refine(value=>Buffer.byteLength(JSON.stringify(value.args??{}))<=16384,'Build arguments exceed 16 KiB');
 const build=z.union([buildPath,buildOptions]);
-const service = z.object({ image: z.string().min(1).max(300).regex(/^[A-Za-z0-9][A-Za-z0-9._/:@-]*$/).optional(), build:build.optional(), command: z.union([z.string().max(8192), z.array(z.string().max(8192)).max(100)]).optional(), entrypoint: z.union([z.string().max(8192), z.array(z.string().max(8192)).max(100)]).optional(), environment: environment.optional(), volumes: z.array(mount).max(20).optional(), networks: z.array(composeName).max(20).optional(), restart: z.enum(['no','always','on-failure','unless-stopped']).optional(), depends_on: z.array(composeName).max(20).optional(), healthcheck: healthcheck.optional(), expose: z.array(z.union([z.number().int().min(1).max(65535), z.string().regex(/^\d{1,5}(?:\/(?:tcp|udp))?$/)])).max(20).optional(), user: z.string().max(128).regex(/^[A-Za-z0-9_.:-]+$/).optional(), working_dir: target.optional(), cpus: z.number().positive().max(64).optional(), mem_limit: z.string().regex(/^[1-9]\d{0,5}[kKmMgG]$/).optional(), init: z.boolean().optional(), read_only: z.boolean().optional() }).strict().refine(value=>Boolean(value.image||value.build),'A service requires image or build');
+const service = z.object({ image: z.string().min(1).max(300).regex(/^[A-Za-z0-9][A-Za-z0-9._/:@-]*$/).optional(), build:build.optional(), command: z.union([z.string().max(8192), z.array(z.string().max(8192)).max(100)]).optional(), entrypoint: z.union([z.string().max(8192), z.array(z.string().max(8192)).max(100)]).optional(), environment: environment.optional(), volumes: z.array(mount).max(20).optional(), networks: z.array(composeName).max(20).optional(), restart: z.enum(['no','always','on-failure','unless-stopped']).optional(), depends_on: z.array(composeName).max(20).optional(), healthcheck: healthcheck.optional(), expose: z.array(z.union([z.number().int().min(1).max(65535), z.string().regex(/^\d{1,5}(?:\/(?:tcp|udp))?$/)])).max(20).optional(), ports: z.array(controlledPortEntry).max(10).optional(), user: z.string().max(128).regex(/^[A-Za-z0-9_.:-]+$/).optional(), working_dir: target.optional(), cpus: z.number().positive().max(64).optional(), mem_limit: z.string().regex(/^[1-9]\d{0,5}[kKmMgG]$/).optional(), init: z.boolean().optional(), read_only: z.boolean().optional() }).strict().refine(value=>Boolean(value.image||value.build),'A service requires image or build');
 const definition = z.object({ version: z.string().optional(), services: z.record(composeName, service).refine(value => Object.keys(value).length > 0 && Object.keys(value).length <= 20), volumes: z.record(composeName, z.object({}).strict().nullable()).optional(), networks: z.record(composeName, z.object({ internal: z.boolean().optional() }).strict().nullable()).optional() }).strict();
 export type ComposeDefinition = z.infer<typeof definition>;
 
 /** Parse before invoking Compose, which otherwise resolves local includes and env files. */
-export function parseComposeDefinition(yaml: string,sourceType:'inline'|'git'='inline'): ComposeDefinition {
+export function parseComposeDefinition(yaml: string, sourceType: 'inline' | 'git' = 'inline', options: { allowSsh?: boolean } = {}): ComposeDefinition {
   if (Buffer.byteLength(yaml) > 256 * 1024) throw new Error('Compose source exceeds 256 KiB.');
   const document = parseDocument(yaml, { strict: true, uniqueKeys: true, merge: false, prettyErrors: false });
   if (document.errors.length || document.warnings.length) throw new Error('Invalid Compose YAML.');
   let value: unknown;
   try { value = document.toJS({ maxAliasCount: 0 }); } catch { throw new Error('Compose aliases are unsupported.'); }
   const result = definition.safeParse(value);
-  if (!result.success) throw new Error('Unsupported Compose configuration. Use images or bounded Dockerfile builds, named volumes, private networks and explicit values. Host mounts, ports, includes, external resources and privileged settings are unsupported.');
+  if (!result.success) throw new Error('Unsupported Compose configuration. Use images or bounded Dockerfile builds, named volumes, private networks and explicit values. Host mounts, privileged ports, includes, external resources and privileged settings are unsupported.');
   const config = result.data;
   for (const item of Object.values(config.services)) {
+    if (item.build && typeof item.build !== 'string' && item.build.ssh?.length && !options.allowSsh) {
+      throw new Error('Compose build SSH forwarding requires sshForwarding to be explicitly enabled.');
+    }
     if(sourceType==='inline'&&item.build&&(typeof item.build==='string'||!item.build.dockerfile_inline||!['.','./'].includes(item.build.context)))throw new Error('Inline Compose builds require dockerfile_inline and an empty context (.). File-based build contexts require a Git source.');
     for (const entry of item.volumes ?? []) {
       const parts = typeof entry === 'string' ? entry.split(':') : undefined;

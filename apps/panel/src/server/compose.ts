@@ -45,18 +45,32 @@ export function registerCompose(app: FastifyInstance, options: Options) {
     }
   };
   const redactConfig = (configuration: ComposeConfiguration) => {
-    if (configuration.source.type !== 'git' || !configuration.source.credential) return configuration;
+    const redactedSecrets = configuration.buildSecrets?.map(secret => ({ id: secret.id, hasValue: Boolean(secret.value || secret.hasValue) }));
+    const base = { ...configuration, ...(redactedSecrets ? { buildSecrets: redactedSecrets } : {}) };
+    if (base.source.type !== 'git' || !base.source.credential) return base;
     return {
-      ...configuration,
+      ...base,
       source: {
-        ...configuration.source,
-        credential: { username: configuration.source.credential.username, hasToken: Boolean(configuration.source.credential.token) },
+        ...base.source,
+        credential: { username: base.source.credential.username, hasToken: Boolean(base.source.credential.token) },
       },
     };
   };
+  const resolveBuildSecrets = (configuration: ComposeConfiguration, previous?: ComposeConfiguration): ComposeConfiguration => {
+    if (!configuration.buildSecrets?.length) return configuration;
+    const prevMap = new Map((previous?.buildSecrets ?? []).filter(s => s.value).map(s => [s.id, s.value!]));
+    const resolved = configuration.buildSecrets.map(item => {
+      if (item.value) return { id: item.id, value: item.value };
+      const kept = prevMap.get(item.id);
+      if (kept) return { id: item.id, value: kept };
+      throw new AppError('SECRET_REQUIRED', `Enter a value for build secret "${item.id}"`, 400);
+    });
+    return { ...configuration, buildSecrets: resolved };
+  };
   const resolveGitCredentials = (configuration: ComposeConfiguration, previous?: ComposeConfiguration): ComposeConfiguration => {
-    if (configuration.source.type !== 'git') return configuration;
-    const source = configuration.source;
+    const withSecrets = resolveBuildSecrets(configuration, previous);
+    if (withSecrets.source.type !== 'git') return withSecrets;
+    const source = withSecrets.source;
     const url = new URL(source.repository);
     if (source.sharedGithub) {
       if (url.protocol !== 'https:' || url.host.toLowerCase() !== 'github.com') {
@@ -67,18 +81,18 @@ export function registerCompose(app: FastifyInstance, options: Options) {
       }
       const connection = store.vault.githubConnection();
       if (!connection) throw new AppError('GITHUB_CONNECTION_REQUIRED', 'Configure the shared GitHub connection first', 409);
-      return { ...configuration, source: { ...source, repository: url.href, credential: { username: connection.username, token: connection.token } } };
+      return { ...withSecrets, source: { ...source, repository: url.href, credential: { username: connection.username, token: connection.token } } };
     }
     if (source.credential) {
       if (url.protocol !== 'https:') throw new AppError('INVALID_COMPOSE', 'Authenticated Compose Git repositories require HTTPS', 400);
-      if (source.credential.token) return { ...configuration, source: { ...source, repository: url.href } };
+      if (source.credential.token) return { ...withSecrets, source: { ...source, repository: url.href } };
       const prevGit = previous?.source.type === 'git' ? previous.source : undefined;
       if (prevGit?.credential?.token && prevGit.repository === url.href && prevGit.credential.username === source.credential.username) {
-        return { ...configuration, source: { ...source, repository: url.href, credential: { username: source.credential.username, token: prevGit.credential.token } } };
+        return { ...withSecrets, source: { ...source, repository: url.href, credential: { username: source.credential.username, token: prevGit.credential.token } } };
       }
       throw new AppError('SECRET_REQUIRED', 'Enter a Git access token for this private repository', 400);
     }
-    return configuration;
+    return withSecrets;
   };
   const validate = (configuration:ComposeConfiguration) => {
     for(const domain of configuration.domains.filter(item=>item.https)) {
@@ -88,7 +102,7 @@ export function registerCompose(app: FastifyInstance, options: Options) {
     if (new Set(configuration.domains.map(item=>item.hostname)).size !== configuration.domains.length) throw new AppError('DUPLICATE_DOMAIN','Compose domains must be unique',400);
     if (configuration.source.type === 'inline') {
       let definition;
-      try { definition = parseComposeDefinition(configuration.source.yaml); } catch(error) { throw new AppError('INVALID_COMPOSE',error instanceof Error?error.message:'Invalid Compose source',400); }
+      try { definition = parseComposeDefinition(configuration.source.yaml, 'inline', { allowSsh: Boolean(configuration.sshForwarding) }); } catch(error) { throw new AppError('INVALID_COMPOSE',error instanceof Error?error.message:'Invalid Compose source',400); }
       for (const domain of configuration.domains) if (!Object.hasOwn(definition.services,domain.service)) throw new AppError('INVALID_COMPOSE','Domain target must name a Compose service',400);
     }
   };

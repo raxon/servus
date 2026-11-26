@@ -56,7 +56,7 @@ it('supports separate MinIO console and API domains and rejects invalid combinat
 
 it('authenticates the catalog and returns metadata without generated configuration',async()=>{
   const {app,headers}=await fixture();expect((await app.inject({url:'/api/v1/templates'})).statusCode).toBe(401);
-  const response=await app.inject({url:'/api/v1/templates',headers});expect(response.statusCode).toBe(200);expect(response.json().templates).toHaveLength(5);expect(response.payload).not.toContain('GF_SECURITY_ADMIN_PASSWORD');expect(response.payload).not.toContain('yaml');
+  const response=await app.inject({url:'/api/v1/templates',headers});expect(response.statusCode).toBe(200);expect(response.json().templates).toHaveLength(10);expect(response.payload).not.toContain('GF_SECURITY_ADMIN_PASSWORD');expect(response.payload).not.toContain('yaml');
 });
 
 it('checks CSRF and project write access before generating a workload',async()=>{

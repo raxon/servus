@@ -17,7 +17,17 @@ export const composeSourceSchema = z.discriminatedUnion('type', [
   }).strict(),
 ]);
 export const composeDomainSchema = z.object({ hostname: z.string().min(1).max(253).toLowerCase().refine(value => value.split('.').every(part => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(part))), service: composeName, port: z.number().int().min(1).max(65535), https: z.boolean().default(false), redirectHttps: z.boolean().optional() }).strict().refine(value=>!value.redirectHttps||value.https,{message:'HTTP redirects require HTTPS for the same domain',path:['redirectHttps']});
-export const composeConfigSchema = z.object({ source: composeSourceSchema, domains: z.array(composeDomainSchema).max(20).default([]) }).strict();
+export const composeBuildSecretSchema = z.object({
+  id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/),
+  value: z.string().min(1).max(32768).optional(),
+  hasValue: z.boolean().optional(),
+}).strict();
+export const composeConfigSchema = z.object({
+  source: composeSourceSchema,
+  domains: z.array(composeDomainSchema).max(20).default([]),
+  buildSecrets: z.array(composeBuildSecretSchema).max(20).optional(),
+  sshForwarding: z.boolean().optional(),
+}).strict();
 export type ComposeConfiguration = z.infer<typeof composeConfigSchema>;
 export type ComposeOperationType = 'deploy' | 'start' | 'stop' | 'restart' | 'destroy';
 export interface ComposeWorkload { id: string; projectId: string; name: string; revision: number; deployedRevision: number | null; state: 'pending' | 'running' | 'stopped' | 'failed' | 'deleted'; sourceType: 'inline' | 'git'; domains: z.infer<typeof composeDomainSchema>[]; createdAt: string; updatedAt: string; lastError: string | null }

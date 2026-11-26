@@ -63,7 +63,7 @@ export class ComposeRuntime {
     });
   }
   private async source(request: ComposeApplyRequest, directory: string,pinnedCommit?:string): Promise<{ definition: ComposeDefinition; commit?: string;checkout?:string }> {
-    if (request.configuration.source.type === 'inline') return { definition: parseComposeDefinition(request.configuration.source.yaml) };
+    if (request.configuration.source.type === 'inline') return { definition: parseComposeDefinition(request.configuration.source.yaml, 'inline', { allowSsh: Boolean(request.configuration.sshForwarding) }) };
     const source = request.configuration.source, resolved = await resolveRepository(source.repository);
     if (source.branch.includes('..') || source.branch.endsWith('/')) throw new Error('Invalid Compose Git branch.');
     const gitConfig = ['-c','protocol.file.allow=never','-c','http.followRedirects=false','-c','core.hooksPath=/dev/null'];
@@ -100,7 +100,7 @@ export class ComposeRuntime {
     if (inside === '..' || inside.startsWith('..' + sep) || isAbsolute(inside) || !statSync(path).isFile() || statSync(path).size > 256 * 1024) throw new Error('Compose file must remain inside the repository and be at most 256 KiB.');
     const commit = (await this.run('git', ['rev-parse','HEAD'], root, request.operationId, env)).trim();
     if (!/^[a-f0-9]{40,64}$/.test(commit)||pinnedCommit&&commit!==pinnedCommit) throw new Error('Invalid Compose Git commit.');
-    return { definition: parseComposeDefinition(readFileSync(path,'utf8'),'git'), commit,checkout:root };
+    return { definition: parseComposeDefinition(readFileSync(path,'utf8'),'git', { allowSsh: Boolean(request.configuration.sshForwarding) }), commit,checkout:root };
   }
   private latest(workloadId: string, projectId: string,allowFailed=false): Snapshot {
     const rows = this.journal.prepare(`SELECT snapshot FROM compose_operations WHERE workload_id=? AND project_id=? AND type='deploy' ${allowFailed?'':"AND state='succeeded'"} ORDER BY updated_at DESC,rowid DESC LIMIT 100`).all(workloadId,projectId) as { snapshot: string }[];

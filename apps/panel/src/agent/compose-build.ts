@@ -89,8 +89,41 @@ export async function buildComposeImages(options:{docker:Docker;request:ComposeA
     if(options.commit)args.push('--label',`panel.source.commit=${options.commit}`);
     for(const[key,value]of Object.entries(build.args??{}))args.push('--build-arg',`${key}=${String(value)}`);
     if(build.target)args.push('--target',build.target);
+    // Additional build contexts (docker-image:// or relative paths inside pinned Git checkout)
+    if(build.additional_contexts) {
+      const base = request.configuration.source.type === 'git' && options.checkout
+        ? dirname(composeBuildPath(options.checkout, options.checkout, request.configuration.source.path, 'file'))
+        : undefined;
+      for(const [ctxName, ctxTarget] of Object.entries(build.additional_contexts)) {
+        if (ctxTarget.startsWith('docker-image://')) {
+          args.push('--build-context', `${ctxName}=${ctxTarget}`);
+        } else {
+          if (!base || !options.checkout) throw new Error('File-based additional_contexts require a Git Compose source.');
+          const srcDir = composeBuildPath(options.checkout, base, ctxTarget, 'directory');
+          const stagedDir = join(directory, `ctx-${ctxName}`);
+          stageComposeBuildContext(srcDir, stagedDir);
+          args.push('--build-context', `${ctxName}=${stagedDir}`);
+        }
+      }
+    }
+    // BuildKit build secrets (provided via encrypted Compose buildSecrets)
+    const secretMap = new Map((request.configuration.buildSecrets ?? []).filter(s => typeof s.value === 'string').map(s => [s.id, s.value!]));
+    for (const secretId of build.secrets ?? []) {
+      const secretValue = secretMap.get(secretId);
+      if (secretValue === undefined) throw new Error(`Compose build secret "${secretId}" is not configured.`);
+      const secretFile = join(directory, `secret-${secretId}`);
+      writeFileSync(secretFile, secretValue, { mode: 0o600 });
+      args.push('--secret', `id=${secretId},src=${secretFile}`);
+    }
+    // Controlled SSH forwarding when explicitly enabled on the Compose configuration
+    if (build.ssh?.length) {
+      if (!request.configuration.sshForwarding) throw new Error('Compose SSH forwarding is disabled for this workload.');
+      args.push('--ssh', 'default');
+    }
     args.push(context);
-    logs+=(await run('docker',args,directory,request.operationId,{DOCKER_CONFIG:privateConfig,DOCKER_BUILDKIT:'1'},Math.min(300_000,remaining))).slice(-16000);
+    let buildLog = await run('docker',args,directory,request.operationId,{DOCKER_CONFIG:privateConfig,DOCKER_BUILDKIT:'1'},Math.min(300_000,remaining));
+    for (const val of secretMap.values()) if (val) buildLog = buildLog.replaceAll(val, '[REDACTED]');
+    logs += buildLog.slice(-16000);
     const resolved=await docker.getImage(tag).inspect(),checkpoint={id:resolved.Id,tag,...identity};
     await inspectOwnedImage(docker,request,name,checkpoint);images[name]=checkpoint;options.checkpoint();
   }

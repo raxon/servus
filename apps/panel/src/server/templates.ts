@@ -39,6 +39,20 @@ export function templateConfiguration(id:ApplicationTemplateId,input:TemplateInp
       port=3000;definition={services:{app:{...runtime,image:template.images[0],environment:{GF_SECURITY_ADMIN_USER:'admin',GF_SECURITY_ADMIN_PASSWORD:secret(),GF_USERS_ALLOW_SIGN_UP:'false'},volumes:['data:/var/lib/grafana'],expose:[port]}},volumes:{data:{}}};break;
     case 'minio':
       port=9001;definition={services:{app:{...runtime,image:template.images[0],environment:{MINIO_ROOT_USER:`servus${randomBytes(8).toString('hex')}`,MINIO_ROOT_PASSWORD:secret()},command:['server','/data','--console-address',':9001'],volumes:['data:/data'],expose:[9000,9001]}},volumes:{data:{}}};break;
+    case 'umami': {
+      port=3000;
+      const dbPass=secret(),appSecret=secret();
+      definition={services:{app:{...runtime,image:template.images[0],environment:{DATABASE_URL:`postgresql://umami:${dbPass}@database:5432/umami`,DATABASE_TYPE:'postgresql',APP_SECRET:appSecret},networks:['private'],depends_on:['database'],expose:[3000]},database:{...runtime,image:template.images[1],environment:{POSTGRES_DB:'umami',POSTGRES_USER:'umami',POSTGRES_PASSWORD:dbPass},volumes:['database:/var/lib/postgresql/data'],networks:['private']}},volumes:{database:{}},networks:{private:{internal:true}}};
+      break;
+    }
+    case 'pocketbase':
+      port=8090;definition={services:{app:{...runtime,image:template.images[0],volumes:['data:/pb_data'],expose:[8090]}},volumes:{data:{}}};break;
+    case 'vaultwarden':
+      port=80;definition={services:{app:{...runtime,image:template.images[0],environment:{SIGNUPS_ALLOWED:'true',WEBSOCKET_ENABLED:'true',...(input.hostname?{DOMAIN:`https://${input.hostname}`}:{})},volumes:['data:/data'],expose:[80]}},volumes:{data:{}}};break;
+    case 'gitea':
+      port=3000;definition={services:{app:{...runtime,image:template.images[0],environment:{USER_UID:'1000',USER_GID:'1000'},volumes:['data:/var/lib/gitea'],expose:[3000]}},volumes:{data:{}}};break;
+    case 'metabase':
+      port=3000;definition={services:{app:{...runtime,mem_limit:'1g',image:template.images[0],environment:{MB_DB_FILE:'/metabase-data/metabase.db'},volumes:['data:/metabase-data'],expose:[3000]}},volumes:{data:{}}};break;
   }
   const yaml=stringify(definition);parseComposeDefinition(yaml);
   return {source:{type:'inline',yaml},domains:[...(input.hostname?[{hostname:input.hostname,service:'app',port,https:false}]:[]),...(input.apiHostname?[{hostname:input.apiHostname,service:'app',port:9000,https:false}]:[])]};

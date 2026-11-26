@@ -213,9 +213,9 @@ export function HostAdminPanel() {
           }}
         >
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {["uptime && free -m", "df -h", "docker service ls", "docker ps --format 'table {{.Names}}\\t{{.Status}}'"].map((preset) => (
+            {["cat /proc/loadavg && head -n 3 /proc/meminfo", "df -h", "docker service ls", "docker ps --format 'table {{.Names}}\\t{{.Status}}'"].map((preset) => (
               <button key={preset} type="button" className="button button-small" onClick={() => { setCommand(preset); execMutation.mutate(preset); }}>
-                {preset.split(" ")[0]} {preset.split(" ")[1] ?? ""}
+                {preset.startsWith("cat /proc") ? "load & mem" : `${preset.split(" ")[0]} ${preset.split(" ")[1] ?? ""}`}
               </button>
             ))}
           </div>

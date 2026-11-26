@@ -120,8 +120,8 @@ try {
     await page.route(`**/api/v1/services/${value.service.id}/check-source`, route => route.fulfill({status:422,contentType:'application/json',body:JSON.stringify({error:{code:'SOURCE_DOCKERFILE',message:'The Dockerfile is missing, inaccessible or outside the build context.'}})}));
     await check.click();
     await page.locator('.source-field-error').filter({hasText:'The Dockerfile is missing, inaccessible or outside the build context.'}).waitFor();
-    assert.equal(await page.getByLabel('Dockerfile').getAttribute('aria-invalid'),'true');
-    await page.getByLabel('Dockerfile').fill('Containerfile');
+    assert.equal(await page.getByRole('textbox',{name:'Dockerfile'}).getAttribute('aria-invalid'),'true');
+    await page.getByRole('textbox',{name:'Dockerfile'}).fill('Containerfile');
     assert.equal(await page.getByText('The Dockerfile is missing, inaccessible or outside the build context.').count(),0);
     await page.getByLabel('Branch or ref').fill('other');
     assert.equal(await check.isDisabled(),false);

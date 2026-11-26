@@ -87,6 +87,7 @@ import { InstallationBackupSettings } from "./InstallationBackupSettings.js";
 import { BackupStorageSettings } from "./BackupStorageSettings.js";
 import { HostMetricsCard } from "./HostMetricsCard.js";
 import { HostAdminPanel } from "./HostAdminPanel.js";
+import { DatabaseAdminTools } from "./DatabaseAdminTools.js";
 import { AlertsSettings } from "./AlertsSettings.js";
 import { BuildConcurrencySettings } from "./BuildConcurrencySettings.js";
 import { ProjectAccess } from "./ProjectAccess.js";
@@ -1281,7 +1282,10 @@ function ServicePage() {
           <ServiceMetricsPanel service={service} />
           <div className="service-overview-grid">
             {database ? (
-              <DatabaseConnection service={service} admin={user.role === "admin"} canWrite={canWrite} />
+              <>
+                <DatabaseConnection service={service} admin={user.role === "admin"} canWrite={canWrite} />
+                <DatabaseAdminTools service={service} canWrite={canWrite} />
+              </>
             ) : (
               <section className="surface details-card">
                 <div className="card-heading">
