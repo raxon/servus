@@ -546,7 +546,7 @@ function Shell() {
               <Brand />
             )}
           </Link>
-          {!compactRail ? <span className="ep-version-chip">v0.7.1</span> : null}
+          {!compactRail ? <span className="ep-version-chip">v0.7.2</span> : null}
         </div>
         <nav aria-label="Main navigation">
           <Link
